@@ -3,6 +3,7 @@ use serde::{Deserialize, Serialize};
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 pub enum SuggestionOrigin {
     Filename,
+    Metadata,
 }
 
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
@@ -19,6 +20,13 @@ pub struct ParsedFilename {
     pub tokens: Vec<String>,
     pub bpm: Option<u16>,
     pub musical_key: Option<String>,
+}
+
+#[derive(Clone, Debug, Default, Eq, PartialEq, Serialize, Deserialize)]
+pub struct EmbeddedAudioMetadata {
+    pub title: Option<String>,
+    pub genre: Option<String>,
+    pub comment: Option<String>,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
@@ -84,21 +92,80 @@ pub fn suggest_tags_from_filename(filename: &str) -> Vec<TagSuggestion> {
     parsed
         .tokens
         .iter()
-        .filter_map(|token| match token.as_str() {
-            "impact" | "hit" => Some(("Impact", "action", 0.86)),
-            "whoosh" => Some(("Whoosh", "action", 0.9)),
-            "metal" | "metallic" => Some(("Metal", "source", 0.84)),
-            "bright" => Some(("Bright", "frequency", 0.78)),
-            "dark" => Some(("Dark", "character", 0.76)),
-            "short" => Some(("Short", "duration", 0.72)),
-            _ => None,
-        })
+        .filter_map(|token| tag_for_token(token, 0.0))
         .map(|(name, facet, confidence)| TagSuggestion {
             name: name.to_string(),
             facet: facet.to_string(),
             confidence,
             origin: SuggestionOrigin::Filename,
         })
+        .collect()
+}
+
+pub fn suggest_tags_from_embedded_metadata(metadata: &EmbeddedAudioMetadata) -> Vec<TagSuggestion> {
+    let mut suggestions = Vec::new();
+
+    if let Some(genre) = &metadata.genre {
+        suggestions.extend(metadata_field_suggestions(genre, 0.1));
+    }
+    if let Some(title) = &metadata.title {
+        suggestions.extend(metadata_field_suggestions(title, 0.0));
+    }
+    if let Some(comment) = &metadata.comment {
+        suggestions.extend(metadata_field_suggestions(comment, -0.04));
+    }
+
+    suggestions
+        .into_iter()
+        .fold(Vec::new(), |mut deduped, next| {
+            if let Some(existing) = deduped
+                .iter_mut()
+                .find(|existing| existing.name == next.name && existing.facet == next.facet)
+            {
+                existing.confidence = existing.confidence.max(next.confidence);
+            } else {
+                deduped.push(next);
+            }
+            deduped
+        })
+}
+
+fn metadata_field_suggestions(value: &str, confidence_delta: f32) -> Vec<TagSuggestion> {
+    tokenize_metadata_value(value)
+        .iter()
+        .filter_map(|token| tag_for_token(token, confidence_delta))
+        .map(|(name, facet, confidence)| TagSuggestion {
+            name: name.to_string(),
+            facet: facet.to_string(),
+            confidence,
+            origin: SuggestionOrigin::Metadata,
+        })
+        .collect()
+}
+
+fn tag_for_token(token: &str, confidence_delta: f32) -> Option<(&'static str, &'static str, f32)> {
+    let (name, facet, confidence) = match token {
+        "impact" | "hit" => ("Impact", "action", 0.86),
+        "whoosh" => ("Whoosh", "action", 0.9),
+        "metal" | "metallic" => ("Metal", "source", 0.84),
+        "bright" => ("Bright", "frequency", 0.78),
+        "dark" => ("Dark", "character", 0.76),
+        "short" => ("Short", "duration", 0.72),
+        "cinematic" | "trailer" => ("Cinematic", "character", 0.82),
+        "sfx" | "effect" | "effects" => ("Sound Effect", "media_type", 0.82),
+        "ambience" | "ambient" => ("Ambience", "media_type", 0.84),
+        "music" | "song" | "track" => ("Music", "media_type", 0.84),
+        _ => return None,
+    };
+
+    Some((name, facet, (confidence + confidence_delta).clamp(0.0, 1.0)))
+}
+
+fn tokenize_metadata_value(value: &str) -> Vec<String> {
+    value
+        .split(|character: char| !character.is_ascii_alphanumeric())
+        .filter(|token| !token.is_empty())
+        .map(|token| token.to_ascii_lowercase())
         .collect()
 }
 
@@ -145,5 +212,29 @@ mod tests {
         assert!(suggestions
             .iter()
             .any(|suggestion| suggestion.name == "Metal"));
+    }
+
+    #[test]
+    fn embedded_metadata_suggests_traceable_tags() {
+        let metadata = EmbeddedAudioMetadata {
+            title: Some("Dark metallic impact".to_string()),
+            genre: Some("Cinematic Sound Effects".to_string()),
+            comment: Some("short trailer hit".to_string()),
+        };
+
+        let suggestions = suggest_tags_from_embedded_metadata(&metadata);
+
+        assert!(suggestions.iter().any(|suggestion| {
+            suggestion.name == "Sound Effect"
+                && suggestion.facet == "media_type"
+                && suggestion.origin == SuggestionOrigin::Metadata
+                && suggestion.confidence > 0.8
+        }));
+        assert!(suggestions.iter().any(|suggestion| {
+            suggestion.name == "Impact" && suggestion.origin == SuggestionOrigin::Metadata
+        }));
+        assert!(suggestions
+            .iter()
+            .any(|suggestion| suggestion.name == "Cinematic"));
     }
 }

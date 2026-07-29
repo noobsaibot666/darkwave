@@ -9,6 +9,7 @@ Implemented behavior:
 
 - Filename parsing extracts a cleaned display name, useful tokens, BPM, and musical key hints.
 - Filename-origin tag suggestions include tag name, facet, confidence, and origin.
+- Embedded metadata fields such as title, genre, and comments can map to the same tag vocabulary with metadata-origin traceability.
 - SQLite FTS5 indexes asset display names, original filenames, and notes.
 - Catalog search supports text search, tag filters, and media-type filters.
 - Smart collections store serialized query definitions.
