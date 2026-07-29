@@ -1,3 +1,4 @@
+import { invoke } from "@tauri-apps/api/core";
 import {
   Bell,
   Command,
@@ -20,6 +21,7 @@ import {
   Volume2,
   Zap
 } from "lucide-react";
+import { useEffect, useState } from "react";
 
 type AssetRow = {
   name: string;
@@ -35,15 +37,21 @@ const rows: AssetRow[] = [
   { name: "Slow Analog Pulse 92 BPM", type: "Music", duration: "1:48", energy: "Medium", source: "Local" }
 ];
 
-const releaseItems = [
-  { label: "macOS audit", state: "Passed" },
-  { label: "Windows audit", state: "Passed" },
-  { label: "Accessibility", state: "Passed" },
-  { label: "Performance", state: "Passed" },
-  { label: "Codec packaging", state: "Planned" },
-  { label: "Codec license", state: "Planned" },
-  { label: "Updates", state: "Planned" },
-  { label: "Signing", state: "Planned" }
+type ReleaseReadinessItem = {
+  label: string;
+  blocker: string;
+  state: "Passed" | "Planned";
+};
+
+const fallbackReleaseItems: ReleaseReadinessItem[] = [
+  { label: "macOS audit", blocker: "macos_audit", state: "Passed" },
+  { label: "Windows audit", blocker: "windows_audit", state: "Passed" },
+  { label: "Accessibility", blocker: "accessibility_audit", state: "Passed" },
+  { label: "Performance", blocker: "performance_profile", state: "Passed" },
+  { label: "Codec packaging", blocker: "codec_packaging", state: "Planned" },
+  { label: "Codec license", blocker: "codec_license_review", state: "Planned" },
+  { label: "Updates", blocker: "update_system", state: "Planned" },
+  { label: "Signing", blocker: "signing_notarization", state: "Planned" }
 ];
 
 const shortcutItems = [
@@ -69,6 +77,15 @@ const maintenanceItems = [
 const duplicateActions = ["Keep", "Link", "Merge", "Replace", "Trash"];
 
 export function App() {
+  const [releaseItems, setReleaseItems] = useState(fallbackReleaseItems);
+  const updateChannelState = releaseItems.find((item) => item.blocker === "update_system")?.state ?? "Planned";
+
+  useEffect(() => {
+    invoke<ReleaseReadinessItem[]>("release_readiness_items")
+      .then(setReleaseItems)
+      .catch(() => setReleaseItems(fallbackReleaseItems));
+  }, []);
+
   return (
     <main className="shell">
       <aside className="sidebar" aria-label="Library">
@@ -274,7 +291,7 @@ export function App() {
           </div>
           <div className="status-line">
             <Bell size={15} />
-            Update channel planned
+            {updateChannelState === "Passed" ? "Update channel ready" : "Update channel planned"}
           </div>
         </section>
         <section>

@@ -1,27 +1,74 @@
+use std::collections::HashSet;
+
+use release_readiness::{ReleaseBlocker, ReleaseReadinessConfig};
+
+#[derive(Clone, Debug, Eq, PartialEq, serde::Serialize)]
+struct ReleaseReadinessItem {
+    label: &'static str,
+    blocker: &'static str,
+    state: &'static str,
+}
+
+const RELEASE_ITEM_DEFINITIONS: [(&str, ReleaseBlocker); 8] = [
+    ("macOS audit", ReleaseBlocker::MacosAudit),
+    ("Windows audit", ReleaseBlocker::WindowsAudit),
+    ("Accessibility", ReleaseBlocker::AccessibilityAudit),
+    ("Performance", ReleaseBlocker::PerformanceProfile),
+    ("Codec packaging", ReleaseBlocker::CodecPackaging),
+    ("Codec license", ReleaseBlocker::CodecLicenseReview),
+    ("Updates", ReleaseBlocker::UpdateSystem),
+    ("Signing", ReleaseBlocker::SigningNotarization),
+];
+
 #[tauri::command]
 fn healthcheck() -> &'static str {
     library_core::product_codename()
 }
 
+fn release_blocker_id(blocker: ReleaseBlocker) -> &'static str {
+    match blocker {
+        ReleaseBlocker::MacosAudit => "macos_audit",
+        ReleaseBlocker::WindowsAudit => "windows_audit",
+        ReleaseBlocker::AccessibilityAudit => "accessibility_audit",
+        ReleaseBlocker::PerformanceProfile => "performance_profile",
+        ReleaseBlocker::CrashRecovery => "crash_recovery",
+        ReleaseBlocker::OnboardingDocs => "onboarding_docs",
+        ReleaseBlocker::CodecPackaging => "codec_packaging",
+        ReleaseBlocker::CodecLicenseReview => "codec_license_review",
+        ReleaseBlocker::UpdateSystem => "update_system",
+        ReleaseBlocker::SigningNotarization => "signing_notarization",
+    }
+}
+
 #[tauri::command]
 fn release_blockers() -> Vec<&'static str> {
-    use release_readiness::{ReleaseBlocker, ReleaseReadinessConfig};
-
     ReleaseReadinessConfig::code_gates_passed()
         .candidate()
         .blockers()
         .into_iter()
-        .map(|blocker| match blocker {
-            ReleaseBlocker::MacosAudit => "macos_audit",
-            ReleaseBlocker::WindowsAudit => "windows_audit",
-            ReleaseBlocker::AccessibilityAudit => "accessibility_audit",
-            ReleaseBlocker::PerformanceProfile => "performance_profile",
-            ReleaseBlocker::CrashRecovery => "crash_recovery",
-            ReleaseBlocker::OnboardingDocs => "onboarding_docs",
-            ReleaseBlocker::CodecPackaging => "codec_packaging",
-            ReleaseBlocker::CodecLicenseReview => "codec_license_review",
-            ReleaseBlocker::UpdateSystem => "update_system",
-            ReleaseBlocker::SigningNotarization => "signing_notarization",
+        .map(release_blocker_id)
+        .collect()
+}
+
+#[tauri::command]
+fn release_readiness_items() -> Vec<ReleaseReadinessItem> {
+    let current_blockers: HashSet<_> = release_blockers().into_iter().collect();
+
+    RELEASE_ITEM_DEFINITIONS
+        .into_iter()
+        .map(|(label, blocker)| {
+            let blocker = release_blocker_id(blocker);
+            let state = if current_blockers.contains(blocker) {
+                "Planned"
+            } else {
+                "Passed"
+            };
+
+            ReleaseReadinessItem {
+                label,
+                blocker,
+                state,
+            }
         })
         .collect()
 }
@@ -107,6 +154,7 @@ pub fn run() {
         .invoke_handler(tauri::generate_handler![
             healthcheck,
             release_blockers,
+            release_readiness_items,
             default_preferences,
             supported_drag_targets,
             default_virtualized_range,
@@ -138,6 +186,28 @@ mod tests {
                 "signing_notarization"
             ]
         );
+    }
+
+    #[test]
+    fn release_readiness_items_reflect_current_blockers() {
+        let items = super::release_readiness_items();
+        let planned: Vec<_> = items
+            .iter()
+            .filter(|item| item.state == "Planned")
+            .map(|item| item.blocker)
+            .collect();
+
+        assert_eq!(
+            planned,
+            vec![
+                "codec_packaging",
+                "codec_license_review",
+                "update_system",
+                "signing_notarization"
+            ]
+        );
+        assert_eq!(items[0].label, "macOS audit");
+        assert_eq!(items[0].state, "Passed");
     }
 
     #[test]
