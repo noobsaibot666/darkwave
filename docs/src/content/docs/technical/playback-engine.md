@@ -12,6 +12,7 @@ The first playback core is a tested state machine, not the final output engine.
 - Current position.
 - Playing or paused state.
 - Optional loop region.
+- Playback speed percentage with a 50%-200% editorial range and a reset-to-normal command.
 - Playback source selection between original media and cached preview files.
 - Cached WAV preview decoding into PCM buffers for offline playback preparation.
 - Decode cancellation tokens so a newer asset load invalidates earlier decode work.
@@ -19,10 +20,10 @@ The first playback core is a tested state machine, not the final output engine.
 - Output route selection from saved preferences and available device IDs.
 - Output route binding to platform output handles with explicit system-default fallback state.
 
-Loading a new asset resets position to zero, clears loop state, and stops playback. Decode coordination issues a new token for each load, so moving to another row invalidates previous decode work before it can overlap the current selection.
+Loading a new asset resets position to zero, clears loop state, and stops playback. Playback speed is transport state, so it can be adjusted independently and reset to normal without reloading the selected asset. Decode coordination issues a new token for each load, so moving to another row invalidates previous decode work before it can overlap the current selection.
 
 When an original file is local, playback source selection uses the original media path. When the original is missing or unavailable but a preview cache file exists, the cached preview is selected instead. Cached WAV previews can be decoded into PCM for playback preparation. Assets without either source are reported unavailable.
 
 Output routing uses the system default unless the saved preference names a currently available device. Missing saved devices fall back to the system default while preserving which device disappeared. Bound routes carry the platform output handle used by the audio backend; if no default handle is available, the engine reports an unbound fallback instead of pretending playback can start.
 
-Future Milestone 2 work will connect this state model to arbitrary-format decoding, playback speed, and platform transport output.
+Future Milestone 2 work will connect this state model to arbitrary-format decoding and platform transport output, including applying the selected playback speed in the audio backend.

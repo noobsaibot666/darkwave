@@ -325,6 +325,7 @@ export function App() {
           ))}
         </div>
         <span className="time">0:01 / 0:02</span>
+        <span className="time">1.00x</span>
         <span className="time">80 ms start</span>
       </footer>
     </main>

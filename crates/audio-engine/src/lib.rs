@@ -3,6 +3,10 @@ use preferences::OutputDevicePreference;
 use shared_types::AvailabilityState;
 use uuid::Uuid;
 
+pub const NORMAL_PLAYBACK_SPEED_PERCENT: u16 = 100;
+pub const MIN_PLAYBACK_SPEED_PERCENT: u16 = 50;
+pub const MAX_PLAYBACK_SPEED_PERCENT: u16 = 200;
+
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum PlaybackCommand {
     Play,
@@ -34,15 +38,18 @@ pub enum PlaybackEvent {
     SeekMs(u64),
     SetLoopRegion { start_ms: u64, end_ms: u64 },
     ClearLoopRegion,
+    SetPlaybackSpeedPercent(u16),
+    ResetPlaybackSpeed,
 }
 
-#[derive(Clone, Debug, Default, Eq, PartialEq)]
+#[derive(Clone, Debug, Eq, PartialEq)]
 pub struct PlaybackSession {
     active_asset_id: Option<Uuid>,
     duration_ms: u64,
     position_ms: u64,
     playing: bool,
     loop_region: Option<LoopRegion>,
+    playback_speed_percent: u16,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -241,6 +248,10 @@ pub fn classify_playback_startup_latency(
     }
 }
 
+fn clamp_playback_speed_percent(percent: u16) -> u16 {
+    percent.clamp(MIN_PLAYBACK_SPEED_PERCENT, MAX_PLAYBACK_SPEED_PERCENT)
+}
+
 impl PlaybackDecodeCoordinator {
     pub fn new() -> Self {
         Self::default()
@@ -263,6 +274,19 @@ impl PlaybackDecodeCoordinator {
 
     pub fn active_asset_id(&self) -> Option<Uuid> {
         self.active_token.map(|token| token.asset_id)
+    }
+}
+
+impl Default for PlaybackSession {
+    fn default() -> Self {
+        Self {
+            active_asset_id: None,
+            duration_ms: 0,
+            position_ms: 0,
+            playing: false,
+            loop_region: None,
+            playback_speed_percent: NORMAL_PLAYBACK_SPEED_PERCENT,
+        }
     }
 }
 
@@ -302,6 +326,12 @@ impl PlaybackSession {
             PlaybackEvent::ClearLoopRegion => {
                 self.loop_region = None;
             }
+            PlaybackEvent::SetPlaybackSpeedPercent(percent) => {
+                self.playback_speed_percent = clamp_playback_speed_percent(percent);
+            }
+            PlaybackEvent::ResetPlaybackSpeed => {
+                self.playback_speed_percent = NORMAL_PLAYBACK_SPEED_PERCENT;
+            }
         }
     }
 
@@ -319,6 +349,10 @@ impl PlaybackSession {
 
     pub fn loop_region(&self) -> Option<LoopRegion> {
         self.loop_region
+    }
+
+    pub fn playback_speed_percent(&self) -> u16 {
+        self.playback_speed_percent
     }
 }
 
@@ -388,6 +422,37 @@ mod tests {
             })
         );
         assert!(session.is_playing());
+    }
+
+    #[test]
+    fn playback_speed_defaults_to_normal_and_clamps_to_editorial_range() {
+        let mut session = PlaybackSession::default();
+
+        assert_eq!(session.playback_speed_percent(), 100);
+
+        session.apply(PlaybackEvent::SetPlaybackSpeedPercent(25));
+        assert_eq!(session.playback_speed_percent(), 50);
+
+        session.apply(PlaybackEvent::SetPlaybackSpeedPercent(240));
+        assert_eq!(session.playback_speed_percent(), 200);
+    }
+
+    #[test]
+    fn playback_speed_reset_returns_to_normal_without_reloading_asset() {
+        let mut session = PlaybackSession::default();
+        let asset_id = Uuid::new_v4();
+        session.apply(PlaybackEvent::Load {
+            asset_id,
+            duration_ms: 10_000,
+        });
+        session.apply(PlaybackEvent::Play);
+        session.apply(PlaybackEvent::SetPlaybackSpeedPercent(75));
+
+        session.apply(PlaybackEvent::ResetPlaybackSpeed);
+
+        assert_eq!(session.active_asset_id(), Some(asset_id));
+        assert!(session.is_playing());
+        assert_eq!(session.playback_speed_percent(), 100);
     }
 
     #[test]
