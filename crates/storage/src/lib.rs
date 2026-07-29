@@ -127,6 +127,46 @@ pub struct CollectionRecord {
     pub query_definition: Option<String>,
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum UsageEventType {
+    Played,
+    Exported,
+    Dragged,
+    Copied,
+    Used,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct UsageEventRecord {
+    pub id: Uuid,
+    pub asset_id: Uuid,
+    pub project_id: Option<Uuid>,
+    pub event_type: UsageEventType,
+    pub destination: Option<String>,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct SourceRecordDraft {
+    pub asset_id: Uuid,
+    pub provider: Option<String>,
+    pub source_url: Option<String>,
+    pub license_type: Option<String>,
+    pub license_status: Option<String>,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct ProjectSourceReportRow {
+    pub asset_id: Uuid,
+    pub asset_title: String,
+    pub original_filename: String,
+    pub provider: Option<String>,
+    pub source_url: Option<String>,
+    pub license_type: Option<String>,
+    pub license_status: Option<String>,
+    pub usage_status: String,
+    pub destination: Option<String>,
+}
+
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 pub struct AssetSearchQuery {
     pub text: String,
@@ -723,6 +763,120 @@ impl Catalog {
         Ok(())
     }
 
+    pub fn record_usage_event(
+        &self,
+        asset_id: Uuid,
+        project_id: Option<Uuid>,
+        event_type: UsageEventType,
+        destination: impl AsRef<str>,
+    ) -> Result<UsageEventRecord, StorageError> {
+        let event = UsageEventRecord {
+            id: Uuid::new_v4(),
+            asset_id,
+            project_id,
+            event_type,
+            destination: Some(destination.as_ref().to_string()),
+        };
+
+        self.connection.execute(
+            "INSERT INTO usage_events (id, asset_id, project_id, event_type, destination, created_at)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
+            params![
+                event.id.to_string(),
+                event.asset_id.to_string(),
+                event.project_id.map(|id| id.to_string()),
+                usage_event_type_to_db(event.event_type),
+                event.destination,
+                Utc::now().to_rfc3339(),
+            ],
+        )?;
+
+        self.connection.execute(
+            "UPDATE assets SET export_count = export_count + ?1 WHERE id = ?2",
+            params![
+                (event_type == UsageEventType::Exported) as i64,
+                asset_id.to_string()
+            ],
+        )?;
+
+        Ok(event)
+    }
+
+    pub fn usage_events_for_project(
+        &self,
+        project_id: Uuid,
+    ) -> Result<Vec<UsageEventRecord>, StorageError> {
+        let mut statement = self.connection.prepare(
+            "SELECT id, asset_id, project_id, event_type, destination
+             FROM usage_events
+             WHERE project_id = ?1
+             ORDER BY created_at ASC",
+        )?;
+        let events = statement
+            .query_map(params![project_id.to_string()], usage_event_from_row)?
+            .collect::<Result<Vec<_>, _>>()?;
+
+        Ok(events)
+    }
+
+    pub fn set_source_record(&self, draft: SourceRecordDraft) -> Result<(), StorageError> {
+        self.connection.execute(
+            "INSERT INTO source_records (
+                id, asset_id, provider, source_url, license_type, license_status
+             ) VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
+            params![
+                Uuid::new_v4().to_string(),
+                draft.asset_id.to_string(),
+                draft.provider,
+                draft.source_url,
+                draft.license_type,
+                draft.license_status,
+            ],
+        )?;
+
+        Ok(())
+    }
+
+    pub fn project_source_report(
+        &self,
+        project_id: Uuid,
+    ) -> Result<Vec<ProjectSourceReportRow>, StorageError> {
+        let mut statement = self.connection.prepare(
+            "SELECT
+                assets.id,
+                assets.display_name,
+                assets.original_filename,
+                source_records.provider,
+                source_records.source_url,
+                source_records.license_type,
+                source_records.license_status,
+                usage_events.event_type,
+                usage_events.destination
+             FROM usage_events
+             INNER JOIN assets ON assets.id = usage_events.asset_id
+             LEFT JOIN source_records ON source_records.asset_id = assets.id
+             WHERE usage_events.project_id = ?1
+             ORDER BY usage_events.created_at ASC",
+        )?;
+        let rows = statement
+            .query_map(params![project_id.to_string()], |row| {
+                Ok(ProjectSourceReportRow {
+                    asset_id: parse_uuid(row.get::<_, String>(0)?),
+                    asset_title: row.get(1)?,
+                    original_filename: row.get(2)?,
+                    provider: row.get(3)?,
+                    source_url: row.get(4)?,
+                    license_type: row.get(5)?,
+                    license_status: row.get(6)?,
+                    usage_status: row.get(7)?,
+                    destination: row.get(8)?,
+                })
+            })?
+            .collect::<Result<Vec<_>, _>>()?;
+
+        Ok(rows)
+    }
+
     pub fn undo(&self, undo_id: Uuid) -> Result<(), StorageError> {
         let undo = self
             .connection
@@ -862,6 +1016,29 @@ impl Catalog {
               PRIMARY KEY (collection_id, asset_id)
             );
 
+            CREATE TABLE IF NOT EXISTS source_records (
+              id TEXT PRIMARY KEY,
+              asset_id TEXT NOT NULL REFERENCES assets(id) ON DELETE CASCADE,
+              provider TEXT,
+              source_url TEXT,
+              downloaded_at TEXT,
+              license_type TEXT,
+              license_status TEXT,
+              attribution TEXT,
+              restrictions TEXT,
+              receipt_path TEXT,
+              notes TEXT
+            );
+
+            CREATE TABLE IF NOT EXISTS usage_events (
+              id TEXT PRIMARY KEY,
+              asset_id TEXT NOT NULL REFERENCES assets(id) ON DELETE CASCADE,
+              project_id TEXT REFERENCES collections(id) ON DELETE SET NULL,
+              event_type TEXT NOT NULL,
+              destination TEXT,
+              created_at TEXT NOT NULL
+            );
+
             CREATE TABLE IF NOT EXISTS undo_actions (
               id TEXT PRIMARY KEY,
               kind TEXT NOT NULL,
@@ -902,6 +1079,8 @@ impl Catalog {
               ON background_jobs(state, priority, created_at);
             CREATE INDEX IF NOT EXISTS idx_asset_tags_asset ON asset_tags(asset_id);
             CREATE INDEX IF NOT EXISTS idx_collection_assets_collection ON collection_assets(collection_id);
+            CREATE INDEX IF NOT EXISTS idx_usage_events_project ON usage_events(project_id);
+            CREATE INDEX IF NOT EXISTS idx_usage_events_asset ON usage_events(asset_id);
             ",
         )?;
 
@@ -1116,6 +1295,37 @@ fn tag_approval_to_db(approval_state: TagApprovalState) -> &'static str {
         TagApprovalState::Accepted => "accepted",
         TagApprovalState::Rejected => "rejected",
     }
+}
+
+fn usage_event_type_to_db(event_type: UsageEventType) -> &'static str {
+    match event_type {
+        UsageEventType::Played => "played",
+        UsageEventType::Exported => "exported",
+        UsageEventType::Dragged => "dragged",
+        UsageEventType::Copied => "copied",
+        UsageEventType::Used => "used",
+    }
+}
+
+fn usage_event_type_from_db(value: &str) -> UsageEventType {
+    match value {
+        "exported" => UsageEventType::Exported,
+        "dragged" => UsageEventType::Dragged,
+        "copied" => UsageEventType::Copied,
+        "used" => UsageEventType::Used,
+        _ => UsageEventType::Played,
+    }
+}
+
+fn usage_event_from_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<UsageEventRecord> {
+    let project_id: Option<String> = row.get(2)?;
+    Ok(UsageEventRecord {
+        id: parse_uuid(row.get::<_, String>(0)?),
+        asset_id: parse_uuid(row.get::<_, String>(1)?),
+        project_id: project_id.map(parse_uuid),
+        event_type: usage_event_type_from_db(&row.get::<_, String>(3)?),
+        destination: row.get(4)?,
+    })
 }
 
 fn normalize_term(value: &str) -> String {
@@ -1523,6 +1733,76 @@ mod tests {
             AssetPath::Referenced("/new/location/moved.wav".to_string())
         );
         assert_eq!(loaded.availability_state, AvailabilityState::Local);
+    }
+
+    #[test]
+    fn export_usage_event_is_recorded_for_project() {
+        let catalog_path = unique_catalog_path("usage");
+        let catalog = Catalog::open(&catalog_path).expect("open catalog");
+        let library = catalog
+            .create_library("Usage", "/library")
+            .expect("library");
+        let asset = test_asset(&catalog, library.id, "used.wav", "hash-used");
+        let project = catalog
+            .create_collection(library.id, "Trailer", CollectionType::Project)
+            .expect("project");
+
+        let event = catalog
+            .record_usage_event(
+                asset.id,
+                Some(project.id),
+                UsageEventType::Exported,
+                "/projects/trailer/audio/used.wav",
+            )
+            .expect("usage");
+
+        assert_eq!(event.asset_id, asset.id);
+        assert_eq!(event.project_id, Some(project.id));
+        assert_eq!(
+            catalog
+                .usage_events_for_project(project.id)
+                .expect("events")
+                .len(),
+            1
+        );
+    }
+
+    #[test]
+    fn project_source_license_report_includes_traceable_asset_rows() {
+        let catalog_path = unique_catalog_path("report");
+        let catalog = Catalog::open(&catalog_path).expect("open catalog");
+        let library = catalog
+            .create_library("Report", "/library")
+            .expect("library");
+        let asset = test_asset(&catalog, library.id, "licensed.wav", "hash-licensed");
+        let project = catalog
+            .create_collection(library.id, "Client Film", CollectionType::Project)
+            .expect("project");
+        catalog
+            .set_source_record(SourceRecordDraft {
+                asset_id: asset.id,
+                provider: Some("Boom Library".to_string()),
+                source_url: Some("https://example.com/sound".to_string()),
+                license_type: Some("subscription".to_string()),
+                license_status: Some("active".to_string()),
+            })
+            .expect("source");
+        catalog
+            .record_usage_event(
+                asset.id,
+                Some(project.id),
+                UsageEventType::Exported,
+                "/project/audio/licensed.wav",
+            )
+            .expect("usage");
+
+        let report = catalog.project_source_report(project.id).expect("report");
+
+        assert_eq!(report.len(), 1);
+        assert_eq!(report[0].asset_id, asset.id);
+        assert_eq!(report[0].provider.as_deref(), Some("Boom Library"));
+        assert_eq!(report[0].license_status.as_deref(), Some("active"));
+        assert_eq!(report[0].usage_status, "exported");
     }
 
     fn unique_catalog_path(name: &str) -> PathBuf {

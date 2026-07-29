@@ -21,6 +21,8 @@ The initial SQLite migration defines:
 - Suggested tag approval state and origin
 - Portable manifest asset snapshots
 - Writer lease state for shared-library coordination
+- Usage events for exported, dragged, copied, played, and used assets
+- Source records for project license reports
 
 Migrations live in `db/migrations`.
 
