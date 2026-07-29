@@ -72,6 +72,35 @@ pub enum AudioOutputRoute {
     FallbackToSystemDefault { missing_device_id: String },
 }
 
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct PlatformAudioOutput {
+    pub device_id: String,
+    pub handle_id: String,
+    pub is_system_default: bool,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct AudioOutputBindingRequest {
+    pub route: AudioOutputRoute,
+    pub platform_outputs: Vec<PlatformAudioOutput>,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum AudioOutputBindingFallback {
+    NoSystemDefaultHandle,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub enum AudioOutputBinding {
+    Bound {
+        route: AudioOutputRoute,
+        handle_id: String,
+    },
+    UnboundSystemDefault {
+        reason: AudioOutputBindingFallback,
+    },
+}
+
 pub fn choose_playback_source(request: PlaybackSourceRequest) -> PlaybackSource {
     match request.availability_state {
         AvailabilityState::Local => PlaybackSource::Original {
@@ -108,6 +137,48 @@ pub fn choose_audio_output_route(request: AudioOutputRouteRequest) -> AudioOutpu
                 }
             }
         }
+    }
+}
+
+pub fn bind_audio_output_route(request: AudioOutputBindingRequest) -> AudioOutputBinding {
+    let default_handle = || {
+        request
+            .platform_outputs
+            .iter()
+            .find(|output| output.is_system_default)
+            .map(|output| output.handle_id.clone())
+    };
+
+    match &request.route {
+        AudioOutputRoute::SystemDefault | AudioOutputRoute::FallbackToSystemDefault { .. } => {
+            default_handle()
+                .map(|handle_id| AudioOutputBinding::Bound {
+                    route: request.route,
+                    handle_id,
+                })
+                .unwrap_or(AudioOutputBinding::UnboundSystemDefault {
+                    reason: AudioOutputBindingFallback::NoSystemDefaultHandle,
+                })
+        }
+        AudioOutputRoute::Device { device_id } => request
+            .platform_outputs
+            .iter()
+            .find(|output| output.device_id == *device_id)
+            .map(|output| AudioOutputBinding::Bound {
+                route: request.route.clone(),
+                handle_id: output.handle_id.clone(),
+            })
+            .or_else(|| {
+                default_handle().map(|handle_id| AudioOutputBinding::Bound {
+                    route: AudioOutputRoute::FallbackToSystemDefault {
+                        missing_device_id: device_id.clone(),
+                    },
+                    handle_id,
+                })
+            })
+            .unwrap_or(AudioOutputBinding::UnboundSystemDefault {
+                reason: AudioOutputBindingFallback::NoSystemDefaultHandle,
+            }),
     }
 }
 
@@ -325,6 +396,74 @@ mod tests {
             route,
             AudioOutputRoute::FallbackToSystemDefault {
                 missing_device_id: "disconnected-interface".to_string()
+            }
+        );
+    }
+
+    #[test]
+    fn audio_output_binding_uses_platform_handle_for_selected_device() {
+        let binding = bind_audio_output_route(AudioOutputBindingRequest {
+            route: AudioOutputRoute::Device {
+                device_id: "interface-a".to_string(),
+            },
+            platform_outputs: vec![
+                PlatformAudioOutput {
+                    device_id: "speakers".to_string(),
+                    handle_id: "coreaudio-default".to_string(),
+                    is_system_default: true,
+                },
+                PlatformAudioOutput {
+                    device_id: "interface-a".to_string(),
+                    handle_id: "coreaudio-interface-a".to_string(),
+                    is_system_default: false,
+                },
+            ],
+        });
+
+        assert_eq!(
+            binding,
+            AudioOutputBinding::Bound {
+                route: AudioOutputRoute::Device {
+                    device_id: "interface-a".to_string()
+                },
+                handle_id: "coreaudio-interface-a".to_string()
+            }
+        );
+    }
+
+    #[test]
+    fn audio_output_binding_uses_system_default_handle_for_default_route() {
+        let binding = bind_audio_output_route(AudioOutputBindingRequest {
+            route: AudioOutputRoute::SystemDefault,
+            platform_outputs: vec![PlatformAudioOutput {
+                device_id: "speakers".to_string(),
+                handle_id: "coreaudio-default".to_string(),
+                is_system_default: true,
+            }],
+        });
+
+        assert_eq!(
+            binding,
+            AudioOutputBinding::Bound {
+                route: AudioOutputRoute::SystemDefault,
+                handle_id: "coreaudio-default".to_string()
+            }
+        );
+    }
+
+    #[test]
+    fn audio_output_binding_records_unbound_fallback_without_platform_handle() {
+        let binding = bind_audio_output_route(AudioOutputBindingRequest {
+            route: AudioOutputRoute::FallbackToSystemDefault {
+                missing_device_id: "interface-a".to_string(),
+            },
+            platform_outputs: Vec::new(),
+        });
+
+        assert_eq!(
+            binding,
+            AudioOutputBinding::UnboundSystemDefault {
+                reason: AudioOutputBindingFallback::NoSystemDefaultHandle
             }
         );
     }

@@ -14,4 +14,4 @@ Shortcut validation groups bindings by accelerator and rejects conflicts before 
 
 Preferences can be loaded from and saved to a JSON settings file. Missing settings files fall back to the editorial defaults, and saved preferences normalize the preview cache limit before writing.
 
-The desktop shell exposes default preferences through a Tauri command. The playback engine consumes the saved output-device preference when choosing an output route, falling back to the system default if a saved device is unavailable. Future work will bind those routes to platform output handles.
+The desktop shell exposes default preferences through a Tauri command. The playback engine consumes the saved output-device preference when choosing an output route, binds that route to platform output handles, and falls back to the system default when a saved device or default handle is unavailable.
