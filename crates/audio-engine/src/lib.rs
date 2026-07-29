@@ -66,6 +66,31 @@ pub struct PreparedPreviewPlayback {
     pub decoded: DecodedAudioBuffer,
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct PlaybackDecodeToken {
+    pub asset_id: Uuid,
+    pub generation: u64,
+    pub requested_at_ms: u64,
+}
+
+#[derive(Clone, Debug, Default, Eq, PartialEq)]
+pub struct PlaybackDecodeCoordinator {
+    active_token: Option<PlaybackDecodeToken>,
+    next_generation: u64,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct PlaybackStartupMeasurement {
+    pub requested_at_ms: u64,
+    pub started_at_ms: u64,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum PlaybackStartupLatency {
+    Passed { elapsed_ms: u64 },
+    TooSlow { elapsed_ms: u64 },
+}
+
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct AudioOutputRouteRequest {
     pub preference: OutputDevicePreference,
@@ -200,6 +225,44 @@ pub fn prepare_cached_preview_playback(
             })
         }),
         PlaybackSource::Original { .. } | PlaybackSource::Unavailable { .. } => Ok(None),
+    }
+}
+
+pub fn classify_playback_startup_latency(
+    measurement: PlaybackStartupMeasurement,
+) -> PlaybackStartupLatency {
+    let elapsed_ms = measurement
+        .started_at_ms
+        .saturating_sub(measurement.requested_at_ms);
+    if elapsed_ms <= 100 {
+        PlaybackStartupLatency::Passed { elapsed_ms }
+    } else {
+        PlaybackStartupLatency::TooSlow { elapsed_ms }
+    }
+}
+
+impl PlaybackDecodeCoordinator {
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    pub fn begin_decode(&mut self, asset_id: Uuid, requested_at_ms: u64) -> PlaybackDecodeToken {
+        self.next_generation += 1;
+        let token = PlaybackDecodeToken {
+            asset_id,
+            generation: self.next_generation,
+            requested_at_ms,
+        };
+        self.active_token = Some(token);
+        token
+    }
+
+    pub fn is_cancelled(&self, token: &PlaybackDecodeToken) -> bool {
+        self.active_token.as_ref() != Some(token)
+    }
+
+    pub fn active_asset_id(&self) -> Option<Uuid> {
+        self.active_token.map(|token| token.asset_id)
     }
 }
 
@@ -507,6 +570,38 @@ mod tests {
         assert_eq!(prepared.decoded.sample_rate, 48_000);
         assert_eq!(prepared.decoded.channels, 1);
         assert_eq!(prepared.decoded.samples.len(), 3);
+    }
+
+    #[test]
+    fn playback_decode_tokens_cancel_previous_asset_loads() {
+        let first = Uuid::new_v4();
+        let second = Uuid::new_v4();
+        let mut coordinator = PlaybackDecodeCoordinator::new();
+
+        let first_token = coordinator.begin_decode(first, 0);
+        let second_token = coordinator.begin_decode(second, 40);
+
+        assert!(coordinator.is_cancelled(&first_token));
+        assert!(!coordinator.is_cancelled(&second_token));
+        assert_eq!(coordinator.active_asset_id(), Some(second));
+    }
+
+    #[test]
+    fn playback_startup_latency_passes_under_one_hundred_ms() {
+        assert_eq!(
+            classify_playback_startup_latency(PlaybackStartupMeasurement {
+                requested_at_ms: 1_000,
+                started_at_ms: 1_080,
+            }),
+            PlaybackStartupLatency::Passed { elapsed_ms: 80 }
+        );
+        assert_eq!(
+            classify_playback_startup_latency(PlaybackStartupMeasurement {
+                requested_at_ms: 1_000,
+                started_at_ms: 1_125,
+            }),
+            PlaybackStartupLatency::TooSlow { elapsed_ms: 125 }
+        );
     }
 
     #[test]

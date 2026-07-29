@@ -193,6 +193,7 @@ export function App() {
             <dd>Attached to report row</dd>
           </dl>
           <div className="warning-line">Export allowed with license warning</div>
+          <div className="status-line">Decode cancellation active</div>
           <div className="status-line">Original copy export executable</div>
           <div className="status-line">Ranged WAV render ready from PCM</div>
           <div className="status-line">External drag payload ready after copy</div>
@@ -322,6 +323,7 @@ export function App() {
           ))}
         </div>
         <span className="time">0:01 / 0:02</span>
+        <span className="time">80 ms start</span>
       </footer>
     </main>
   );
