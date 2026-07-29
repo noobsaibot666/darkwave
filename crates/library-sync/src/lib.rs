@@ -1,3 +1,5 @@
+use std::path::Path;
+
 use serde::{Deserialize, Serialize};
 use uuid::Uuid;
 
@@ -19,6 +21,24 @@ pub struct PortableManifest {
     pub library_id: Uuid,
     pub revision: u64,
     pub assets: Vec<ManifestAsset>,
+}
+
+#[derive(Debug)]
+pub enum ManifestFileError {
+    Io(std::io::Error),
+    Json(serde_json::Error),
+}
+
+impl From<std::io::Error> for ManifestFileError {
+    fn from(error: std::io::Error) -> Self {
+        Self::Io(error)
+    }
+}
+
+impl From<serde_json::Error> for ManifestFileError {
+    fn from(error: serde_json::Error) -> Self {
+        Self::Json(error)
+    }
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -105,6 +125,24 @@ impl PortableManifest {
     pub fn from_json(value: &str) -> Result<Self, serde_json::Error> {
         serde_json::from_str(value)
     }
+}
+
+pub fn write_manifest_file(
+    manifest: &PortableManifest,
+    path: impl AsRef<Path>,
+) -> Result<(), ManifestFileError> {
+    let path = path.as_ref();
+    if let Some(parent) = path.parent() {
+        std::fs::create_dir_all(parent)?;
+    }
+    std::fs::write(path, manifest.to_json()?)?;
+
+    Ok(())
+}
+
+pub fn read_manifest_file(path: impl AsRef<Path>) -> Result<PortableManifest, ManifestFileError> {
+    let contents = std::fs::read_to_string(path)?;
+    Ok(PortableManifest::from_json(&contents)?)
 }
 
 pub fn probe_media_root(
@@ -311,6 +349,22 @@ mod tests {
     }
 
     #[test]
+    fn manifest_snapshot_round_trips_through_file() {
+        let library_id = Uuid::new_v4();
+        let manifest = PortableManifest::new(library_id, 8).with_asset(ManifestAsset {
+            id: Uuid::new_v4(),
+            relative_path: "Media/00/impact.wav".to_string(),
+            content_hash: "hash-impact".to_string(),
+        });
+        let path = unique_manifest_path("portable-manifest");
+
+        write_manifest_file(&manifest, &path).expect("write manifest");
+        let loaded = read_manifest_file(&path).expect("read manifest");
+
+        assert_eq!(loaded, manifest);
+    }
+
+    #[test]
     fn expired_writer_lease_allows_current_device_to_take_over() {
         let lease = WriterLease {
             device_id: "edit-suite".to_string(),
@@ -470,5 +524,12 @@ mod tests {
 
         controls.apply(OfflineControlCommand::ResumeValidation);
         assert!(!controls.validation_paused);
+    }
+
+    fn unique_manifest_path(name: &str) -> std::path::PathBuf {
+        let mut path = std::env::temp_dir();
+        path.push(format!("darkwave-{name}-{}", Uuid::new_v4()));
+        path.push("library.darkwave-manifest.json");
+        path
     }
 }

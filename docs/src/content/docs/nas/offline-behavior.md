@@ -17,6 +17,7 @@ Current behavior:
 - Playback source selection can fall back to cached preview files when originals are missing.
 - Cached previews can be decoded into PCM for offline playback preparation through native WAV decoding or an attached packaged decoder provider.
 - Reconnect validation jobs are created from portable manifests when a media root comes back online.
+- Portable manifests can be written to and read from manifest files beside shared media.
 - Reconnect validation scheduling queues one pending job per library revision and marks jobs completed after validation.
 - Offline controls support catalog-only mode, reconnect retry, validation pause/resume, and media-root relinking.
 
