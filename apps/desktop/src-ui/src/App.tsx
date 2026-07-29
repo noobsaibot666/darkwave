@@ -9,6 +9,7 @@ import {
   Pause,
   Play,
   RotateCcw,
+  Save,
   Search,
   Settings,
   ShieldCheck,
@@ -209,6 +210,11 @@ export function App() {
               <Gauge size={15} />
               <span>Preview cache</span>
               <strong>16 GB</strong>
+            </div>
+            <div className="setting-row">
+              <Save size={15} />
+              <span>Settings file</span>
+              <strong>JSON</strong>
             </div>
           </div>
         </section>

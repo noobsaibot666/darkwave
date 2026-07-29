@@ -12,4 +12,6 @@ The `preferences` crate defines the default editorial audio workspace settings:
 
 Shortcut validation groups bindings by accelerator and rejects conflicts before settings are saved.
 
-The desktop shell exposes default preferences through a Tauri command. Future work will persist edited settings per user and apply output-device changes to the playback backend.
+Preferences can be loaded from and saved to a JSON settings file. Missing settings files fall back to the editorial defaults, and saved preferences normalize the preview cache limit before writing.
+
+The desktop shell exposes default preferences through a Tauri command. Future work will apply output-device changes to the playback backend.

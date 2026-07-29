@@ -1,5 +1,8 @@
 use serde::{Deserialize, Serialize};
 use std::collections::BTreeMap;
+use std::fs;
+use std::io;
+use std::path::Path;
 
 pub const MIN_PREVIEW_CACHE_LIMIT_MB: u32 = 512;
 
@@ -33,6 +36,31 @@ pub enum ShortcutError {
         accelerator: String,
         commands: Vec<CommandId>,
     },
+}
+
+#[derive(Debug)]
+pub enum PreferenceStoreError {
+    Io(io::Error),
+    Json(serde_json::Error),
+    Shortcut(ShortcutError),
+}
+
+impl From<io::Error> for PreferenceStoreError {
+    fn from(error: io::Error) -> Self {
+        PreferenceStoreError::Io(error)
+    }
+}
+
+impl From<serde_json::Error> for PreferenceStoreError {
+    fn from(error: serde_json::Error) -> Self {
+        PreferenceStoreError::Json(error)
+    }
+}
+
+impl From<ShortcutError> for PreferenceStoreError {
+    fn from(error: ShortcutError) -> Self {
+        PreferenceStoreError::Shortcut(error)
+    }
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
@@ -145,9 +173,43 @@ pub fn normalize_preview_cache_limit_mb(limit_mb: u32) -> u32 {
     limit_mb.max(MIN_PREVIEW_CACHE_LIMIT_MB)
 }
 
+pub fn load_preferences(path: impl AsRef<Path>) -> Result<AppPreferences, PreferenceStoreError> {
+    let path = path.as_ref();
+    if !path.exists() {
+        return Ok(AppPreferences::default_for_editorial_audio());
+    }
+
+    let contents = fs::read_to_string(path)?;
+    let mut preferences: AppPreferences = serde_json::from_str(&contents)?;
+    preferences.preview_cache_limit_mb =
+        normalize_preview_cache_limit_mb(preferences.preview_cache_limit_mb);
+    preferences.shortcuts.validate()?;
+
+    Ok(preferences)
+}
+
+pub fn save_preferences(
+    path: impl AsRef<Path>,
+    preferences: &AppPreferences,
+) -> Result<(), PreferenceStoreError> {
+    preferences.shortcuts.validate()?;
+    let mut normalized = preferences.clone();
+    normalized.preview_cache_limit_mb =
+        normalize_preview_cache_limit_mb(normalized.preview_cache_limit_mb);
+
+    let path = path.as_ref();
+    if let Some(parent) = path.parent() {
+        fs::create_dir_all(parent)?;
+    }
+    fs::write(path, serde_json::to_string_pretty(&normalized)?)?;
+
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::path::PathBuf;
 
     #[test]
     fn default_shortcuts_cover_keyboard_led_auditioning() {
@@ -218,5 +280,42 @@ mod tests {
             normalize_preview_cache_limit_mb(128),
             MIN_PREVIEW_CACHE_LIMIT_MB
         );
+    }
+
+    #[test]
+    fn missing_preferences_file_loads_editorial_defaults() {
+        let preferences =
+            load_preferences(unique_preferences_path("missing")).expect("load defaults");
+
+        assert_eq!(preferences.browser_density, BrowserDensity::Compact);
+        assert_eq!(preferences.preview_cache_limit_mb, 16_384);
+    }
+
+    #[test]
+    fn preferences_round_trip_with_normalized_cache_floor() {
+        let path = unique_preferences_path("round-trip");
+        let mut preferences = AppPreferences::default_for_editorial_audio();
+        preferences.browser_density = BrowserDensity::Comfortable;
+        preferences.preview_cache_limit_mb = 128;
+
+        save_preferences(&path, &preferences).expect("save");
+        let loaded = load_preferences(&path).expect("load");
+
+        assert_eq!(loaded.browser_density, BrowserDensity::Comfortable);
+        assert_eq!(loaded.preview_cache_limit_mb, MIN_PREVIEW_CACHE_LIMIT_MB);
+        assert_eq!(
+            loaded.shortcuts.binding_for(CommandId::ExportSelected),
+            Some("Mod+E")
+        );
+    }
+
+    fn unique_preferences_path(name: &str) -> PathBuf {
+        let mut path = std::env::temp_dir();
+        path.push(format!(
+            "darkwave-preferences-{name}-{}.json",
+            std::process::id()
+        ));
+        let _ = fs::remove_file(&path);
+        path
     }
 }
