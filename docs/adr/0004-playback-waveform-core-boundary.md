@@ -32,4 +32,5 @@ The waveform crate owns:
 - UI and future decoder integration can share one playback state contract.
 - Rapid row changes can be represented as asset load events that stop prior playback before output integration exists.
 - Waveform rendering can consume precomputed peak payloads without decoding full files in list rows.
-- Real audio decoding, output device selection, and under-100 ms playback benchmarking remain future Milestone 2 work.
+- Native WAV decoding, packaged-decoder provider seams, output route binding, and playback latency checks are covered in source.
+- Shipped arbitrary-format decoder artifacts and hardware-specific audio output validation remain future Milestone 2 work.

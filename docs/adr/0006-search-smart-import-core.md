@@ -24,4 +24,5 @@ Implement the first search and smart-import core across `search` and `storage`:
 - Search behavior is local-first and explainable.
 - Smart collection query definitions can later be rendered as visible filter chips.
 - Filename intelligence remains a first signal, not the final classifier.
-- Natural-language query parsing, large-catalog performance benchmarks, and embedded audio metadata mapping remain future Milestone 4 work.
+- Embedded WAV metadata can contribute traceable metadata-origin suggestions alongside filename signals.
+- Natural-language query parsing and large-catalog performance benchmarks remain future Milestone 4 work.
