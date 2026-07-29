@@ -39,6 +39,22 @@ pub struct MaintenanceReport {
     pub findings: Vec<MaintenanceFinding>,
 }
 
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+pub struct PreviewCacheEntry {
+    pub asset_id: Uuid,
+    pub path: String,
+    pub size_bytes: u64,
+    pub last_accessed_at_ms: u64,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+pub struct PreviewCacheEvictionPlan {
+    pub limit_bytes: u64,
+    pub current_size_bytes: u64,
+    pub bytes_to_free: u64,
+    pub candidates: Vec<PreviewCacheEntry>,
+}
+
 impl MaintenanceFinding {
     pub fn missing_media(asset_id: Uuid) -> Self {
         Self {
@@ -77,6 +93,46 @@ impl MaintenanceFinding {
     }
 }
 
+pub fn plan_preview_cache_eviction(
+    entries: impl IntoIterator<Item = PreviewCacheEntry>,
+    limit_bytes: u64,
+) -> PreviewCacheEvictionPlan {
+    let mut entries = entries.into_iter().collect::<Vec<_>>();
+    let current_size_bytes = entries
+        .iter()
+        .map(|entry| entry.size_bytes)
+        .fold(0_u64, u64::saturating_add);
+    let bytes_to_free = current_size_bytes.saturating_sub(limit_bytes);
+
+    entries.sort_by(|left, right| {
+        left.last_accessed_at_ms
+            .cmp(&right.last_accessed_at_ms)
+            .then_with(|| left.path.cmp(&right.path))
+            .then_with(|| left.asset_id.cmp(&right.asset_id))
+    });
+
+    let mut planned_free_bytes = 0_u64;
+    let mut candidates = Vec::new();
+
+    if bytes_to_free > 0 {
+        for entry in entries {
+            planned_free_bytes = planned_free_bytes.saturating_add(entry.size_bytes);
+            candidates.push(entry);
+
+            if planned_free_bytes >= bytes_to_free {
+                break;
+            }
+        }
+    }
+
+    PreviewCacheEvictionPlan {
+        limit_bytes,
+        current_size_bytes,
+        bytes_to_free,
+        candidates,
+    }
+}
+
 impl MaintenanceReport {
     pub fn from_findings(findings: Vec<MaintenanceFinding>) -> Self {
         let mut counts_by_kind = BTreeMap::new();
@@ -99,6 +155,15 @@ impl MaintenanceReport {
 
     pub fn count_for(&self, kind: MaintenanceFindingKind) -> usize {
         self.counts_by_kind.get(&kind).copied().unwrap_or(0)
+    }
+}
+
+impl PreviewCacheEvictionPlan {
+    pub fn planned_free_bytes(&self) -> u64 {
+        self.candidates
+            .iter()
+            .map(|entry| entry.size_bytes)
+            .fold(0_u64, u64::saturating_add)
     }
 }
 
@@ -150,5 +215,63 @@ mod tests {
 
         assert_eq!(report.total_findings, 0);
         assert_eq!(report.severity, MaintenanceSeverity::Ok);
+    }
+
+    #[test]
+    fn preview_cache_eviction_plans_least_recently_used_files_until_under_limit() {
+        let oldest = Uuid::new_v4();
+        let newer = Uuid::new_v4();
+        let newest = Uuid::new_v4();
+        let entries = vec![
+            PreviewCacheEntry {
+                asset_id: newest,
+                path: "cache/newest.wav".to_string(),
+                size_bytes: 300,
+                last_accessed_at_ms: 30,
+            },
+            PreviewCacheEntry {
+                asset_id: oldest,
+                path: "cache/oldest.wav".to_string(),
+                size_bytes: 400,
+                last_accessed_at_ms: 10,
+            },
+            PreviewCacheEntry {
+                asset_id: newer,
+                path: "cache/newer.wav".to_string(),
+                size_bytes: 500,
+                last_accessed_at_ms: 20,
+            },
+        ];
+
+        let plan = plan_preview_cache_eviction(entries, 700);
+
+        assert_eq!(plan.current_size_bytes, 1_200);
+        assert_eq!(plan.limit_bytes, 700);
+        assert_eq!(plan.bytes_to_free, 500);
+        assert_eq!(
+            plan.candidates
+                .iter()
+                .map(|candidate| candidate.asset_id)
+                .collect::<Vec<_>>(),
+            vec![oldest, newer]
+        );
+        assert_eq!(plan.planned_free_bytes(), 900);
+    }
+
+    #[test]
+    fn preview_cache_eviction_is_empty_when_cache_is_under_limit() {
+        let plan = plan_preview_cache_eviction(
+            vec![PreviewCacheEntry {
+                asset_id: Uuid::new_v4(),
+                path: "cache/preview.wav".to_string(),
+                size_bytes: 512,
+                last_accessed_at_ms: 10,
+            }],
+            700,
+        );
+
+        assert_eq!(plan.current_size_bytes, 512);
+        assert_eq!(plan.bytes_to_free, 0);
+        assert!(plan.candidates.is_empty());
     }
 }
