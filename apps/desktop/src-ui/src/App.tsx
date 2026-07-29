@@ -279,6 +279,11 @@ export function App() {
             ))}
           </div>
         </section>
+        <section>
+          <h2>Trash</h2>
+          <div className="status-line">30 day retention before explicit purge</div>
+          <div className="status-line">Restore keeps original asset identity</div>
+        </section>
       </aside>
       <footer className="transport" aria-label="Transport">
         <button className="icon-button" aria-label="Previous">

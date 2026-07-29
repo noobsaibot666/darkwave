@@ -11,4 +11,6 @@ If playback is slow from a NAS path, use the preview cache and verify the share 
 
 Run maintenance to review missing media, source/license gaps, stale waveform caches, and duplicate content. Maintenance reports issues but does not automatically delete files.
 
+Trash actions are recoverable until an explicit purge is requested after the retention period.
+
 If an installed build cannot launch on macOS or Windows, verify the signing/notarization status for that build and install the latest release candidate.

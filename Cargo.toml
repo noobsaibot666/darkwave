@@ -17,6 +17,7 @@ members = [
   "crates/search",
   "crates/shared-types",
   "crates/storage",
+  "crates/trash",
   "crates/waveform",
   "crates/viewport",
   "crates/workspace-state"
