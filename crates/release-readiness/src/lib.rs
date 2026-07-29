@@ -73,6 +73,33 @@ pub enum GateState {
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum UpdateChannel {
+    Stable,
+    Beta,
+    Nightly,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct UpdateChannelConfig {
+    pub channel: UpdateChannel,
+    pub manifest_url: String,
+    pub public_key_id: String,
+}
+
+impl UpdateChannelConfig {
+    pub fn has_complete_metadata(&self) -> bool {
+        self.manifest_url.starts_with("https://") && !self.public_key_id.trim().is_empty()
+    }
+}
+
+pub fn update_system_gate(config: Option<&UpdateChannelConfig>) -> GateState {
+    config
+        .filter(|config| config.has_complete_metadata())
+        .map(|_| GateState::Passed)
+        .unwrap_or(GateState::Planned)
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum ReleaseBlocker {
     MacosAudit,
     WindowsAudit,
@@ -197,5 +224,38 @@ mod tests {
                 ReleaseBlocker::SigningNotarization
             ]
         );
+    }
+
+    #[test]
+    fn update_system_passes_with_https_manifest_and_public_key() {
+        let config = UpdateChannelConfig {
+            channel: UpdateChannel::Stable,
+            manifest_url: "https://updates.darkwave.example/stable/latest.json".to_string(),
+            public_key_id: "darkwave-release-2026".to_string(),
+        };
+
+        assert_eq!(update_system_gate(Some(&config)), GateState::Passed);
+    }
+
+    #[test]
+    fn update_system_remains_planned_without_complete_channel_metadata() {
+        assert_eq!(update_system_gate(None), GateState::Planned);
+
+        let insecure_manifest = UpdateChannelConfig {
+            channel: UpdateChannel::Beta,
+            manifest_url: "http://updates.darkwave.example/beta/latest.json".to_string(),
+            public_key_id: "darkwave-beta-2026".to_string(),
+        };
+        assert_eq!(
+            update_system_gate(Some(&insecure_manifest)),
+            GateState::Planned
+        );
+
+        let missing_key = UpdateChannelConfig {
+            channel: UpdateChannel::Beta,
+            manifest_url: "https://updates.darkwave.example/beta/latest.json".to_string(),
+            public_key_id: " ".to_string(),
+        };
+        assert_eq!(update_system_gate(Some(&missing_key)), GateState::Planned);
     }
 }

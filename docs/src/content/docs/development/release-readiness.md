@@ -18,7 +18,9 @@ Release readiness is tracked through explicit gates:
 
 WAV PCM decoding is native. Compressed MVP formats such as MP3, FLAC, AAC/M4A, AIFF, and OGG are tracked as packaged-decoder work until the decoder bundle and codec licensing review are complete. Unsupported formats remain visible with a conversion option.
 
-The update system and signing/notarization gates remain planned until distribution credentials and release channels are configured.
+The update system gate now validates source-owned channel metadata: an HTTPS update manifest URL and a non-empty release public-key identifier. The desktop shell still reports the update gate as planned until real channel metadata is configured for a release build.
+
+Signing/notarization remains planned until distribution credentials and platform release channels are configured.
 
 Before a release candidate, run:
 
