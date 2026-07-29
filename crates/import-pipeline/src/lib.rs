@@ -7,7 +7,10 @@ use shared_types::{AvailabilityState, StorageMode};
 use std::collections::BTreeMap;
 use std::fs;
 use std::path::{Path, PathBuf};
-use storage::{AssetPath, AssetRecord, Catalog, JobKind, NewAssetRecord, StorageError, TagOrigin};
+use storage::{
+    AssetPath, AssetRecord, Catalog, JobKind, NewAssetRecord, SourceRecordDraft, StorageError,
+    TagOrigin,
+};
 use thiserror::Error;
 use uuid::Uuid;
 
@@ -15,6 +18,17 @@ use uuid::Uuid;
 pub enum ImportMode {
     Managed,
     Referenced,
+}
+
+#[derive(Clone, Debug, Default, Eq, PartialEq)]
+pub struct ImportSourceContext {
+    pub provider: Option<String>,
+    pub source_url: Option<String>,
+    pub license_type: Option<String>,
+    pub license_status: Option<String>,
+    pub attribution: Option<String>,
+    pub restrictions: Option<String>,
+    pub receipt_path: Option<String>,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -192,7 +206,32 @@ pub fn import_file(
     path: impl AsRef<Path>,
     mode: ImportMode,
 ) -> Result<AssetRecord, ImportError> {
-    let path = path.as_ref();
+    import_file_internal(catalog, library_id, path.as_ref(), mode, None)
+}
+
+pub fn import_file_with_source_context(
+    catalog: &Catalog,
+    library_id: Uuid,
+    path: impl AsRef<Path>,
+    mode: ImportMode,
+    source_context: ImportSourceContext,
+) -> Result<AssetRecord, ImportError> {
+    import_file_internal(
+        catalog,
+        library_id,
+        path.as_ref(),
+        mode,
+        Some(source_context),
+    )
+}
+
+fn import_file_internal(
+    catalog: &Catalog,
+    library_id: Uuid,
+    path: &Path,
+    mode: ImportMode,
+    source_context: Option<ImportSourceContext>,
+) -> Result<AssetRecord, ImportError> {
     let metadata = extract_immediate_metadata(path)?;
 
     if !supported_mvp_format(&metadata.extension) {
@@ -238,6 +277,18 @@ pub fn import_file(
     catalog.enqueue_job(asset.id, JobKind::Hashing, 20)?;
     catalog.enqueue_job(asset.id, JobKind::WaveformGeneration, 30)?;
     suggest_import_tags(catalog, &asset, &tag_suggestions)?;
+    if let Some(source_context) = source_context {
+        catalog.set_source_record(SourceRecordDraft {
+            asset_id: asset.id,
+            provider: source_context.provider,
+            source_url: source_context.source_url,
+            license_type: source_context.license_type,
+            license_status: source_context.license_status,
+            attribution: source_context.attribution,
+            restrictions: source_context.restrictions,
+            receipt_path: source_context.receipt_path,
+        })?;
+    }
 
     if mode == ImportMode::Managed {
         copy_managed_source(catalog, library_id, path, &asset)?;
@@ -606,6 +657,54 @@ mod tests {
         assert_eq!(imported.media_type, "sound_effect");
         assert!(suggested_tags.iter().any(|tag| tag.name == "Impact"));
         assert!(suggested_tags.iter().any(|tag| tag.name == "Sound Effect"));
+    }
+
+    #[test]
+    fn import_can_attach_source_license_context() {
+        let catalog_path = unique_catalog_path("source-context-import");
+        let audio_path = unique_audio_path("licensed-impact.wav");
+        fs::write(&audio_path, b"licensed audio").expect("fixture");
+
+        let catalog = Catalog::open(&catalog_path).expect("catalog");
+        let library = catalog
+            .create_library("Source Context", "/library")
+            .expect("library");
+        let imported = import_file_with_source_context(
+            &catalog,
+            library.id,
+            &audio_path,
+            ImportMode::Referenced,
+            ImportSourceContext {
+                provider: Some("Boom Library".to_string()),
+                source_url: Some("https://example.com/sounds/licensed-impact".to_string()),
+                license_type: Some("subscription".to_string()),
+                license_status: Some("active".to_string()),
+                attribution: Some("Boom Library".to_string()),
+                restrictions: Some("client projects allowed".to_string()),
+                receipt_path: Some("receipts/boom-2026.pdf".to_string()),
+            },
+        )
+        .expect("import");
+        let project = catalog
+            .create_collection(library.id, "Trailer", storage::CollectionType::Project)
+            .expect("project");
+        catalog
+            .record_usage_event(
+                imported.id,
+                Some(project.id),
+                storage::UsageEventType::Exported,
+                "/project/licensed-impact.wav",
+            )
+            .expect("usage");
+
+        let report = catalog.project_source_report(project.id).expect("report");
+
+        assert_eq!(report[0].provider.as_deref(), Some("Boom Library"));
+        assert_eq!(report[0].license_status.as_deref(), Some("active"));
+        assert_eq!(
+            report[0].receipt_path.as_deref(),
+            Some("receipts/boom-2026.pdf")
+        );
     }
 
     fn unique_catalog_path(name: &str) -> PathBuf {

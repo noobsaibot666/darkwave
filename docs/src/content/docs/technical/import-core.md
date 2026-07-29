@@ -17,6 +17,7 @@ The import core is intentionally small and restart-safe.
 - Register an asset through `storage`.
 - Derive an initial media type from filename and embedded metadata smart-import signals.
 - Persist pending filename-origin and metadata-origin tag suggestions for review.
+- Attach optional source and license context when the caller has it at import time.
 - Copy managed imports into the library media root after catalog registration.
 - Enqueue follow-up jobs.
 

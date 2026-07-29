@@ -16,6 +16,7 @@ When a supported audio file is imported, Darkwave:
 - Tracks the asset as locally available.
 - Avoids creating a second asset row when the same content hash and file size already exist in the same library.
 - Adds pending filename-based and metadata-based tag suggestions for review.
+- Can attach known source URL, provider, license, attribution, restrictions, and receipt context at import time.
 - Creates pending background jobs for metadata extraction, hashing, and waveform generation.
 - Discovers watched-folder candidates only after supported audio files have stabilized.
 - Maintains watched-folder size snapshots across polls so new files are imported only after a later stable scan.
