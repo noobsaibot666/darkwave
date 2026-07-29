@@ -1,3 +1,4 @@
+use audio_metadata::{decode_wav_pcm, DecodedAudioBuffer, MetadataError};
 use preferences::OutputDevicePreference;
 use shared_types::AvailabilityState;
 use uuid::Uuid;
@@ -57,6 +58,12 @@ pub enum PlaybackSource {
     Original { asset_id: Uuid, path: String },
     CachedPreview { asset_id: Uuid, path: String },
     Unavailable { asset_id: Uuid },
+}
+
+#[derive(Clone, Debug, PartialEq)]
+pub struct PreparedPreviewPlayback {
+    pub asset_id: Uuid,
+    pub decoded: DecodedAudioBuffer,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -179,6 +186,20 @@ pub fn bind_audio_output_route(request: AudioOutputBindingRequest) -> AudioOutpu
             .unwrap_or(AudioOutputBinding::UnboundSystemDefault {
                 reason: AudioOutputBindingFallback::NoSystemDefaultHandle,
             }),
+    }
+}
+
+pub fn prepare_cached_preview_playback(
+    source: &PlaybackSource,
+) -> Result<Option<PreparedPreviewPlayback>, MetadataError> {
+    match source {
+        PlaybackSource::CachedPreview { asset_id, path } => decode_wav_pcm(path).map(|decoded| {
+            Some(PreparedPreviewPlayback {
+                asset_id: *asset_id,
+                decoded,
+            })
+        }),
+        PlaybackSource::Original { .. } | PlaybackSource::Unavailable { .. } => Ok(None),
     }
 }
 
@@ -466,5 +487,75 @@ mod tests {
                 reason: AudioOutputBindingFallback::NoSystemDefaultHandle
             }
         );
+    }
+
+    #[test]
+    fn cached_preview_playback_decodes_wav_preview() {
+        let asset_id = Uuid::new_v4();
+        let path = unique_wav_path();
+        std::fs::write(&path, wav_16_bit_fixture()).expect("fixture");
+        let source = PlaybackSource::CachedPreview {
+            asset_id,
+            path: path.to_string_lossy().to_string(),
+        };
+
+        let prepared = prepare_cached_preview_playback(&source)
+            .expect("prepare")
+            .expect("decoded preview");
+
+        assert_eq!(prepared.asset_id, asset_id);
+        assert_eq!(prepared.decoded.sample_rate, 48_000);
+        assert_eq!(prepared.decoded.channels, 1);
+        assert_eq!(prepared.decoded.samples.len(), 3);
+    }
+
+    #[test]
+    fn non_cached_preview_sources_do_not_decode_preview_audio() {
+        let asset_id = Uuid::new_v4();
+
+        assert_eq!(
+            prepare_cached_preview_playback(&PlaybackSource::Original {
+                asset_id,
+                path: "/library/Media/00/hit.wav".to_string(),
+            })
+            .expect("prepare"),
+            None
+        );
+        assert_eq!(
+            prepare_cached_preview_playback(&PlaybackSource::Unavailable { asset_id })
+                .expect("prepare"),
+            None
+        );
+    }
+
+    fn unique_wav_path() -> std::path::PathBuf {
+        let mut path = std::env::temp_dir();
+        path.push(format!("darkwave-preview-{}.wav", Uuid::new_v4()));
+        path
+    }
+
+    fn wav_16_bit_fixture() -> Vec<u8> {
+        let samples = [-32768i16, 0, 32767];
+        let data_size = samples.len() as u32 * 2;
+        let mut wav = Vec::new();
+
+        wav.extend_from_slice(b"RIFF");
+        wav.extend_from_slice(&(36 + data_size).to_le_bytes());
+        wav.extend_from_slice(b"WAVE");
+        wav.extend_from_slice(b"fmt ");
+        wav.extend_from_slice(&16u32.to_le_bytes());
+        wav.extend_from_slice(&1u16.to_le_bytes());
+        wav.extend_from_slice(&1u16.to_le_bytes());
+        wav.extend_from_slice(&48_000u32.to_le_bytes());
+        wav.extend_from_slice(&96_000u32.to_le_bytes());
+        wav.extend_from_slice(&2u16.to_le_bytes());
+        wav.extend_from_slice(&16u16.to_le_bytes());
+        wav.extend_from_slice(b"data");
+        wav.extend_from_slice(&data_size.to_le_bytes());
+        for sample in samples {
+            wav.extend_from_slice(&sample.to_le_bytes());
+        }
+
+        wav
     }
 }

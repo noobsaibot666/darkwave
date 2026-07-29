@@ -188,7 +188,7 @@ export function App() {
             <dt>Storage</dt>
             <dd>Referenced NAS path</dd>
             <dt>Preview</dt>
-            <dd>Cache fallback enabled</dd>
+            <dd>Cached WAV decode ready</dd>
             <dt>Receipt</dt>
             <dd>Attached to report row</dd>
           </dl>
