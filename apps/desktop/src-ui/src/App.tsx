@@ -99,7 +99,7 @@ export function App() {
             <Import size={16} />
             Import Folder
           </button>
-          <span>Managed copy and watched polling ready</span>
+          <span>Managed copy and watch events ready</span>
           <button>
             <Zap size={16} />
             Open NAS Library

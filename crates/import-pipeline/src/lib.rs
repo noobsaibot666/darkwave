@@ -27,6 +27,24 @@ pub struct WatchedFolderPoller {
     previous_sizes: BTreeMap<PathBuf, u64>,
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum FilesystemNotificationKind {
+    CreatedOrModified,
+    Removed,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct FilesystemNotification {
+    pub path: PathBuf,
+    pub kind: FilesystemNotificationKind,
+    pub current_size: Option<u64>,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct FilesystemNotificationBuffer {
+    observed_sizes: BTreeMap<PathBuf, u64>,
+}
+
 #[derive(Debug, Error)]
 pub enum ImportError {
     #[error("unsupported audio format: {0}")]
@@ -112,6 +130,56 @@ impl WatchedFolderPoller {
 
     pub fn previous_sizes(&self) -> &BTreeMap<PathBuf, u64> {
         &self.previous_sizes
+    }
+}
+
+impl FilesystemNotificationBuffer {
+    pub fn new() -> Self {
+        Self {
+            observed_sizes: BTreeMap::new(),
+        }
+    }
+
+    pub fn apply(
+        &mut self,
+        notification: FilesystemNotification,
+    ) -> Option<WatchedImportCandidate> {
+        if notification.kind == FilesystemNotificationKind::Removed {
+            self.observed_sizes.remove(&notification.path);
+            return None;
+        }
+
+        let filename = notification.path.file_name()?.to_str()?;
+        let extension = notification.path.extension()?.to_str()?;
+        let current_size = notification.current_size?;
+
+        if should_ignore_watched_file(filename) || !supported_mvp_format(extension) {
+            self.observed_sizes.remove(&notification.path);
+            return None;
+        }
+
+        let previous_size = self
+            .observed_sizes
+            .insert(notification.path.clone(), current_size)
+            .unwrap_or_default();
+
+        is_stable_watched_file(filename, previous_size, current_size).then_some(
+            WatchedImportCandidate {
+                path: notification.path,
+                previous_size,
+                current_size,
+            },
+        )
+    }
+
+    pub fn observed_sizes(&self) -> &BTreeMap<PathBuf, u64> {
+        &self.observed_sizes
+    }
+}
+
+impl Default for FilesystemNotificationBuffer {
+    fn default() -> Self {
+        Self::new()
     }
 }
 
@@ -306,6 +374,74 @@ mod tests {
 
         assert!(poller.poll().expect("second poll").is_empty());
         assert!(!poller.previous_sizes().contains_key(&removed));
+    }
+
+    #[test]
+    fn filesystem_notifications_emit_candidate_after_stable_repeat_event() {
+        let path = PathBuf::from("/watch/impact.wav");
+        let mut buffer = FilesystemNotificationBuffer::new();
+
+        let first = buffer.apply(FilesystemNotification {
+            path: path.clone(),
+            kind: FilesystemNotificationKind::CreatedOrModified,
+            current_size: Some(8),
+        });
+        let second = buffer.apply(FilesystemNotification {
+            path: path.clone(),
+            kind: FilesystemNotificationKind::CreatedOrModified,
+            current_size: Some(8),
+        });
+
+        assert_eq!(first, None);
+        assert_eq!(
+            second,
+            Some(WatchedImportCandidate {
+                path,
+                previous_size: 8,
+                current_size: 8,
+            })
+        );
+    }
+
+    #[test]
+    fn filesystem_notifications_ignore_partial_unsupported_and_removed_files() {
+        let mut buffer = FilesystemNotificationBuffer::new();
+
+        assert_eq!(
+            buffer.apply(FilesystemNotification {
+                path: PathBuf::from("/watch/partial.wav.crdownload"),
+                kind: FilesystemNotificationKind::CreatedOrModified,
+                current_size: Some(8),
+            }),
+            None
+        );
+        assert_eq!(
+            buffer.apply(FilesystemNotification {
+                path: PathBuf::from("/watch/notes.txt"),
+                kind: FilesystemNotificationKind::CreatedOrModified,
+                current_size: Some(8),
+            }),
+            None
+        );
+
+        let path = PathBuf::from("/watch/removed.wav");
+        assert_eq!(
+            buffer.apply(FilesystemNotification {
+                path: path.clone(),
+                kind: FilesystemNotificationKind::CreatedOrModified,
+                current_size: Some(8),
+            }),
+            None
+        );
+        assert_eq!(
+            buffer.apply(FilesystemNotification {
+                path: path.clone(),
+                kind: FilesystemNotificationKind::Removed,
+                current_size: None,
+            }),
+            None
+        );
+        assert!(!buffer.observed_sizes().contains_key(&path));
     }
 
     #[test]
