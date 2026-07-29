@@ -1,4 +1,6 @@
-use audio_metadata::{decode_wav_pcm, DecodedAudioBuffer, MetadataError};
+use audio_metadata::{
+    decode_supported_audio, decode_wav_pcm, DecodedAudioBuffer, MetadataError, PackagedAudioDecoder,
+};
 use preferences::OutputDevicePreference;
 use shared_types::AvailabilityState;
 use uuid::Uuid;
@@ -310,6 +312,23 @@ pub fn prepare_cached_preview_playback(
                 decoded,
             })
         }),
+        PlaybackSource::Original { .. } | PlaybackSource::Unavailable { .. } => Ok(None),
+    }
+}
+
+pub fn prepare_supported_preview_playback(
+    source: &PlaybackSource,
+    packaged_decoder: Option<&dyn PackagedAudioDecoder>,
+) -> Result<Option<PreparedPreviewPlayback>, MetadataError> {
+    match source {
+        PlaybackSource::CachedPreview { asset_id, path } => {
+            decode_supported_audio(path, packaged_decoder).map(|decoded| {
+                Some(PreparedPreviewPlayback {
+                    asset_id: *asset_id,
+                    decoded,
+                })
+            })
+        }
         PlaybackSource::Original { .. } | PlaybackSource::Unavailable { .. } => Ok(None),
     }
 }
@@ -860,6 +879,50 @@ mod tests {
     }
 
     #[test]
+    fn supported_cached_preview_playback_delegates_packaged_formats() {
+        let asset_id = Uuid::new_v4();
+        let mut path = std::env::temp_dir();
+        path.push(format!("darkwave-preview-{}.mp3", Uuid::new_v4()));
+        std::fs::write(&path, b"packaged preview").expect("fixture");
+        let source = PlaybackSource::CachedPreview {
+            asset_id,
+            path: path.to_string_lossy().to_string(),
+        };
+        let decoder = FixturePackagedDecoder;
+
+        let prepared = prepare_supported_preview_playback(&source, Some(&decoder))
+            .expect("prepare")
+            .expect("decoded preview");
+
+        assert_eq!(prepared.asset_id, asset_id);
+        assert_eq!(
+            prepared.decoded,
+            DecodedAudioBuffer {
+                sample_rate: 44_100,
+                channels: 2,
+                samples: vec![0.5, -0.5],
+            }
+        );
+    }
+
+    #[test]
+    fn supported_cached_preview_playback_reports_missing_packaged_decoder() {
+        let asset_id = Uuid::new_v4();
+        let mut path = std::env::temp_dir();
+        path.push(format!("darkwave-preview-{}.ogg", Uuid::new_v4()));
+        std::fs::write(&path, b"packaged preview").expect("fixture");
+        let source = PlaybackSource::CachedPreview {
+            asset_id,
+            path: path.to_string_lossy().to_string(),
+        };
+
+        assert_eq!(
+            prepare_supported_preview_playback(&source, None),
+            Err(MetadataError::PackagedDecoderUnavailable("ogg".to_string()))
+        );
+    }
+
+    #[test]
     fn playback_decode_tokens_cancel_previous_asset_loads() {
         let first = Uuid::new_v4();
         let second = Uuid::new_v4();
@@ -908,6 +971,24 @@ mod tests {
                 .expect("prepare"),
             None
         );
+    }
+
+    struct FixturePackagedDecoder;
+
+    impl audio_metadata::PackagedAudioDecoder for FixturePackagedDecoder {
+        fn decode_packaged_audio(
+            &self,
+            path: &std::path::Path,
+            extension: &str,
+        ) -> Result<DecodedAudioBuffer, MetadataError> {
+            assert_eq!(extension, "mp3");
+            assert!(path.exists());
+            Ok(DecodedAudioBuffer {
+                sample_rate: 44_100,
+                channels: 2,
+                samples: vec![0.5, -0.5],
+            })
+        }
     }
 
     fn unique_wav_path() -> std::path::PathBuf {

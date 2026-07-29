@@ -14,7 +14,7 @@ The first playback core is a tested state machine, not the final output engine.
 - Optional loop region.
 - Playback speed percentage with a 50%-200% editorial range and a reset-to-normal command.
 - Playback source selection between original media and cached preview files.
-- Cached WAV preview decoding into PCM buffers for offline playback preparation.
+- Cached preview decoding into PCM buffers for offline playback preparation, using native WAV decoding or an attached packaged decoder provider.
 - Supported arbitrary-format audio decoding through the `audio-metadata` packaged-decoder provider interface.
 - Decode cancellation tokens so a newer asset load invalidates earlier decode work.
 - Startup latency classification with a pass threshold at 100 ms.
@@ -25,7 +25,7 @@ The first playback core is a tested state machine, not the final output engine.
 
 Loading a new asset resets position to zero, clears loop state, and stops playback. Playback speed is transport state, so it can be adjusted independently and reset to normal without reloading the selected asset. Decode coordination issues a new token for each load, so moving to another row invalidates previous decode work before it can overlap the current selection.
 
-When an original file is local, playback source selection uses the original media path. When the original is missing or unavailable but a preview cache file exists, the cached preview is selected instead. Cached WAV previews can be decoded into PCM for playback preparation. Packaged decoder providers can attach decoding for other supported formats once release artifacts are available. Assets without either source are reported unavailable.
+When an original file is local, playback source selection uses the original media path. When the original is missing or unavailable but a preview cache file exists, the cached preview is selected instead. Cached previews can be decoded into PCM for playback preparation through native WAV decoding or an attached packaged decoder provider. Assets without either source are reported unavailable.
 
 Output routing uses the system default unless the saved preference names a currently available device. Missing saved devices fall back to the system default while preserving which device disappeared. Bound routes carry the platform output handle used by the audio backend; if no default handle is available, the engine reports an unbound fallback instead of pretending playback can start. Platform transport snapshots only become ready when an asset is loaded and a platform output handle is bound. Decoded PCM can then be converted into a platform playback buffer that carries the selected output handle and applies the transport speed before backend submission.
 
