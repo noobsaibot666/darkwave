@@ -98,6 +98,7 @@ export function App() {
             <Import size={16} />
             Import Folder
           </button>
+          <span>Managed imports copy to Media/00</span>
           <button>
             <Zap size={16} />
             Open NAS Library

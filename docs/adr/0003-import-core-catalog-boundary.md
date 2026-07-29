@@ -26,4 +26,4 @@ The storage crate owns SQLite persistence and job queue records. Import orchestr
 - Imported files can become visible before expensive audio decoding exists.
 - Restart can recover pending jobs from SQLite.
 - The content hash used in this milestone is intentionally lightweight and will be replaced by the dedicated hashing/fingerprinting pipeline.
-- Managed import currently records the intended managed path; physical copy policy will be implemented with recoverable file operations in a later Milestone 1 refinement.
+- Managed import copies into the library media root after registration and does not overwrite an existing managed destination.

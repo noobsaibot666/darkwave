@@ -11,6 +11,7 @@ The import core is intentionally small and restart-safe.
 - Extract immediate metadata through `audio-metadata`.
 - Compute a temporary lightweight content key.
 - Register an asset through `storage`.
+- Copy managed imports into the library media root after catalog registration.
 - Enqueue follow-up jobs.
 
 `storage` handles persistence:

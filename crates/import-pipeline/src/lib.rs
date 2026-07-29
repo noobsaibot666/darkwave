@@ -2,7 +2,7 @@ use audio_metadata::{extract_immediate_metadata, supported_mvp_format, MetadataE
 use sha2::{Digest, Sha256};
 use shared_types::{AvailabilityState, StorageMode};
 use std::fs;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use storage::{AssetPath, AssetRecord, Catalog, JobKind, NewAssetRecord, StorageError};
 use thiserror::Error;
 use uuid::Uuid;
@@ -19,6 +19,8 @@ pub enum ImportError {
     UnsupportedFormat(String),
     #[error("file name is required")]
     MissingFilename,
+    #[error("library does not exist: {0}")]
+    MissingLibrary(Uuid),
     #[error("metadata error: {0}")]
     Metadata(#[from] MetadataError),
     #[error("storage error: {0}")]
@@ -88,6 +90,10 @@ pub fn import_file(
     catalog.enqueue_job(asset.id, JobKind::Hashing, 20)?;
     catalog.enqueue_job(asset.id, JobKind::WaveformGeneration, 30)?;
 
+    if mode == ImportMode::Managed {
+        copy_managed_source(catalog, library_id, path, &asset)?;
+    }
+
     Ok(asset)
 }
 
@@ -95,6 +101,33 @@ fn lightweight_content_hash(path: &Path) -> Result<String, ImportError> {
     let bytes = fs::read(path)?;
     let digest = Sha256::digest(bytes);
     Ok(format!("{digest:x}"))
+}
+
+fn copy_managed_source(
+    catalog: &Catalog,
+    library_id: Uuid,
+    source_path: &Path,
+    asset: &AssetRecord,
+) -> Result<(), ImportError> {
+    let library = catalog
+        .get_library(library_id)?
+        .ok_or(ImportError::MissingLibrary(library_id))?;
+    let relative_path = match &asset.path {
+        AssetPath::Managed(relative_path) => relative_path,
+        AssetPath::Referenced(_) => return Ok(()),
+    };
+    let destination = PathBuf::from(library.media_root).join(relative_path);
+
+    if destination.exists() {
+        return Ok(());
+    }
+
+    if let Some(parent) = destination.parent() {
+        fs::create_dir_all(parent)?;
+    }
+    fs::copy(source_path, destination)?;
+
+    Ok(())
 }
 
 #[cfg(test)]
@@ -138,6 +171,32 @@ mod tests {
         assert!(catalog.next_pending_job().expect("job query").is_some());
     }
 
+    #[test]
+    fn managed_import_copies_file_into_library_media_root() {
+        let catalog_path = unique_catalog_path("managed-import");
+        let audio_path = unique_audio_path("managed-impact.wav");
+        fs::write(&audio_path, b"managed audio").expect("fixture");
+        let media_root = unique_media_root();
+
+        let catalog = Catalog::open(&catalog_path).expect("catalog");
+        let library = catalog
+            .create_library("Managed Import", media_root.to_string_lossy())
+            .expect("library");
+        let imported =
+            import_file(&catalog, library.id, &audio_path, ImportMode::Managed).expect("import");
+
+        assert_eq!(imported.storage_mode, StorageMode::Managed);
+        assert_eq!(
+            imported.path,
+            AssetPath::Managed("Media/00/managed-impact.wav".to_string())
+        );
+        assert_eq!(
+            fs::read(media_root.join("Media/00/managed-impact.wav")).expect("managed copy"),
+            b"managed audio"
+        );
+        assert_eq!(fs::read(&audio_path).expect("source"), b"managed audio");
+    }
+
     fn unique_catalog_path(name: &str) -> PathBuf {
         let mut path = std::env::temp_dir();
         path.push(format!("darkwave-{name}-{}.sqlite", Uuid::new_v4()));
@@ -150,6 +209,13 @@ mod tests {
         path.push(format!("darkwave-audio-{}", Uuid::new_v4()));
         fs::create_dir_all(&path).expect("fixture directory");
         path.push(name);
+        path
+    }
+
+    fn unique_media_root() -> PathBuf {
+        let mut path = std::env::temp_dir();
+        path.push(format!("darkwave-media-{}", Uuid::new_v4()));
+        fs::create_dir_all(&path).expect("media root");
         path
     }
 }
