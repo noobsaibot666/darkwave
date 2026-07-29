@@ -152,6 +152,9 @@ pub struct SourceRecordDraft {
     pub source_url: Option<String>,
     pub license_type: Option<String>,
     pub license_status: Option<String>,
+    pub attribution: Option<String>,
+    pub restrictions: Option<String>,
+    pub receipt_path: Option<String>,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -163,6 +166,9 @@ pub struct ProjectSourceReportRow {
     pub source_url: Option<String>,
     pub license_type: Option<String>,
     pub license_status: Option<String>,
+    pub attribution: Option<String>,
+    pub restrictions: Option<String>,
+    pub receipt_path: Option<String>,
     pub usage_status: String,
     pub destination: Option<String>,
 }
@@ -822,8 +828,9 @@ impl Catalog {
     pub fn set_source_record(&self, draft: SourceRecordDraft) -> Result<(), StorageError> {
         self.connection.execute(
             "INSERT INTO source_records (
-                id, asset_id, provider, source_url, license_type, license_status
-             ) VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
+                id, asset_id, provider, source_url, license_type, license_status,
+                attribution, restrictions, receipt_path
+             ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)",
             params![
                 Uuid::new_v4().to_string(),
                 draft.asset_id.to_string(),
@@ -831,6 +838,9 @@ impl Catalog {
                 draft.source_url,
                 draft.license_type,
                 draft.license_status,
+                draft.attribution,
+                draft.restrictions,
+                draft.receipt_path,
             ],
         )?;
 
@@ -850,6 +860,9 @@ impl Catalog {
                 source_records.source_url,
                 source_records.license_type,
                 source_records.license_status,
+                source_records.attribution,
+                source_records.restrictions,
+                source_records.receipt_path,
                 usage_events.event_type,
                 usage_events.destination
              FROM usage_events
@@ -868,8 +881,11 @@ impl Catalog {
                     source_url: row.get(4)?,
                     license_type: row.get(5)?,
                     license_status: row.get(6)?,
-                    usage_status: row.get(7)?,
-                    destination: row.get(8)?,
+                    attribution: row.get(7)?,
+                    restrictions: row.get(8)?,
+                    receipt_path: row.get(9)?,
+                    usage_status: row.get(10)?,
+                    destination: row.get(11)?,
                 })
             })?
             .collect::<Result<Vec<_>, _>>()?;
@@ -1785,6 +1801,9 @@ mod tests {
                 source_url: Some("https://example.com/sound".to_string()),
                 license_type: Some("subscription".to_string()),
                 license_status: Some("active".to_string()),
+                attribution: Some("Boom Library / Artist Pack".to_string()),
+                restrictions: Some("client project only".to_string()),
+                receipt_path: Some("receipts/boom-library-2026-07.pdf".to_string()),
             })
             .expect("source");
         catalog
@@ -1802,6 +1821,18 @@ mod tests {
         assert_eq!(report[0].asset_id, asset.id);
         assert_eq!(report[0].provider.as_deref(), Some("Boom Library"));
         assert_eq!(report[0].license_status.as_deref(), Some("active"));
+        assert_eq!(
+            report[0].attribution.as_deref(),
+            Some("Boom Library / Artist Pack")
+        );
+        assert_eq!(
+            report[0].restrictions.as_deref(),
+            Some("client project only")
+        );
+        assert_eq!(
+            report[0].receipt_path.as_deref(),
+            Some("receipts/boom-library-2026-07.pdf")
+        );
         assert_eq!(report[0].usage_status, "exported");
     }
 

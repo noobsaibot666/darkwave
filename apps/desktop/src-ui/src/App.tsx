@@ -184,6 +184,8 @@ export function App() {
             <dd>Needs review</dd>
             <dt>Storage</dt>
             <dd>Referenced NAS path</dd>
+            <dt>Receipt</dt>
+            <dd>Attached to report row</dd>
           </dl>
           <div className="warning-line">Export allowed with license warning</div>
         </section>
