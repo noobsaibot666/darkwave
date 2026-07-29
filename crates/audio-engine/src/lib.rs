@@ -157,6 +157,22 @@ pub enum PlatformTransportSnapshotError {
     NoOutputHandle,
 }
 
+#[derive(Clone, Debug, PartialEq)]
+pub struct PlatformPlaybackBuffer {
+    pub asset_id: Uuid,
+    pub output_handle_id: String,
+    pub sample_rate: u32,
+    pub channels: u16,
+    pub playback_speed_percent: u16,
+    pub samples: Vec<f32>,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum PlatformPlaybackBufferError {
+    EmptySource,
+    InvalidChannelCount,
+}
+
 pub fn choose_playback_source(request: PlaybackSourceRequest) -> PlaybackSource {
     match request.availability_state {
         AvailabilityState::Local => PlaybackSource::Original {
@@ -263,6 +279,27 @@ pub fn platform_transport_snapshot(
     })
 }
 
+pub fn platform_playback_buffer(
+    decoded: &DecodedAudioBuffer,
+    snapshot: &PlatformTransportSnapshot,
+) -> Result<PlatformPlaybackBuffer, PlatformPlaybackBufferError> {
+    if decoded.samples.is_empty() {
+        return Err(PlatformPlaybackBufferError::EmptySource);
+    }
+    if decoded.channels == 0 {
+        return Err(PlatformPlaybackBufferError::InvalidChannelCount);
+    }
+
+    Ok(PlatformPlaybackBuffer {
+        asset_id: snapshot.asset_id,
+        output_handle_id: snapshot.output_handle_id.clone(),
+        sample_rate: decoded.sample_rate,
+        channels: decoded.channels,
+        playback_speed_percent: snapshot.playback_speed_percent,
+        samples: resample_for_playback_speed(&decoded.samples, snapshot.playback_speed_percent),
+    })
+}
+
 pub fn prepare_cached_preview_playback(
     source: &PlaybackSource,
 ) -> Result<Option<PreparedPreviewPlayback>, MetadataError> {
@@ -292,6 +329,29 @@ pub fn classify_playback_startup_latency(
 
 fn clamp_playback_speed_percent(percent: u16) -> u16 {
     percent.clamp(MIN_PLAYBACK_SPEED_PERCENT, MAX_PLAYBACK_SPEED_PERCENT)
+}
+
+fn resample_for_playback_speed(samples: &[f32], speed_percent: u16) -> Vec<f32> {
+    if samples.len() == 1 || speed_percent == NORMAL_PLAYBACK_SPEED_PERCENT {
+        return samples.to_vec();
+    }
+
+    let speed = speed_percent as f32 / NORMAL_PLAYBACK_SPEED_PERCENT as f32;
+    let output_len = (((samples.len() - 1) as f32 / speed).round() as usize + 1).max(1);
+
+    (0..output_len)
+        .map(|index| {
+            let source_position = (index as f32 * speed).min((samples.len() - 1) as f32);
+            let left_index = source_position.floor() as usize;
+            let right_index = source_position.ceil() as usize;
+            if left_index == right_index {
+                samples[left_index]
+            } else {
+                let fraction = source_position - left_index as f32;
+                samples[left_index] + (samples[right_index] - samples[left_index]) * fraction
+            }
+        })
+        .collect()
 }
 
 impl PlaybackDecodeCoordinator {
@@ -720,6 +780,63 @@ mod tests {
             ),
             Err(PlatformTransportSnapshotError::NoOutputHandle)
         );
+    }
+
+    #[test]
+    fn platform_playback_buffer_applies_faster_transport_speed() {
+        let asset_id = Uuid::new_v4();
+        let decoded = DecodedAudioBuffer {
+            sample_rate: 48_000,
+            channels: 1,
+            samples: vec![0.0, 0.25, 0.5, 0.75, 1.0],
+        };
+        let snapshot = PlatformTransportSnapshot {
+            asset_id,
+            duration_ms: 5,
+            position_ms: 0,
+            playing: true,
+            loop_region: None,
+            playback_speed_percent: 200,
+            output_handle_id: "coreaudio-default".to_string(),
+        };
+
+        let buffer = platform_playback_buffer(&decoded, &snapshot).expect("playback buffer");
+
+        assert_eq!(
+            buffer,
+            PlatformPlaybackBuffer {
+                asset_id,
+                output_handle_id: "coreaudio-default".to_string(),
+                sample_rate: 48_000,
+                channels: 1,
+                playback_speed_percent: 200,
+                samples: vec![0.0, 0.5, 1.0],
+            }
+        );
+    }
+
+    #[test]
+    fn platform_playback_buffer_applies_slower_transport_speed() {
+        let asset_id = Uuid::new_v4();
+        let decoded = DecodedAudioBuffer {
+            sample_rate: 48_000,
+            channels: 1,
+            samples: vec![0.0, 1.0],
+        };
+        let snapshot = PlatformTransportSnapshot {
+            asset_id,
+            duration_ms: 2,
+            position_ms: 0,
+            playing: true,
+            loop_region: None,
+            playback_speed_percent: 50,
+            output_handle_id: "coreaudio-default".to_string(),
+        };
+
+        let buffer = platform_playback_buffer(&decoded, &snapshot).expect("playback buffer");
+
+        assert_eq!(buffer.samples, vec![0.0, 0.5, 1.0]);
+        assert_eq!(buffer.playback_speed_percent, 50);
     }
 
     #[test]
