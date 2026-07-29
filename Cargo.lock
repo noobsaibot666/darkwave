@@ -652,6 +652,7 @@ name = "darkwave-desktop"
 version = "0.1.0"
 dependencies = [
  "library-core",
+ "preferences",
  "release-readiness",
  "serde",
  "serde_json",
@@ -2626,6 +2627,13 @@ name = "precomputed-hash"
 version = "0.1.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "925383efa346730478fb4838dbe9137d2a47675ad789c546d150a6e1dd4ab31c"
+
+[[package]]
+name = "preferences"
+version = "0.1.0"
+dependencies = [
+ "serde",
+]
 
 [[package]]
 name = "proc-macro-crate"

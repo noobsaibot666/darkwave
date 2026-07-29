@@ -10,3 +10,5 @@ Start by creating or opening a library. A library can manage copied media, refer
 Use folder import for existing sound libraries and watched Downloads for new files. NAS-backed libraries should keep media on the share while the active catalog and waveform cache stay local.
 
 Keep backups of the library manifest and media root. If a NAS path moves, use relinking instead of re-importing the same files.
+
+Default settings use compact browser rows, the system audio output device, and a 16 GB preview cache. These defaults favor fast auditioning on large libraries.

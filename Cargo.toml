@@ -10,6 +10,7 @@ members = [
   "crates/import-pipeline",
   "crates/library-core",
   "crates/release-readiness",
+  "crates/preferences",
   "crates/library-sync",
   "crates/search",
   "crates/shared-types",

@@ -2,6 +2,7 @@ import {
   Bell,
   Command,
   Contrast,
+  Gauge,
   Import,
   ListFilter,
   Pause,
@@ -12,7 +13,9 @@ import {
   ShieldCheck,
   SkipBack,
   SkipForward,
+  SlidersHorizontal,
   Star,
+  Volume2,
   Zap
 } from "lucide-react";
 
@@ -37,6 +40,15 @@ const releaseItems = [
   { label: "Performance", state: "Passed" },
   { label: "Updates", state: "Planned" },
   { label: "Signing", state: "Planned" }
+];
+
+const shortcutItems = [
+  { command: "Play/Pause", binding: "Space" },
+  { command: "Next sound", binding: "Arrow Down" },
+  { command: "Previous sound", binding: "Arrow Up" },
+  { command: "Favorite", binding: "F" },
+  { command: "Command palette", binding: "Mod K" },
+  { command: "Import", binding: "Mod I" }
 ];
 
 export function App() {
@@ -134,6 +146,37 @@ export function App() {
             <dt>Storage</dt>
             <dd>Referenced NAS path</dd>
           </dl>
+        </section>
+        <section>
+          <h2>Settings</h2>
+          <div className="settings-stack">
+            <div className="setting-row">
+              <SlidersHorizontal size={15} />
+              <span>Browser density</span>
+              <strong>Compact</strong>
+            </div>
+            <div className="setting-row">
+              <Volume2 size={15} />
+              <span>Output device</span>
+              <strong>System</strong>
+            </div>
+            <div className="setting-row">
+              <Gauge size={15} />
+              <span>Preview cache</span>
+              <strong>16 GB</strong>
+            </div>
+          </div>
+        </section>
+        <section>
+          <h2>Shortcuts</h2>
+          <div className="shortcut-list">
+            {shortcutItems.map((item) => (
+              <div className="shortcut-row" key={item.command}>
+                <span>{item.command}</span>
+                <kbd>{item.binding}</kbd>
+              </div>
+            ))}
+          </div>
         </section>
         <section>
           <h2>Accessibility</h2>

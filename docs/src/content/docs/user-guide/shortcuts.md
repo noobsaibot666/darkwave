@@ -11,6 +11,8 @@ Initial shortcut targets:
 - F: toggle favorite.
 - Command/Control K: command palette.
 - Command/Control I: import.
+- Command/Control E: export selected.
+- Command/Control F: focus search.
 - Escape: close transient panels.
 
 Shortcuts must remain available without requiring pointer interaction.
