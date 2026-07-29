@@ -88,6 +88,11 @@ fn trash_retention_policy_days() -> u64 {
     30
 }
 
+#[tauri::command]
+fn backup_restore_requirements() -> Vec<&'static str> {
+    vec!["catalog_snapshot", "portable_manifest", "media_root"]
+}
+
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
     tauri::Builder::default()
@@ -102,7 +107,8 @@ pub fn run() {
             default_virtualized_range,
             default_command_titles,
             sample_maintenance_summary,
-            trash_retention_policy_days
+            trash_retention_policy_days,
+            backup_restore_requirements
         ])
         .run(tauri::generate_context!())
         .expect("failed to run Darkwave desktop shell");
@@ -171,5 +177,13 @@ mod tests {
     #[test]
     fn trash_retention_policy_defaults_to_30_days() {
         assert_eq!(super::trash_retention_policy_days(), 30);
+    }
+
+    #[test]
+    fn backup_restore_requirements_include_catalog_manifest_and_media_root() {
+        assert_eq!(
+            super::backup_restore_requirements(),
+            vec!["catalog_snapshot", "portable_manifest", "media_root"]
+        );
     }
 }

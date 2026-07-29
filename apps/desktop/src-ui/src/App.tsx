@@ -284,6 +284,12 @@ export function App() {
           <div className="status-line">30 day retention before explicit purge</div>
           <div className="status-line">Restore keeps original asset identity</div>
         </section>
+        <section>
+          <h2>Backup</h2>
+          <div className="status-line">Catalog snapshot required</div>
+          <div className="status-line">Portable manifest required</div>
+          <div className="status-line">Media root verified on restore</div>
+        </section>
       </aside>
       <footer className="transport" aria-label="Transport">
         <button className="icon-button" aria-label="Previous">

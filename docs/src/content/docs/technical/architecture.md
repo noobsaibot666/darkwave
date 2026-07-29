@@ -28,3 +28,4 @@ Milestone 1 introduces the first catalog boundary:
 - `maintenance` owns structured catalog health findings and non-destructive maintenance summaries.
 - `fingerprint` owns exact duplicate keys, likely duplicate classification, and duplicate review actions.
 - `trash` owns non-destructive application Trash state, restore plans, and purge guards.
+- `backup` owns backup package metadata and restore input validation.
