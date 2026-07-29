@@ -23,5 +23,7 @@ Introduce an export planning layer in `export-pipeline` and traceability persist
 ## Consequences
 
 - The UI can plan export/copy actions before invoking filesystem or conversion code.
+- Original-file copy execution is available without mutating library originals.
+- Project source/license reports can be rendered as CSV.
 - Traceability is available before direct NLE integrations exist.
-- Actual copy execution, external drag payloads, FFmpeg conversion, and report file rendering remain future Milestone 6 work.
+- External drag payloads, FFmpeg conversion, and ranged export rendering remain future Milestone 6 work.
