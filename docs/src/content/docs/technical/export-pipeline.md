@@ -13,9 +13,10 @@ Implemented behavior:
 - Destination path planning for project media folders.
 - Non-destructive original-file copy execution.
 - Queued export state for offline source paths and ready original-copy execution.
+- External drag payloads for ready original-copy exports, including ordered file URLs and license-report intent.
 - Traceability flags for preserving source and license records.
 - Project source reports include attribution, restriction notes, and source receipt paths.
 - CSV rendering for project source/license reports.
 - License assessment warnings for missing, uncertain, or expired source/license context.
 
-The planner remains separate from execution. Original-file copies can be executed directly or held in a queue until offline source paths become available. WAV conversion, ranged export rendering, and external drag payload creation remain explicit backend follow-up work.
+The planner remains separate from execution. Original-file copies can be executed directly, held in a queue until offline source paths become available, or exposed as OS-facing drag payloads after the destination copy exists. WAV conversion and ranged export rendering remain explicit backend follow-up work, including drag payloads for exports that still need rendering.

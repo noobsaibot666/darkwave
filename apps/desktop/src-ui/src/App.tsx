@@ -194,6 +194,7 @@ export function App() {
           </dl>
           <div className="warning-line">Export allowed with license warning</div>
           <div className="status-line">Original copy export executable</div>
+          <div className="status-line">External drag payload ready after copy</div>
         </section>
         <section>
           <h2>Settings</h2>

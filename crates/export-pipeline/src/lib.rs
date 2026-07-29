@@ -69,6 +69,24 @@ pub struct QueuedExport {
     pub attempts: u32,
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum ExternalDragOperation {
+    Copy,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct ExternalDragPayload {
+    pub file_urls: Vec<String>,
+    pub operation: ExternalDragOperation,
+    pub include_license_report: bool,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub enum ExternalDragPayloadError {
+    EmptySelection,
+    RequiresRenderedExport,
+}
+
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct ExportQueue {
     next_queue_id: u64,
@@ -266,6 +284,30 @@ pub fn execute_original_copy_export(
     })
 }
 
+pub fn build_external_drag_payload(
+    plans: &[ExportPlan],
+) -> Result<ExternalDragPayload, ExternalDragPayloadError> {
+    if plans.is_empty() {
+        return Err(ExternalDragPayloadError::EmptySelection);
+    }
+
+    if plans
+        .iter()
+        .any(|plan| plan.conversion.is_some() || plan.range.is_some())
+    {
+        return Err(ExternalDragPayloadError::RequiresRenderedExport);
+    }
+
+    Ok(ExternalDragPayload {
+        file_urls: plans
+            .iter()
+            .map(|plan| file_url_for_path(&plan.destination_path))
+            .collect(),
+        operation: ExternalDragOperation::Copy,
+        include_license_report: plans.iter().any(|plan| plan.include_license_record),
+    })
+}
+
 impl ExportQueue {
     pub fn new() -> Self {
         Self {
@@ -392,6 +434,29 @@ fn csv_escape(value: &str) -> String {
     } else {
         value.to_string()
     }
+}
+
+fn file_url_for_path(path: &str) -> String {
+    let encoded_path = percent_encode_path(path);
+    if path.starts_with('/') {
+        format!("file://{}", encoded_path)
+    } else {
+        format!("file:///{}", encoded_path)
+    }
+}
+
+fn percent_encode_path(path: &str) -> String {
+    let mut encoded = String::new();
+
+    for byte in path.bytes() {
+        if byte.is_ascii_alphanumeric() || matches!(byte, b'/' | b'.' | b'-' | b'_' | b'~') {
+            encoded.push(byte as char);
+        } else {
+            encoded.push_str(&format!("%{byte:02X}"));
+        }
+    }
+
+    encoded
 }
 
 #[cfg(test)]
@@ -646,6 +711,56 @@ mod tests {
                 .next_ready_original_copy()
                 .map(|entry| entry.plan.clone()),
             Some(original_copy_plan("/library/b.wav", "/project/b.wav"))
+        );
+    }
+
+    #[test]
+    fn external_drag_payload_uses_ready_destination_file_urls_in_order() {
+        let first = original_copy_plan("/library/a.wav", "/project/audio/Dark Hit.wav");
+        let second = ExportPlan {
+            include_license_record: false,
+            ..original_copy_plan("/library/b.wav", "/project/audio/b.wav")
+        };
+
+        let payload = build_external_drag_payload(&[first, second]).expect("external drag payload");
+
+        assert_eq!(
+            payload,
+            ExternalDragPayload {
+                file_urls: vec![
+                    "file:///project/audio/Dark%20Hit.wav".to_string(),
+                    "file:///project/audio/b.wav".to_string()
+                ],
+                operation: ExternalDragOperation::Copy,
+                include_license_report: true
+            }
+        );
+    }
+
+    #[test]
+    fn external_drag_payload_rejects_exports_that_still_need_rendering() {
+        let conversion_plan = ExportPlan {
+            conversion: Some(AudioConversion {
+                sample_rate: 48_000,
+                bit_depth: 24,
+            }),
+            ..original_copy_plan("/library/music.mp3", "/project/audio/music.wav")
+        };
+        let ranged_plan = ExportPlan {
+            range: Some(ExportRangeMs {
+                start_ms: 100,
+                end_ms: 400,
+            }),
+            ..original_copy_plan("/library/impact.wav", "/project/audio/impact.wav")
+        };
+
+        assert_eq!(
+            build_external_drag_payload(&[conversion_plan]),
+            Err(ExternalDragPayloadError::RequiresRenderedExport)
+        );
+        assert_eq!(
+            build_external_drag_payload(&[ranged_plan]),
+            Err(ExternalDragPayloadError::RequiresRenderedExport)
         );
     }
 
