@@ -140,6 +140,23 @@ pub enum AudioOutputBinding {
     },
 }
 
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct PlatformTransportSnapshot {
+    pub asset_id: Uuid,
+    pub duration_ms: u64,
+    pub position_ms: u64,
+    pub playing: bool,
+    pub loop_region: Option<LoopRegion>,
+    pub playback_speed_percent: u16,
+    pub output_handle_id: String,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum PlatformTransportSnapshotError {
+    NoActiveAsset,
+    NoOutputHandle,
+}
+
 pub fn choose_playback_source(request: PlaybackSourceRequest) -> PlaybackSource {
     match request.availability_state {
         AvailabilityState::Local => PlaybackSource::Original {
@@ -219,6 +236,31 @@ pub fn bind_audio_output_route(request: AudioOutputBindingRequest) -> AudioOutpu
                 reason: AudioOutputBindingFallback::NoSystemDefaultHandle,
             }),
     }
+}
+
+pub fn platform_transport_snapshot(
+    session: &PlaybackSession,
+    binding: &AudioOutputBinding,
+) -> Result<PlatformTransportSnapshot, PlatformTransportSnapshotError> {
+    let asset_id = session
+        .active_asset_id
+        .ok_or(PlatformTransportSnapshotError::NoActiveAsset)?;
+    let output_handle_id = match binding {
+        AudioOutputBinding::Bound { handle_id, .. } => handle_id.clone(),
+        AudioOutputBinding::UnboundSystemDefault { .. } => {
+            return Err(PlatformTransportSnapshotError::NoOutputHandle);
+        }
+    };
+
+    Ok(PlatformTransportSnapshot {
+        asset_id,
+        duration_ms: session.duration_ms,
+        position_ms: session.position_ms,
+        playing: session.playing,
+        loop_region: session.loop_region,
+        playback_speed_percent: session.playback_speed_percent,
+        output_handle_id,
+    })
 }
 
 pub fn prepare_cached_preview_playback(
@@ -614,6 +656,69 @@ mod tests {
             AudioOutputBinding::UnboundSystemDefault {
                 reason: AudioOutputBindingFallback::NoSystemDefaultHandle
             }
+        );
+    }
+
+    #[test]
+    fn platform_transport_snapshot_includes_session_speed_and_output_handle() {
+        let asset_id = Uuid::new_v4();
+        let mut session = PlaybackSession::default();
+        session.apply(PlaybackEvent::Load {
+            asset_id,
+            duration_ms: 12_000,
+        });
+        session.apply(PlaybackEvent::SeekMs(3_200));
+        session.apply(PlaybackEvent::SetLoopRegion {
+            start_ms: 2_000,
+            end_ms: 5_000,
+        });
+        session.apply(PlaybackEvent::SetPlaybackSpeedPercent(125));
+        session.apply(PlaybackEvent::Play);
+
+        let snapshot = platform_transport_snapshot(
+            &session,
+            &AudioOutputBinding::Bound {
+                route: AudioOutputRoute::Device {
+                    device_id: "interface-a".to_string(),
+                },
+                handle_id: "coreaudio-interface-a".to_string(),
+            },
+        )
+        .expect("transport snapshot");
+
+        assert_eq!(
+            snapshot,
+            PlatformTransportSnapshot {
+                asset_id,
+                duration_ms: 12_000,
+                position_ms: 3_200,
+                playing: true,
+                loop_region: Some(LoopRegion {
+                    start_ms: 2_000,
+                    end_ms: 5_000
+                }),
+                playback_speed_percent: 125,
+                output_handle_id: "coreaudio-interface-a".to_string()
+            }
+        );
+    }
+
+    #[test]
+    fn platform_transport_snapshot_reports_missing_output_handle() {
+        let mut session = PlaybackSession::default();
+        session.apply(PlaybackEvent::Load {
+            asset_id: Uuid::new_v4(),
+            duration_ms: 12_000,
+        });
+
+        assert_eq!(
+            platform_transport_snapshot(
+                &session,
+                &AudioOutputBinding::UnboundSystemDefault {
+                    reason: AudioOutputBindingFallback::NoSystemDefaultHandle
+                }
+            ),
+            Err(PlatformTransportSnapshotError::NoOutputHandle)
         );
     }
 
