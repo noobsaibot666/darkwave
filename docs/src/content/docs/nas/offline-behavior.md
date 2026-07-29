@@ -15,5 +15,6 @@ Current behavior:
 - Online media-root probes request reconnect validation before assuming asset paths are usable.
 - Export plans can wait in a queue while source paths are offline and become ready after the source returns.
 - Playback source selection can fall back to cached preview files when originals are missing.
+- Reconnect validation jobs are planned from portable manifests when a media root comes back online.
 
-Future work will add background reconnect validation jobs, fuller user-facing offline controls, and decoder integration for cached preview playback.
+Future work will add a background scheduler for reconnect validation jobs, fuller user-facing offline controls, and decoder integration for cached preview playback.

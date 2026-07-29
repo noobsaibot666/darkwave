@@ -41,6 +41,13 @@ pub struct MediaRootProbe {
     pub reconnect_validation_required: bool,
 }
 
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct ReconnectValidationJob {
+    pub library_id: Uuid,
+    pub manifest_revision: u64,
+    pub paths_to_validate: Vec<String>,
+}
+
 impl PortableManifest {
     pub fn new(library_id: Uuid, revision: u64) -> Self {
         Self {
@@ -80,6 +87,26 @@ pub fn probe_media_root(
         status,
         reconnect_validation_required: status == MediaRootStatus::Online,
     }
+}
+
+pub fn plan_reconnect_validation(
+    manifest: &PortableManifest,
+    probe: &MediaRootProbe,
+) -> Option<ReconnectValidationJob> {
+    if !probe.reconnect_validation_required || probe.status != MediaRootStatus::Online {
+        return None;
+    }
+
+    let media_root = probe.media_root.trim_end_matches('/');
+    Some(ReconnectValidationJob {
+        library_id: manifest.library_id,
+        manifest_revision: manifest.revision,
+        paths_to_validate: manifest
+            .assets
+            .iter()
+            .map(|asset| format!("{media_root}/{}", asset.relative_path))
+            .collect(),
+    })
 }
 
 pub fn lease_state(active_writer_device: Option<&str>, current_device: &str) -> WriterLeaseState {
@@ -172,5 +199,50 @@ mod tests {
 
         assert_eq!(probe.status, MediaRootStatus::Offline);
         assert!(!probe.reconnect_validation_required);
+    }
+
+    #[test]
+    fn online_media_root_plans_reconnect_validation_for_manifest_assets() {
+        let library_id = Uuid::new_v4();
+        let manifest = PortableManifest::new(library_id, 9)
+            .with_asset(ManifestAsset {
+                id: Uuid::new_v4(),
+                relative_path: "Media/00/impact.wav".to_string(),
+                content_hash: "hash-impact".to_string(),
+            })
+            .with_asset(ManifestAsset {
+                id: Uuid::new_v4(),
+                relative_path: "Media/00/riser.wav".to_string(),
+                content_hash: "hash-riser".to_string(),
+            });
+        let probe = MediaRootProbe {
+            media_root: "/Volumes/TrueNAS/SFX".to_string(),
+            status: MediaRootStatus::Online,
+            reconnect_validation_required: true,
+        };
+
+        let job = plan_reconnect_validation(&manifest, &probe).expect("validation job");
+
+        assert_eq!(job.library_id, library_id);
+        assert_eq!(job.manifest_revision, 9);
+        assert_eq!(
+            job.paths_to_validate,
+            vec![
+                "/Volumes/TrueNAS/SFX/Media/00/impact.wav".to_string(),
+                "/Volumes/TrueNAS/SFX/Media/00/riser.wav".to_string(),
+            ]
+        );
+    }
+
+    #[test]
+    fn offline_media_root_does_not_plan_reconnect_validation() {
+        let manifest = PortableManifest::new(Uuid::new_v4(), 1);
+        let probe = MediaRootProbe {
+            media_root: "/Volumes/TrueNAS/SFX".to_string(),
+            status: MediaRootStatus::Offline,
+            reconnect_validation_required: false,
+        };
+
+        assert_eq!(plan_reconnect_validation(&manifest, &probe), None);
     }
 }

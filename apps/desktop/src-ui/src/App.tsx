@@ -104,7 +104,7 @@ export function App() {
             <Zap size={16} />
             Open NAS Library
           </button>
-          <span>NAS status probes before validation</span>
+          <span>NAS probe plans reconnect validation</span>
           <button>
             <RotateCcw size={16} />
             Restore Session
