@@ -14,6 +14,8 @@ fn release_blockers() -> Vec<&'static str> {
         performance_profile: GateState::Passed,
         crash_recovery: GateState::Passed,
         onboarding_docs: GateState::Passed,
+        codec_packaging: GateState::Planned,
+        codec_license_review: GateState::Planned,
         update_system: GateState::Planned,
         signing_notarization: GateState::Planned,
     }
@@ -26,6 +28,8 @@ fn release_blockers() -> Vec<&'static str> {
         ReleaseBlocker::PerformanceProfile => "performance_profile",
         ReleaseBlocker::CrashRecovery => "crash_recovery",
         ReleaseBlocker::OnboardingDocs => "onboarding_docs",
+        ReleaseBlocker::CodecPackaging => "codec_packaging",
+        ReleaseBlocker::CodecLicenseReview => "codec_license_review",
         ReleaseBlocker::UpdateSystem => "update_system",
         ReleaseBlocker::SigningNotarization => "signing_notarization",
     })
@@ -137,7 +141,12 @@ mod tests {
     fn release_blockers_expose_planned_distribution_work() {
         assert_eq!(
             super::release_blockers(),
-            vec!["update_system", "signing_notarization"]
+            vec![
+                "codec_packaging",
+                "codec_license_review",
+                "update_system",
+                "signing_notarization"
+            ]
         );
     }
 

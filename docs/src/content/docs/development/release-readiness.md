@@ -11,8 +11,12 @@ Release readiness is tracked through explicit gates:
 - Performance profile.
 - Crash recovery.
 - Onboarding and documentation.
+- Codec packaging.
+- Codec license review.
 - Update system.
 - Signing and notarization.
+
+WAV PCM decoding is native. Compressed MVP formats such as MP3, FLAC, AAC/M4A, AIFF, and OGG are tracked as packaged-decoder work until the decoder bundle and codec licensing review are complete. Unsupported formats remain visible with a conversion option.
 
 The update system and signing/notarization gates remain planned until distribution credentials and release channels are configured.
 

@@ -40,6 +40,8 @@ const releaseItems = [
   { label: "Windows audit", state: "Passed" },
   { label: "Accessibility", state: "Passed" },
   { label: "Performance", state: "Passed" },
+  { label: "Codec packaging", state: "Planned" },
+  { label: "Codec license", state: "Planned" },
   { label: "Updates", state: "Planned" },
   { label: "Signing", state: "Planned" }
 ];

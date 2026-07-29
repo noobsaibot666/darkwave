@@ -14,6 +14,20 @@ pub struct DecodedAudioBuffer {
     pub samples: Vec<f32>,
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum CodecSupportStatus {
+    NativePcm,
+    RequiresPackagedDecoder,
+    Unsupported,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct CodecSupport {
+    pub extension: String,
+    pub status: CodecSupportStatus,
+    pub conversion_available: bool,
+}
+
 #[derive(Debug, Error)]
 pub enum MetadataError {
     #[error("file has no extension")]
@@ -47,6 +61,23 @@ pub fn supported_mvp_format(extension: &str) -> bool {
         extension.to_ascii_lowercase().as_str(),
         "wav" | "aiff" | "aif" | "mp3" | "flac" | "aac" | "m4a" | "ogg"
     )
+}
+
+pub fn codec_support_for_extension(extension: &str) -> CodecSupport {
+    let extension = extension.to_ascii_lowercase();
+    let status = match extension.as_str() {
+        "wav" => CodecSupportStatus::NativePcm,
+        "aiff" | "aif" | "mp3" | "flac" | "aac" | "m4a" | "ogg" => {
+            CodecSupportStatus::RequiresPackagedDecoder
+        }
+        _ => CodecSupportStatus::Unsupported,
+    };
+
+    CodecSupport {
+        extension,
+        status,
+        conversion_available: status != CodecSupportStatus::NativePcm,
+    }
 }
 
 pub fn extract_immediate_metadata(path: impl AsRef<Path>) -> Result<FileMetadata, MetadataError> {
@@ -212,6 +243,38 @@ mod tests {
         assert_eq!(
             decode_wav_pcm(&path).map(|_| ()),
             Err(MetadataError::UnsupportedDecoderFormat("mp3".to_string()))
+        );
+    }
+
+    #[test]
+    fn codec_support_marks_wav_native_and_compressed_formats_packaged() {
+        assert_eq!(
+            codec_support_for_extension("wav"),
+            CodecSupport {
+                extension: "wav".to_string(),
+                status: CodecSupportStatus::NativePcm,
+                conversion_available: false,
+            }
+        );
+        assert_eq!(
+            codec_support_for_extension("mp3"),
+            CodecSupport {
+                extension: "mp3".to_string(),
+                status: CodecSupportStatus::RequiresPackagedDecoder,
+                conversion_available: true,
+            }
+        );
+    }
+
+    #[test]
+    fn unsupported_codec_remains_visible_with_conversion_option() {
+        assert_eq!(
+            codec_support_for_extension("wma"),
+            CodecSupport {
+                extension: "wma".to_string(),
+                status: CodecSupportStatus::Unsupported,
+                conversion_available: true,
+            }
         );
     }
 

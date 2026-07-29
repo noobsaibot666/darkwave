@@ -80,6 +80,8 @@ pub enum ReleaseBlocker {
     PerformanceProfile,
     CrashRecovery,
     OnboardingDocs,
+    CodecPackaging,
+    CodecLicenseReview,
     UpdateSystem,
     SigningNotarization,
 }
@@ -92,6 +94,8 @@ pub struct ReleaseCandidate {
     pub performance_profile: GateState,
     pub crash_recovery: GateState,
     pub onboarding_docs: GateState,
+    pub codec_packaging: GateState,
+    pub codec_license_review: GateState,
     pub update_system: GateState,
     pub signing_notarization: GateState,
 }
@@ -105,6 +109,11 @@ impl ReleaseCandidate {
             (ReleaseBlocker::PerformanceProfile, self.performance_profile),
             (ReleaseBlocker::CrashRecovery, self.crash_recovery),
             (ReleaseBlocker::OnboardingDocs, self.onboarding_docs),
+            (ReleaseBlocker::CodecPackaging, self.codec_packaging),
+            (
+                ReleaseBlocker::CodecLicenseReview,
+                self.codec_license_review,
+            ),
             (ReleaseBlocker::UpdateSystem, self.update_system),
             (
                 ReleaseBlocker::SigningNotarization,
@@ -173,6 +182,8 @@ mod tests {
             performance_profile: GateState::Passed,
             crash_recovery: GateState::Passed,
             onboarding_docs: GateState::Passed,
+            codec_packaging: GateState::Planned,
+            codec_license_review: GateState::Planned,
             update_system: GateState::Planned,
             signing_notarization: GateState::Planned,
         };
@@ -180,6 +191,8 @@ mod tests {
         assert_eq!(
             candidate.blockers(),
             vec![
+                ReleaseBlocker::CodecPackaging,
+                ReleaseBlocker::CodecLicenseReview,
                 ReleaseBlocker::UpdateSystem,
                 ReleaseBlocker::SigningNotarization
             ]
