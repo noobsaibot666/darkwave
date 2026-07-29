@@ -226,6 +226,9 @@ version = "0.1.0"
 [[package]]
 name = "audio-engine"
 version = "0.1.0"
+dependencies = [
+ "uuid",
+]
 
 [[package]]
 name = "audio-metadata"

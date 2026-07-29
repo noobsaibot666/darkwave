@@ -11,3 +11,10 @@ npm run check
 ```
 
 Use `npm run dev` for the desktop UI development server and `npm run tauri` for Tauri commands.
+
+Useful targeted Rust checks:
+
+```sh
+cargo test -p storage -p import-pipeline -p audio-metadata
+cargo test -p audio-engine -p waveform
+```

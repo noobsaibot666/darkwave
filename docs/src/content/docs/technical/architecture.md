@@ -14,3 +14,5 @@ Milestone 1 introduces the first catalog boundary:
 - `storage` owns the local SQLite catalog, library records, asset records, duplicate suppression, availability state, and persistent background jobs.
 - `audio-metadata` extracts immediate filesystem metadata without decoding audio.
 - `import-pipeline` turns a file path into a catalog asset and job records while avoiding incomplete watched-folder downloads.
+- `audio-engine` owns playback session state so rapid row changes cancel prior playback before decoder integration.
+- `waveform` creates reusable peak payloads for row, inspector, and transport renderers.
