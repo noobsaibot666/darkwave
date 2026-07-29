@@ -19,6 +19,8 @@ The initial SQLite migration defines:
 - Undo actions for recoverable metadata relationship changes
 - Smart collection query definitions
 - Suggested tag approval state and origin
+- Portable manifest asset snapshots
+- Writer lease state for shared-library coordination
 
 Migrations live in `db/migrations`.
 

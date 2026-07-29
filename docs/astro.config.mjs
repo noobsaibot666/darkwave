@@ -19,6 +19,10 @@ export default defineConfig({
           autogenerate: { directory: "user-guide" }
         },
         {
+          label: "NAS",
+          autogenerate: { directory: "nas" }
+        },
+        {
           label: "Development",
           autogenerate: { directory: "development" }
         },

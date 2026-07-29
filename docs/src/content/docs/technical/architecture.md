@@ -18,3 +18,4 @@ Milestone 1 introduces the first catalog boundary:
 - `waveform` creates reusable peak payloads for row, inspector, and transport renderers.
 - `storage` also owns organization primitives: tags, asset tags, collections, projects, favorite/review flags, and undo records.
 - `search` provides filename intelligence and traceable suggestions, while `storage` owns FTS-backed catalog search and smart collection persistence.
+- `library-sync` owns portable manifests and writer leases; `storage` owns local availability validation and relinking.

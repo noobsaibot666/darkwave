@@ -666,6 +666,63 @@ impl Catalog {
         Ok(())
     }
 
+    pub fn validate_media_availability(
+        &self,
+        library_id: Uuid,
+        is_available: impl Fn(&str) -> bool,
+    ) -> Result<usize, StorageError> {
+        let assets = self.list_assets(library_id)?;
+        let mut changed = 0;
+
+        for asset in assets {
+            let path = match &asset.path {
+                AssetPath::Managed(path) | AssetPath::Referenced(path) => path,
+            };
+            let next_state = if is_available(path) {
+                AvailabilityState::Local
+            } else {
+                AvailabilityState::Missing
+            };
+
+            if asset.availability_state != next_state {
+                self.connection.execute(
+                    "UPDATE assets SET availability_state = ?1, last_seen = ?2 WHERE id = ?3",
+                    params![
+                        availability_to_db(&next_state),
+                        Utc::now().to_rfc3339(),
+                        asset.id.to_string(),
+                    ],
+                )?;
+                changed += 1;
+            }
+        }
+
+        Ok(changed)
+    }
+
+    pub fn relink_asset(
+        &self,
+        asset_id: Uuid,
+        referenced_path: impl AsRef<str>,
+    ) -> Result<(), StorageError> {
+        self.connection.execute(
+            "UPDATE assets
+             SET referenced_path = ?1,
+                 relative_path = NULL,
+                 storage_mode = 'referenced',
+                 availability_state = 'local',
+                 last_seen = ?2
+             WHERE id = ?3",
+            params![
+                referenced_path.as_ref(),
+                Utc::now().to_rfc3339(),
+                asset_id.to_string(),
+            ],
+        )?;
+
+        Ok(())
+    }
+
     pub fn undo(&self, undo_id: Uuid) -> Result<(), StorageError> {
         let undo = self
             .connection
@@ -1420,6 +1477,52 @@ mod tests {
             .query_definition
             .expect("query")
             .contains("sound_effect"));
+    }
+
+    #[test]
+    fn unavailable_media_root_marks_originals_missing_but_keeps_catalog_searchable() {
+        let catalog_path = unique_catalog_path("offline");
+        let catalog = Catalog::open(&catalog_path).expect("open catalog");
+        let library = catalog
+            .create_library("Offline", "/missing-root")
+            .expect("library");
+        let asset = test_asset(&catalog, library.id, "nas-impact.wav", "hash-offline");
+
+        let changed = catalog
+            .validate_media_availability(library.id, |_| false)
+            .expect("validate");
+        let loaded = catalog.get_asset(asset.id).expect("asset").expect("exists");
+        let results = catalog
+            .search_assets(library.id, AssetSearchQuery::text("nas"))
+            .expect("search");
+
+        assert_eq!(changed, 1);
+        assert_eq!(loaded.availability_state, AvailabilityState::Missing);
+        assert_eq!(results.len(), 1);
+    }
+
+    #[test]
+    fn relinking_moved_asset_updates_path_and_restores_local_availability() {
+        let catalog_path = unique_catalog_path("relink");
+        let catalog = Catalog::open(&catalog_path).expect("open catalog");
+        let library = catalog
+            .create_library("Relink", "/library")
+            .expect("library");
+        let asset = test_asset(&catalog, library.id, "moved.wav", "hash-moved");
+        catalog
+            .validate_media_availability(library.id, |_| false)
+            .expect("offline");
+
+        catalog
+            .relink_asset(asset.id, "/new/location/moved.wav")
+            .expect("relink");
+        let loaded = catalog.get_asset(asset.id).expect("asset").expect("exists");
+
+        assert_eq!(
+            loaded.path,
+            AssetPath::Referenced("/new/location/moved.wav".to_string())
+        );
+        assert_eq!(loaded.availability_state, AvailabilityState::Local);
     }
 
     fn unique_catalog_path(name: &str) -> PathBuf {
