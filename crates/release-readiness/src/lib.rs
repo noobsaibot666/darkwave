@@ -121,6 +121,45 @@ pub fn signing_notarization_gate(config: Option<&SigningNotarizationConfig>) -> 
         .unwrap_or(GateState::Planned)
 }
 
+pub const REQUIRED_PACKAGED_DECODER_EXTENSIONS: [&str; 6] =
+    ["mp3", "flac", "aac", "m4a", "aiff", "ogg"];
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct CodecDistributionConfig {
+    pub packaged_decoder_extensions: Vec<String>,
+    pub license_review_reference: Option<String>,
+}
+
+impl CodecDistributionConfig {
+    pub fn covers_required_decoders(&self) -> bool {
+        REQUIRED_PACKAGED_DECODER_EXTENSIONS.iter().all(|required| {
+            self.packaged_decoder_extensions
+                .iter()
+                .any(|extension| extension.eq_ignore_ascii_case(required))
+        })
+    }
+
+    pub fn has_license_review(&self) -> bool {
+        self.license_review_reference
+            .as_ref()
+            .is_some_and(|reference| !reference.trim().is_empty())
+    }
+}
+
+pub fn codec_packaging_gate(config: Option<&CodecDistributionConfig>) -> GateState {
+    config
+        .filter(|config| config.covers_required_decoders())
+        .map(|_| GateState::Passed)
+        .unwrap_or(GateState::Planned)
+}
+
+pub fn codec_license_review_gate(config: Option<&CodecDistributionConfig>) -> GateState {
+    config
+        .filter(|config| config.has_license_review())
+        .map(|_| GateState::Passed)
+        .unwrap_or(GateState::Planned)
+}
+
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum ReleaseBlocker {
     MacosAudit,
@@ -304,6 +343,41 @@ mod tests {
 
         assert_eq!(
             signing_notarization_gate(Some(&missing_windows_certificate)),
+            GateState::Planned
+        );
+    }
+
+    #[test]
+    fn codec_distribution_passes_with_required_decoder_coverage_and_license_review() {
+        let config = CodecDistributionConfig {
+            packaged_decoder_extensions: vec![
+                "mp3".to_string(),
+                "flac".to_string(),
+                "aac".to_string(),
+                "m4a".to_string(),
+                "aiff".to_string(),
+                "ogg".to_string(),
+            ],
+            license_review_reference: Some("LEGAL-CODEC-2026-07".to_string()),
+        };
+
+        assert_eq!(codec_packaging_gate(Some(&config)), GateState::Passed);
+        assert_eq!(codec_license_review_gate(Some(&config)), GateState::Passed);
+    }
+
+    #[test]
+    fn codec_distribution_remains_planned_without_bundle_or_license_review() {
+        assert_eq!(codec_packaging_gate(None), GateState::Planned);
+        assert_eq!(codec_license_review_gate(None), GateState::Planned);
+
+        let incomplete = CodecDistributionConfig {
+            packaged_decoder_extensions: vec!["mp3".to_string(), "flac".to_string()],
+            license_review_reference: None,
+        };
+
+        assert_eq!(codec_packaging_gate(Some(&incomplete)), GateState::Planned);
+        assert_eq!(
+            codec_license_review_gate(Some(&incomplete)),
             GateState::Planned
         );
     }

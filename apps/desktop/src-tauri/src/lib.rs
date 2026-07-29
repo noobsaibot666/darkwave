@@ -6,7 +6,8 @@ fn healthcheck() -> &'static str {
 #[tauri::command]
 fn release_blockers() -> Vec<&'static str> {
     use release_readiness::{
-        signing_notarization_gate, update_system_gate, GateState, ReleaseBlocker, ReleaseCandidate,
+        codec_license_review_gate, codec_packaging_gate, signing_notarization_gate,
+        update_system_gate, GateState, ReleaseBlocker, ReleaseCandidate,
     };
 
     ReleaseCandidate {
@@ -16,8 +17,8 @@ fn release_blockers() -> Vec<&'static str> {
         performance_profile: GateState::Passed,
         crash_recovery: GateState::Passed,
         onboarding_docs: GateState::Passed,
-        codec_packaging: GateState::Planned,
-        codec_license_review: GateState::Planned,
+        codec_packaging: codec_packaging_gate(None),
+        codec_license_review: codec_license_review_gate(None),
         update_system: update_system_gate(None),
         signing_notarization: signing_notarization_gate(None),
     }
