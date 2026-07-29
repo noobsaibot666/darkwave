@@ -188,6 +188,7 @@ export function App() {
             <dd>Attached to report row</dd>
           </dl>
           <div className="warning-line">Export allowed with license warning</div>
+          <div className="status-line">Original copy export executable</div>
         </section>
         <section>
           <h2>Settings</h2>

@@ -11,8 +11,10 @@ Implemented behavior:
 - WAV 48 kHz/24-bit conversion plans.
 - Selected in/out range validation.
 - Destination path planning for project media folders.
+- Non-destructive original-file copy execution.
 - Traceability flags for preserving source and license records.
 - Project source reports include attribution, restriction notes, and source receipt paths.
+- CSV rendering for project source/license reports.
 - License assessment warnings for missing, uncertain, or expired source/license context.
 
-The plan is intentionally separate from execution. File copying, drag payload creation, and audio conversion will be implemented on top of this contract.
+The planner remains separate from execution. Original-file copies can be executed directly. WAV conversion, ranged export rendering, and external drag payload creation remain explicit backend follow-up work.

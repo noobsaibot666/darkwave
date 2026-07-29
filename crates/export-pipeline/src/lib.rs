@@ -1,3 +1,7 @@
+use std::fs;
+use std::io;
+use std::path::Path;
+
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct ExportIntent {
     pub preserve_original: bool,
@@ -40,6 +44,59 @@ pub struct ExportPlan {
     pub conversion: Option<AudioConversion>,
     pub preserve_original: bool,
     pub include_license_record: bool,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct ExecutedExport {
+    pub source_path: String,
+    pub destination_path: String,
+    pub bytes_copied: u64,
+    pub license_record_expected: bool,
+}
+
+#[derive(Debug)]
+pub enum ExportExecutionError {
+    UnsupportedConversion,
+    UnsupportedRange,
+    Io(io::Error),
+}
+
+impl PartialEq for ExportExecutionError {
+    fn eq(&self, other: &Self) -> bool {
+        matches!(
+            (self, other),
+            (
+                ExportExecutionError::UnsupportedConversion,
+                ExportExecutionError::UnsupportedConversion
+            ) | (
+                ExportExecutionError::UnsupportedRange,
+                ExportExecutionError::UnsupportedRange
+            )
+        )
+    }
+}
+
+impl Eq for ExportExecutionError {}
+
+impl From<io::Error> for ExportExecutionError {
+    fn from(error: io::Error) -> Self {
+        ExportExecutionError::Io(error)
+    }
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct LicenseReportRow {
+    pub asset_title: String,
+    pub original_filename: String,
+    pub provider: Option<String>,
+    pub source_url: Option<String>,
+    pub license_type: Option<String>,
+    pub license_status: Option<String>,
+    pub attribution: Option<String>,
+    pub restrictions: Option<String>,
+    pub receipt_path: Option<String>,
+    pub usage_status: String,
+    pub destination: Option<String>,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -163,6 +220,63 @@ pub fn assess_export_license(context: &LicenseContext) -> ExportLicenseAssessmen
     }
 }
 
+pub fn execute_original_copy_export(
+    plan: &ExportPlan,
+) -> Result<ExecutedExport, ExportExecutionError> {
+    if plan.conversion.is_some() {
+        return Err(ExportExecutionError::UnsupportedConversion);
+    }
+
+    if plan.range.is_some() {
+        return Err(ExportExecutionError::UnsupportedRange);
+    }
+
+    if let Some(parent) = Path::new(&plan.destination_path).parent() {
+        fs::create_dir_all(parent)?;
+    }
+
+    let bytes_copied = fs::copy(&plan.source_path, &plan.destination_path)?;
+
+    Ok(ExecutedExport {
+        source_path: plan.source_path.clone(),
+        destination_path: plan.destination_path.clone(),
+        bytes_copied,
+        license_record_expected: plan.include_license_record,
+    })
+}
+
+pub fn render_license_report_csv(rows: &[LicenseReportRow]) -> String {
+    let mut output = String::from(
+        "asset_title,original_filename,provider,source_url,license_type,license_status,attribution,restrictions,receipt_path,usage_status,destination\n",
+    );
+
+    for row in rows {
+        let fields = [
+            row.asset_title.as_str(),
+            row.original_filename.as_str(),
+            row.provider.as_deref().unwrap_or_default(),
+            row.source_url.as_deref().unwrap_or_default(),
+            row.license_type.as_deref().unwrap_or_default(),
+            row.license_status.as_deref().unwrap_or_default(),
+            row.attribution.as_deref().unwrap_or_default(),
+            row.restrictions.as_deref().unwrap_or_default(),
+            row.receipt_path.as_deref().unwrap_or_default(),
+            row.usage_status.as_str(),
+            row.destination.as_deref().unwrap_or_default(),
+        ];
+        output.push_str(
+            &fields
+                .iter()
+                .map(|field| csv_escape(field))
+                .collect::<Vec<_>>()
+                .join(","),
+        );
+        output.push('\n');
+    }
+
+    output
+}
+
 impl ExportLicenseAssessment {
     pub fn allows_export(&self) -> bool {
         true
@@ -183,9 +297,18 @@ fn sanitize_filename(value: &str) -> String {
         .collect()
 }
 
+fn csv_escape(value: &str) -> String {
+    if value.contains([',', '"', '\n']) {
+        format!("\"{}\"", value.replace('"', "\"\""))
+    } else {
+        value.to_string()
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::path::PathBuf;
 
     #[test]
     fn exports_preserve_traceability_by_default() {
@@ -315,5 +438,93 @@ mod tests {
             ])
         );
         assert!(assessment.allows_export());
+    }
+
+    #[test]
+    fn original_copy_execution_creates_destination_without_mutating_source() {
+        let source_path = unique_export_path("source.wav");
+        let destination_path = unique_export_path("project/audio/Dark Hit.wav");
+        fs::create_dir_all(source_path.parent().expect("source parent")).expect("source dir");
+        fs::write(&source_path, b"audio-bytes").expect("source file");
+
+        let plan = ExportPlan {
+            source_path: source_path.to_string_lossy().to_string(),
+            destination_path: destination_path.to_string_lossy().to_string(),
+            range: None,
+            conversion: None,
+            preserve_original: true,
+            include_license_record: true,
+        };
+
+        let executed = execute_original_copy_export(&plan).expect("execute");
+
+        assert_eq!(executed.bytes_copied, 11);
+        assert!(executed.license_record_expected);
+        assert_eq!(fs::read(&source_path).expect("source"), b"audio-bytes");
+        assert_eq!(
+            fs::read(&destination_path).expect("destination"),
+            b"audio-bytes"
+        );
+    }
+
+    #[test]
+    fn copy_execution_rejects_plans_that_require_conversion() {
+        let plan = ExportPlan {
+            source_path: "/library/music.mp3".to_string(),
+            destination_path: "/project/audio/music.wav".to_string(),
+            range: None,
+            conversion: Some(AudioConversion {
+                sample_rate: 48_000,
+                bit_depth: 24,
+            }),
+            preserve_original: true,
+            include_license_record: true,
+        };
+
+        assert_eq!(
+            execute_original_copy_export(&plan).map(|_| ()),
+            Err(ExportExecutionError::UnsupportedConversion)
+        );
+    }
+
+    #[test]
+    fn license_report_csv_includes_receipts_and_escapes_fields() {
+        let csv = render_license_report_csv(&[LicenseReportRow {
+            asset_title: "Dark, Metallic Hit".to_string(),
+            original_filename: "impact.wav".to_string(),
+            provider: Some("Boom Library".to_string()),
+            source_url: Some("https://example.com/sound".to_string()),
+            license_type: Some("subscription".to_string()),
+            license_status: Some("active".to_string()),
+            attribution: Some("Artist \"A\"".to_string()),
+            restrictions: Some("client project only".to_string()),
+            receipt_path: Some("receipts/boom.pdf".to_string()),
+            usage_status: "exported".to_string(),
+            destination: Some("/project/audio/impact.wav".to_string()),
+        }]);
+
+        assert!(csv.starts_with("asset_title,original_filename,provider"));
+        assert!(csv.contains("\"Dark, Metallic Hit\""));
+        assert!(csv.contains("\"Artist \"\"A\"\"\""));
+        assert!(csv.contains("receipts/boom.pdf"));
+    }
+
+    fn unique_export_path(name: &str) -> PathBuf {
+        let mut path = std::env::temp_dir();
+        path.push(format!("darkwave-export-{}", uuid_like_suffix()));
+        path.push(name);
+        let _ = fs::remove_file(&path);
+        path
+    }
+
+    fn uuid_like_suffix() -> String {
+        format!(
+            "{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .expect("time")
+                .as_nanos()
+        )
     }
 }
