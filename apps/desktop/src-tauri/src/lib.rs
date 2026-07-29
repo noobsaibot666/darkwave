@@ -3,13 +3,42 @@ fn healthcheck() -> &'static str {
     library_core::product_codename()
 }
 
+#[tauri::command]
+fn release_blockers() -> Vec<&'static str> {
+    use release_readiness::{GateState, ReleaseBlocker, ReleaseCandidate};
+
+    ReleaseCandidate {
+        macos_audit: GateState::Passed,
+        windows_audit: GateState::Passed,
+        accessibility_audit: GateState::Passed,
+        performance_profile: GateState::Passed,
+        crash_recovery: GateState::Passed,
+        onboarding_docs: GateState::Passed,
+        update_system: GateState::Planned,
+        signing_notarization: GateState::Planned,
+    }
+    .blockers()
+    .into_iter()
+    .map(|blocker| match blocker {
+        ReleaseBlocker::MacosAudit => "macos_audit",
+        ReleaseBlocker::WindowsAudit => "windows_audit",
+        ReleaseBlocker::AccessibilityAudit => "accessibility_audit",
+        ReleaseBlocker::PerformanceProfile => "performance_profile",
+        ReleaseBlocker::CrashRecovery => "crash_recovery",
+        ReleaseBlocker::OnboardingDocs => "onboarding_docs",
+        ReleaseBlocker::UpdateSystem => "update_system",
+        ReleaseBlocker::SigningNotarization => "signing_notarization",
+    })
+    .collect()
+}
+
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
     tauri::Builder::default()
         .plugin(tauri_plugin_dialog::init())
         .plugin(tauri_plugin_fs::init())
         .plugin(tauri_plugin_opener::init())
-        .invoke_handler(tauri::generate_handler![healthcheck])
+        .invoke_handler(tauri::generate_handler![healthcheck, release_blockers])
         .run(tauri::generate_context!())
         .expect("failed to run Darkwave desktop shell");
 }
@@ -19,5 +48,13 @@ mod tests {
     #[test]
     fn healthcheck_returns_product_codename() {
         assert_eq!(super::healthcheck(), "Darkwave");
+    }
+
+    #[test]
+    fn release_blockers_expose_planned_distribution_work() {
+        assert_eq!(
+            super::release_blockers(),
+            vec!["update_system", "signing_notarization"]
+        );
     }
 }

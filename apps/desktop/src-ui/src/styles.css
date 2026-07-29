@@ -20,6 +20,12 @@ input {
   font: inherit;
 }
 
+button:focus-visible,
+input:focus-visible {
+  outline: 2px solid #9be7dc;
+  outline-offset: 2px;
+}
+
 .shell {
   display: grid;
   grid-template-columns: 220px minmax(460px, 1fr) 300px;
@@ -80,6 +86,28 @@ input {
   min-height: 58px;
   padding: 12px 14px;
   border-bottom: 1px solid rgba(255, 255, 255, 0.1);
+}
+
+.onboarding-strip {
+  display: flex;
+  gap: 8px;
+  align-items: center;
+  min-height: 46px;
+  padding: 8px 14px;
+  border-bottom: 1px solid rgba(255, 255, 255, 0.08);
+  background: #14161a;
+}
+
+.onboarding-strip button {
+  display: inline-flex;
+  align-items: center;
+  gap: 7px;
+  height: 30px;
+  padding: 0 10px;
+  border: 1px solid rgba(255, 255, 255, 0.1);
+  border-radius: 6px;
+  background: #20242b;
+  color: #dce3ec;
 }
 
 .search {
@@ -239,12 +267,96 @@ h2 {
   color: #d9fffa;
 }
 
+.toggle-list {
+  display: grid;
+  gap: 8px;
+}
+
+.toggle-list label {
+  display: grid;
+  grid-template-columns: 18px 16px 1fr;
+  gap: 8px;
+  align-items: center;
+  min-height: 30px;
+  color: #dce3ec;
+  font-size: 13px;
+}
+
+.toggle-list input {
+  width: 16px;
+  height: 16px;
+  accent-color: #52c7b8;
+}
+
+.status-line {
+  display: flex;
+  gap: 8px;
+  align-items: center;
+  min-height: 28px;
+  color: #aeb6c2;
+  font-size: 13px;
+}
+
+.release-grid {
+  display: grid;
+  gap: 6px;
+}
+
+.release-item {
+  display: grid;
+  grid-template-columns: minmax(0, 1fr) auto;
+  gap: 8px;
+  align-items: center;
+  min-height: 28px;
+  color: #dce3ec;
+  font-size: 13px;
+}
+
+.release-item mark {
+  padding: 2px 7px;
+  border-radius: 999px;
+  background: #2b3139;
+  color: #dce3ec;
+  font-size: 11px;
+  font-weight: 700;
+}
+
+.release-item mark.passed {
+  background: rgba(82, 199, 184, 0.16);
+  color: #9be7dc;
+}
+
+.release-item mark.planned {
+  background: rgba(240, 179, 90, 0.16);
+  color: #ffd69b;
+}
+
 dl {
   display: grid;
   grid-template-columns: 90px 1fr;
   gap: 8px 10px;
   margin: 0;
   font-size: 13px;
+}
+
+@media (prefers-reduced-motion: reduce) {
+  *,
+  *::before,
+  *::after {
+    scroll-behavior: auto !important;
+    transition-duration: 0.01ms !important;
+    animation-duration: 0.01ms !important;
+    animation-iteration-count: 1 !important;
+  }
+}
+
+@media (prefers-reduced-transparency: reduce) {
+  .sidebar,
+  .inspector,
+  .transport {
+    background: #181a1f;
+    backdrop-filter: none;
+  }
 }
 
 dt {

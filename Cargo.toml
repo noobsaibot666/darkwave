@@ -9,6 +9,7 @@ members = [
   "crates/fingerprint",
   "crates/import-pipeline",
   "crates/library-core",
+  "crates/release-readiness",
   "crates/library-sync",
   "crates/search",
   "crates/shared-types",

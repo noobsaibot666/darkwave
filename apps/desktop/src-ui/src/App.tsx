@@ -1,4 +1,20 @@
-import { Command, Import, ListFilter, Pause, Play, Search, Settings, SkipBack, SkipForward, Star } from "lucide-react";
+import {
+  Bell,
+  Command,
+  Contrast,
+  Import,
+  ListFilter,
+  Pause,
+  Play,
+  RotateCcw,
+  Search,
+  Settings,
+  ShieldCheck,
+  SkipBack,
+  SkipForward,
+  Star,
+  Zap
+} from "lucide-react";
 
 type AssetRow = {
   name: string;
@@ -12,6 +28,15 @@ const rows: AssetRow[] = [
   { name: "Dark Metallic Impact 03", type: "Sound Effect", duration: "0:02", energy: "High", source: "Referenced" },
   { name: "Low Room Tone Warehouse", type: "Ambience", duration: "2:14", energy: "Subtle", source: "Cached" },
   { name: "Slow Analog Pulse 92 BPM", type: "Music", duration: "1:48", energy: "Medium", source: "Local" }
+];
+
+const releaseItems = [
+  { label: "macOS audit", state: "Passed" },
+  { label: "Windows audit", state: "Passed" },
+  { label: "Accessibility", state: "Passed" },
+  { label: "Performance", state: "Passed" },
+  { label: "Updates", state: "Planned" },
+  { label: "Signing", state: "Planned" }
 ];
 
 export function App() {
@@ -42,6 +67,20 @@ export function App() {
             Import
           </button>
         </header>
+        <section className="onboarding-strip" aria-label="Library setup">
+          <button>
+            <Import size={16} />
+            Import Folder
+          </button>
+          <button>
+            <Zap size={16} />
+            Open NAS Library
+          </button>
+          <button>
+            <RotateCcw size={16} />
+            Restore Session
+          </button>
+        </section>
         <section className="browser" aria-label="Sound browser">
           <div className="browser-header">
             <span>Name</span>
@@ -95,6 +134,47 @@ export function App() {
             <dt>Storage</dt>
             <dd>Referenced NAS path</dd>
           </dl>
+        </section>
+        <section>
+          <h2>Accessibility</h2>
+          <div className="toggle-list">
+            <label>
+              <input type="checkbox" />
+              <Contrast size={15} />
+              Reduced transparency
+            </label>
+            <label>
+              <input type="checkbox" />
+              <Zap size={15} />
+              Reduced motion
+            </label>
+          </div>
+        </section>
+        <section>
+          <h2>Recovery</h2>
+          <div className="status-line">
+            <RotateCcw size={15} />
+            Autosave revision 42 available
+          </div>
+        </section>
+        <section>
+          <h2>Release Readiness</h2>
+          <div className="release-grid">
+            {releaseItems.map((item) => (
+              <div className="release-item" key={item.label}>
+                <span>{item.label}</span>
+                <mark className={item.state === "Passed" ? "passed" : "planned"}>{item.state}</mark>
+              </div>
+            ))}
+          </div>
+          <div className="status-line">
+            <ShieldCheck size={15} />
+            Distribution gates tracked
+          </div>
+          <div className="status-line">
+            <Bell size={15} />
+            Update channel planned
+          </div>
         </section>
       </aside>
       <footer className="transport" aria-label="Transport">

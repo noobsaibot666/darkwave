@@ -17,4 +17,5 @@ Useful targeted Rust checks:
 ```sh
 cargo test -p storage -p import-pipeline -p audio-metadata
 cargo test -p audio-engine -p waveform
+cargo test -p release-readiness
 ```

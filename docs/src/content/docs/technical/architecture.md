@@ -20,3 +20,4 @@ Milestone 1 introduces the first catalog boundary:
 - `search` provides filename intelligence and traceable suggestions, while `storage` owns FTS-backed catalog search and smart collection persistence.
 - `library-sync` owns portable manifests and writer leases; `storage` owns local availability validation and relinking.
 - `export-pipeline` owns non-destructive editorial export plans; `storage` owns usage events and project source/license report data.
+- `release-readiness` owns accessibility policy, crash-recovery prompts, and release gate status.
