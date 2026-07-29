@@ -54,6 +54,27 @@ pub struct ExecutedExport {
     pub license_record_expected: bool,
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum ExportQueueStatus {
+    Ready,
+    WaitingForSource,
+    Completed,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct QueuedExport {
+    pub queue_id: u64,
+    pub plan: ExportPlan,
+    pub status: ExportQueueStatus,
+    pub attempts: u32,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct ExportQueue {
+    next_queue_id: u64,
+    pub entries: Vec<QueuedExport>,
+}
+
 #[derive(Debug)]
 pub enum ExportExecutionError {
     UnsupportedConversion,
@@ -243,6 +264,74 @@ pub fn execute_original_copy_export(
         bytes_copied,
         license_record_expected: plan.include_license_record,
     })
+}
+
+impl ExportQueue {
+    pub fn new() -> Self {
+        Self {
+            next_queue_id: 1,
+            entries: Vec::new(),
+        }
+    }
+
+    pub fn enqueue(
+        &mut self,
+        plan: ExportPlan,
+        source_exists: impl Fn(&str) -> bool,
+    ) -> QueuedExport {
+        let status = if source_exists(&plan.source_path) {
+            ExportQueueStatus::Ready
+        } else {
+            ExportQueueStatus::WaitingForSource
+        };
+        let queued = QueuedExport {
+            queue_id: self.next_queue_id,
+            plan,
+            status,
+            attempts: 0,
+        };
+        self.next_queue_id += 1;
+        self.entries.push(queued.clone());
+
+        queued
+    }
+
+    pub fn refresh_source_availability(&mut self, source_exists: impl Fn(&str) -> bool) {
+        for entry in &mut self.entries {
+            if entry.status == ExportQueueStatus::WaitingForSource
+                && source_exists(&entry.plan.source_path)
+            {
+                entry.status = ExportQueueStatus::Ready;
+            }
+        }
+    }
+
+    pub fn next_ready_original_copy(&self) -> Option<&QueuedExport> {
+        self.entries.iter().find(|entry| {
+            entry.status == ExportQueueStatus::Ready
+                && entry.plan.conversion.is_none()
+                && entry.plan.range.is_none()
+        })
+    }
+
+    pub fn mark_completed(&mut self, queue_id: u64) -> bool {
+        if let Some(entry) = self
+            .entries
+            .iter_mut()
+            .find(|entry| entry.queue_id == queue_id)
+        {
+            entry.status = ExportQueueStatus::Completed;
+            return true;
+        }
+
+        false
+    }
+}
+
+impl Default for ExportQueue {
+    fn default() -> Self {
+        Self::new()
+    }
 }
 
 pub fn render_license_report_csv(rows: &[LicenseReportRow]) -> String {
@@ -509,6 +598,57 @@ mod tests {
         assert!(csv.contains("receipts/boom.pdf"));
     }
 
+    #[test]
+    fn export_queue_waits_for_offline_source_then_promotes_when_available() {
+        let plan = original_copy_plan("/Volumes/TrueNAS/SFX/hit.wav", "/project/audio/hit.wav");
+        let mut queue = ExportQueue::new();
+
+        let queued = queue.enqueue(plan.clone(), |_| false);
+
+        assert_eq!(queued.status, ExportQueueStatus::WaitingForSource);
+        assert_eq!(queue.next_ready_original_copy(), None);
+
+        queue.refresh_source_availability(|path| path == "/Volumes/TrueNAS/SFX/hit.wav");
+
+        assert_eq!(queue.entries[0].status, ExportQueueStatus::Ready);
+        assert_eq!(
+            queue
+                .next_ready_original_copy()
+                .map(|entry| entry.plan.clone()),
+            Some(plan)
+        );
+    }
+
+    #[test]
+    fn export_queue_returns_ready_original_copies_in_insert_order() {
+        let conversion_plan = ExportPlan {
+            conversion: Some(AudioConversion {
+                sample_rate: 48_000,
+                bit_depth: 24,
+            }),
+            ..original_copy_plan("/library/music.mp3", "/project/music.wav")
+        };
+        let first_copy = original_copy_plan("/library/a.wav", "/project/a.wav");
+        let second_copy = original_copy_plan("/library/b.wav", "/project/b.wav");
+        let mut queue = ExportQueue::new();
+
+        queue.enqueue(conversion_plan, |_| true);
+        let first = queue.enqueue(first_copy.clone(), |_| true);
+        queue.enqueue(second_copy, |_| true);
+
+        assert_eq!(
+            queue.next_ready_original_copy().map(|entry| entry.queue_id),
+            Some(first.queue_id)
+        );
+        assert!(queue.mark_completed(first.queue_id));
+        assert_eq!(
+            queue
+                .next_ready_original_copy()
+                .map(|entry| entry.plan.clone()),
+            Some(original_copy_plan("/library/b.wav", "/project/b.wav"))
+        );
+    }
+
     fn unique_export_path(name: &str) -> PathBuf {
         let mut path = std::env::temp_dir();
         path.push(format!("darkwave-export-{}", uuid_like_suffix()));
@@ -526,5 +666,16 @@ mod tests {
                 .expect("time")
                 .as_nanos()
         )
+    }
+
+    fn original_copy_plan(source_path: &str, destination_path: &str) -> ExportPlan {
+        ExportPlan {
+            source_path: source_path.to_string(),
+            destination_path: destination_path.to_string(),
+            range: None,
+            conversion: None,
+            preserve_original: true,
+            include_license_record: true,
+        }
     }
 }

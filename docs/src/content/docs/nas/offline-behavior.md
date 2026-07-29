@@ -13,5 +13,6 @@ Current behavior:
 - Writer lease state can place a second device into read-only mode while another active writer owns the lease.
 - Media-root probing reports whether a NAS-backed root is online or offline.
 - Online media-root probes request reconnect validation before assuming asset paths are usable.
+- Export plans can wait in a queue while source paths are offline and become ready after the source returns.
 
-Future work will add preview cache playback, queued exports, background reconnect validation jobs, and fuller user-facing offline controls.
+Future work will add preview cache playback, background reconnect validation jobs, and fuller user-facing offline controls.

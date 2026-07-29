@@ -10,6 +10,7 @@ Darkwave can:
 - Plan a copy of the original file into a project media folder.
 - Plan a WAV 48 kHz/24-bit editorial copy.
 - Execute original-file copy exports without changing the library original.
+- Queue exports whose source paths are temporarily offline.
 - Validate selected in/out export ranges.
 - Record project usage events.
 - Generate project source/license report rows from usage and source records, including attribution, restrictions, and receipt paths.
