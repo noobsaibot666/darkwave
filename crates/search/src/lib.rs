@@ -36,6 +36,13 @@ pub struct VisibleFilter {
     pub value: String,
 }
 
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+pub struct NaturalLanguageQuery {
+    pub text: String,
+    pub media_type: Option<String>,
+    pub visible_filters: Vec<VisibleFilter>,
+}
+
 pub fn explain_text_query(query: &str) -> Vec<VisibleFilter> {
     query
         .split_whitespace()
@@ -46,6 +53,52 @@ pub fn explain_text_query(query: &str) -> Vec<VisibleFilter> {
             value: token.to_string(),
         })
         .collect()
+}
+
+pub fn parse_natural_language_query(query: &str) -> NaturalLanguageQuery {
+    let tokens = tokenize_metadata_value(query);
+    let mut text_terms = Vec::new();
+    let mut media_type = None;
+    let mut index = 0;
+
+    while index < tokens.len() {
+        let token = tokens[index].as_str();
+        let next = tokens.get(index + 1).map(String::as_str);
+
+        if token == "sound" && matches!(next, Some("effect" | "effects")) {
+            media_type = Some("sound_effect".to_string());
+            index += 2;
+            continue;
+        }
+
+        if let Some(value) = media_type_for_query_token(token) {
+            media_type = Some(value.to_string());
+            index += 1;
+            continue;
+        }
+
+        if !is_query_filler_token(token) {
+            text_terms.push(token.to_string());
+        }
+
+        index += 1;
+    }
+
+    let text = text_terms.join(" ");
+    let mut visible_filters = explain_text_query(&text);
+    if let Some(media_type) = &media_type {
+        visible_filters.push(VisibleFilter {
+            field: "media_type".to_string(),
+            operator: "equals".to_string(),
+            value: media_type.clone(),
+        });
+    }
+
+    NaturalLanguageQuery {
+        text,
+        media_type,
+        visible_filters,
+    }
 }
 
 pub fn parse_audio_filename(filename: &str) -> ParsedFilename {
@@ -169,6 +222,35 @@ fn tokenize_metadata_value(value: &str) -> Vec<String> {
         .collect()
 }
 
+fn media_type_for_query_token(token: &str) -> Option<&'static str> {
+    match token {
+        "sfx" | "effect" | "effects" => Some("sound_effect"),
+        "ambience" | "ambient" => Some("ambience"),
+        "music" | "song" | "songs" | "track" | "tracks" => Some("music"),
+        _ => None,
+    }
+}
+
+fn is_query_filler_token(token: &str) -> bool {
+    matches!(
+        token,
+        "a" | "an"
+            | "all"
+            | "and"
+            | "are"
+            | "find"
+            | "for"
+            | "in"
+            | "is"
+            | "me"
+            | "of"
+            | "show"
+            | "that"
+            | "the"
+            | "with"
+    )
+}
+
 fn is_key_token(token: &str) -> bool {
     matches!(
         token,
@@ -236,5 +318,33 @@ mod tests {
         assert!(suggestions
             .iter()
             .any(|suggestion| suggestion.name == "Cinematic"));
+    }
+
+    #[test]
+    fn natural_language_query_extracts_media_type_and_search_terms() {
+        let query = parse_natural_language_query("find dark cinematic impacts in sound effects");
+
+        assert_eq!(query.text, "dark cinematic impacts");
+        assert_eq!(query.media_type, Some("sound_effect".to_string()));
+        assert!(query.visible_filters.iter().any(|filter| {
+            filter.field == "media_type"
+                && filter.operator == "equals"
+                && filter.value == "sound_effect"
+        }));
+        assert!(query
+            .visible_filters
+            .iter()
+            .any(|filter| filter.field == "text" && filter.value == "dark"));
+    }
+
+    #[test]
+    fn natural_language_query_handles_ambient_and_music_synonyms() {
+        let ambience = parse_natural_language_query("show me ambient beds");
+        let music = parse_natural_language_query("music tracks for trailer");
+
+        assert_eq!(ambience.text, "beds");
+        assert_eq!(ambience.media_type, Some("ambience".to_string()));
+        assert_eq!(music.text, "trailer");
+        assert_eq!(music.media_type, Some("music".to_string()));
     }
 }

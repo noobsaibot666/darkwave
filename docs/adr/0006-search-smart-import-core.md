@@ -13,6 +13,7 @@ Milestone 4 requires FTS search, faceted filters, saved smart collections, filen
 Implement the first search and smart-import core across `search` and `storage`:
 
 - `search` parses filenames into display names, tokens, BPM, key, and traceable filename-origin tag suggestions.
+- `search` parses conservative natural-language queries into free-text terms, visible filters, and supported media-type filters.
 - `storage` owns persisted FTS indexing through SQLite FTS5.
 - `storage` evaluates text search, tag filters, and media-type filters in SQLite instead of loading the full asset list into memory first.
 - `storage` includes an ignored 100,000-asset profile test for explicit large-catalog search validation.
@@ -26,4 +27,4 @@ Implement the first search and smart-import core across `search` and `storage`:
 - Smart collection query definitions can later be rendered as visible filter chips.
 - Filename intelligence remains a first signal, not the final classifier.
 - Embedded WAV metadata can contribute traceable metadata-origin suggestions alongside filename signals.
-- Natural-language query parsing remains future Milestone 4 work.
+- Natural-language parsing intentionally stays conservative and explainable before any later ranking or semantic expansion.
