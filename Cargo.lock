@@ -3284,6 +3284,8 @@ version = "0.1.0"
 dependencies = [
  "chrono",
  "rusqlite",
+ "serde",
+ "serde_json",
  "shared-types",
  "thiserror 2.0.19",
  "uuid",

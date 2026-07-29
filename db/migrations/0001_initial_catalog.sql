@@ -142,6 +142,23 @@ CREATE VIRTUAL TABLE assets_fts USING fts5(
   content_rowid='rowid'
 );
 
+CREATE TRIGGER assets_fts_insert AFTER INSERT ON assets BEGIN
+  INSERT INTO assets_fts(rowid, display_name, original_filename, notes)
+  VALUES (new.rowid, new.display_name, new.original_filename, new.notes);
+END;
+
+CREATE TRIGGER assets_fts_delete AFTER DELETE ON assets BEGIN
+  INSERT INTO assets_fts(assets_fts, rowid, display_name, original_filename, notes)
+  VALUES ('delete', old.rowid, old.display_name, old.original_filename, old.notes);
+END;
+
+CREATE TRIGGER assets_fts_update AFTER UPDATE ON assets BEGIN
+  INSERT INTO assets_fts(assets_fts, rowid, display_name, original_filename, notes)
+  VALUES ('delete', old.rowid, old.display_name, old.original_filename, old.notes);
+  INSERT INTO assets_fts(rowid, display_name, original_filename, notes)
+  VALUES (new.rowid, new.display_name, new.original_filename, new.notes);
+END;
+
 CREATE INDEX idx_assets_library ON assets(library_id);
 CREATE INDEX idx_assets_media_type ON assets(media_type);
 CREATE INDEX idx_assets_availability ON assets(availability_state);

@@ -17,6 +17,8 @@ The initial SQLite migration defines:
 - FTS index for asset text search
 - Background jobs for restart-safe import and analysis work
 - Undo actions for recoverable metadata relationship changes
+- Smart collection query definitions
+- Suggested tag approval state and origin
 
 Migrations live in `db/migrations`.
 

@@ -9,6 +9,8 @@ rust-version.workspace = true
 [dependencies]
 chrono.workspace = true
 rusqlite = { version = "0.32", features = ["bundled"] }
+serde.workspace = true
+serde_json.workspace = true
 shared-types = { path = "../shared-types" }
 thiserror.workspace = true
 uuid.workspace = true

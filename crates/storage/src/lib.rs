@@ -1,5 +1,6 @@
 use chrono::Utc;
 use rusqlite::{params, Connection, OptionalExtension};
+use serde::{Deserialize, Serialize};
 use shared_types::{AvailabilityState, StorageMode};
 use std::path::Path;
 use thiserror::Error;
@@ -94,6 +95,13 @@ pub enum TagOrigin {
     Manual,
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum TagApprovalState {
+    Suggested,
+    Accepted,
+    Rejected,
+}
+
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct TagRecord {
     pub id: Uuid,
@@ -116,6 +124,34 @@ pub struct CollectionRecord {
     pub library_id: Uuid,
     pub name: String,
     pub collection_type: CollectionType,
+    pub query_definition: Option<String>,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+pub struct AssetSearchQuery {
+    pub text: String,
+    pub tag_id: Option<Uuid>,
+    pub media_type: Option<String>,
+}
+
+impl AssetSearchQuery {
+    pub fn text(text: impl AsRef<str>) -> Self {
+        Self {
+            text: text.as_ref().to_string(),
+            tag_id: None,
+            media_type: None,
+        }
+    }
+
+    pub fn with_tag(mut self, tag_id: Uuid) -> Self {
+        self.tag_id = Some(tag_id);
+        self
+    }
+
+    pub fn with_media_type(mut self, media_type: impl AsRef<str>) -> Self {
+        self.media_type = Some(media_type.as_ref().to_string());
+        self
+    }
 }
 
 pub struct Catalog {
@@ -211,7 +247,6 @@ impl Catalog {
                 now,
             ],
         )?;
-
         self.get_asset(id)
             .map(|asset| asset.expect("inserted asset exists"))
     }
@@ -403,6 +438,7 @@ impl Catalog {
             library_id,
             name: name.as_ref().to_string(),
             collection_type,
+            query_definition: None,
         };
         let now = Utc::now().to_rfc3339();
 
@@ -419,6 +455,50 @@ impl Catalog {
         )?;
 
         Ok(collection)
+    }
+
+    pub fn create_smart_collection(
+        &self,
+        library_id: Uuid,
+        name: impl AsRef<str>,
+        query: &AssetSearchQuery,
+    ) -> Result<CollectionRecord, StorageError> {
+        let collection = CollectionRecord {
+            id: Uuid::new_v4(),
+            library_id,
+            name: name.as_ref().to_string(),
+            collection_type: CollectionType::Smart,
+            query_definition: Some(serde_json::to_string(query).expect("query serializes")),
+        };
+        let now = Utc::now().to_rfc3339();
+
+        self.connection.execute(
+            "INSERT INTO collections (id, library_id, name, type, query_definition, created_at)
+             VALUES (?1, ?2, ?3, 'smart', ?4, ?5)",
+            params![
+                collection.id.to_string(),
+                collection.library_id.to_string(),
+                collection.name,
+                collection.query_definition,
+                now,
+            ],
+        )?;
+
+        Ok(collection)
+    }
+
+    pub fn get_collection(
+        &self,
+        collection_id: Uuid,
+    ) -> Result<Option<CollectionRecord>, StorageError> {
+        self.connection
+            .query_row(
+                "SELECT id, library_id, name, type, query_definition FROM collections WHERE id = ?1",
+                params![collection_id.to_string()],
+                collection_from_row,
+            )
+            .optional()
+            .map_err(StorageError::from)
     }
 
     pub fn add_assets_to_collection(
@@ -482,6 +562,106 @@ impl Catalog {
                 params![review_state_to_db(review_state), asset_id.to_string()],
             )?;
         }
+
+        Ok(())
+    }
+
+    pub fn search_assets(
+        &self,
+        library_id: Uuid,
+        query: AssetSearchQuery,
+    ) -> Result<Vec<AssetRecord>, StorageError> {
+        let mut assets = self.list_assets(library_id)?;
+        let text = query.text.trim().to_ascii_lowercase();
+
+        if !text.is_empty() {
+            let matched_ids = self.asset_ids_matching_text(library_id, &text)?;
+            assets.retain(|asset| matched_ids.contains(&asset.id));
+        }
+
+        if let Some(media_type) = query.media_type {
+            assets.retain(|asset| asset.media_type == media_type);
+        }
+
+        if let Some(tag_id) = query.tag_id {
+            let tagged_ids = self.asset_ids_for_tag(tag_id)?;
+            assets.retain(|asset| tagged_ids.contains(&asset.id));
+        }
+
+        Ok(assets)
+    }
+
+    pub fn suggest_tag_for_asset(
+        &self,
+        asset_id: Uuid,
+        tag_id: Uuid,
+        origin: TagOrigin,
+        confidence: f32,
+    ) -> Result<(), StorageError> {
+        let existing_state: Option<String> = self
+            .connection
+            .query_row(
+                "SELECT approval_state FROM asset_tags WHERE asset_id = ?1 AND tag_id = ?2 AND origin = ?3",
+                params![asset_id.to_string(), tag_id.to_string(), tag_origin_to_db(origin)],
+                |row| row.get(0),
+            )
+            .optional()?;
+
+        if matches!(existing_state.as_deref(), Some("rejected")) {
+            return Ok(());
+        }
+
+        self.connection.execute(
+            "INSERT INTO asset_tags (asset_id, tag_id, origin, confidence, approval_state, created_at)
+             VALUES (?1, ?2, ?3, ?4, 'suggested', ?5)
+             ON CONFLICT(asset_id, tag_id, origin) DO UPDATE SET
+                confidence = excluded.confidence
+             WHERE asset_tags.approval_state != 'rejected'",
+            params![
+                asset_id.to_string(),
+                tag_id.to_string(),
+                tag_origin_to_db(origin),
+                confidence,
+                Utc::now().to_rfc3339(),
+            ],
+        )?;
+
+        Ok(())
+    }
+
+    pub fn pending_suggested_tags(&self, asset_id: Uuid) -> Result<Vec<TagRecord>, StorageError> {
+        let mut statement = self.connection.prepare(
+            "SELECT tags.id, tags.name, tags.normalized_name, tags.facet, tags.is_system
+             FROM tags
+             INNER JOIN asset_tags ON asset_tags.tag_id = tags.id
+             WHERE asset_tags.asset_id = ?1 AND asset_tags.approval_state = 'suggested'
+             ORDER BY asset_tags.confidence DESC",
+        )?;
+        let tags = statement
+            .query_map(params![asset_id.to_string()], tag_from_row)?
+            .collect::<Result<Vec<_>, _>>()
+            .map_err(StorageError::from)?;
+
+        Ok(tags)
+    }
+
+    pub fn set_tag_approval(
+        &self,
+        asset_id: Uuid,
+        tag_id: Uuid,
+        origin: TagOrigin,
+        approval_state: TagApprovalState,
+    ) -> Result<(), StorageError> {
+        self.connection.execute(
+            "UPDATE asset_tags SET approval_state = ?1
+             WHERE asset_id = ?2 AND tag_id = ?3 AND origin = ?4",
+            params![
+                tag_approval_to_db(approval_state),
+                asset_id.to_string(),
+                tag_id.to_string(),
+                tag_origin_to_db(origin),
+            ],
+        )?;
 
         Ok(())
     }
@@ -633,6 +813,31 @@ impl Catalog {
               applied_at TEXT
             );
 
+            CREATE VIRTUAL TABLE IF NOT EXISTS assets_fts USING fts5(
+              display_name,
+              original_filename,
+              notes,
+              content='assets',
+              content_rowid='rowid'
+            );
+
+            CREATE TRIGGER IF NOT EXISTS assets_fts_insert AFTER INSERT ON assets BEGIN
+              INSERT INTO assets_fts(rowid, display_name, original_filename, notes)
+              VALUES (new.rowid, new.display_name, new.original_filename, new.notes);
+            END;
+
+            CREATE TRIGGER IF NOT EXISTS assets_fts_delete AFTER DELETE ON assets BEGIN
+              INSERT INTO assets_fts(assets_fts, rowid, display_name, original_filename, notes)
+              VALUES ('delete', old.rowid, old.display_name, old.original_filename, old.notes);
+            END;
+
+            CREATE TRIGGER IF NOT EXISTS assets_fts_update AFTER UPDATE ON assets BEGIN
+              INSERT INTO assets_fts(assets_fts, rowid, display_name, original_filename, notes)
+              VALUES ('delete', old.rowid, old.display_name, old.original_filename, old.notes);
+              INSERT INTO assets_fts(rowid, display_name, original_filename, notes)
+              VALUES (new.rowid, new.display_name, new.original_filename, new.notes);
+            END;
+
             CREATE UNIQUE INDEX IF NOT EXISTS idx_assets_library_hash_size
               ON assets(library_id, content_hash, file_size)
               WHERE content_hash IS NOT NULL;
@@ -687,6 +892,41 @@ impl Catalog {
         )?;
         Ok(id)
     }
+
+    fn asset_ids_matching_text(
+        &self,
+        library_id: Uuid,
+        text: &str,
+    ) -> Result<Vec<Uuid>, StorageError> {
+        let query = fts_query(text);
+        let mut statement = self.connection.prepare(
+            "SELECT assets.id
+             FROM assets_fts
+             INNER JOIN assets ON assets_fts.rowid = assets.rowid
+             WHERE assets.library_id = ?1 AND assets_fts MATCH ?2
+             ORDER BY rank",
+        )?;
+        let ids = statement
+            .query_map(params![library_id.to_string(), query], |row| {
+                Ok(parse_uuid(row.get::<_, String>(0)?))
+            })?
+            .collect::<Result<Vec<_>, _>>()?;
+
+        Ok(ids)
+    }
+
+    fn asset_ids_for_tag(&self, tag_id: Uuid) -> Result<Vec<Uuid>, StorageError> {
+        let mut statement = self.connection.prepare(
+            "SELECT asset_id FROM asset_tags WHERE tag_id = ?1 AND approval_state = 'accepted'",
+        )?;
+        let ids = statement
+            .query_map(params![tag_id.to_string()], |row| {
+                Ok(parse_uuid(row.get::<_, String>(0)?))
+            })?
+            .collect::<Result<Vec<_>, _>>()?;
+
+        Ok(ids)
+    }
 }
 
 fn asset_from_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<AssetRecord> {
@@ -721,6 +961,16 @@ fn tag_from_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<TagRecord> {
         normalized_name: row.get(2)?,
         facet: row.get(3)?,
         is_system: row.get::<_, i64>(4)? != 0,
+    })
+}
+
+fn collection_from_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<CollectionRecord> {
+    Ok(CollectionRecord {
+        id: parse_uuid(row.get::<_, String>(0)?),
+        library_id: parse_uuid(row.get::<_, String>(1)?),
+        name: row.get(2)?,
+        collection_type: collection_type_from_db(&row.get::<_, String>(3)?),
+        query_definition: row.get(4)?,
     })
 }
 
@@ -795,11 +1045,35 @@ fn collection_type_to_db(collection_type: CollectionType) -> &'static str {
     }
 }
 
+fn collection_type_from_db(value: &str) -> CollectionType {
+    match value {
+        "smart" => CollectionType::Smart,
+        "project" => CollectionType::Project,
+        _ => CollectionType::Manual,
+    }
+}
+
+fn tag_approval_to_db(approval_state: TagApprovalState) -> &'static str {
+    match approval_state {
+        TagApprovalState::Suggested => "suggested",
+        TagApprovalState::Accepted => "accepted",
+        TagApprovalState::Rejected => "rejected",
+    }
+}
+
 fn normalize_term(value: &str) -> String {
     value
         .trim()
         .to_ascii_lowercase()
         .replace([' ', '/', '-'], "_")
+}
+
+fn fts_query(value: &str) -> String {
+    value
+        .split_whitespace()
+        .map(|token| format!("{}*", token.replace('"', "")))
+        .collect::<Vec<_>>()
+        .join(" ")
 }
 
 fn join_uuids(ids: &[Uuid]) -> String {
@@ -1045,6 +1319,107 @@ mod tests {
                 availability_state: AvailabilityState::Local,
             })
             .expect("asset")
+    }
+
+    #[test]
+    fn full_text_search_finds_assets_by_display_name_and_tag_filter() {
+        let catalog_path = unique_catalog_path("fts-search");
+        let catalog = Catalog::open(&catalog_path).expect("open catalog");
+        let library = catalog
+            .create_library("Search", "/library")
+            .expect("library");
+        let impact = test_asset(&catalog, library.id, "dark-impact.wav", "hash-dark");
+        let ambience = test_asset(&catalog, library.id, "room-tone.wav", "hash-room");
+        let tag = catalog.create_tag("Impact", "action", true).expect("tag");
+        catalog
+            .apply_tag_to_assets(&[impact.id], tag.id, TagOrigin::Manual)
+            .expect("tag");
+
+        let text_results = catalog
+            .search_assets(library.id, AssetSearchQuery::text("dark"))
+            .expect("search");
+        let filtered_results = catalog
+            .search_assets(library.id, AssetSearchQuery::text("").with_tag(tag.id))
+            .expect("filtered");
+
+        assert_eq!(
+            text_results
+                .iter()
+                .map(|asset| asset.id)
+                .collect::<Vec<_>>(),
+            vec![impact.id]
+        );
+        assert_eq!(
+            filtered_results
+                .iter()
+                .map(|asset| asset.id)
+                .collect::<Vec<_>>(),
+            vec![impact.id]
+        );
+        assert!(!filtered_results.iter().any(|asset| asset.id == ambience.id));
+    }
+
+    #[test]
+    fn suggested_tags_can_be_accepted_or_rejected_without_reappearing_as_pending() {
+        let catalog_path = unique_catalog_path("suggestions");
+        let catalog = Catalog::open(&catalog_path).expect("open catalog");
+        let library = catalog
+            .create_library("Suggestions", "/library")
+            .expect("library");
+        let asset = test_asset(&catalog, library.id, "metal-hit.wav", "hash-metal-hit");
+        let tag = catalog.create_tag("Impact", "action", true).expect("tag");
+
+        catalog
+            .suggest_tag_for_asset(asset.id, tag.id, TagOrigin::Filename, 0.82)
+            .expect("suggest");
+        assert_eq!(
+            catalog
+                .pending_suggested_tags(asset.id)
+                .expect("pending")
+                .len(),
+            1
+        );
+
+        catalog
+            .set_tag_approval(
+                asset.id,
+                tag.id,
+                TagOrigin::Filename,
+                TagApprovalState::Rejected,
+            )
+            .expect("reject");
+        catalog
+            .suggest_tag_for_asset(asset.id, tag.id, TagOrigin::Filename, 0.91)
+            .expect("suggest again");
+
+        assert!(catalog
+            .pending_suggested_tags(asset.id)
+            .expect("pending")
+            .is_empty());
+    }
+
+    #[test]
+    fn smart_collection_stores_visible_query_definition() {
+        let catalog_path = unique_catalog_path("smart-collection");
+        let catalog = Catalog::open(&catalog_path).expect("open catalog");
+        let library = catalog
+            .create_library("Smart", "/library")
+            .expect("library");
+        let query = AssetSearchQuery::text("dark").with_media_type("sound_effect");
+
+        let collection = catalog
+            .create_smart_collection(library.id, "Dark SFX", &query)
+            .expect("smart collection");
+        let loaded = catalog
+            .get_collection(collection.id)
+            .expect("load")
+            .expect("exists");
+
+        assert_eq!(loaded.collection_type, CollectionType::Smart);
+        assert!(loaded
+            .query_definition
+            .expect("query")
+            .contains("sound_effect"));
     }
 
     fn unique_catalog_path(name: &str) -> PathBuf {
