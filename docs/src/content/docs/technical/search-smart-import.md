@@ -12,8 +12,9 @@ Implemented behavior:
 - Embedded metadata fields such as title, genre, and comments can map to the same tag vocabulary with metadata-origin traceability.
 - SQLite FTS5 indexes asset display names, original filenames, and notes.
 - Catalog search supports text search, tag filters, and media-type filters using SQL-backed predicates and supporting indexes.
+- Storage includes an ignored 100,000-asset search profile test that can be run explicitly with `cargo test -p storage large_catalog_search_profile_exercises_one_hundred_thousand_assets -- --ignored --nocapture`.
 - Smart collections store serialized query definitions.
 - Suggested tags can be accepted or rejected.
 - A rejected suggestion from the same origin is preserved and not recreated as pending without new evidence.
 
-This keeps search explainable and local-first while leaving natural-language query translation and a dedicated large-catalog benchmark harness for a later refinement.
+This keeps search explainable and local-first while leaving natural-language query translation for a later refinement.

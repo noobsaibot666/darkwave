@@ -1697,6 +1697,105 @@ mod tests {
     }
 
     #[test]
+    #[ignore = "profiles 100,000-asset search explicitly; set DARKWAVE_LARGE_CATALOG_SEARCH_MAX_MS to enforce a timing budget"]
+    fn large_catalog_search_profile_exercises_one_hundred_thousand_assets() {
+        let catalog_path = unique_catalog_path("large-catalog-search");
+        let catalog = Catalog::open(&catalog_path).expect("open catalog");
+        let library = catalog
+            .create_library("Large Search", "/library")
+            .expect("library");
+        let tag = catalog.create_tag("Impact", "action", true).expect("tag");
+        let target_index = 90_000;
+        let target_id = Uuid::new_v4();
+
+        catalog
+            .connection
+            .execute_batch("BEGIN IMMEDIATE")
+            .expect("begin bulk insert");
+        {
+            let mut insert = catalog
+                .connection
+                .prepare(
+                    "INSERT INTO assets (
+                        id, library_id, original_filename, display_name, referenced_path,
+                        storage_mode, media_type, file_size, availability_state, date_added, last_seen
+                    ) VALUES (?1, ?2, ?3, ?4, ?5, 'referenced', ?6, ?7, 'local', ?8, ?8)",
+                )
+                .expect("prepare insert");
+
+            for index in 0..100_000 {
+                let id = if index == target_index {
+                    target_id
+                } else {
+                    Uuid::new_v4()
+                };
+                let display_name = if index == target_index {
+                    "dark benchmark impact".to_string()
+                } else {
+                    format!("ambient pad {index}")
+                };
+                let media_type = if index % 10 == 0 {
+                    "sound_effect"
+                } else {
+                    "music_loop"
+                };
+                let original_filename = format!("asset-{index:06}.wav");
+                let referenced_path = format!("/fixtures/{original_filename}");
+
+                insert
+                    .execute(params![
+                        id.to_string(),
+                        library.id.to_string(),
+                        original_filename,
+                        display_name,
+                        referenced_path,
+                        media_type,
+                        10_i64,
+                        "2026-01-01T00:00:00Z",
+                    ])
+                    .expect("insert asset");
+            }
+        }
+        catalog
+            .connection
+            .execute_batch("COMMIT")
+            .expect("commit bulk insert");
+        catalog
+            .apply_tag_to_assets(&[target_id], tag.id, TagOrigin::Manual)
+            .expect("tag target");
+
+        let started = std::time::Instant::now();
+        let results = catalog
+            .search_assets(
+                library.id,
+                AssetSearchQuery::text("dark benchmark")
+                    .with_media_type("sound_effect")
+                    .with_tag(tag.id),
+            )
+            .expect("search");
+        let elapsed = started.elapsed();
+
+        eprintln!(
+            "100k catalog search returned {} row(s) in {} ms",
+            results.len(),
+            elapsed.as_millis()
+        );
+        assert_eq!(
+            results.iter().map(|asset| asset.id).collect::<Vec<_>>(),
+            vec![target_id]
+        );
+
+        if let Ok(max_ms) = std::env::var("DARKWAVE_LARGE_CATALOG_SEARCH_MAX_MS") {
+            let max_ms = max_ms.parse::<u128>().expect("valid millisecond budget");
+            assert!(
+                elapsed.as_millis() <= max_ms,
+                "search took {} ms, budget was {max_ms} ms",
+                elapsed.as_millis()
+            );
+        }
+    }
+
+    #[test]
     fn suggested_tags_can_be_accepted_or_rejected_without_reappearing_as_pending() {
         let catalog_path = unique_catalog_path("suggestions");
         let catalog = Catalog::open(&catalog_path).expect("open catalog");
