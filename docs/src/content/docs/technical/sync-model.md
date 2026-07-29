@@ -10,6 +10,7 @@ The sync model starts with two primitives:
 - Writer leases with device ID, acquisition time, and TTL.
 - Media-root probes that report online/offline state and whether reconnect validation should run.
 - Reconnect validation jobs that expand an online media root and manifest into concrete paths to check.
+- Reconnect validation reports that count checked manifest paths and return the missing paths that still need relinking.
 
 The live query database remains local SQLite. Portable manifests are for recovery, reconciliation, and shared-library synchronization, not for live multi-user querying.
 

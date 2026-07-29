@@ -68,6 +68,14 @@ pub struct ReconnectValidationJob {
     pub paths_to_validate: Vec<String>,
 }
 
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct ReconnectValidationReport {
+    pub library_id: Uuid,
+    pub manifest_revision: u64,
+    pub checked_paths: usize,
+    pub missing_paths: Vec<String>,
+}
+
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum ReconnectValidationStatus {
     Pending,
@@ -183,6 +191,25 @@ pub fn plan_reconnect_validation(
     })
 }
 
+pub fn validate_reconnect_paths(
+    job: &ReconnectValidationJob,
+    exists: impl Fn(&str) -> bool,
+) -> ReconnectValidationReport {
+    let missing_paths = job
+        .paths_to_validate
+        .iter()
+        .filter(|path| !exists(path))
+        .cloned()
+        .collect();
+
+    ReconnectValidationReport {
+        library_id: job.library_id,
+        manifest_revision: job.manifest_revision,
+        checked_paths: job.paths_to_validate.len(),
+        missing_paths,
+    }
+}
+
 pub fn lease_state(active_writer_device: Option<&str>, current_device: &str) -> WriterLeaseState {
     match active_writer_device {
         Some(device) if device != current_device => {
@@ -273,6 +300,12 @@ impl ReconnectValidationScheduler {
             .iter()
             .filter(|entry| entry.status == ReconnectValidationStatus::Completed)
             .count()
+    }
+}
+
+impl ReconnectValidationReport {
+    pub fn all_available(&self) -> bool {
+        self.missing_paths.is_empty()
     }
 }
 
@@ -494,6 +527,31 @@ mod tests {
         assert_eq!(scheduler.next_pending(), None);
         assert_eq!(scheduler.pending_count(), 0);
         assert_eq!(scheduler.completed_count(), 1);
+    }
+
+    #[test]
+    fn reconnect_validation_reports_missing_manifest_paths() {
+        let library_id = Uuid::new_v4();
+        let job = ReconnectValidationJob {
+            library_id,
+            manifest_revision: 12,
+            paths_to_validate: vec![
+                "/Volumes/TrueNAS/SFX/Media/00/impact.wav".to_string(),
+                "/Volumes/TrueNAS/SFX/Media/00/missing.wav".to_string(),
+                "/Volumes/TrueNAS/SFX/Media/00/riser.wav".to_string(),
+            ],
+        };
+
+        let report = validate_reconnect_paths(&job, |path| !path.ends_with("missing.wav"));
+
+        assert_eq!(report.library_id, library_id);
+        assert_eq!(report.manifest_revision, 12);
+        assert_eq!(report.checked_paths, 3);
+        assert_eq!(
+            report.missing_paths,
+            vec!["/Volumes/TrueNAS/SFX/Media/00/missing.wav".to_string()]
+        );
+        assert!(!report.all_available());
     }
 
     #[test]
