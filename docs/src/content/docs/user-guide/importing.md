@@ -18,8 +18,9 @@ When a supported audio file is imported, Darkwave:
 - Maintains watched-folder size snapshots across polls so new files are imported only after a later stable scan.
 - Ingests platform filesystem notifications and emits import candidates only after repeat stable events.
 - Decodes WAV PCM files for cached-preview playback preparation.
+- Supports a packaged-decoder provider interface for compressed MVP formats once release decoder artifacts are installed.
 - Reports codec capability for imported extensions: native WAV PCM, packaged-decoder formats, or unsupported with conversion available.
 
 Watched folders ignore incomplete browser download files such as `.crdownload`, `.download`, `.part`, and `.tmp`. A watched file is considered ready only after its file size has stabilized.
 
-Referenced imports remain catalog-only and keep pointing at their original file path. Arbitrary-format decoder packaging and licensing review are planned refinements.
+Referenced imports remain catalog-only and keep pointing at their original file path. Arbitrary-format decoder artifacts and licensing review remain release-build requirements.

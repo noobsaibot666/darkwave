@@ -28,12 +28,22 @@ pub struct CodecSupport {
     pub conversion_available: bool,
 }
 
+pub trait PackagedAudioDecoder {
+    fn decode_packaged_audio(
+        &self,
+        path: &Path,
+        extension: &str,
+    ) -> Result<DecodedAudioBuffer, MetadataError>;
+}
+
 #[derive(Debug, Error)]
 pub enum MetadataError {
     #[error("file has no extension")]
     MissingExtension,
     #[error("unsupported decoder format: {0}")]
     UnsupportedDecoderFormat(String),
+    #[error("packaged decoder unavailable for format: {0}")]
+    PackagedDecoderUnavailable(String),
     #[error("invalid wav data")]
     InvalidWav,
     #[error("metadata read failed: {0}")]
@@ -48,6 +58,10 @@ impl PartialEq for MetadataError {
             (
                 MetadataError::UnsupportedDecoderFormat(left),
                 MetadataError::UnsupportedDecoderFormat(right),
+            )
+            | (
+                MetadataError::PackagedDecoderUnavailable(left),
+                MetadataError::PackagedDecoderUnavailable(right),
             ) => left == right,
             _ => false,
         }
@@ -108,6 +122,26 @@ pub fn decode_wav_pcm(path: impl AsRef<Path>) -> Result<DecodedAudioBuffer, Meta
 
     let bytes = std::fs::read(path)?;
     parse_wav_pcm(&bytes)
+}
+
+pub fn decode_supported_audio(
+    path: impl AsRef<Path>,
+    packaged_decoder: Option<&dyn PackagedAudioDecoder>,
+) -> Result<DecodedAudioBuffer, MetadataError> {
+    let path = path.as_ref();
+    let extension = path
+        .extension()
+        .and_then(|extension| extension.to_str())
+        .ok_or(MetadataError::MissingExtension)?
+        .to_ascii_lowercase();
+
+    match codec_support_for_extension(&extension).status {
+        CodecSupportStatus::NativePcm => decode_wav_pcm(path),
+        CodecSupportStatus::RequiresPackagedDecoder => packaged_decoder
+            .ok_or_else(|| MetadataError::PackagedDecoderUnavailable(extension.clone()))?
+            .decode_packaged_audio(path, &extension),
+        CodecSupportStatus::Unsupported => Err(MetadataError::UnsupportedDecoderFormat(extension)),
+    }
 }
 
 fn parse_wav_pcm(bytes: &[u8]) -> Result<DecodedAudioBuffer, MetadataError> {
@@ -247,6 +281,51 @@ mod tests {
     }
 
     #[test]
+    fn supported_audio_decoder_uses_native_wav_without_packaged_decoder() {
+        let mut path = std::env::temp_dir();
+        path.push(format!("darkwave-decoder-{}.wav", Uuid::new_v4()));
+        fs::write(&path, wav_16_bit_fixture()).expect("fixture");
+
+        let decoded = decode_supported_audio(&path, None).expect("decode wav");
+
+        assert_eq!(decoded.sample_rate, 48_000);
+        assert_eq!(decoded.channels, 1);
+    }
+
+    #[test]
+    fn supported_audio_decoder_delegates_packaged_formats() {
+        let mut path = std::env::temp_dir();
+        path.push(format!("darkwave-decoder-{}.mp3", Uuid::new_v4()));
+        fs::write(&path, b"packaged fixture").expect("fixture");
+        let decoder = FixturePackagedDecoder;
+
+        let decoded = decode_supported_audio(&path, Some(&decoder)).expect("decode packaged");
+
+        assert_eq!(
+            decoded,
+            DecodedAudioBuffer {
+                sample_rate: 44_100,
+                channels: 2,
+                samples: vec![0.25, -0.25],
+            }
+        );
+    }
+
+    #[test]
+    fn supported_audio_decoder_reports_missing_packaged_decoder() {
+        let mut path = std::env::temp_dir();
+        path.push(format!("darkwave-decoder-{}.flac", Uuid::new_v4()));
+        fs::write(&path, b"packaged fixture").expect("fixture");
+
+        assert_eq!(
+            decode_supported_audio(&path, None),
+            Err(MetadataError::PackagedDecoderUnavailable(
+                "flac".to_string()
+            ))
+        );
+    }
+
+    #[test]
     fn codec_support_marks_wav_native_and_compressed_formats_packaged() {
         assert_eq!(
             codec_support_for_extension("wav"),
@@ -301,5 +380,23 @@ mod tests {
         }
 
         wav
+    }
+
+    struct FixturePackagedDecoder;
+
+    impl PackagedAudioDecoder for FixturePackagedDecoder {
+        fn decode_packaged_audio(
+            &self,
+            path: &Path,
+            extension: &str,
+        ) -> Result<DecodedAudioBuffer, MetadataError> {
+            assert_eq!(extension, "mp3");
+            assert!(path.exists());
+            Ok(DecodedAudioBuffer {
+                sample_rate: 44_100,
+                channels: 2,
+                samples: vec![0.25, -0.25],
+            })
+        }
     }
 }

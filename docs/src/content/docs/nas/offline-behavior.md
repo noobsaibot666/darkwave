@@ -16,8 +16,9 @@ Current behavior:
 - Export plans can wait in a queue while source paths are offline and become ready after the source returns.
 - Playback source selection can fall back to cached preview files when originals are missing.
 - Cached WAV previews can be decoded into PCM for offline playback preparation.
+- Supported arbitrary-format previews can attach a packaged decoder provider once release decoder artifacts are available.
 - Reconnect validation jobs are created from portable manifests when a media root comes back online.
 - Reconnect validation scheduling queues one pending job per library revision and marks jobs completed after validation.
 - Offline controls support catalog-only mode, reconnect retry, validation pause/resume, and media-root relinking.
 
-Future work will add arbitrary-format decoder and resampler integration for cached preview playback.
+Future work will add shipped arbitrary-format decoder artifacts for cached preview playback.

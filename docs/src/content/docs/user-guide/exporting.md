@@ -13,6 +13,7 @@ Darkwave can:
 - Queue exports whose source paths are temporarily offline.
 - Prepare external drag-and-drop payloads for ready original-copy exports.
 - Render decoded PCM to 24-bit WAV files with resampling and selected range slicing.
+- Decode supported packaged formats through the decoder provider interface when release decoder artifacts are installed.
 - Prepare drag-and-drop payloads for completed rendered WAV exports.
 - Validate selected in/out export ranges.
 - Record project usage events.
@@ -20,4 +21,4 @@ Darkwave can:
 - Render project source/license reports as CSV.
 - Warn, rather than block, when source or license context is missing, uncertain, or expired.
 
-Arbitrary-format decoder attachment for source formats beyond decoded PCM is a planned next step.
+Packaged decoder artifacts remain a release-build requirement before compressed source formats can render in installed builds.
