@@ -1,5 +1,5 @@
 use chrono::Utc;
-use rusqlite::{params, Connection, OptionalExtension};
+use rusqlite::{params, params_from_iter, Connection, OptionalExtension};
 use serde::{Deserialize, Serialize};
 use shared_types::{AvailabilityState, StorageMode};
 use std::path::Path;
@@ -617,22 +617,54 @@ impl Catalog {
         library_id: Uuid,
         query: AssetSearchQuery,
     ) -> Result<Vec<AssetRecord>, StorageError> {
-        let mut assets = self.list_assets(library_id)?;
         let text = query.text.trim().to_ascii_lowercase();
+        let use_fts = !text.is_empty();
+        let mut sql = String::from(
+            "SELECT assets.id, assets.library_id, assets.original_filename, assets.display_name,
+                assets.relative_path, assets.referenced_path, assets.storage_mode, assets.content_hash,
+                assets.media_type, assets.file_size, assets.availability_state, assets.review_state, assets.favorite
+             FROM assets",
+        );
+        let mut query_params = vec![library_id.to_string()];
 
-        if !text.is_empty() {
-            let matched_ids = self.asset_ids_matching_text(library_id, &text)?;
-            assets.retain(|asset| matched_ids.contains(&asset.id));
+        if use_fts {
+            sql.push_str(" INNER JOIN assets_fts ON assets_fts.rowid = assets.rowid");
+        }
+
+        sql.push_str(" WHERE assets.library_id = ?");
+
+        if use_fts {
+            sql.push_str(" AND assets_fts MATCH ?");
+            query_params.push(fts_query(&text));
         }
 
         if let Some(media_type) = query.media_type {
-            assets.retain(|asset| asset.media_type == media_type);
+            sql.push_str(" AND assets.media_type = ?");
+            query_params.push(media_type);
         }
 
         if let Some(tag_id) = query.tag_id {
-            let tagged_ids = self.asset_ids_for_tag(tag_id)?;
-            assets.retain(|asset| tagged_ids.contains(&asset.id));
+            sql.push_str(
+                " AND EXISTS (
+                    SELECT 1 FROM asset_tags
+                    WHERE asset_tags.asset_id = assets.id
+                      AND asset_tags.tag_id = ?
+                      AND asset_tags.approval_state = 'accepted'
+                )",
+            );
+            query_params.push(tag_id.to_string());
         }
+
+        if use_fts {
+            sql.push_str(" ORDER BY rank");
+        } else {
+            sql.push_str(" ORDER BY assets.date_added ASC");
+        }
+
+        let mut statement = self.connection.prepare(&sql)?;
+        let assets = statement
+            .query_map(params_from_iter(query_params.iter()), asset_from_row)?
+            .collect::<Result<Vec<_>, _>>()?;
 
         Ok(assets)
     }
@@ -1095,9 +1127,13 @@ impl Catalog {
             CREATE UNIQUE INDEX IF NOT EXISTS idx_assets_library_hash_size
               ON assets(library_id, content_hash, file_size)
               WHERE content_hash IS NOT NULL;
+            CREATE INDEX IF NOT EXISTS idx_assets_library_media_date
+              ON assets(library_id, media_type, date_added);
             CREATE INDEX IF NOT EXISTS idx_background_jobs_pending
               ON background_jobs(state, priority, created_at);
             CREATE INDEX IF NOT EXISTS idx_asset_tags_asset ON asset_tags(asset_id);
+            CREATE INDEX IF NOT EXISTS idx_asset_tags_tag_state_asset
+              ON asset_tags(tag_id, approval_state, asset_id);
             CREATE INDEX IF NOT EXISTS idx_collection_assets_collection ON collection_assets(collection_id);
             CREATE INDEX IF NOT EXISTS idx_usage_events_project ON usage_events(project_id);
             CREATE INDEX IF NOT EXISTS idx_usage_events_asset ON usage_events(asset_id);
@@ -1147,41 +1183,6 @@ impl Catalog {
             params![id.to_string(), kind, payload, Utc::now().to_rfc3339()],
         )?;
         Ok(id)
-    }
-
-    fn asset_ids_matching_text(
-        &self,
-        library_id: Uuid,
-        text: &str,
-    ) -> Result<Vec<Uuid>, StorageError> {
-        let query = fts_query(text);
-        let mut statement = self.connection.prepare(
-            "SELECT assets.id
-             FROM assets_fts
-             INNER JOIN assets ON assets_fts.rowid = assets.rowid
-             WHERE assets.library_id = ?1 AND assets_fts MATCH ?2
-             ORDER BY rank",
-        )?;
-        let ids = statement
-            .query_map(params![library_id.to_string(), query], |row| {
-                Ok(parse_uuid(row.get::<_, String>(0)?))
-            })?
-            .collect::<Result<Vec<_>, _>>()?;
-
-        Ok(ids)
-    }
-
-    fn asset_ids_for_tag(&self, tag_id: Uuid) -> Result<Vec<Uuid>, StorageError> {
-        let mut statement = self.connection.prepare(
-            "SELECT asset_id FROM asset_tags WHERE tag_id = ?1 AND approval_state = 'accepted'",
-        )?;
-        let ids = statement
-            .query_map(params![tag_id.to_string()], |row| {
-                Ok(parse_uuid(row.get::<_, String>(0)?))
-            })?
-            .collect::<Result<Vec<_>, _>>()?;
-
-        Ok(ids)
     }
 }
 
@@ -1644,6 +1645,55 @@ mod tests {
             vec![impact.id]
         );
         assert!(!filtered_results.iter().any(|asset| asset.id == ambience.id));
+    }
+
+    #[test]
+    fn search_combines_text_media_type_and_accepted_tag_filters() {
+        let catalog_path = unique_catalog_path("combined-search");
+        let catalog = Catalog::open(&catalog_path).expect("open catalog");
+        let library = catalog
+            .create_library("Search", "/library")
+            .expect("library");
+        let matching = test_asset(&catalog, library.id, "dark-impact.wav", "hash-dark-impact");
+        let wrong_media = catalog
+            .register_asset(NewAssetRecord {
+                library_id: library.id,
+                original_filename: "dark-loop.wav".to_string(),
+                display_name: "dark-loop".to_string(),
+                path: AssetPath::Referenced("/fixtures/dark-loop.wav".to_string()),
+                storage_mode: StorageMode::Referenced,
+                content_hash: Some("hash-dark-loop".to_string()),
+                media_type: "music_loop".to_string(),
+                file_size: 10,
+                availability_state: AvailabilityState::Local,
+            })
+            .expect("asset");
+        let untagged = test_asset(
+            &catalog,
+            library.id,
+            "dark-untagged.wav",
+            "hash-dark-untagged",
+        );
+        let tag = catalog.create_tag("Impact", "action", true).expect("tag");
+        catalog
+            .apply_tag_to_assets(&[matching.id, wrong_media.id], tag.id, TagOrigin::Manual)
+            .expect("tag");
+
+        let results = catalog
+            .search_assets(
+                library.id,
+                AssetSearchQuery::text("dark")
+                    .with_media_type("sound_effect")
+                    .with_tag(tag.id),
+            )
+            .expect("search");
+
+        assert_eq!(
+            results.iter().map(|asset| asset.id).collect::<Vec<_>>(),
+            vec![matching.id]
+        );
+        assert!(!results.iter().any(|asset| asset.id == wrong_media.id));
+        assert!(!results.iter().any(|asset| asset.id == untagged.id));
     }
 
     #[test]

@@ -11,9 +11,9 @@ Implemented behavior:
 - Filename-origin tag suggestions include tag name, facet, confidence, and origin.
 - Embedded metadata fields such as title, genre, and comments can map to the same tag vocabulary with metadata-origin traceability.
 - SQLite FTS5 indexes asset display names, original filenames, and notes.
-- Catalog search supports text search, tag filters, and media-type filters.
+- Catalog search supports text search, tag filters, and media-type filters using SQL-backed predicates and supporting indexes.
 - Smart collections store serialized query definitions.
 - Suggested tags can be accepted or rejected.
 - A rejected suggestion from the same origin is preserved and not recreated as pending without new evidence.
 
-This keeps search explainable and local-first while leaving natural-language query translation and larger performance benchmarks for a later refinement.
+This keeps search explainable and local-first while leaving natural-language query translation and a dedicated large-catalog benchmark harness for a later refinement.
