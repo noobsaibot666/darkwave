@@ -18,3 +18,5 @@ Initial shortcut targets:
 - Escape: close transient panels.
 
 Shortcuts must remain available without requiring pointer interaction.
+
+The command palette exposes import, search, tagging, collection assignment, export, reveal, conversion, rescan, settings, and maintenance actions.

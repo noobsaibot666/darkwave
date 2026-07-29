@@ -98,6 +98,28 @@ input:focus-visible {
   background: #14161a;
 }
 
+.command-strip {
+  display: grid;
+  grid-template-columns: 18px repeat(5, auto) 1fr;
+  gap: 8px;
+  align-items: center;
+  min-height: 42px;
+  padding: 7px 14px;
+  border-bottom: 1px solid rgba(255, 255, 255, 0.08);
+  background: #101114;
+  color: #717987;
+}
+
+.command-strip button {
+  min-height: 28px;
+  padding: 0 9px;
+  border: 1px solid rgba(255, 255, 255, 0.1);
+  border-radius: 6px;
+  background: #181a1f;
+  color: #dce3ec;
+  font-size: 12px;
+}
+
 .onboarding-strip button {
   display: inline-flex;
   align-items: center;

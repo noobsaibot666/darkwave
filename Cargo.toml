@@ -5,6 +5,7 @@ members = [
   "crates/audio-analysis",
   "crates/audio-engine",
   "crates/audio-metadata",
+  "crates/command-palette",
   "crates/export-pipeline",
   "crates/fingerprint",
   "crates/import-pipeline",

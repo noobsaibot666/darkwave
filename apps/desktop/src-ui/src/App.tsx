@@ -53,6 +53,8 @@ const shortcutItems = [
 
 const dragTargets = ["Tag", "Collection", "Project", "Favorite", "Trash", "External Export"];
 
+const paletteCommands = ["Import Folder", "Focus Search", "Apply Tag", "Export Selected", "Open Settings"];
+
 export function App() {
   return (
     <main className="shell">
@@ -94,6 +96,12 @@ export function App() {
             <RotateCcw size={16} />
             Restore Session
           </button>
+        </section>
+        <section className="command-strip" aria-label="Command palette preview">
+          <Command size={15} />
+          {paletteCommands.map((command) => (
+            <button key={command}>{command}</button>
+          ))}
         </section>
         <section className="browser" aria-label="Sound browser">
           <div className="selection-bar" aria-label="Selection actions">

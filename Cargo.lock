@@ -507,6 +507,13 @@ dependencies = [
 ]
 
 [[package]]
+name = "command-palette"
+version = "0.1.0"
+dependencies = [
+ "serde",
+]
+
+[[package]]
 name = "concurrent-queue"
 version = "2.5.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -651,6 +658,7 @@ checksum = "52560adf09603e58c9a7ee1fe1dcb95a16927b17c127f0ac02d6e768a0e25bc1"
 name = "darkwave-desktop"
 version = "0.1.0"
 dependencies = [
+ "command-palette",
  "library-core",
  "preferences",
  "release-readiness",

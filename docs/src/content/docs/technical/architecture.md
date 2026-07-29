@@ -24,3 +24,4 @@ Milestone 1 introduces the first catalog boundary:
 - `preferences` owns user settings defaults, shortcut bindings, and shortcut conflict validation.
 - `workspace-state` owns browser focus, selection, range/additive selection, and drag payload state.
 - `viewport` owns virtualized browser row range and spacer calculations for large result sets.
+- `command-palette` owns searchable action metadata for palette, shortcut, and menu commands.

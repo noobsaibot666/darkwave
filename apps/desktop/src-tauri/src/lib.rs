@@ -63,6 +63,15 @@ fn default_virtualized_range() -> (usize, usize) {
     (range.start, range.end_exclusive)
 }
 
+#[tauri::command]
+fn default_command_titles() -> Vec<String> {
+    command_palette::CommandRegistry::default_audio_workspace()
+        .search("")
+        .into_iter()
+        .map(|command| command.title)
+        .collect()
+}
+
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
     tauri::Builder::default()
@@ -74,7 +83,8 @@ pub fn run() {
             release_blockers,
             default_preferences,
             supported_drag_targets,
-            default_virtualized_range
+            default_virtualized_range,
+            default_command_titles
         ])
         .run(tauri::generate_context!())
         .expect("failed to run Darkwave desktop shell");
@@ -125,5 +135,13 @@ mod tests {
     #[test]
     fn default_virtualized_range_keeps_initial_render_bounded() {
         assert_eq!(super::default_virtualized_range(), (0, 16));
+    }
+
+    #[test]
+    fn default_command_titles_include_import_and_search_first() {
+        assert_eq!(
+            &super::default_command_titles()[0..2],
+            ["Import Folder".to_string(), "Focus Search".to_string()]
+        );
     }
 }

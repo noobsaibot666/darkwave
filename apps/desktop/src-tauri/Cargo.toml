@@ -15,6 +15,7 @@ crate-type = ["staticlib", "cdylib", "rlib"]
 tauri-build = { version = "2", features = [] }
 
 [dependencies]
+command-palette = { path = "../../../crates/command-palette" }
 library-core = { path = "../../../crates/library-core" }
 preferences = { path = "../../../crates/preferences" }
 release-readiness = { path = "../../../crates/release-readiness" }
