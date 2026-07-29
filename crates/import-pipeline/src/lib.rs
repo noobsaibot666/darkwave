@@ -4,7 +4,7 @@ use shared_types::{AvailabilityState, StorageMode};
 use std::collections::BTreeMap;
 use std::fs;
 use std::path::{Path, PathBuf};
-use storage::{AssetPath, AssetRecord, Catalog, JobKind, NewAssetRecord, StorageError};
+use storage::{AssetPath, AssetRecord, Catalog, JobKind, NewAssetRecord, StorageError, TagOrigin};
 use thiserror::Error;
 use uuid::Uuid;
 
@@ -231,6 +231,7 @@ pub fn import_file(
     catalog.enqueue_job(asset.id, JobKind::MetadataExtraction, 10)?;
     catalog.enqueue_job(asset.id, JobKind::Hashing, 20)?;
     catalog.enqueue_job(asset.id, JobKind::WaveformGeneration, 30)?;
+    suggest_filename_tags(catalog, &asset)?;
 
     if mode == ImportMode::Managed {
         copy_managed_source(catalog, library_id, path, &asset)?;
@@ -257,6 +258,20 @@ fn lightweight_content_hash(path: &Path) -> Result<String, ImportError> {
     let bytes = fs::read(path)?;
     let digest = Sha256::digest(bytes);
     Ok(format!("{digest:x}"))
+}
+
+fn suggest_filename_tags(catalog: &Catalog, asset: &AssetRecord) -> Result<(), ImportError> {
+    for suggestion in search::suggest_tags_from_filename(&asset.original_filename) {
+        let tag = catalog.create_tag(&suggestion.name, &suggestion.facet, true)?;
+        catalog.suggest_tag_for_asset(
+            asset.id,
+            tag.id,
+            TagOrigin::Filename,
+            suggestion.confidence,
+        )?;
+    }
+
+    Ok(())
 }
 
 fn copy_managed_source(
@@ -487,6 +502,28 @@ mod tests {
             b"managed audio"
         );
         assert_eq!(fs::read(&audio_path).expect("source"), b"managed audio");
+    }
+
+    #[test]
+    fn import_adds_pending_filename_tag_suggestions() {
+        let catalog_path = unique_catalog_path("smart-import-suggestions");
+        let audio_path = unique_audio_path("dark-metal-impact.wav");
+        fs::write(&audio_path, b"suggestion audio").expect("fixture");
+
+        let catalog = Catalog::open(&catalog_path).expect("catalog");
+        catalog.seed_starter_taxonomy().expect("taxonomy");
+        let library = catalog
+            .create_library("Smart Import", "/library")
+            .expect("library");
+
+        let imported =
+            import_file(&catalog, library.id, &audio_path, ImportMode::Referenced).expect("import");
+        let suggested_tags = catalog
+            .pending_suggested_tags(imported.id)
+            .expect("suggestions");
+
+        assert!(suggested_tags.iter().any(|tag| tag.name == "Impact"));
+        assert!(suggested_tags.iter().any(|tag| tag.name == "Metal"));
     }
 
     fn unique_catalog_path(name: &str) -> PathBuf {

@@ -8,6 +8,7 @@ rust-version.workspace = true
 
 [dependencies]
 audio-metadata = { path = "../audio-metadata" }
+search = { path = "../search" }
 sha2 = "0.10"
 shared-types = { path = "../shared-types" }
 storage = { path = "../storage" }
