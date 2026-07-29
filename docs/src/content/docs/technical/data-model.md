@@ -11,10 +11,12 @@ The initial SQLite migration defines:
 - Asset tags with suggestion origin and approval state
 - Source records
 - Collections and projects
+- Collection membership
 - Usage events
 - Library sync records
 - FTS index for asset text search
 - Background jobs for restart-safe import and analysis work
+- Undo actions for recoverable metadata relationship changes
 
 Migrations live in `db/migrations`.
 

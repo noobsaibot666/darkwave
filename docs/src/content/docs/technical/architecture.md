@@ -16,3 +16,4 @@ Milestone 1 introduces the first catalog boundary:
 - `import-pipeline` turns a file path into a catalog asset and job records while avoiding incomplete watched-folder downloads.
 - `audio-engine` owns playback session state so rapid row changes cancel prior playback before decoder integration.
 - `waveform` creates reusable peak payloads for row, inspector, and transport renderers.
+- `storage` also owns organization primitives: tags, asset tags, collections, projects, favorite/review flags, and undo records.

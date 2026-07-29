@@ -88,6 +88,13 @@ CREATE TABLE collections (
   archived_at TEXT
 );
 
+CREATE TABLE collection_assets (
+  collection_id TEXT NOT NULL REFERENCES collections(id) ON DELETE CASCADE,
+  asset_id TEXT NOT NULL REFERENCES assets(id) ON DELETE CASCADE,
+  created_at TEXT NOT NULL,
+  PRIMARY KEY (collection_id, asset_id)
+);
+
 CREATE TABLE usage_events (
   id TEXT PRIMARY KEY,
   asset_id TEXT NOT NULL REFERENCES assets(id) ON DELETE CASCADE,
@@ -107,6 +114,14 @@ CREATE TABLE background_jobs (
   error TEXT,
   created_at TEXT NOT NULL,
   updated_at TEXT NOT NULL
+);
+
+CREATE TABLE undo_actions (
+  id TEXT PRIMARY KEY,
+  kind TEXT NOT NULL,
+  payload TEXT NOT NULL,
+  created_at TEXT NOT NULL,
+  applied_at TEXT
 );
 
 CREATE TABLE library_sync_records (
@@ -136,3 +151,5 @@ CREATE UNIQUE INDEX idx_assets_library_hash_size
   ON assets(library_id, content_hash, file_size)
   WHERE content_hash IS NOT NULL;
 CREATE INDEX idx_background_jobs_pending ON background_jobs(state, priority, created_at);
+CREATE INDEX idx_asset_tags_asset ON asset_tags(asset_id);
+CREATE INDEX idx_collection_assets_collection ON collection_assets(collection_id);

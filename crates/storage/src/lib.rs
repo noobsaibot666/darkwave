@@ -59,6 +59,14 @@ pub struct AssetRecord {
     pub media_type: String,
     pub file_size: u64,
     pub availability_state: AvailabilityState,
+    pub review_state: ReviewState,
+    pub favorite: bool,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum ReviewState {
+    Unreviewed,
+    Reviewed,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -74,6 +82,40 @@ pub struct JobRecord {
     pub asset_id: Uuid,
     pub kind: JobKind,
     pub priority: i64,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum TagOrigin {
+    Filename,
+    Metadata,
+    AcousticModel,
+    UserRule,
+    UserCorrection,
+    Manual,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct TagRecord {
+    pub id: Uuid,
+    pub name: String,
+    pub normalized_name: String,
+    pub facet: Option<String>,
+    pub is_system: bool,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum CollectionType {
+    Manual,
+    Smart,
+    Project,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct CollectionRecord {
+    pub id: Uuid,
+    pub library_id: Uuid,
+    pub name: String,
+    pub collection_type: CollectionType,
 }
 
 pub struct Catalog {
@@ -177,7 +219,7 @@ impl Catalog {
     pub fn list_assets(&self, library_id: Uuid) -> Result<Vec<AssetRecord>, StorageError> {
         let mut statement = self.connection.prepare(
             "SELECT id, library_id, original_filename, display_name, relative_path, referenced_path,
-                storage_mode, content_hash, media_type, file_size, availability_state
+                storage_mode, content_hash, media_type, file_size, availability_state, review_state, favorite
              FROM assets
              WHERE library_id = ?1
              ORDER BY date_added ASC",
@@ -241,6 +283,252 @@ impl Catalog {
             .map_err(StorageError::from)
     }
 
+    pub fn seed_starter_taxonomy(&self) -> Result<(), StorageError> {
+        for (name, facet) in [
+            ("Music", "media_type"),
+            ("Sound Effect", "media_type"),
+            ("Ambience", "media_type"),
+            ("Foley", "media_type"),
+            ("Voice / Dialogue", "media_type"),
+            ("Impact", "action"),
+            ("Whoosh", "action"),
+            ("Rise", "action"),
+            ("Metal", "source"),
+            ("Glass", "source"),
+            ("Cinematic", "character"),
+            ("Subtle", "energy"),
+            ("High", "energy"),
+        ] {
+            self.create_tag(name, facet, true)?;
+        }
+
+        Ok(())
+    }
+
+    pub fn create_tag(
+        &self,
+        name: impl AsRef<str>,
+        facet: impl AsRef<str>,
+        is_system: bool,
+    ) -> Result<TagRecord, StorageError> {
+        let normalized_name = normalize_term(name.as_ref());
+        let now = Utc::now().to_rfc3339();
+
+        self.connection.execute(
+            "INSERT OR IGNORE INTO tags (id, name, normalized_name, facet, is_system, is_hidden, created_at)
+             VALUES (?1, ?2, ?3, ?4, ?5, 0, ?6)",
+            params![
+                Uuid::new_v4().to_string(),
+                name.as_ref(),
+                normalized_name,
+                facet.as_ref(),
+                is_system as i64,
+                now,
+            ],
+        )?;
+
+        self.connection
+            .query_row(
+                "SELECT id, name, normalized_name, facet, is_system FROM tags WHERE normalized_name = ?1",
+                params![normalize_term(name.as_ref())],
+                tag_from_row,
+            )
+            .map_err(StorageError::from)
+    }
+
+    pub fn list_tags(&self) -> Result<Vec<TagRecord>, StorageError> {
+        let mut statement = self.connection.prepare(
+            "SELECT id, name, normalized_name, facet, is_system FROM tags ORDER BY facet, name",
+        )?;
+
+        let tags = statement
+            .query_map([], tag_from_row)?
+            .collect::<Result<Vec<_>, _>>()
+            .map_err(StorageError::from)?;
+
+        Ok(tags)
+    }
+
+    pub fn apply_tag_to_assets(
+        &self,
+        asset_ids: &[Uuid],
+        tag_id: Uuid,
+        origin: TagOrigin,
+    ) -> Result<Uuid, StorageError> {
+        let now = Utc::now().to_rfc3339();
+        for asset_id in asset_ids {
+            self.connection.execute(
+                "INSERT OR IGNORE INTO asset_tags (asset_id, tag_id, origin, confidence, approval_state, created_at)
+                 VALUES (?1, ?2, ?3, 1.0, 'accepted', ?4)",
+                params![
+                    asset_id.to_string(),
+                    tag_id.to_string(),
+                    tag_origin_to_db(origin),
+                    now,
+                ],
+            )?;
+        }
+
+        self.record_undo(
+            "remove_asset_tags",
+            &format!("{}|{}", tag_id, join_uuids(asset_ids)),
+        )
+    }
+
+    pub fn tags_for_asset(&self, asset_id: Uuid) -> Result<Vec<TagRecord>, StorageError> {
+        let mut statement = self.connection.prepare(
+            "SELECT tags.id, tags.name, tags.normalized_name, tags.facet, tags.is_system
+             FROM tags
+             INNER JOIN asset_tags ON asset_tags.tag_id = tags.id
+             WHERE asset_tags.asset_id = ?1
+             ORDER BY tags.facet, tags.name",
+        )?;
+
+        let tags = statement
+            .query_map(params![asset_id.to_string()], tag_from_row)?
+            .collect::<Result<Vec<_>, _>>()
+            .map_err(StorageError::from)?;
+
+        Ok(tags)
+    }
+
+    pub fn create_collection(
+        &self,
+        library_id: Uuid,
+        name: impl AsRef<str>,
+        collection_type: CollectionType,
+    ) -> Result<CollectionRecord, StorageError> {
+        let collection = CollectionRecord {
+            id: Uuid::new_v4(),
+            library_id,
+            name: name.as_ref().to_string(),
+            collection_type,
+        };
+        let now = Utc::now().to_rfc3339();
+
+        self.connection.execute(
+            "INSERT INTO collections (id, library_id, name, type, created_at)
+             VALUES (?1, ?2, ?3, ?4, ?5)",
+            params![
+                collection.id.to_string(),
+                collection.library_id.to_string(),
+                collection.name,
+                collection_type_to_db(collection.collection_type),
+                now,
+            ],
+        )?;
+
+        Ok(collection)
+    }
+
+    pub fn add_assets_to_collection(
+        &self,
+        collection_id: Uuid,
+        asset_ids: &[Uuid],
+    ) -> Result<Uuid, StorageError> {
+        let now = Utc::now().to_rfc3339();
+        for asset_id in asset_ids {
+            self.connection.execute(
+                "INSERT OR IGNORE INTO collection_assets (collection_id, asset_id, created_at)
+                 VALUES (?1, ?2, ?3)",
+                params![collection_id.to_string(), asset_id.to_string(), now],
+            )?;
+        }
+
+        self.record_undo(
+            "remove_collection_assets",
+            &format!("{}|{}", collection_id, join_uuids(asset_ids)),
+        )
+    }
+
+    pub fn assets_in_collection(
+        &self,
+        collection_id: Uuid,
+    ) -> Result<Vec<AssetRecord>, StorageError> {
+        let mut statement = self.connection.prepare(
+            "SELECT assets.id, assets.library_id, assets.original_filename, assets.display_name,
+                assets.relative_path, assets.referenced_path, assets.storage_mode, assets.content_hash,
+                assets.media_type, assets.file_size, assets.availability_state, assets.review_state, assets.favorite
+             FROM assets
+             INNER JOIN collection_assets ON collection_assets.asset_id = assets.id
+             WHERE collection_assets.collection_id = ?1
+             ORDER BY collection_assets.created_at ASC",
+        )?;
+
+        let assets = statement
+            .query_map(params![collection_id.to_string()], asset_from_row)?
+            .collect::<Result<Vec<_>, _>>()
+            .map_err(StorageError::from)?;
+
+        Ok(assets)
+    }
+
+    pub fn set_asset_flags(
+        &self,
+        asset_id: Uuid,
+        favorite: Option<bool>,
+        review_state: Option<ReviewState>,
+    ) -> Result<(), StorageError> {
+        if let Some(favorite) = favorite {
+            self.connection.execute(
+                "UPDATE assets SET favorite = ?1 WHERE id = ?2",
+                params![favorite as i64, asset_id.to_string()],
+            )?;
+        }
+
+        if let Some(review_state) = review_state {
+            self.connection.execute(
+                "UPDATE assets SET review_state = ?1 WHERE id = ?2",
+                params![review_state_to_db(review_state), asset_id.to_string()],
+            )?;
+        }
+
+        Ok(())
+    }
+
+    pub fn undo(&self, undo_id: Uuid) -> Result<(), StorageError> {
+        let undo = self
+            .connection
+            .query_row(
+                "SELECT kind, payload FROM undo_actions WHERE id = ?1 AND applied_at IS NULL",
+                params![undo_id.to_string()],
+                |row| Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?)),
+            )
+            .optional()?;
+
+        let Some((kind, payload)) = undo else {
+            return Ok(());
+        };
+
+        let (owner_id, asset_ids) = split_owner_and_assets(&payload);
+        match kind.as_str() {
+            "remove_asset_tags" => {
+                for asset_id in asset_ids {
+                    self.connection.execute(
+                        "DELETE FROM asset_tags WHERE tag_id = ?1 AND asset_id = ?2",
+                        params![owner_id.to_string(), asset_id.to_string()],
+                    )?;
+                }
+            }
+            "remove_collection_assets" => {
+                for asset_id in asset_ids {
+                    self.connection.execute(
+                        "DELETE FROM collection_assets WHERE collection_id = ?1 AND asset_id = ?2",
+                        params![owner_id.to_string(), asset_id.to_string()],
+                    )?;
+                }
+            }
+            _ => {}
+        }
+
+        self.connection.execute(
+            "UPDATE undo_actions SET applied_at = ?1 WHERE id = ?2",
+            params![Utc::now().to_rfc3339(), undo_id.to_string()],
+        )?;
+
+        Ok(())
+    }
+
     fn migrate(&self) -> Result<(), StorageError> {
         self.connection.execute_batch(
             "
@@ -297,22 +585,72 @@ impl Catalog {
               updated_at TEXT NOT NULL
             );
 
+            CREATE TABLE IF NOT EXISTS tags (
+              id TEXT PRIMARY KEY,
+              name TEXT NOT NULL,
+              normalized_name TEXT NOT NULL UNIQUE,
+              facet TEXT,
+              parent_id TEXT REFERENCES tags(id) ON DELETE SET NULL,
+              preferred_term_id TEXT REFERENCES tags(id) ON DELETE SET NULL,
+              is_system INTEGER NOT NULL DEFAULT 0,
+              is_hidden INTEGER NOT NULL DEFAULT 0,
+              created_at TEXT NOT NULL
+            );
+
+            CREATE TABLE IF NOT EXISTS asset_tags (
+              asset_id TEXT NOT NULL REFERENCES assets(id) ON DELETE CASCADE,
+              tag_id TEXT NOT NULL REFERENCES tags(id) ON DELETE CASCADE,
+              origin TEXT NOT NULL,
+              confidence REAL NOT NULL DEFAULT 1.0,
+              approval_state TEXT NOT NULL,
+              created_at TEXT NOT NULL,
+              PRIMARY KEY (asset_id, tag_id, origin)
+            );
+
+            CREATE TABLE IF NOT EXISTS collections (
+              id TEXT PRIMARY KEY,
+              library_id TEXT NOT NULL REFERENCES libraries(id) ON DELETE CASCADE,
+              name TEXT NOT NULL,
+              type TEXT NOT NULL,
+              query_definition TEXT,
+              parent_id TEXT REFERENCES collections(id) ON DELETE SET NULL,
+              created_at TEXT NOT NULL,
+              archived_at TEXT
+            );
+
+            CREATE TABLE IF NOT EXISTS collection_assets (
+              collection_id TEXT NOT NULL REFERENCES collections(id) ON DELETE CASCADE,
+              asset_id TEXT NOT NULL REFERENCES assets(id) ON DELETE CASCADE,
+              created_at TEXT NOT NULL,
+              PRIMARY KEY (collection_id, asset_id)
+            );
+
+            CREATE TABLE IF NOT EXISTS undo_actions (
+              id TEXT PRIMARY KEY,
+              kind TEXT NOT NULL,
+              payload TEXT NOT NULL,
+              created_at TEXT NOT NULL,
+              applied_at TEXT
+            );
+
             CREATE UNIQUE INDEX IF NOT EXISTS idx_assets_library_hash_size
               ON assets(library_id, content_hash, file_size)
               WHERE content_hash IS NOT NULL;
             CREATE INDEX IF NOT EXISTS idx_background_jobs_pending
               ON background_jobs(state, priority, created_at);
+            CREATE INDEX IF NOT EXISTS idx_asset_tags_asset ON asset_tags(asset_id);
+            CREATE INDEX IF NOT EXISTS idx_collection_assets_collection ON collection_assets(collection_id);
             ",
         )?;
 
         Ok(())
     }
 
-    fn get_asset(&self, id: Uuid) -> Result<Option<AssetRecord>, StorageError> {
+    pub fn get_asset(&self, id: Uuid) -> Result<Option<AssetRecord>, StorageError> {
         self.connection
             .query_row(
                 "SELECT id, library_id, original_filename, display_name, relative_path, referenced_path,
-                    storage_mode, content_hash, media_type, file_size, availability_state
+                    storage_mode, content_hash, media_type, file_size, availability_state, review_state, favorite
                  FROM assets WHERE id = ?1",
                 params![id.to_string()],
                 asset_from_row,
@@ -330,7 +668,7 @@ impl Catalog {
         self.connection
             .query_row(
                 "SELECT id, library_id, original_filename, display_name, relative_path, referenced_path,
-                    storage_mode, content_hash, media_type, file_size, availability_state
+                    storage_mode, content_hash, media_type, file_size, availability_state, review_state, favorite
                  FROM assets
                  WHERE library_id = ?1 AND content_hash = ?2 AND file_size = ?3
                  LIMIT 1",
@@ -339,6 +677,15 @@ impl Catalog {
             )
             .optional()
             .map_err(StorageError::from)
+    }
+
+    fn record_undo(&self, kind: &str, payload: &str) -> Result<Uuid, StorageError> {
+        let id = Uuid::new_v4();
+        self.connection.execute(
+            "INSERT INTO undo_actions (id, kind, payload, created_at) VALUES (?1, ?2, ?3, ?4)",
+            params![id.to_string(), kind, payload, Utc::now().to_rfc3339()],
+        )?;
+        Ok(id)
     }
 }
 
@@ -362,6 +709,18 @@ fn asset_from_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<AssetRecord> {
         media_type: row.get(8)?,
         file_size: row.get::<_, i64>(9)? as u64,
         availability_state: availability_from_db(&row.get::<_, String>(10)?),
+        review_state: review_state_from_db(&row.get::<_, String>(11)?),
+        favorite: row.get::<_, i64>(12)? != 0,
+    })
+}
+
+fn tag_from_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<TagRecord> {
+    Ok(TagRecord {
+        id: parse_uuid(row.get::<_, String>(0)?),
+        name: row.get(1)?,
+        normalized_name: row.get(2)?,
+        facet: row.get(3)?,
+        is_system: row.get::<_, i64>(4)? != 0,
     })
 }
 
@@ -401,6 +760,69 @@ fn availability_from_db(value: &str) -> AvailabilityState {
         "missing" => AvailabilityState::Missing,
         _ => AvailabilityState::Unknown,
     }
+}
+
+fn review_state_to_db(state: ReviewState) -> &'static str {
+    match state {
+        ReviewState::Unreviewed => "unreviewed",
+        ReviewState::Reviewed => "reviewed",
+    }
+}
+
+fn review_state_from_db(value: &str) -> ReviewState {
+    match value {
+        "reviewed" => ReviewState::Reviewed,
+        _ => ReviewState::Unreviewed,
+    }
+}
+
+fn tag_origin_to_db(origin: TagOrigin) -> &'static str {
+    match origin {
+        TagOrigin::Filename => "filename",
+        TagOrigin::Metadata => "metadata",
+        TagOrigin::AcousticModel => "acoustic_model",
+        TagOrigin::UserRule => "user_rule",
+        TagOrigin::UserCorrection => "user_correction",
+        TagOrigin::Manual => "manual",
+    }
+}
+
+fn collection_type_to_db(collection_type: CollectionType) -> &'static str {
+    match collection_type {
+        CollectionType::Manual => "manual",
+        CollectionType::Smart => "smart",
+        CollectionType::Project => "project",
+    }
+}
+
+fn normalize_term(value: &str) -> String {
+    value
+        .trim()
+        .to_ascii_lowercase()
+        .replace([' ', '/', '-'], "_")
+}
+
+fn join_uuids(ids: &[Uuid]) -> String {
+    ids.iter()
+        .map(Uuid::to_string)
+        .collect::<Vec<_>>()
+        .join(",")
+}
+
+fn split_owner_and_assets(payload: &str) -> (Uuid, Vec<Uuid>) {
+    let (owner, assets) = payload
+        .split_once('|')
+        .expect("undo payload contains owner and asset ids");
+    let asset_ids = assets
+        .split(',')
+        .filter(|value| !value.is_empty())
+        .map(|value| Uuid::parse_str(value).expect("undo payload contains valid asset uuid"))
+        .collect();
+
+    (
+        Uuid::parse_str(owner).expect("undo payload contains valid owner uuid"),
+        asset_ids,
+    )
 }
 
 fn job_kind_to_db(kind: &JobKind) -> &'static str {
@@ -516,6 +938,113 @@ mod tests {
 
         assert_eq!(job.asset_id, asset.id);
         assert_eq!(job.kind, JobKind::MetadataExtraction);
+    }
+
+    #[test]
+    fn starter_taxonomy_seeds_system_tags_once() {
+        let catalog_path = unique_catalog_path("taxonomy");
+        let catalog = Catalog::open(&catalog_path).expect("open catalog");
+
+        catalog.seed_starter_taxonomy().expect("seed");
+        catalog.seed_starter_taxonomy().expect("seed again");
+        let tags = catalog.list_tags().expect("tags");
+
+        assert!(tags
+            .iter()
+            .any(|tag| tag.name == "Impact" && tag.facet == Some("action".to_string())));
+        assert!(tags
+            .iter()
+            .any(|tag| tag.name == "Music" && tag.facet == Some("media_type".to_string())));
+        assert_eq!(tags.iter().filter(|tag| tag.name == "Impact").count(), 1);
+    }
+
+    #[test]
+    fn bulk_tagging_assets_is_undoable() {
+        let catalog_path = unique_catalog_path("tag-undo");
+        let catalog = Catalog::open(&catalog_path).expect("open catalog");
+        let library = catalog.create_library("Org", "/library").expect("library");
+        let first = test_asset(&catalog, library.id, "one.wav", "hash-one");
+        let second = test_asset(&catalog, library.id, "two.wav", "hash-two");
+        let tag = catalog.create_tag("Impact", "action", true).expect("tag");
+
+        let undo_id = catalog
+            .apply_tag_to_assets(&[first.id, second.id], tag.id, TagOrigin::Manual)
+            .expect("apply tag");
+
+        assert_eq!(
+            catalog.tags_for_asset(first.id).expect("first tags").len(),
+            1
+        );
+        assert_eq!(
+            catalog
+                .tags_for_asset(second.id)
+                .expect("second tags")
+                .len(),
+            1
+        );
+
+        catalog.undo(undo_id).expect("undo");
+
+        assert!(catalog
+            .tags_for_asset(first.id)
+            .expect("first tags")
+            .is_empty());
+        assert!(catalog
+            .tags_for_asset(second.id)
+            .expect("second tags")
+            .is_empty());
+    }
+
+    #[test]
+    fn project_collection_membership_and_favorite_state_are_undoable() {
+        let catalog_path = unique_catalog_path("collection-favorite");
+        let catalog = Catalog::open(&catalog_path).expect("open catalog");
+        let library = catalog.create_library("Org", "/library").expect("library");
+        let asset = test_asset(&catalog, library.id, "hit.wav", "hash-hit");
+        let project = catalog
+            .create_collection(library.id, "Film Trailer", CollectionType::Project)
+            .expect("project");
+
+        let membership_undo = catalog
+            .add_assets_to_collection(project.id, &[asset.id])
+            .expect("membership");
+        catalog
+            .set_asset_flags(asset.id, Some(true), Some(ReviewState::Reviewed))
+            .expect("flags");
+        let updated = catalog.get_asset(asset.id).expect("asset").expect("exists");
+
+        assert!(updated.favorite);
+        assert_eq!(updated.review_state, ReviewState::Reviewed);
+        assert_eq!(
+            catalog
+                .assets_in_collection(project.id)
+                .expect("collection assets")
+                .len(),
+            1
+        );
+
+        catalog.undo(membership_undo).expect("undo membership");
+
+        assert!(catalog
+            .assets_in_collection(project.id)
+            .expect("collection assets")
+            .is_empty());
+    }
+
+    fn test_asset(catalog: &Catalog, library_id: Uuid, filename: &str, hash: &str) -> AssetRecord {
+        catalog
+            .register_asset(NewAssetRecord {
+                library_id,
+                original_filename: filename.to_string(),
+                display_name: filename.trim_end_matches(".wav").to_string(),
+                path: AssetPath::Referenced(format!("/fixtures/{filename}")),
+                storage_mode: StorageMode::Referenced,
+                content_hash: Some(hash.to_string()),
+                media_type: "sound_effect".to_string(),
+                file_size: 10,
+                availability_state: AvailabilityState::Local,
+            })
+            .expect("asset")
     }
 
     fn unique_catalog_path(name: &str) -> PathBuf {
