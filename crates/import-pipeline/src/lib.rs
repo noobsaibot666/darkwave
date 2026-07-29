@@ -215,6 +215,8 @@ pub fn import_file(
         ImportMode::Managed => AssetPath::Managed(format!("Media/00/{original_filename}")),
         ImportMode::Referenced => AssetPath::Referenced(path.to_string_lossy().to_string()),
     };
+    let filename_suggestions = search::suggest_tags_from_filename(&original_filename);
+    let media_type = infer_media_type_from_suggestions(&filename_suggestions);
 
     let asset = catalog.register_asset(NewAssetRecord {
         library_id,
@@ -223,7 +225,7 @@ pub fn import_file(
         path: asset_path,
         storage_mode,
         content_hash: Some(content_hash),
-        media_type: "other".to_string(),
+        media_type,
         file_size: metadata.file_size,
         availability_state: AvailabilityState::Local,
     })?;
@@ -231,7 +233,7 @@ pub fn import_file(
     catalog.enqueue_job(asset.id, JobKind::MetadataExtraction, 10)?;
     catalog.enqueue_job(asset.id, JobKind::Hashing, 20)?;
     catalog.enqueue_job(asset.id, JobKind::WaveformGeneration, 30)?;
-    suggest_filename_tags(catalog, &asset)?;
+    suggest_filename_tags(catalog, &asset, &filename_suggestions)?;
 
     if mode == ImportMode::Managed {
         copy_managed_source(catalog, library_id, path, &asset)?;
@@ -260,8 +262,36 @@ fn lightweight_content_hash(path: &Path) -> Result<String, ImportError> {
     Ok(format!("{digest:x}"))
 }
 
-fn suggest_filename_tags(catalog: &Catalog, asset: &AssetRecord) -> Result<(), ImportError> {
-    for suggestion in search::suggest_tags_from_filename(&asset.original_filename) {
+fn infer_media_type_from_suggestions(suggestions: &[search::TagSuggestion]) -> String {
+    if let Some(suggestion) = suggestions
+        .iter()
+        .find(|suggestion| suggestion.facet == "media_type")
+    {
+        return normalize_media_type(&suggestion.name);
+    }
+
+    if suggestions
+        .iter()
+        .any(|suggestion| matches!(suggestion.facet.as_str(), "action" | "source"))
+    {
+        return "sound_effect".to_string();
+    }
+
+    "other".to_string()
+}
+
+fn normalize_media_type(name: &str) -> String {
+    name.to_ascii_lowercase()
+        .replace(" / ", "_")
+        .replace([' ', '-'], "_")
+}
+
+fn suggest_filename_tags(
+    catalog: &Catalog,
+    asset: &AssetRecord,
+    suggestions: &[search::TagSuggestion],
+) -> Result<(), ImportError> {
+    for suggestion in suggestions {
         let tag = catalog.create_tag(&suggestion.name, &suggestion.facet, true)?;
         catalog.suggest_tag_for_asset(
             asset.id,
@@ -524,6 +554,23 @@ mod tests {
 
         assert!(suggested_tags.iter().any(|tag| tag.name == "Impact"));
         assert!(suggested_tags.iter().any(|tag| tag.name == "Metal"));
+    }
+
+    #[test]
+    fn import_derives_media_type_from_filename_suggestions() {
+        let catalog_path = unique_catalog_path("media-type-import");
+        let audio_path = unique_audio_path("dark-metal-impact.wav");
+        fs::write(&audio_path, b"classified audio").expect("fixture");
+
+        let catalog = Catalog::open(&catalog_path).expect("catalog");
+        let library = catalog
+            .create_library("Media Type", "/library")
+            .expect("library");
+
+        let imported =
+            import_file(&catalog, library.id, &audio_path, ImportMode::Referenced).expect("import");
+
+        assert_eq!(imported.media_type, "sound_effect");
     }
 
     fn unique_catalog_path(name: &str) -> PathBuf {

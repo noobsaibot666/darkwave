@@ -11,6 +11,7 @@ When a supported audio file is imported, Darkwave:
 - Registers the asset in the local catalog.
 - Records whether the asset is managed or referenced.
 - Copies managed imports into the library media root under `Media/00`.
+- Sets an initial media type when filename signals clearly imply music, ambience, or sound effects.
 - Tracks the asset as locally available.
 - Avoids creating a second asset row when the same content hash and file size already exist in the same library.
 - Adds pending filename-based tag suggestions for review.
