@@ -37,6 +37,18 @@ fn default_preferences() -> preferences::AppPreferences {
     preferences::AppPreferences::default_for_editorial_audio()
 }
 
+#[tauri::command]
+fn supported_drag_targets() -> Vec<&'static str> {
+    vec![
+        "tag",
+        "collection",
+        "project",
+        "favorite",
+        "trash",
+        "external_export",
+    ]
+}
+
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
     tauri::Builder::default()
@@ -46,7 +58,8 @@ pub fn run() {
         .invoke_handler(tauri::generate_handler![
             healthcheck,
             release_blockers,
-            default_preferences
+            default_preferences,
+            supported_drag_targets
         ])
         .run(tauri::generate_context!())
         .expect("failed to run Darkwave desktop shell");
@@ -76,6 +89,21 @@ mod tests {
                 .shortcuts
                 .binding_for(preferences::CommandId::TogglePlayback),
             Some("Space")
+        );
+    }
+
+    #[test]
+    fn supported_drag_targets_include_classification_and_export() {
+        assert_eq!(
+            super::supported_drag_targets(),
+            vec![
+                "tag",
+                "collection",
+                "project",
+                "favorite",
+                "trash",
+                "external_export"
+            ]
         );
     }
 }

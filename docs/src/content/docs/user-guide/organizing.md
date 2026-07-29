@@ -12,5 +12,7 @@ Current behavior supports:
 - Project collections.
 - Favorite and reviewed states.
 - Undo for bulk tag and collection membership changes.
+- Browser interaction state for replace selection, range selection, additive selection, and select-all-visible.
+- Drag payload targets for tags, collections, projects, favorites, trash, and external export.
 
-The desktop drag-and-drop interface and shortcut wiring are planned UI work on top of these catalog operations.
+Catalog mutations and desktop event wiring remain separate from the interaction-state reducer.

@@ -51,6 +51,8 @@ const shortcutItems = [
   { command: "Import", binding: "Mod I" }
 ];
 
+const dragTargets = ["Tag", "Collection", "Project", "Favorite", "Trash", "External Export"];
+
 export function App() {
   return (
     <main className="shell">
@@ -94,6 +96,12 @@ export function App() {
           </button>
         </section>
         <section className="browser" aria-label="Sound browser">
+          <div className="selection-bar" aria-label="Selection actions">
+            <strong>1 selected</strong>
+            <span>Shift range</span>
+            <span>Mod additive</span>
+            <span>Drag to classify or export</span>
+          </div>
           <div className="browser-header">
             <span>Name</span>
             <span>Type</span>
@@ -135,6 +143,14 @@ export function App() {
           <div className="tag-grid">
             {["Impact", "Metal", "Cinematic", "Dark", "High Energy"].map((tag) => (
               <button key={tag}>{tag}</button>
+            ))}
+          </div>
+        </section>
+        <section>
+          <h2>Drop Targets</h2>
+          <div className="drop-target-grid">
+            {dragTargets.map((target) => (
+              <button key={target}>{target}</button>
             ))}
           </div>
         </section>

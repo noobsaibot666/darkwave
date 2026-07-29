@@ -15,7 +15,8 @@ members = [
   "crates/search",
   "crates/shared-types",
   "crates/storage",
-  "crates/waveform"
+  "crates/waveform",
+  "crates/workspace-state"
 ]
 
 [workspace.package]

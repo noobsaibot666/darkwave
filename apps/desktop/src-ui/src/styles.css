@@ -168,6 +168,32 @@ input:focus-visible {
   overflow: auto;
 }
 
+.selection-bar {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 8px;
+  align-items: center;
+  min-height: 34px;
+  margin-bottom: 8px;
+  color: #aeb6c2;
+  font-size: 12px;
+}
+
+.selection-bar strong,
+.selection-bar span {
+  display: inline-flex;
+  align-items: center;
+  min-height: 26px;
+  padding: 0 8px;
+  border: 1px solid rgba(255, 255, 255, 0.1);
+  border-radius: 6px;
+  background: #181a1f;
+}
+
+.selection-bar strong {
+  color: #f2f4f8;
+}
+
 .browser-header,
 .asset-row {
   display: grid;
@@ -258,13 +284,25 @@ h2 {
   gap: 8px;
 }
 
-.tag-grid button {
+.tag-grid button,
+.drop-target-grid button {
   min-height: 30px;
   padding: 0 10px;
   border: 1px solid rgba(82, 199, 184, 0.28);
   border-radius: 6px;
   background: rgba(82, 199, 184, 0.1);
   color: #d9fffa;
+}
+
+.drop-target-grid {
+  display: grid;
+  grid-template-columns: repeat(2, minmax(0, 1fr));
+  gap: 8px;
+}
+
+.drop-target-grid button {
+  border-style: dashed;
+  background: rgba(82, 199, 184, 0.07);
 }
 
 .toggle-list {
