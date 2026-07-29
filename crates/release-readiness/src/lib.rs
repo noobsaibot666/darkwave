@@ -99,6 +99,28 @@ pub fn update_system_gate(config: Option<&UpdateChannelConfig>) -> GateState {
         .unwrap_or(GateState::Planned)
 }
 
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct SigningNotarizationConfig {
+    pub macos_developer_id: String,
+    pub macos_team_id: String,
+    pub windows_certificate_thumbprint: String,
+}
+
+impl SigningNotarizationConfig {
+    pub fn has_complete_metadata(&self) -> bool {
+        !self.macos_developer_id.trim().is_empty()
+            && !self.macos_team_id.trim().is_empty()
+            && !self.windows_certificate_thumbprint.trim().is_empty()
+    }
+}
+
+pub fn signing_notarization_gate(config: Option<&SigningNotarizationConfig>) -> GateState {
+    config
+        .filter(|config| config.has_complete_metadata())
+        .map(|_| GateState::Passed)
+        .unwrap_or(GateState::Planned)
+}
+
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum ReleaseBlocker {
     MacosAudit,
@@ -257,5 +279,32 @@ mod tests {
             public_key_id: " ".to_string(),
         };
         assert_eq!(update_system_gate(Some(&missing_key)), GateState::Planned);
+    }
+
+    #[test]
+    fn signing_notarization_passes_with_platform_identity_metadata() {
+        let config = SigningNotarizationConfig {
+            macos_developer_id: "Developer ID Application: Darkwave Audio GmbH".to_string(),
+            macos_team_id: "ABCD123456".to_string(),
+            windows_certificate_thumbprint: "00112233445566778899AABBCCDDEEFF00112233".to_string(),
+        };
+
+        assert_eq!(signing_notarization_gate(Some(&config)), GateState::Passed);
+    }
+
+    #[test]
+    fn signing_notarization_remains_planned_without_complete_identity_metadata() {
+        assert_eq!(signing_notarization_gate(None), GateState::Planned);
+
+        let missing_windows_certificate = SigningNotarizationConfig {
+            macos_developer_id: "Developer ID Application: Darkwave Audio GmbH".to_string(),
+            macos_team_id: "ABCD123456".to_string(),
+            windows_certificate_thumbprint: " ".to_string(),
+        };
+
+        assert_eq!(
+            signing_notarization_gate(Some(&missing_windows_certificate)),
+            GateState::Planned
+        );
     }
 }

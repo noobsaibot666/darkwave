@@ -10,7 +10,7 @@ Milestone 7 includes platform polish, accessibility, crash recovery, onboarding,
 
 ## Decision
 
-Darkwave tracks release readiness as an explicit gate model in `release-readiness`. Code-owned gates include accessibility preferences, recovery prompts, performance profiling status, onboarding/documentation coverage, and validation for configured update channel metadata. Distribution-owned gates still include actual update channel provisioning and signing/notarization until certificates and platform release credentials are configured.
+Darkwave tracks release readiness as an explicit gate model in `release-readiness`. Code-owned gates include accessibility preferences, recovery prompts, performance profiling status, onboarding/documentation coverage, validation for configured update channel metadata, and validation for signing identity metadata. Distribution-owned gates still include actual update channel provisioning and signing/notarization until certificates and platform release credentials are configured.
 
 ## Consequences
 
