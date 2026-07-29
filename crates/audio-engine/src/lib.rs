@@ -1,3 +1,4 @@
+use preferences::OutputDevicePreference;
 use shared_types::AvailabilityState;
 use uuid::Uuid;
 
@@ -58,6 +59,19 @@ pub enum PlaybackSource {
     Unavailable { asset_id: Uuid },
 }
 
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct AudioOutputRouteRequest {
+    pub preference: OutputDevicePreference,
+    pub available_device_ids: Vec<String>,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub enum AudioOutputRoute {
+    SystemDefault,
+    Device { device_id: String },
+    FallbackToSystemDefault { missing_device_id: String },
+}
+
 pub fn choose_playback_source(request: PlaybackSourceRequest) -> PlaybackSource {
     match request.availability_state {
         AvailabilityState::Local => PlaybackSource::Original {
@@ -74,6 +88,25 @@ pub fn choose_playback_source(request: PlaybackSourceRequest) -> PlaybackSource 
                 .unwrap_or(PlaybackSource::Unavailable {
                     asset_id: request.asset_id,
                 })
+        }
+    }
+}
+
+pub fn choose_audio_output_route(request: AudioOutputRouteRequest) -> AudioOutputRoute {
+    match request.preference {
+        OutputDevicePreference::SystemDefault => AudioOutputRoute::SystemDefault,
+        OutputDevicePreference::DeviceId(device_id) => {
+            if request
+                .available_device_ids
+                .iter()
+                .any(|available| available == &device_id)
+            {
+                AudioOutputRoute::Device { device_id }
+            } else {
+                AudioOutputRoute::FallbackToSystemDefault {
+                    missing_device_id: device_id,
+                }
+            }
         }
     }
 }
@@ -137,6 +170,7 @@ impl PlaybackSession {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use preferences::OutputDevicePreference;
     use shared_types::AvailabilityState;
     use uuid::Uuid;
 
@@ -253,5 +287,45 @@ mod tests {
         });
 
         assert_eq!(source, PlaybackSource::Unavailable { asset_id });
+    }
+
+    #[test]
+    fn audio_output_route_uses_system_default_preference() {
+        let route = choose_audio_output_route(AudioOutputRouteRequest {
+            preference: OutputDevicePreference::SystemDefault,
+            available_device_ids: vec!["interface-a".to_string()],
+        });
+
+        assert_eq!(route, AudioOutputRoute::SystemDefault);
+    }
+
+    #[test]
+    fn audio_output_route_uses_available_saved_device() {
+        let route = choose_audio_output_route(AudioOutputRouteRequest {
+            preference: OutputDevicePreference::DeviceId("interface-a".to_string()),
+            available_device_ids: vec!["interface-a".to_string(), "speakers".to_string()],
+        });
+
+        assert_eq!(
+            route,
+            AudioOutputRoute::Device {
+                device_id: "interface-a".to_string()
+            }
+        );
+    }
+
+    #[test]
+    fn audio_output_route_falls_back_when_saved_device_is_missing() {
+        let route = choose_audio_output_route(AudioOutputRouteRequest {
+            preference: OutputDevicePreference::DeviceId("disconnected-interface".to_string()),
+            available_device_ids: vec!["speakers".to_string()],
+        });
+
+        assert_eq!(
+            route,
+            AudioOutputRoute::FallbackToSystemDefault {
+                missing_device_id: "disconnected-interface".to_string()
+            }
+        );
     }
 }

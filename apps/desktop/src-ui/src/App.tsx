@@ -205,8 +205,8 @@ export function App() {
             </div>
             <div className="setting-row">
               <Volume2 size={15} />
-              <span>Output device</span>
-              <strong>System</strong>
+              <span>Output route</span>
+              <strong>System fallback</strong>
             </div>
             <div className="setting-row">
               <Gauge size={15} />
