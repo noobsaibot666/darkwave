@@ -48,6 +48,25 @@ pub struct ReconnectValidationJob {
     pub paths_to_validate: Vec<String>,
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum ReconnectValidationStatus {
+    Pending,
+    Completed,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct QueuedReconnectValidation {
+    pub queue_id: u64,
+    pub job: ReconnectValidationJob,
+    pub status: ReconnectValidationStatus,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct ReconnectValidationScheduler {
+    next_queue_id: u64,
+    pub entries: Vec<QueuedReconnectValidation>,
+}
+
 impl PortableManifest {
     pub fn new(library_id: Uuid, revision: u64) -> Self {
         Self {
@@ -131,6 +150,80 @@ pub fn lease_state_at(
             WriterLeaseState::ReadOnlyBecauseAnotherWriterExists
         }
         _ => WriterLeaseState::Writable,
+    }
+}
+
+impl ReconnectValidationScheduler {
+    pub fn new() -> Self {
+        Self {
+            next_queue_id: 1,
+            entries: Vec::new(),
+        }
+    }
+
+    pub fn enqueue_from_probe(
+        &mut self,
+        manifest: &PortableManifest,
+        probe: &MediaRootProbe,
+    ) -> Option<QueuedReconnectValidation> {
+        let job = plan_reconnect_validation(manifest, probe)?;
+
+        if self.entries.iter().any(|entry| {
+            entry.status == ReconnectValidationStatus::Pending
+                && entry.job.library_id == job.library_id
+                && entry.job.manifest_revision == job.manifest_revision
+        }) {
+            return None;
+        }
+
+        let queued = QueuedReconnectValidation {
+            queue_id: self.next_queue_id,
+            job,
+            status: ReconnectValidationStatus::Pending,
+        };
+        self.next_queue_id += 1;
+        self.entries.push(queued.clone());
+
+        Some(queued)
+    }
+
+    pub fn next_pending(&self) -> Option<&QueuedReconnectValidation> {
+        self.entries
+            .iter()
+            .find(|entry| entry.status == ReconnectValidationStatus::Pending)
+    }
+
+    pub fn mark_completed(&mut self, queue_id: u64) -> bool {
+        if let Some(entry) = self
+            .entries
+            .iter_mut()
+            .find(|entry| entry.queue_id == queue_id)
+        {
+            entry.status = ReconnectValidationStatus::Completed;
+            return true;
+        }
+
+        false
+    }
+
+    pub fn pending_count(&self) -> usize {
+        self.entries
+            .iter()
+            .filter(|entry| entry.status == ReconnectValidationStatus::Pending)
+            .count()
+    }
+
+    pub fn completed_count(&self) -> usize {
+        self.entries
+            .iter()
+            .filter(|entry| entry.status == ReconnectValidationStatus::Completed)
+            .count()
+    }
+}
+
+impl Default for ReconnectValidationScheduler {
+    fn default() -> Self {
+        Self::new()
     }
 }
 
@@ -244,5 +337,56 @@ mod tests {
         };
 
         assert_eq!(plan_reconnect_validation(&manifest, &probe), None);
+    }
+
+    #[test]
+    fn reconnect_validation_scheduler_enqueues_online_probe_once() {
+        let library_id = Uuid::new_v4();
+        let manifest = PortableManifest::new(library_id, 4).with_asset(ManifestAsset {
+            id: Uuid::new_v4(),
+            relative_path: "Media/00/impact.wav".to_string(),
+            content_hash: "hash-impact".to_string(),
+        });
+        let probe = MediaRootProbe {
+            media_root: "/Volumes/TrueNAS/SFX".to_string(),
+            status: MediaRootStatus::Online,
+            reconnect_validation_required: true,
+        };
+        let mut scheduler = ReconnectValidationScheduler::new();
+
+        let first = scheduler.enqueue_from_probe(&manifest, &probe);
+        let duplicate = scheduler.enqueue_from_probe(&manifest, &probe);
+
+        assert!(first.is_some());
+        assert_eq!(duplicate, None);
+        assert_eq!(scheduler.pending_count(), 1);
+        assert_eq!(
+            scheduler.next_pending().map(|entry| entry.job.library_id),
+            Some(library_id)
+        );
+    }
+
+    #[test]
+    fn reconnect_validation_scheduler_marks_pending_job_completed() {
+        let manifest = PortableManifest::new(Uuid::new_v4(), 2).with_asset(ManifestAsset {
+            id: Uuid::new_v4(),
+            relative_path: "Media/00/riser.wav".to_string(),
+            content_hash: "hash-riser".to_string(),
+        });
+        let probe = MediaRootProbe {
+            media_root: "/Volumes/TrueNAS/SFX".to_string(),
+            status: MediaRootStatus::Online,
+            reconnect_validation_required: true,
+        };
+        let mut scheduler = ReconnectValidationScheduler::new();
+        let queued = scheduler
+            .enqueue_from_probe(&manifest, &probe)
+            .expect("queued validation");
+
+        assert!(scheduler.mark_completed(queued.queue_id));
+
+        assert_eq!(scheduler.next_pending(), None);
+        assert_eq!(scheduler.pending_count(), 0);
+        assert_eq!(scheduler.completed_count(), 1);
     }
 }
