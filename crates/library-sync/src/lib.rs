@@ -67,6 +67,23 @@ pub struct ReconnectValidationScheduler {
     pub entries: Vec<QueuedReconnectValidation>,
 }
 
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct OfflineControlState {
+    pub media_root: String,
+    pub catalog_only: bool,
+    pub validation_paused: bool,
+    pub reconnect_requested: bool,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub enum OfflineControlCommand {
+    UseCatalogOnly,
+    RetryReconnect,
+    PauseValidation,
+    ResumeValidation,
+    RelinkMediaRoot { media_root: String },
+}
+
 impl PortableManifest {
     pub fn new(library_id: Uuid, revision: u64) -> Self {
         Self {
@@ -224,6 +241,41 @@ impl ReconnectValidationScheduler {
 impl Default for ReconnectValidationScheduler {
     fn default() -> Self {
         Self::new()
+    }
+}
+
+impl OfflineControlState {
+    pub fn new(media_root: impl Into<String>) -> Self {
+        Self {
+            media_root: media_root.into(),
+            catalog_only: false,
+            validation_paused: false,
+            reconnect_requested: false,
+        }
+    }
+
+    pub fn apply(&mut self, command: OfflineControlCommand) {
+        match command {
+            OfflineControlCommand::UseCatalogOnly => {
+                self.catalog_only = true;
+                self.reconnect_requested = false;
+            }
+            OfflineControlCommand::RetryReconnect => {
+                self.catalog_only = false;
+                self.reconnect_requested = true;
+            }
+            OfflineControlCommand::PauseValidation => {
+                self.validation_paused = true;
+            }
+            OfflineControlCommand::ResumeValidation => {
+                self.validation_paused = false;
+            }
+            OfflineControlCommand::RelinkMediaRoot { media_root } => {
+                self.media_root = media_root;
+                self.catalog_only = false;
+                self.reconnect_requested = true;
+            }
+        }
     }
 }
 
@@ -388,5 +440,35 @@ mod tests {
         assert_eq!(scheduler.next_pending(), None);
         assert_eq!(scheduler.pending_count(), 0);
         assert_eq!(scheduler.completed_count(), 1);
+    }
+
+    #[test]
+    fn offline_controls_switch_to_catalog_only_and_retry_reconnect() {
+        let mut controls = OfflineControlState::new("/Volumes/TrueNAS/SFX");
+
+        controls.apply(OfflineControlCommand::UseCatalogOnly);
+        assert!(controls.catalog_only);
+        assert!(!controls.reconnect_requested);
+
+        controls.apply(OfflineControlCommand::RetryReconnect);
+        assert!(!controls.catalog_only);
+        assert!(controls.reconnect_requested);
+    }
+
+    #[test]
+    fn offline_controls_pause_resume_and_relink_media_root() {
+        let mut controls = OfflineControlState::new("/Volumes/TrueNAS/SFX");
+
+        controls.apply(OfflineControlCommand::PauseValidation);
+        controls.apply(OfflineControlCommand::RelinkMediaRoot {
+            media_root: "/Volumes/Sound/SFX".to_string(),
+        });
+
+        assert!(controls.validation_paused);
+        assert_eq!(controls.media_root, "/Volumes/Sound/SFX");
+        assert!(controls.reconnect_requested);
+
+        controls.apply(OfflineControlCommand::ResumeValidation);
+        assert!(!controls.validation_paused);
     }
 }

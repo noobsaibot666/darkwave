@@ -17,5 +17,6 @@ Current behavior:
 - Playback source selection can fall back to cached preview files when originals are missing.
 - Reconnect validation jobs are planned from portable manifests when a media root comes back online.
 - Reconnect validation scheduling queues one pending job per library revision and marks jobs completed after validation.
+- Offline controls support catalog-only mode, reconnect retry, validation pause/resume, and media-root relinking.
 
-Future work will add fuller user-facing offline controls and decoder integration for cached preview playback.
+Future work will add decoder integration for cached preview playback.
