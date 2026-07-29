@@ -1,0 +1,26 @@
+{
+  "name": "darkwave",
+  "private": true,
+  "version": "0.1.0",
+  "description": "Local-first desktop audio asset library workspace.",
+  "workspaces": [
+    "apps/desktop",
+    "docs",
+    "packages/design-tokens"
+  ],
+  "scripts": {
+    "build": "npm run build --workspaces",
+    "check": "npm run check --workspaces && cargo test --workspace",
+    "dev": "npm run dev -w @darkwave/desktop",
+    "docs:dev": "npm run dev -w @darkwave/docs",
+    "tauri": "npm run tauri -w @darkwave/desktop"
+  },
+  "devDependencies": {
+    "@types/node": "^22.10.2",
+    "typescript": "^5.7.2"
+  },
+  "engines": {
+    "node": ">=20.11",
+    "npm": ">=10"
+  }
+}

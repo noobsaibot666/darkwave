@@ -1,0 +1,12 @@
+.DS_Store
+node_modules/
+dist/
+build/
+.astro/
+.vite/
+target/
+*.log
+*.sqlite
+*.sqlite3
+*.db
+apps/desktop/src-tauri/gen/
