@@ -1,4 +1,7 @@
-use audio_metadata::{extract_immediate_metadata, supported_mvp_format, MetadataError};
+use audio_metadata::{
+    extract_embedded_metadata, extract_immediate_metadata, supported_mvp_format,
+    EmbeddedFileMetadata, MetadataError,
+};
 use sha2::{Digest, Sha256};
 use shared_types::{AvailabilityState, StorageMode};
 use std::collections::BTreeMap;
@@ -215,8 +218,9 @@ pub fn import_file(
         ImportMode::Managed => AssetPath::Managed(format!("Media/00/{original_filename}")),
         ImportMode::Referenced => AssetPath::Referenced(path.to_string_lossy().to_string()),
     };
-    let filename_suggestions = search::suggest_tags_from_filename(&original_filename);
-    let media_type = infer_media_type_from_suggestions(&filename_suggestions);
+    let mut tag_suggestions = search::suggest_tags_from_filename(&original_filename);
+    tag_suggestions.extend(metadata_tag_suggestions(path));
+    let media_type = infer_media_type_from_suggestions(&tag_suggestions);
 
     let asset = catalog.register_asset(NewAssetRecord {
         library_id,
@@ -233,7 +237,7 @@ pub fn import_file(
     catalog.enqueue_job(asset.id, JobKind::MetadataExtraction, 10)?;
     catalog.enqueue_job(asset.id, JobKind::Hashing, 20)?;
     catalog.enqueue_job(asset.id, JobKind::WaveformGeneration, 30)?;
-    suggest_filename_tags(catalog, &asset, &filename_suggestions)?;
+    suggest_import_tags(catalog, &asset, &tag_suggestions)?;
 
     if mode == ImportMode::Managed {
         copy_managed_source(catalog, library_id, path, &asset)?;
@@ -286,19 +290,28 @@ fn normalize_media_type(name: &str) -> String {
         .replace([' ', '-'], "_")
 }
 
-fn suggest_filename_tags(
+fn metadata_tag_suggestions(path: &Path) -> Vec<search::TagSuggestion> {
+    let metadata =
+        extract_embedded_metadata(path).unwrap_or_else(|_| EmbeddedFileMetadata::default());
+    search::suggest_tags_from_embedded_metadata(&search::EmbeddedAudioMetadata {
+        title: metadata.title,
+        genre: metadata.genre,
+        comment: metadata.comment,
+    })
+}
+
+fn suggest_import_tags(
     catalog: &Catalog,
     asset: &AssetRecord,
     suggestions: &[search::TagSuggestion],
 ) -> Result<(), ImportError> {
     for suggestion in suggestions {
         let tag = catalog.create_tag(&suggestion.name, &suggestion.facet, true)?;
-        catalog.suggest_tag_for_asset(
-            asset.id,
-            tag.id,
-            TagOrigin::Filename,
-            suggestion.confidence,
-        )?;
+        let origin = match suggestion.origin {
+            search::SuggestionOrigin::Filename => TagOrigin::Filename,
+            search::SuggestionOrigin::Metadata => TagOrigin::Metadata,
+        };
+        catalog.suggest_tag_for_asset(asset.id, tag.id, origin, suggestion.confidence)?;
     }
 
     Ok(())
@@ -573,6 +586,28 @@ mod tests {
         assert_eq!(imported.media_type, "sound_effect");
     }
 
+    #[test]
+    fn import_uses_embedded_metadata_for_suggestions_and_media_type() {
+        let catalog_path = unique_catalog_path("embedded-smart-import");
+        let audio_path = unique_audio_path("unknown.wav");
+        fs::write(&audio_path, wav_info_fixture()).expect("fixture");
+
+        let catalog = Catalog::open(&catalog_path).expect("catalog");
+        let library = catalog
+            .create_library("Embedded Smart Import", "/library")
+            .expect("library");
+
+        let imported =
+            import_file(&catalog, library.id, &audio_path, ImportMode::Referenced).expect("import");
+        let suggested_tags = catalog
+            .pending_suggested_tags(imported.id)
+            .expect("suggestions");
+
+        assert_eq!(imported.media_type, "sound_effect");
+        assert!(suggested_tags.iter().any(|tag| tag.name == "Impact"));
+        assert!(suggested_tags.iter().any(|tag| tag.name == "Sound Effect"));
+    }
+
     fn unique_catalog_path(name: &str) -> PathBuf {
         let mut path = std::env::temp_dir();
         path.push(format!("darkwave-{name}-{}.sqlite", Uuid::new_v4()));
@@ -600,5 +635,30 @@ mod tests {
         path.push(format!("darkwave-media-{}", Uuid::new_v4()));
         fs::create_dir_all(&path).expect("media root");
         path
+    }
+
+    fn wav_info_fixture() -> Vec<u8> {
+        let mut list_payload = Vec::new();
+        list_payload.extend_from_slice(b"INFO");
+        append_info_chunk(&mut list_payload, b"INAM", b"Dark Metallic Impact");
+        append_info_chunk(&mut list_payload, b"IGNR", b"Sound Effects");
+
+        let mut wav = Vec::new();
+        wav.extend_from_slice(b"RIFF");
+        wav.extend_from_slice(&((4 + 8 + list_payload.len()) as u32).to_le_bytes());
+        wav.extend_from_slice(b"WAVE");
+        wav.extend_from_slice(b"LIST");
+        wav.extend_from_slice(&(list_payload.len() as u32).to_le_bytes());
+        wav.extend_from_slice(&list_payload);
+        wav
+    }
+
+    fn append_info_chunk(payload: &mut Vec<u8>, id: &[u8; 4], value: &[u8]) {
+        payload.extend_from_slice(id);
+        payload.extend_from_slice(&(value.len() as u32).to_le_bytes());
+        payload.extend_from_slice(value);
+        if value.len() % 2 == 1 {
+            payload.push(0);
+        }
     }
 }

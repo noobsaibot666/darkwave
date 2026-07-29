@@ -15,8 +15,8 @@ The import core is intentionally small and restart-safe.
 - Read WAV LIST/INFO embedded fields for title, genre, and comments when present.
 - Compute a temporary lightweight content key.
 - Register an asset through `storage`.
-- Derive an initial media type from filename smart-import signals.
-- Persist pending filename-origin tag suggestions for review.
+- Derive an initial media type from filename and embedded metadata smart-import signals.
+- Persist pending filename-origin and metadata-origin tag suggestions for review.
 - Copy managed imports into the library media root after catalog registration.
 - Enqueue follow-up jobs.
 
