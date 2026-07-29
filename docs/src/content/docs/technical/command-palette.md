@@ -17,3 +17,5 @@ The `command-palette` crate defines the default audio workspace actions:
 - Run maintenance.
 
 Commands have stable ids, titles, categories, and keywords. Search ranks title matches first, then keyword matches, then category matches.
+
+The maintenance command opens the catalog health workflow backed by the `maintenance` report model.

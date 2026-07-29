@@ -17,6 +17,7 @@ tauri-build = { version = "2", features = [] }
 [dependencies]
 command-palette = { path = "../../../crates/command-palette" }
 library-core = { path = "../../../crates/library-core" }
+maintenance = { path = "../../../crates/maintenance" }
 preferences = { path = "../../../crates/preferences" }
 release-readiness = { path = "../../../crates/release-readiness" }
 viewport = { path = "../../../crates/viewport" }

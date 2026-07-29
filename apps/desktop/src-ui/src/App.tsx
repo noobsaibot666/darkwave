@@ -5,6 +5,7 @@ import {
   Gauge,
   Import,
   ListFilter,
+  MonitorCheck,
   Pause,
   Play,
   RotateCcw,
@@ -54,6 +55,13 @@ const shortcutItems = [
 const dragTargets = ["Tag", "Collection", "Project", "Favorite", "Trash", "External Export"];
 
 const paletteCommands = ["Import Folder", "Focus Search", "Apply Tag", "Export Selected", "Open Settings"];
+
+const maintenanceItems = [
+  { label: "Missing media", value: "0" },
+  { label: "License review", value: "0" },
+  { label: "Waveform cache", value: "0" },
+  { label: "Duplicates", value: "Review" }
+];
 
 export function App() {
   return (
@@ -246,6 +254,18 @@ export function App() {
           <div className="status-line">
             <Bell size={15} />
             Update channel planned
+          </div>
+        </section>
+        <section>
+          <h2>Maintenance</h2>
+          <div className="maintenance-list">
+            {maintenanceItems.map((item) => (
+              <div className="maintenance-row" key={item.label}>
+                <MonitorCheck size={15} />
+                <span>{item.label}</span>
+                <strong>{item.value}</strong>
+              </div>
+            ))}
           </div>
         </section>
       </aside>

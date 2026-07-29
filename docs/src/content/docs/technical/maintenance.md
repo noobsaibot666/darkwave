@@ -1,0 +1,15 @@
+---
+title: Maintenance
+description: Catalog health report model.
+---
+
+The `maintenance` crate defines non-destructive health findings:
+
+- Missing media.
+- License review required.
+- Stale waveform cache.
+- Duplicate content.
+
+Reports include total findings, counts by kind, severity, detailed findings, and recommended actions.
+
+Duplicate content recommends review, not deletion. File removal must still go through explicit user action and application Trash.

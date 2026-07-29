@@ -72,6 +72,17 @@ fn default_command_titles() -> Vec<String> {
         .collect()
 }
 
+#[tauri::command]
+fn sample_maintenance_summary() -> (usize, &'static str) {
+    let report = maintenance::MaintenanceReport::from_findings(Vec::new());
+    let severity = match report.severity {
+        maintenance::MaintenanceSeverity::Ok => "ok",
+        maintenance::MaintenanceSeverity::Warning => "warning",
+    };
+
+    (report.total_findings, severity)
+}
+
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
     tauri::Builder::default()
@@ -84,7 +95,8 @@ pub fn run() {
             default_preferences,
             supported_drag_targets,
             default_virtualized_range,
-            default_command_titles
+            default_command_titles,
+            sample_maintenance_summary
         ])
         .run(tauri::generate_context!())
         .expect("failed to run Darkwave desktop shell");
@@ -143,5 +155,10 @@ mod tests {
             &super::default_command_titles()[0..2],
             ["Import Folder".to_string(), "Focus Search".to_string()]
         );
+    }
+
+    #[test]
+    fn sample_maintenance_summary_reports_clean_state() {
+        assert_eq!(super::sample_maintenance_summary(), (0, "ok"));
     }
 }

@@ -9,4 +9,6 @@ If files show as missing, check whether the media root or NAS share is mounted. 
 
 If playback is slow from a NAS path, use the preview cache and verify the share is reachable before starting a full import.
 
+Run maintenance to review missing media, source/license gaps, stale waveform caches, and duplicate content. Maintenance reports issues but does not automatically delete files.
+
 If an installed build cannot launch on macOS or Windows, verify the signing/notarization status for that build and install the latest release candidate.

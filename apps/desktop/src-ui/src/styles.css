@@ -355,13 +355,15 @@ h2 {
 }
 
 .settings-stack,
-.shortcut-list {
+.shortcut-list,
+.maintenance-list {
   display: grid;
   gap: 7px;
 }
 
 .setting-row,
-.shortcut-row {
+.shortcut-row,
+.maintenance-row {
   display: grid;
   align-items: center;
   min-height: 30px;
@@ -382,6 +384,16 @@ h2 {
 .shortcut-row {
   grid-template-columns: minmax(0, 1fr) auto;
   gap: 8px;
+}
+
+.maintenance-row {
+  grid-template-columns: 16px minmax(0, 1fr) auto;
+  gap: 8px;
+}
+
+.maintenance-row strong {
+  color: #f2f4f8;
+  font-size: 12px;
 }
 
 kbd {

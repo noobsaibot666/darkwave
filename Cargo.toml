@@ -11,6 +11,7 @@ members = [
   "crates/import-pipeline",
   "crates/library-core",
   "crates/release-readiness",
+  "crates/maintenance",
   "crates/preferences",
   "crates/library-sync",
   "crates/search",
