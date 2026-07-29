@@ -183,6 +183,7 @@ export function App() {
             <dt>Storage</dt>
             <dd>Referenced NAS path</dd>
           </dl>
+          <div className="warning-line">Export allowed with license warning</div>
         </section>
         <section>
           <h2>Settings</h2>

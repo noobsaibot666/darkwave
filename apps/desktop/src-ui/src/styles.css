@@ -434,6 +434,20 @@ kbd {
   font-size: 13px;
 }
 
+.warning-line {
+  display: inline-flex;
+  align-items: center;
+  min-height: 28px;
+  margin-top: 10px;
+  padding: 0 8px;
+  border: 1px solid rgba(240, 179, 90, 0.28);
+  border-radius: 6px;
+  background: rgba(240, 179, 90, 0.1);
+  color: #ffd69b;
+  font-size: 12px;
+  font-weight: 700;
+}
+
 .release-grid {
   display: grid;
   gap: 6px;

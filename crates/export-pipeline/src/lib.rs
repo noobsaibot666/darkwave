@@ -42,6 +42,36 @@ pub struct ExportPlan {
     pub include_license_record: bool,
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum LicenseStatus {
+    Active,
+    Missing,
+    Uncertain,
+    Expired,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct LicenseContext {
+    pub provider: Option<String>,
+    pub source_url: Option<String>,
+    pub license_status: LicenseStatus,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum ExportLicenseWarning {
+    MissingSource,
+    MissingSourceUrl,
+    MissingLicense,
+    UncertainLicense,
+    ExpiredLicense,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub enum ExportLicenseAssessment {
+    Clear,
+    Warn(Vec<ExportLicenseWarning>),
+}
+
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub enum ExportPlanError {
     InvalidRange,
@@ -93,6 +123,50 @@ pub fn plan_editorial_export(request: ExportRequest) -> Result<ExportPlan, Expor
         preserve_original: request.intent.preserve_original,
         include_license_record: request.intent.include_license_record,
     })
+}
+
+pub fn assess_export_license(context: &LicenseContext) -> ExportLicenseAssessment {
+    let mut warnings = Vec::new();
+
+    if context
+        .provider
+        .as_deref()
+        .unwrap_or_default()
+        .trim()
+        .is_empty()
+    {
+        warnings.push(ExportLicenseWarning::MissingSource);
+    }
+
+    if context
+        .source_url
+        .as_deref()
+        .unwrap_or_default()
+        .trim()
+        .is_empty()
+        && context.provider.is_some()
+    {
+        warnings.push(ExportLicenseWarning::MissingSourceUrl);
+    }
+
+    match context.license_status {
+        LicenseStatus::Active => {}
+        LicenseStatus::Missing => warnings.push(ExportLicenseWarning::MissingLicense),
+        LicenseStatus::Uncertain => warnings.push(ExportLicenseWarning::UncertainLicense),
+        LicenseStatus::Expired => warnings.push(ExportLicenseWarning::ExpiredLicense),
+    }
+
+    if warnings.is_empty() {
+        ExportLicenseAssessment::Clear
+    } else {
+        ExportLicenseAssessment::Warn(warnings)
+    }
+}
+
+impl ExportLicenseAssessment {
+    pub fn allows_export(&self) -> bool {
+        true
+    }
 }
 
 fn sanitize_filename(value: &str) -> String {
@@ -194,5 +268,52 @@ mod tests {
         });
 
         assert_eq!(result, Err(ExportPlanError::InvalidRange));
+    }
+
+    #[test]
+    fn active_license_does_not_warn_before_export() {
+        let assessment = assess_export_license(&LicenseContext {
+            provider: Some("Boom Library".to_string()),
+            source_url: Some("https://example.com/sound".to_string()),
+            license_status: LicenseStatus::Active,
+        });
+
+        assert_eq!(assessment, ExportLicenseAssessment::Clear);
+    }
+
+    #[test]
+    fn missing_license_warns_without_blocking_export() {
+        let assessment = assess_export_license(&LicenseContext {
+            provider: None,
+            source_url: None,
+            license_status: LicenseStatus::Missing,
+        });
+
+        assert_eq!(
+            assessment,
+            ExportLicenseAssessment::Warn(vec![
+                ExportLicenseWarning::MissingSource,
+                ExportLicenseWarning::MissingLicense
+            ])
+        );
+        assert!(assessment.allows_export());
+    }
+
+    #[test]
+    fn uncertain_license_warns_without_blocking_export() {
+        let assessment = assess_export_license(&LicenseContext {
+            provider: Some("Unknown Pack".to_string()),
+            source_url: None,
+            license_status: LicenseStatus::Uncertain,
+        });
+
+        assert_eq!(
+            assessment,
+            ExportLicenseAssessment::Warn(vec![
+                ExportLicenseWarning::MissingSourceUrl,
+                ExportLicenseWarning::UncertainLicense
+            ])
+        );
+        assert!(assessment.allows_export());
     }
 }
