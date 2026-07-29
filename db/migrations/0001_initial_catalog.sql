@@ -97,6 +97,18 @@ CREATE TABLE usage_events (
   created_at TEXT NOT NULL
 );
 
+CREATE TABLE background_jobs (
+  id TEXT PRIMARY KEY,
+  asset_id TEXT NOT NULL REFERENCES assets(id) ON DELETE CASCADE,
+  kind TEXT NOT NULL,
+  priority INTEGER NOT NULL DEFAULT 100,
+  state TEXT NOT NULL DEFAULT 'pending',
+  attempts INTEGER NOT NULL DEFAULT 0,
+  error TEXT,
+  created_at TEXT NOT NULL,
+  updated_at TEXT NOT NULL
+);
+
 CREATE TABLE library_sync_records (
   entity_id TEXT NOT NULL,
   entity_type TEXT NOT NULL,
@@ -120,3 +132,7 @@ CREATE INDEX idx_assets_media_type ON assets(media_type);
 CREATE INDEX idx_assets_availability ON assets(availability_state);
 CREATE INDEX idx_assets_content_hash ON assets(content_hash);
 CREATE INDEX idx_usage_events_asset ON usage_events(asset_id);
+CREATE UNIQUE INDEX idx_assets_library_hash_size
+  ON assets(library_id, content_hash, file_size)
+  WHERE content_hash IS NOT NULL;
+CREATE INDEX idx_background_jobs_pending ON background_jobs(state, priority, created_at);

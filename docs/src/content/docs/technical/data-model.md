@@ -14,5 +14,8 @@ The initial SQLite migration defines:
 - Usage events
 - Library sync records
 - FTS index for asset text search
+- Background jobs for restart-safe import and analysis work
 
 Migrations live in `db/migrations`.
+
+The first catalog implementation stores job state in SQLite with `pending` jobs ordered by priority and creation time. This keeps import registration separate from expensive analysis work.

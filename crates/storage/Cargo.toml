@@ -7,4 +7,8 @@ repository.workspace = true
 rust-version.workspace = true
 
 [dependencies]
+chrono.workspace = true
+rusqlite = { version = "0.32", features = ["bundled"] }
+shared-types = { path = "../shared-types" }
 thiserror.workspace = true
+uuid.workspace = true

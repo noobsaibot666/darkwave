@@ -1,0 +1,19 @@
+---
+title: Importing
+description: Current import behavior for the first library core milestone.
+---
+
+Milestone 1 supports the first backend import path.
+
+When a supported audio file is imported, Darkwave:
+
+- Reads immediate file metadata such as extension and file size.
+- Registers the asset in the local catalog.
+- Records whether the asset is managed or referenced.
+- Tracks the asset as locally available.
+- Avoids creating a second asset row when the same content hash and file size already exist in the same library.
+- Creates pending background jobs for metadata extraction, hashing, and waveform generation.
+
+Watched folders ignore incomplete browser download files such as `.crdownload`, `.download`, `.part`, and `.tmp`. A watched file is considered ready only after its file size has stabilized.
+
+The current importer stores catalog records only. Physical managed-library copying, folder watching services, and rich audio decoding are planned refinements.

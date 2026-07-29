@@ -1,0 +1,24 @@
+---
+title: Import Core
+description: Milestone 1 import and catalog responsibilities.
+---
+
+The import core is intentionally small and restart-safe.
+
+`import-pipeline` handles orchestration:
+
+- Validate supported MVP extensions.
+- Extract immediate metadata through `audio-metadata`.
+- Compute a temporary lightweight content key.
+- Register an asset through `storage`.
+- Enqueue follow-up jobs.
+
+`storage` handles persistence:
+
+- Opens and migrates the local SQLite catalog.
+- Creates and loads libraries.
+- Registers assets.
+- Suppresses exact duplicate rows by library, content hash, and file size.
+- Stores pending jobs.
+
+This preserves the product principle that import should feel immediate while analysis improves the asset progressively in the background.

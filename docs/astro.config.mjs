@@ -15,6 +15,10 @@ export default defineConfig({
           autogenerate: { directory: "technical" }
         },
         {
+          label: "User Guide",
+          autogenerate: { directory: "user-guide" }
+        },
+        {
           label: "Development",
           autogenerate: { directory: "development" }
         },

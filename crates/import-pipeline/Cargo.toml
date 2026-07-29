@@ -7,3 +7,9 @@ repository.workspace = true
 rust-version.workspace = true
 
 [dependencies]
+audio-metadata = { path = "../audio-metadata" }
+sha2 = "0.10"
+shared-types = { path = "../shared-types" }
+storage = { path = "../storage" }
+thiserror.workspace = true
+uuid.workspace = true
