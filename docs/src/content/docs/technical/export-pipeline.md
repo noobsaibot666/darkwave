@@ -18,6 +18,7 @@ Implemented behavior:
 - External drag payloads for completed rendered WAV exports.
 - Traceability flags for preserving source and license records.
 - Project source reports include attribution, restriction notes, and source receipt paths.
+- Source/license context is replacement-style per asset so updated license information does not duplicate report rows.
 - CSV rendering for project source/license reports.
 - License assessment warnings for missing, uncertain, or expired source/license context.
 

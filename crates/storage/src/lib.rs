@@ -827,6 +827,10 @@ impl Catalog {
 
     pub fn set_source_record(&self, draft: SourceRecordDraft) -> Result<(), StorageError> {
         self.connection.execute(
+            "DELETE FROM source_records WHERE asset_id = ?1",
+            params![draft.asset_id.to_string()],
+        )?;
+        self.connection.execute(
             "INSERT INTO source_records (
                 id, asset_id, provider, source_url, license_type, license_status,
                 attribution, restrictions, receipt_path
@@ -1834,6 +1838,58 @@ mod tests {
             Some("receipts/boom-library-2026-07.pdf")
         );
         assert_eq!(report[0].usage_status, "exported");
+    }
+
+    #[test]
+    fn setting_source_record_replaces_existing_asset_context() {
+        let catalog_path = unique_catalog_path("source-replace");
+        let catalog = Catalog::open(&catalog_path).expect("open catalog");
+        let library = catalog
+            .create_library("Report", "/library")
+            .expect("library");
+        let asset = test_asset(&catalog, library.id, "licensed.wav", "hash-source-replace");
+        let project = catalog
+            .create_collection(library.id, "Client Film", CollectionType::Project)
+            .expect("project");
+
+        catalog
+            .set_source_record(SourceRecordDraft {
+                asset_id: asset.id,
+                provider: Some("Old Provider".to_string()),
+                source_url: None,
+                license_type: None,
+                license_status: Some("uncertain".to_string()),
+                attribution: None,
+                restrictions: None,
+                receipt_path: None,
+            })
+            .expect("old source");
+        catalog
+            .set_source_record(SourceRecordDraft {
+                asset_id: asset.id,
+                provider: Some("New Provider".to_string()),
+                source_url: Some("https://example.com/new".to_string()),
+                license_type: Some("subscription".to_string()),
+                license_status: Some("active".to_string()),
+                attribution: None,
+                restrictions: None,
+                receipt_path: None,
+            })
+            .expect("new source");
+        catalog
+            .record_usage_event(
+                asset.id,
+                Some(project.id),
+                UsageEventType::Exported,
+                "/project/audio/licensed.wav",
+            )
+            .expect("usage");
+
+        let report = catalog.project_source_report(project.id).expect("report");
+
+        assert_eq!(report.len(), 1);
+        assert_eq!(report[0].provider.as_deref(), Some("New Provider"));
+        assert_eq!(report[0].license_status.as_deref(), Some("active"));
     }
 
     fn unique_catalog_path(name: &str) -> PathBuf {
