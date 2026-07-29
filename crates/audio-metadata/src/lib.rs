@@ -7,6 +7,13 @@ pub struct FileMetadata {
     pub file_size: u64,
 }
 
+#[derive(Clone, Debug, Default, Eq, PartialEq)]
+pub struct EmbeddedFileMetadata {
+    pub title: Option<String>,
+    pub genre: Option<String>,
+    pub comment: Option<String>,
+}
+
 #[derive(Clone, Debug, PartialEq)]
 pub struct DecodedAudioBuffer {
     pub sample_rate: u32,
@@ -109,6 +116,24 @@ pub fn extract_immediate_metadata(path: impl AsRef<Path>) -> Result<FileMetadata
     })
 }
 
+pub fn extract_embedded_metadata(
+    path: impl AsRef<Path>,
+) -> Result<EmbeddedFileMetadata, MetadataError> {
+    let path = path.as_ref();
+    let extension = path
+        .extension()
+        .and_then(|extension| extension.to_str())
+        .ok_or(MetadataError::MissingExtension)?
+        .to_ascii_lowercase();
+
+    if extension != "wav" {
+        return Ok(EmbeddedFileMetadata::default());
+    }
+
+    let bytes = std::fs::read(path)?;
+    parse_wav_info_metadata(&bytes)
+}
+
 pub fn decode_wav_pcm(path: impl AsRef<Path>) -> Result<DecodedAudioBuffer, MetadataError> {
     let path = path.as_ref();
     let extension = path
@@ -142,6 +167,76 @@ pub fn decode_supported_audio(
             .decode_packaged_audio(path, &extension),
         CodecSupportStatus::Unsupported => Err(MetadataError::UnsupportedDecoderFormat(extension)),
     }
+}
+
+fn parse_wav_info_metadata(bytes: &[u8]) -> Result<EmbeddedFileMetadata, MetadataError> {
+    if bytes.len() < 12 || &bytes[0..4] != b"RIFF" || &bytes[8..12] != b"WAVE" {
+        return Err(MetadataError::InvalidWav);
+    }
+
+    let mut metadata = EmbeddedFileMetadata::default();
+    let mut cursor = 12usize;
+
+    while cursor + 8 <= bytes.len() {
+        let chunk_id = &bytes[cursor..cursor + 4];
+        let chunk_size = read_u32_le(bytes, cursor + 4)? as usize;
+        let chunk_start = cursor + 8;
+        let chunk_end = chunk_start
+            .checked_add(chunk_size)
+            .ok_or(MetadataError::InvalidWav)?;
+        if chunk_end > bytes.len() {
+            return Err(MetadataError::InvalidWav);
+        }
+
+        if chunk_id == b"LIST" && chunk_size >= 4 && &bytes[chunk_start..chunk_start + 4] == b"INFO"
+        {
+            parse_wav_info_list(&bytes[chunk_start + 4..chunk_end], &mut metadata)?;
+        }
+
+        cursor = chunk_end + (chunk_size % 2);
+    }
+
+    Ok(metadata)
+}
+
+fn parse_wav_info_list(
+    bytes: &[u8],
+    metadata: &mut EmbeddedFileMetadata,
+) -> Result<(), MetadataError> {
+    let mut cursor = 0usize;
+
+    while cursor + 8 <= bytes.len() {
+        let chunk_id = &bytes[cursor..cursor + 4];
+        let chunk_size = read_u32_le(bytes, cursor + 4)? as usize;
+        let value_start = cursor + 8;
+        let value_end = value_start
+            .checked_add(chunk_size)
+            .ok_or(MetadataError::InvalidWav)?;
+        if value_end > bytes.len() {
+            return Err(MetadataError::InvalidWav);
+        }
+
+        let value = decode_info_text(&bytes[value_start..value_end]);
+        match chunk_id {
+            b"INAM" => metadata.title = value,
+            b"IGNR" => metadata.genre = value,
+            b"ICMT" => metadata.comment = value,
+            _ => {}
+        }
+
+        cursor = value_end + (chunk_size % 2);
+    }
+
+    Ok(())
+}
+
+fn decode_info_text(bytes: &[u8]) -> Option<String> {
+    let text = String::from_utf8_lossy(bytes)
+        .trim_matches(char::from(0))
+        .trim()
+        .to_string();
+
+    (!text.is_empty()).then_some(text)
 }
 
 fn parse_wav_pcm(bytes: &[u8]) -> Result<DecodedAudioBuffer, MetadataError> {
@@ -250,6 +345,19 @@ mod tests {
 
         assert_eq!(metadata.extension, "wav");
         assert_eq!(metadata.file_size, 13);
+    }
+
+    #[test]
+    fn extracts_wav_info_metadata_fields() {
+        let mut path = std::env::temp_dir();
+        path.push(format!("darkwave-info-metadata-{}.wav", Uuid::new_v4()));
+        fs::write(&path, wav_info_fixture()).expect("fixture");
+
+        let metadata = extract_embedded_metadata(&path).expect("metadata");
+
+        assert_eq!(metadata.title, Some("Dark Metallic Impact".to_string()));
+        assert_eq!(metadata.genre, Some("Sound Effects".to_string()));
+        assert_eq!(metadata.comment, Some("short trailer hit".to_string()));
     }
 
     #[test]
@@ -380,6 +488,32 @@ mod tests {
         }
 
         wav
+    }
+
+    fn wav_info_fixture() -> Vec<u8> {
+        let mut list_payload = Vec::new();
+        list_payload.extend_from_slice(b"INFO");
+        append_info_chunk(&mut list_payload, b"INAM", b"Dark Metallic Impact");
+        append_info_chunk(&mut list_payload, b"IGNR", b"Sound Effects");
+        append_info_chunk(&mut list_payload, b"ICMT", b"short trailer hit");
+
+        let mut wav = Vec::new();
+        wav.extend_from_slice(b"RIFF");
+        wav.extend_from_slice(&((4 + 8 + list_payload.len()) as u32).to_le_bytes());
+        wav.extend_from_slice(b"WAVE");
+        wav.extend_from_slice(b"LIST");
+        wav.extend_from_slice(&(list_payload.len() as u32).to_le_bytes());
+        wav.extend_from_slice(&list_payload);
+        wav
+    }
+
+    fn append_info_chunk(payload: &mut Vec<u8>, id: &[u8; 4], value: &[u8]) {
+        payload.extend_from_slice(id);
+        payload.extend_from_slice(&(value.len() as u32).to_le_bytes());
+        payload.extend_from_slice(value);
+        if value.len() % 2 == 1 {
+            payload.push(0);
+        }
     }
 
     struct FixturePackagedDecoder;

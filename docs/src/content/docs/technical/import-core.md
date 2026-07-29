@@ -12,6 +12,7 @@ The import core is intentionally small and restart-safe.
 - Maintain watched-folder polling snapshots and drop removed files from the snapshot.
 - Ingest platform filesystem notifications with the same stable-size checks used by polling.
 - Extract immediate metadata through `audio-metadata`.
+- Read WAV LIST/INFO embedded fields for title, genre, and comments when present.
 - Compute a temporary lightweight content key.
 - Register an asset through `storage`.
 - Derive an initial media type from filename smart-import signals.

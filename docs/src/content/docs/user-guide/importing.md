@@ -8,6 +8,7 @@ Milestone 1 supports the first backend import path.
 When a supported audio file is imported, Darkwave:
 
 - Reads immediate file metadata such as extension and file size.
+- Reads WAV embedded title, genre, and comment fields when present.
 - Registers the asset in the local catalog.
 - Records whether the asset is managed or referenced.
 - Copies managed imports into the library media root under `Media/00`.
