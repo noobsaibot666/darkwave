@@ -54,6 +54,21 @@ pub struct ExecutedExport {
     pub license_record_expected: bool,
 }
 
+#[derive(Clone, Debug, PartialEq)]
+pub struct DecodedPcmBuffer {
+    pub sample_rate: u32,
+    pub channels: u16,
+    pub samples: Vec<f32>,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct RenderedWavExport {
+    pub destination_path: String,
+    pub frames_rendered: usize,
+    pub bytes_written: u64,
+    pub license_record_expected: bool,
+}
+
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum ExportQueueStatus {
     Ready,
@@ -97,21 +112,40 @@ pub struct ExportQueue {
 pub enum ExportExecutionError {
     UnsupportedConversion,
     UnsupportedRange,
+    UnsupportedBitDepth(u16),
+    DecodedSampleRateMismatch { expected: u32, actual: u32 },
+    InvalidDecodedAudio,
     Io(io::Error),
 }
 
 impl PartialEq for ExportExecutionError {
     fn eq(&self, other: &Self) -> bool {
-        matches!(
-            (self, other),
+        match (self, other) {
             (
                 ExportExecutionError::UnsupportedConversion,
-                ExportExecutionError::UnsupportedConversion
-            ) | (
-                ExportExecutionError::UnsupportedRange,
-                ExportExecutionError::UnsupportedRange
+                ExportExecutionError::UnsupportedConversion,
             )
-        )
+            | (ExportExecutionError::UnsupportedRange, ExportExecutionError::UnsupportedRange)
+            | (
+                ExportExecutionError::InvalidDecodedAudio,
+                ExportExecutionError::InvalidDecodedAudio,
+            ) => true,
+            (
+                ExportExecutionError::UnsupportedBitDepth(left),
+                ExportExecutionError::UnsupportedBitDepth(right),
+            ) => left == right,
+            (
+                ExportExecutionError::DecodedSampleRateMismatch {
+                    expected: left_expected,
+                    actual: left_actual,
+                },
+                ExportExecutionError::DecodedSampleRateMismatch {
+                    expected: right_expected,
+                    actual: right_actual,
+                },
+            ) => left_expected == right_expected && left_actual == right_actual,
+            _ => false,
+        }
     }
 }
 
@@ -308,6 +342,77 @@ pub fn build_external_drag_payload(
     })
 }
 
+pub fn build_rendered_external_drag_payload(
+    rendered_exports: &[RenderedWavExport],
+) -> Result<ExternalDragPayload, ExternalDragPayloadError> {
+    if rendered_exports.is_empty() {
+        return Err(ExternalDragPayloadError::EmptySelection);
+    }
+
+    Ok(ExternalDragPayload {
+        file_urls: rendered_exports
+            .iter()
+            .map(|rendered| file_url_for_path(&rendered.destination_path))
+            .collect(),
+        operation: ExternalDragOperation::Copy,
+        include_license_report: rendered_exports
+            .iter()
+            .any(|rendered| rendered.license_record_expected),
+    })
+}
+
+pub fn render_wav_export(
+    plan: &ExportPlan,
+    decoded: &DecodedPcmBuffer,
+) -> Result<RenderedWavExport, ExportExecutionError> {
+    let conversion = plan
+        .conversion
+        .ok_or(ExportExecutionError::UnsupportedConversion)?;
+    if conversion.bit_depth != 24 {
+        return Err(ExportExecutionError::UnsupportedBitDepth(
+            conversion.bit_depth,
+        ));
+    }
+    if decoded.sample_rate != conversion.sample_rate {
+        return Err(ExportExecutionError::DecodedSampleRateMismatch {
+            expected: conversion.sample_rate,
+            actual: decoded.sample_rate,
+        });
+    }
+    if decoded.channels == 0 || decoded.samples.len() % decoded.channels as usize != 0 {
+        return Err(ExportExecutionError::InvalidDecodedAudio);
+    }
+
+    let channel_count = decoded.channels as usize;
+    let total_frames = decoded.samples.len() / channel_count;
+    let (start_frame, end_frame) = render_frame_range(plan.range, conversion.sample_rate);
+    let start_frame = start_frame.min(total_frames);
+    let end_frame = end_frame.min(total_frames);
+    if start_frame >= end_frame {
+        return Err(ExportExecutionError::UnsupportedRange);
+    }
+
+    let sample_start = start_frame * channel_count;
+    let sample_end = end_frame * channel_count;
+    let wav = encode_wav_24_bit_pcm(
+        &decoded.samples[sample_start..sample_end],
+        conversion.sample_rate,
+        decoded.channels,
+    );
+
+    if let Some(parent) = Path::new(&plan.destination_path).parent() {
+        fs::create_dir_all(parent)?;
+    }
+    fs::write(&plan.destination_path, &wav)?;
+
+    Ok(RenderedWavExport {
+        destination_path: plan.destination_path.clone(),
+        frames_rendered: end_frame - start_frame,
+        bytes_written: wav.len() as u64,
+        license_record_expected: plan.include_license_record,
+    })
+}
+
 impl ExportQueue {
     pub fn new() -> Self {
         Self {
@@ -457,6 +562,51 @@ fn percent_encode_path(path: &str) -> String {
     }
 
     encoded
+}
+
+fn render_frame_range(range: Option<ExportRangeMs>, sample_rate: u32) -> (usize, usize) {
+    range
+        .map(|range| {
+            (
+                ms_to_frame(range.start_ms, sample_rate),
+                ms_to_frame(range.end_ms, sample_rate),
+            )
+        })
+        .unwrap_or((0, usize::MAX))
+}
+
+fn ms_to_frame(ms: u64, sample_rate: u32) -> usize {
+    ((ms as u128 * sample_rate as u128) / 1_000) as usize
+}
+
+fn encode_wav_24_bit_pcm(samples: &[f32], sample_rate: u32, channels: u16) -> Vec<u8> {
+    let bytes_per_sample = 3u16;
+    let data_size = samples.len() as u32 * bytes_per_sample as u32;
+    let byte_rate = sample_rate * channels as u32 * bytes_per_sample as u32;
+    let block_align = channels * bytes_per_sample;
+    let mut wav = Vec::with_capacity(44 + data_size as usize);
+
+    wav.extend_from_slice(b"RIFF");
+    wav.extend_from_slice(&(36 + data_size).to_le_bytes());
+    wav.extend_from_slice(b"WAVE");
+    wav.extend_from_slice(b"fmt ");
+    wav.extend_from_slice(&16u32.to_le_bytes());
+    wav.extend_from_slice(&1u16.to_le_bytes());
+    wav.extend_from_slice(&channels.to_le_bytes());
+    wav.extend_from_slice(&sample_rate.to_le_bytes());
+    wav.extend_from_slice(&byte_rate.to_le_bytes());
+    wav.extend_from_slice(&block_align.to_le_bytes());
+    wav.extend_from_slice(&24u16.to_le_bytes());
+    wav.extend_from_slice(b"data");
+    wav.extend_from_slice(&data_size.to_le_bytes());
+
+    for sample in samples {
+        let scaled = (sample.clamp(-1.0, 1.0) * 8_388_607.0).round() as i32;
+        let bytes = scaled.to_le_bytes();
+        wav.extend_from_slice(&bytes[0..3]);
+    }
+
+    wav
 }
 
 #[cfg(test)]
@@ -761,6 +911,96 @@ mod tests {
         assert_eq!(
             build_external_drag_payload(&[ranged_plan]),
             Err(ExternalDragPayloadError::RequiresRenderedExport)
+        );
+    }
+
+    #[test]
+    fn wav_render_export_writes_24_bit_pcm_with_selected_range() {
+        let destination_path = unique_export_path("project/audio/range.wav");
+        let plan = ExportPlan {
+            source_path: "/library/source.wav".to_string(),
+            destination_path: destination_path.to_string_lossy().to_string(),
+            range: Some(ExportRangeMs {
+                start_ms: 1,
+                end_ms: 3,
+            }),
+            conversion: Some(AudioConversion {
+                sample_rate: 1_000,
+                bit_depth: 24,
+            }),
+            preserve_original: true,
+            include_license_record: true,
+        };
+        let decoded = DecodedPcmBuffer {
+            sample_rate: 1_000,
+            channels: 1,
+            samples: vec![-1.0, -0.5, 0.0, 0.5],
+        };
+
+        let rendered = render_wav_export(&plan, &decoded).expect("render wav");
+        let wav = fs::read(&destination_path).expect("wav");
+
+        assert_eq!(rendered.frames_rendered, 2);
+        assert_eq!(rendered.bytes_written, wav.len() as u64);
+        assert_eq!(&wav[0..4], b"RIFF");
+        assert_eq!(&wav[8..12], b"WAVE");
+        assert_eq!(u16::from_le_bytes([wav[22], wav[23]]), 1);
+        assert_eq!(
+            u32::from_le_bytes([wav[24], wav[25], wav[26], wav[27]]),
+            1_000
+        );
+        assert_eq!(u16::from_le_bytes([wav[34], wav[35]]), 24);
+        assert_eq!(u32::from_le_bytes([wav[40], wav[41], wav[42], wav[43]]), 6);
+        assert_eq!(wav.len(), 44 + 6);
+    }
+
+    #[test]
+    fn wav_render_export_rejects_mismatched_decoded_sample_rate() {
+        let plan = ExportPlan {
+            source_path: "/library/source.mp3".to_string(),
+            destination_path: "/project/audio/source.wav".to_string(),
+            range: None,
+            conversion: Some(AudioConversion {
+                sample_rate: 48_000,
+                bit_depth: 24,
+            }),
+            preserve_original: true,
+            include_license_record: true,
+        };
+        let decoded = DecodedPcmBuffer {
+            sample_rate: 44_100,
+            channels: 2,
+            samples: vec![0.0, 0.0],
+        };
+
+        assert_eq!(
+            render_wav_export(&plan, &decoded).map(|_| ()),
+            Err(ExportExecutionError::DecodedSampleRateMismatch {
+                expected: 48_000,
+                actual: 44_100,
+            })
+        );
+    }
+
+    #[test]
+    fn rendered_exports_build_external_drag_payload_after_wav_rendering() {
+        let rendered = RenderedWavExport {
+            destination_path: "/project/audio/Dark Hit.wav".to_string(),
+            frames_rendered: 480,
+            bytes_written: 1_484,
+            license_record_expected: true,
+        };
+
+        let payload =
+            build_rendered_external_drag_payload(&[rendered]).expect("rendered drag payload");
+
+        assert_eq!(
+            payload,
+            ExternalDragPayload {
+                file_urls: vec!["file:///project/audio/Dark%20Hit.wav".to_string()],
+                operation: ExternalDragOperation::Copy,
+                include_license_report: true,
+            }
         );
     }
 
