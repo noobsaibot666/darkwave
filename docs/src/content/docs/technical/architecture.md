@@ -26,3 +26,4 @@ Milestone 1 introduces the first catalog boundary:
 - `viewport` owns virtualized browser row range and spacer calculations for large result sets.
 - `command-palette` owns searchable action metadata for palette, shortcut, and menu commands.
 - `maintenance` owns structured catalog health findings and non-destructive maintenance summaries.
+- `fingerprint` owns exact duplicate keys, likely duplicate classification, and duplicate review actions.

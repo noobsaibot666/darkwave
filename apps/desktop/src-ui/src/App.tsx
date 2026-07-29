@@ -63,6 +63,8 @@ const maintenanceItems = [
   { label: "Duplicates", value: "Review" }
 ];
 
+const duplicateActions = ["Keep", "Link", "Merge", "Replace", "Trash"];
+
 export function App() {
   return (
     <main className="shell">
@@ -266,6 +268,14 @@ export function App() {
                 <span>{item.label}</span>
                 <strong>{item.value}</strong>
               </div>
+            ))}
+          </div>
+        </section>
+        <section>
+          <h2>Duplicate Review</h2>
+          <div className="duplicate-actions">
+            {duplicateActions.map((action) => (
+              <button key={action}>{action}</button>
             ))}
           </div>
         </section>

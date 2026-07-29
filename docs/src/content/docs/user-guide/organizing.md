@@ -14,5 +14,6 @@ Current behavior supports:
 - Undo for bulk tag and collection membership changes.
 - Browser interaction state for replace selection, range selection, additive selection, and select-all-visible.
 - Drag payload targets for tags, collections, projects, favorites, trash, and external export.
+- Duplicate review options for keeping, linking, merging metadata, replacing lower-quality versions, or moving duplicates to Trash.
 
 Catalog mutations and desktop event wiring remain separate from the interaction-state reducer.

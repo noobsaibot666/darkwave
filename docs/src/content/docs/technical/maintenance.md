@@ -13,3 +13,5 @@ The `maintenance` crate defines non-destructive health findings:
 Reports include total findings, counts by kind, severity, detailed findings, and recommended actions.
 
 Duplicate content recommends review, not deletion. File removal must still go through explicit user action and application Trash.
+
+Likely duplicate groups use the `fingerprint` classification model before being surfaced as maintenance findings.
