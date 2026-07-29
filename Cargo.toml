@@ -16,6 +16,7 @@ members = [
   "crates/shared-types",
   "crates/storage",
   "crates/waveform",
+  "crates/viewport",
   "crates/workspace-state"
 ]
 

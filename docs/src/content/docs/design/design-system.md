@@ -14,3 +14,4 @@ Release polish requirements:
 - Reduced transparency uses solid surfaces instead of blurred material.
 - Compact panels use restrained headings and stable control dimensions.
 - Status labels must distinguish passed, planned, and blocked states.
+- Browser rows need stable height so virtualization math can keep scrolling smooth.

@@ -49,6 +49,20 @@ fn supported_drag_targets() -> Vec<&'static str> {
     ]
 }
 
+#[tauri::command]
+fn default_virtualized_range() -> (usize, usize) {
+    let range = viewport::VirtualViewport {
+        total_rows: 50_000,
+        row_height_px: 52,
+        viewport_height_px: 520,
+        scroll_top_px: 0,
+        overscan_rows: 6,
+    }
+    .visible_range();
+
+    (range.start, range.end_exclusive)
+}
+
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
     tauri::Builder::default()
@@ -59,7 +73,8 @@ pub fn run() {
             healthcheck,
             release_blockers,
             default_preferences,
-            supported_drag_targets
+            supported_drag_targets,
+            default_virtualized_range
         ])
         .run(tauri::generate_context!())
         .expect("failed to run Darkwave desktop shell");
@@ -105,5 +120,10 @@ mod tests {
                 "external_export"
             ]
         );
+    }
+
+    #[test]
+    fn default_virtualized_range_keeps_initial_render_bounded() {
+        assert_eq!(super::default_virtualized_range(), (0, 16));
     }
 }

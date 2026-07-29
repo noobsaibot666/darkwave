@@ -102,6 +102,11 @@ export function App() {
             <span>Mod additive</span>
             <span>Drag to classify or export</span>
           </div>
+          <div className="virtualization-bar" aria-label="Browser performance">
+            <span>50,000 rows</span>
+            <span>16 rendered</span>
+            <span>6 row overscan</span>
+          </div>
           <div className="browser-header">
             <span>Name</span>
             <span>Type</span>

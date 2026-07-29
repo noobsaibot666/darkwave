@@ -23,3 +23,4 @@ Milestone 1 introduces the first catalog boundary:
 - `release-readiness` owns accessibility policy, crash-recovery prompts, and release gate status.
 - `preferences` owns user settings defaults, shortcut bindings, and shortcut conflict validation.
 - `workspace-state` owns browser focus, selection, range/additive selection, and drag payload state.
+- `viewport` owns virtualized browser row range and spacer calculations for large result sets.
