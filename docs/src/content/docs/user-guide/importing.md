@@ -15,7 +15,8 @@ When a supported audio file is imported, Darkwave:
 - Avoids creating a second asset row when the same content hash and file size already exist in the same library.
 - Creates pending background jobs for metadata extraction, hashing, and waveform generation.
 - Discovers watched-folder candidates only after supported audio files have stabilized.
+- Maintains watched-folder size snapshots across polls so new files are imported only after a later stable scan.
 
 Watched folders ignore incomplete browser download files such as `.crdownload`, `.download`, `.part`, and `.tmp`. A watched file is considered ready only after its file size has stabilized.
 
-Referenced imports remain catalog-only and keep pointing at their original file path. A background OS watcher service and rich audio decoding are planned refinements.
+Referenced imports remain catalog-only and keep pointing at their original file path. Platform-native filesystem notifications and rich audio decoding are planned refinements.

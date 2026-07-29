@@ -9,6 +9,7 @@ The import core is intentionally small and restart-safe.
 
 - Validate supported MVP extensions.
 - Discover ready watched-folder candidates by comparing current and previous file sizes.
+- Maintain watched-folder polling snapshots and drop removed files from the snapshot.
 - Extract immediate metadata through `audio-metadata`.
 - Compute a temporary lightweight content key.
 - Register an asset through `storage`.

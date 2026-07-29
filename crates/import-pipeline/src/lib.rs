@@ -21,6 +21,12 @@ pub struct WatchedImportCandidate {
     pub current_size: u64,
 }
 
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct WatchedFolderPoller {
+    folder: PathBuf,
+    previous_sizes: BTreeMap<PathBuf, u64>,
+}
+
 #[derive(Debug, Error)]
 pub enum ImportError {
     #[error("unsupported audio format: {0}")]
@@ -90,6 +96,25 @@ pub fn discover_ready_watched_files(
     Ok(candidates)
 }
 
+impl WatchedFolderPoller {
+    pub fn new(folder: impl Into<PathBuf>) -> Self {
+        Self {
+            folder: folder.into(),
+            previous_sizes: BTreeMap::new(),
+        }
+    }
+
+    pub fn poll(&mut self) -> Result<Vec<WatchedImportCandidate>, ImportError> {
+        let candidates = discover_ready_watched_files(&self.folder, &self.previous_sizes)?;
+        self.previous_sizes = snapshot_file_sizes(&self.folder)?;
+        Ok(candidates)
+    }
+
+    pub fn previous_sizes(&self) -> &BTreeMap<PathBuf, u64> {
+        &self.previous_sizes
+    }
+}
+
 pub fn import_file(
     catalog: &Catalog,
     library_id: Uuid,
@@ -144,6 +169,20 @@ pub fn import_file(
     }
 
     Ok(asset)
+}
+
+fn snapshot_file_sizes(folder: &Path) -> Result<BTreeMap<PathBuf, u64>, ImportError> {
+    let mut sizes = BTreeMap::new();
+
+    for entry in fs::read_dir(folder)? {
+        let entry = entry?;
+        let metadata = entry.metadata()?;
+        if metadata.is_file() {
+            sizes.insert(entry.path(), metadata.len());
+        }
+    }
+
+    Ok(sizes)
 }
 
 fn lightweight_content_hash(path: &Path) -> Result<String, ImportError> {
@@ -232,6 +271,41 @@ mod tests {
                 current_size: 11,
             }]
         );
+    }
+
+    #[test]
+    fn watched_folder_poller_emits_file_only_after_stable_second_scan() {
+        let folder = unique_watch_folder();
+        let ready = folder.join("ready.wav");
+        fs::write(&ready, b"ready audio").expect("ready");
+        let mut poller = WatchedFolderPoller::new(folder.clone());
+
+        let first_scan = poller.poll().expect("first poll");
+        let second_scan = poller.poll().expect("second poll");
+
+        assert!(first_scan.is_empty());
+        assert_eq!(
+            second_scan,
+            vec![WatchedImportCandidate {
+                path: ready,
+                previous_size: 11,
+                current_size: 11,
+            }]
+        );
+    }
+
+    #[test]
+    fn watched_folder_poller_drops_removed_files_from_size_snapshot() {
+        let folder = unique_watch_folder();
+        let removed = folder.join("removed.wav");
+        fs::write(&removed, b"ready audio").expect("ready");
+        let mut poller = WatchedFolderPoller::new(folder.clone());
+
+        assert!(poller.poll().expect("first poll").is_empty());
+        fs::remove_file(&removed).expect("remove");
+
+        assert!(poller.poll().expect("second poll").is_empty());
+        assert!(!poller.previous_sizes().contains_key(&removed));
     }
 
     #[test]
