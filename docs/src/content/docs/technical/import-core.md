@@ -8,6 +8,7 @@ The import core is intentionally small and restart-safe.
 `import-pipeline` handles orchestration:
 
 - Validate supported MVP extensions.
+- Discover ready watched-folder candidates by comparing current and previous file sizes.
 - Extract immediate metadata through `audio-metadata`.
 - Compute a temporary lightweight content key.
 - Register an asset through `storage`.

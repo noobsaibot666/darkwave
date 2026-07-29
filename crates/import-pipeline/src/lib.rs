@@ -1,6 +1,7 @@
 use audio_metadata::{extract_immediate_metadata, supported_mvp_format, MetadataError};
 use sha2::{Digest, Sha256};
 use shared_types::{AvailabilityState, StorageMode};
+use std::collections::BTreeMap;
 use std::fs;
 use std::path::{Path, PathBuf};
 use storage::{AssetPath, AssetRecord, Catalog, JobKind, NewAssetRecord, StorageError};
@@ -11,6 +12,13 @@ use uuid::Uuid;
 pub enum ImportMode {
     Managed,
     Referenced,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct WatchedImportCandidate {
+    pub path: PathBuf,
+    pub previous_size: u64,
+    pub current_size: u64,
 }
 
 #[derive(Debug, Error)]
@@ -39,6 +47,47 @@ pub fn should_ignore_watched_file(filename: &str) -> bool {
 
 pub fn is_stable_watched_file(filename: &str, previous_size: u64, current_size: u64) -> bool {
     !should_ignore_watched_file(filename) && previous_size == current_size
+}
+
+pub fn discover_ready_watched_files(
+    folder: impl AsRef<Path>,
+    previous_sizes: &BTreeMap<PathBuf, u64>,
+) -> Result<Vec<WatchedImportCandidate>, ImportError> {
+    let mut candidates = Vec::new();
+
+    for entry in fs::read_dir(folder)? {
+        let entry = entry?;
+        let path = entry.path();
+        let metadata = entry.metadata()?;
+
+        if !metadata.is_file() {
+            continue;
+        }
+
+        let filename = match path.file_name().and_then(|file_name| file_name.to_str()) {
+            Some(filename) => filename,
+            None => continue,
+        };
+        let extension = path
+            .extension()
+            .and_then(|extension| extension.to_str())
+            .unwrap_or_default();
+        let current_size = metadata.len();
+        let previous_size = previous_sizes.get(&path).copied().unwrap_or_default();
+
+        if supported_mvp_format(extension)
+            && is_stable_watched_file(filename, previous_size, current_size)
+        {
+            candidates.push(WatchedImportCandidate {
+                path,
+                previous_size,
+                current_size,
+            });
+        }
+    }
+
+    candidates.sort_by(|left, right| left.path.cmp(&right.path));
+    Ok(candidates)
 }
 
 pub fn import_file(
@@ -153,6 +202,39 @@ mod tests {
     }
 
     #[test]
+    fn watched_folder_discovers_only_stable_supported_audio_files() {
+        let folder = unique_watch_folder();
+        let ready = folder.join("ready.wav");
+        let growing = folder.join("growing.mp3");
+        let partial = folder.join("partial.wav.crdownload");
+        let unsupported = folder.join("notes.txt");
+        fs::write(&ready, b"ready audio").expect("ready");
+        fs::write(&growing, b"still growing").expect("growing");
+        fs::write(&partial, b"partial").expect("partial");
+        fs::write(&unsupported, b"not audio").expect("unsupported");
+        fs::create_dir_all(folder.join("nested")).expect("nested");
+
+        let previous_sizes = BTreeMap::from([
+            (ready.clone(), 11),
+            (growing.clone(), 4),
+            (partial.clone(), 7),
+            (unsupported.clone(), 9),
+        ]);
+
+        let candidates =
+            discover_ready_watched_files(&folder, &previous_sizes).expect("discover candidates");
+
+        assert_eq!(
+            candidates,
+            vec![WatchedImportCandidate {
+                path: ready,
+                previous_size: 11,
+                current_size: 11,
+            }]
+        );
+    }
+
+    #[test]
     fn referenced_import_registers_asset_and_metadata_jobs() {
         let catalog_path = unique_catalog_path("referenced-import");
         let audio_path = unique_audio_path("referenced-impact.wav");
@@ -209,6 +291,13 @@ mod tests {
         path.push(format!("darkwave-audio-{}", Uuid::new_v4()));
         fs::create_dir_all(&path).expect("fixture directory");
         path.push(name);
+        path
+    }
+
+    fn unique_watch_folder() -> PathBuf {
+        let mut path = std::env::temp_dir();
+        path.push(format!("darkwave-watch-{}", Uuid::new_v4()));
+        fs::create_dir_all(&path).expect("watch folder");
         path
     }
 
