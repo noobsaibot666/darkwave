@@ -1,3 +1,4 @@
+use shared_types::AvailabilityState;
 use uuid::Uuid;
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -40,6 +41,41 @@ pub struct PlaybackSession {
     position_ms: u64,
     playing: bool,
     loop_region: Option<LoopRegion>,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct PlaybackSourceRequest {
+    pub asset_id: Uuid,
+    pub original_path: String,
+    pub availability_state: AvailabilityState,
+    pub cached_preview_path: Option<String>,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub enum PlaybackSource {
+    Original { asset_id: Uuid, path: String },
+    CachedPreview { asset_id: Uuid, path: String },
+    Unavailable { asset_id: Uuid },
+}
+
+pub fn choose_playback_source(request: PlaybackSourceRequest) -> PlaybackSource {
+    match request.availability_state {
+        AvailabilityState::Local => PlaybackSource::Original {
+            asset_id: request.asset_id,
+            path: request.original_path,
+        },
+        AvailabilityState::Cached | AvailabilityState::Missing | AvailabilityState::Unknown => {
+            request
+                .cached_preview_path
+                .map(|path| PlaybackSource::CachedPreview {
+                    asset_id: request.asset_id,
+                    path,
+                })
+                .unwrap_or(PlaybackSource::Unavailable {
+                    asset_id: request.asset_id,
+                })
+        }
+    }
 }
 
 impl PlaybackSession {
@@ -101,6 +137,7 @@ impl PlaybackSession {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use shared_types::AvailabilityState;
     use uuid::Uuid;
 
     #[test]
@@ -162,5 +199,59 @@ mod tests {
             })
         );
         assert!(session.is_playing());
+    }
+
+    #[test]
+    fn playback_source_uses_original_when_asset_is_local() {
+        let asset_id = Uuid::new_v4();
+
+        let source = choose_playback_source(PlaybackSourceRequest {
+            asset_id,
+            original_path: "/library/Media/00/hit.wav".to_string(),
+            availability_state: AvailabilityState::Local,
+            cached_preview_path: Some("/cache/previews/hit.ogg".to_string()),
+        });
+
+        assert_eq!(
+            source,
+            PlaybackSource::Original {
+                asset_id,
+                path: "/library/Media/00/hit.wav".to_string()
+            }
+        );
+    }
+
+    #[test]
+    fn playback_source_uses_preview_cache_when_original_is_missing() {
+        let asset_id = Uuid::new_v4();
+
+        let source = choose_playback_source(PlaybackSourceRequest {
+            asset_id,
+            original_path: "/Volumes/TrueNAS/SFX/hit.wav".to_string(),
+            availability_state: AvailabilityState::Missing,
+            cached_preview_path: Some("/cache/previews/hit.ogg".to_string()),
+        });
+
+        assert_eq!(
+            source,
+            PlaybackSource::CachedPreview {
+                asset_id,
+                path: "/cache/previews/hit.ogg".to_string()
+            }
+        );
+    }
+
+    #[test]
+    fn playback_source_reports_unavailable_without_original_or_cache() {
+        let asset_id = Uuid::new_v4();
+
+        let source = choose_playback_source(PlaybackSourceRequest {
+            asset_id,
+            original_path: "/Volumes/TrueNAS/SFX/hit.wav".to_string(),
+            availability_state: AvailabilityState::Missing,
+            cached_preview_path: None,
+        });
+
+        assert_eq!(source, PlaybackSource::Unavailable { asset_id });
     }
 }

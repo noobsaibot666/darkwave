@@ -7,4 +7,5 @@ repository.workspace = true
 rust-version.workspace = true
 
 [dependencies]
+shared-types = { path = "../shared-types" }
 uuid.workspace = true

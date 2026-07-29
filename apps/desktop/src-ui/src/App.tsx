@@ -187,6 +187,8 @@ export function App() {
             <dd>Needs review</dd>
             <dt>Storage</dt>
             <dd>Referenced NAS path</dd>
+            <dt>Preview</dt>
+            <dd>Cache fallback enabled</dd>
             <dt>Receipt</dt>
             <dd>Attached to report row</dd>
           </dl>

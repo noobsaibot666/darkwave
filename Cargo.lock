@@ -227,6 +227,7 @@ version = "0.1.0"
 name = "audio-engine"
 version = "0.1.0"
 dependencies = [
+ "shared-types",
  "uuid",
 ]
 

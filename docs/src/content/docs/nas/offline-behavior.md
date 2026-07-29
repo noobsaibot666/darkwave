@@ -14,5 +14,6 @@ Current behavior:
 - Media-root probing reports whether a NAS-backed root is online or offline.
 - Online media-root probes request reconnect validation before assuming asset paths are usable.
 - Export plans can wait in a queue while source paths are offline and become ready after the source returns.
+- Playback source selection can fall back to cached preview files when originals are missing.
 
-Future work will add preview cache playback, background reconnect validation jobs, and fuller user-facing offline controls.
+Future work will add background reconnect validation jobs, fuller user-facing offline controls, and decoder integration for cached preview playback.
