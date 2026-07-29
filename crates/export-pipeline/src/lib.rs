@@ -113,7 +113,6 @@ pub enum ExportExecutionError {
     UnsupportedConversion,
     UnsupportedRange,
     UnsupportedBitDepth(u16),
-    DecodedSampleRateMismatch { expected: u32, actual: u32 },
     InvalidDecodedAudio,
     Io(io::Error),
 }
@@ -134,16 +133,6 @@ impl PartialEq for ExportExecutionError {
                 ExportExecutionError::UnsupportedBitDepth(left),
                 ExportExecutionError::UnsupportedBitDepth(right),
             ) => left == right,
-            (
-                ExportExecutionError::DecodedSampleRateMismatch {
-                    expected: left_expected,
-                    actual: left_actual,
-                },
-                ExportExecutionError::DecodedSampleRateMismatch {
-                    expected: right_expected,
-                    actual: right_actual,
-                },
-            ) => left_expected == right_expected && left_actual == right_actual,
             _ => false,
         }
     }
@@ -373,18 +362,14 @@ pub fn render_wav_export(
             conversion.bit_depth,
         ));
     }
-    if decoded.sample_rate != conversion.sample_rate {
-        return Err(ExportExecutionError::DecodedSampleRateMismatch {
-            expected: conversion.sample_rate,
-            actual: decoded.sample_rate,
-        });
-    }
     if decoded.channels == 0 || decoded.samples.len() % decoded.channels as usize != 0 {
         return Err(ExportExecutionError::InvalidDecodedAudio);
     }
 
+    let resampled = resample_pcm(decoded, conversion.sample_rate);
+    let render_source = resampled.as_ref().unwrap_or(decoded);
     let channel_count = decoded.channels as usize;
-    let total_frames = decoded.samples.len() / channel_count;
+    let total_frames = render_source.samples.len() / channel_count;
     let (start_frame, end_frame) = render_frame_range(plan.range, conversion.sample_rate);
     let start_frame = start_frame.min(total_frames);
     let end_frame = end_frame.min(total_frames);
@@ -395,7 +380,7 @@ pub fn render_wav_export(
     let sample_start = start_frame * channel_count;
     let sample_end = end_frame * channel_count;
     let wav = encode_wav_24_bit_pcm(
-        &decoded.samples[sample_start..sample_end],
+        &render_source.samples[sample_start..sample_end],
         conversion.sample_rate,
         decoded.channels,
     );
@@ -573,6 +558,47 @@ fn render_frame_range(range: Option<ExportRangeMs>, sample_rate: u32) -> (usize,
             )
         })
         .unwrap_or((0, usize::MAX))
+}
+
+fn resample_pcm(decoded: &DecodedPcmBuffer, target_sample_rate: u32) -> Option<DecodedPcmBuffer> {
+    if decoded.sample_rate == target_sample_rate {
+        return None;
+    }
+
+    let channel_count = decoded.channels as usize;
+    let source_frames = decoded.samples.len() / channel_count;
+    if source_frames == 0 {
+        return Some(DecodedPcmBuffer {
+            sample_rate: target_sample_rate,
+            channels: decoded.channels,
+            samples: Vec::new(),
+        });
+    }
+
+    let target_frames = ((source_frames as u128 * target_sample_rate as u128)
+        / decoded.sample_rate as u128)
+        .max(1) as usize;
+    let mut samples = Vec::with_capacity(target_frames * channel_count);
+
+    for target_frame in 0..target_frames {
+        let source_position =
+            target_frame as f64 * decoded.sample_rate as f64 / target_sample_rate as f64;
+        let left_frame = source_position.floor() as usize;
+        let right_frame = (left_frame + 1).min(source_frames - 1);
+        let blend = (source_position - left_frame as f64) as f32;
+
+        for channel in 0..channel_count {
+            let left = decoded.samples[left_frame * channel_count + channel];
+            let right = decoded.samples[right_frame * channel_count + channel];
+            samples.push(left + (right - left) * blend);
+        }
+    }
+
+    Some(DecodedPcmBuffer {
+        sample_rate: target_sample_rate,
+        channels: decoded.channels,
+        samples,
+    })
 }
 
 fn ms_to_frame(ms: u64, sample_rate: u32) -> usize {
@@ -955,31 +981,31 @@ mod tests {
     }
 
     #[test]
-    fn wav_render_export_rejects_mismatched_decoded_sample_rate() {
+    fn wav_render_export_resamples_decoded_pcm_to_target_sample_rate() {
+        let destination_path = unique_export_path("project/audio/resampled.wav");
         let plan = ExportPlan {
             source_path: "/library/source.mp3".to_string(),
-            destination_path: "/project/audio/source.wav".to_string(),
+            destination_path: destination_path.to_string_lossy().to_string(),
             range: None,
             conversion: Some(AudioConversion {
-                sample_rate: 48_000,
+                sample_rate: 4,
                 bit_depth: 24,
             }),
             preserve_original: true,
             include_license_record: true,
         };
         let decoded = DecodedPcmBuffer {
-            sample_rate: 44_100,
-            channels: 2,
-            samples: vec![0.0, 0.0],
+            sample_rate: 2,
+            channels: 1,
+            samples: vec![-1.0, 1.0],
         };
 
-        assert_eq!(
-            render_wav_export(&plan, &decoded).map(|_| ()),
-            Err(ExportExecutionError::DecodedSampleRateMismatch {
-                expected: 48_000,
-                actual: 44_100,
-            })
-        );
+        let rendered = render_wav_export(&plan, &decoded).expect("render wav");
+        let wav = fs::read(&destination_path).expect("wav");
+
+        assert_eq!(rendered.frames_rendered, 4);
+        assert_eq!(u32::from_le_bytes([wav[24], wav[25], wav[26], wav[27]]), 4);
+        assert_eq!(u32::from_le_bytes([wav[40], wav[41], wav[42], wav[43]]), 12);
     }
 
     #[test]
