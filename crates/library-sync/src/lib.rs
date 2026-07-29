@@ -28,6 +28,19 @@ pub struct WriterLease {
     pub ttl_ms: u64,
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum MediaRootStatus {
+    Online,
+    Offline,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct MediaRootProbe {
+    pub media_root: String,
+    pub status: MediaRootStatus,
+    pub reconnect_validation_required: bool,
+}
+
 impl PortableManifest {
     pub fn new(library_id: Uuid, revision: u64) -> Self {
         Self {
@@ -48,6 +61,24 @@ impl PortableManifest {
 
     pub fn from_json(value: &str) -> Result<Self, serde_json::Error> {
         serde_json::from_str(value)
+    }
+}
+
+pub fn probe_media_root(
+    media_root: impl AsRef<str>,
+    exists: impl Fn(&str) -> bool,
+) -> MediaRootProbe {
+    let media_root = media_root.as_ref().to_string();
+    let status = if exists(&media_root) {
+        MediaRootStatus::Online
+    } else {
+        MediaRootStatus::Offline
+    };
+
+    MediaRootProbe {
+        media_root,
+        status,
+        reconnect_validation_required: status == MediaRootStatus::Online,
     }
 }
 
@@ -123,5 +154,23 @@ mod tests {
             lease_state_at(Some(&lease), "laptop", 1_200),
             WriterLeaseState::ReadOnlyBecauseAnotherWriterExists
         );
+    }
+
+    #[test]
+    fn online_media_root_requests_reconnect_validation() {
+        let probe = probe_media_root("/Volumes/TrueNAS/SFX", |path| {
+            path == "/Volumes/TrueNAS/SFX"
+        });
+
+        assert_eq!(probe.status, MediaRootStatus::Online);
+        assert!(probe.reconnect_validation_required);
+    }
+
+    #[test]
+    fn offline_media_root_keeps_catalog_available_without_validation() {
+        let probe = probe_media_root("/Volumes/TrueNAS/SFX", |_| false);
+
+        assert_eq!(probe.status, MediaRootStatus::Offline);
+        assert!(!probe.reconnect_validation_required);
     }
 }

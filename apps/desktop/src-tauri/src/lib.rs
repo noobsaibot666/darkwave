@@ -93,6 +93,17 @@ fn backup_restore_requirements() -> Vec<&'static str> {
     vec!["catalog_snapshot", "portable_manifest", "media_root"]
 }
 
+#[tauri::command]
+fn sample_media_root_status() -> (&'static str, bool) {
+    let probe = library_sync::probe_media_root("/Volumes/TrueNAS/SFX", |_| false);
+    let status = match probe.status {
+        library_sync::MediaRootStatus::Online => "online",
+        library_sync::MediaRootStatus::Offline => "offline",
+    };
+
+    (status, probe.reconnect_validation_required)
+}
+
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
     tauri::Builder::default()
@@ -108,7 +119,8 @@ pub fn run() {
             default_command_titles,
             sample_maintenance_summary,
             trash_retention_policy_days,
-            backup_restore_requirements
+            backup_restore_requirements,
+            sample_media_root_status
         ])
         .run(tauri::generate_context!())
         .expect("failed to run Darkwave desktop shell");
@@ -185,5 +197,10 @@ mod tests {
             super::backup_restore_requirements(),
             vec!["catalog_snapshot", "portable_manifest", "media_root"]
         );
+    }
+
+    #[test]
+    fn sample_media_root_status_reports_offline_without_reconnect_validation() {
+        assert_eq!(super::sample_media_root_status(), ("offline", false));
     }
 }

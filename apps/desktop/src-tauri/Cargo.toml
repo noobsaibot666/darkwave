@@ -18,6 +18,7 @@ tauri-build = { version = "2", features = [] }
 backup = { path = "../../../crates/backup" }
 command-palette = { path = "../../../crates/command-palette" }
 library-core = { path = "../../../crates/library-core" }
+library-sync = { path = "../../../crates/library-sync" }
 maintenance = { path = "../../../crates/maintenance" }
 preferences = { path = "../../../crates/preferences" }
 release-readiness = { path = "../../../crates/release-readiness" }

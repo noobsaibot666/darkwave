@@ -669,6 +669,7 @@ dependencies = [
  "backup",
  "command-palette",
  "library-core",
+ "library-sync",
  "maintenance",
  "preferences",
  "release-readiness",
