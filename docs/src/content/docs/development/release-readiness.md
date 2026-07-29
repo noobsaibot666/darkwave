@@ -16,6 +16,8 @@ Release readiness is tracked through explicit gates:
 - Update system.
 - Signing and notarization.
 
+`release-readiness` exposes a `ReleaseReadinessConfig` that combines source-owned gates with optional distribution metadata. The desktop shell uses this aggregate config, so the release blocker list stays consistent with the same gate model used by tests.
+
 WAV PCM decoding is native. Compressed MVP formats such as MP3, FLAC, AAC/M4A, AIFF, and OGG are tracked as packaged-decoder work until the decoder bundle covers every required extension and codec licensing review metadata is attached. Unsupported formats remain visible with a conversion option.
 
 The update system gate now validates source-owned channel metadata: an HTTPS update manifest URL and a non-empty release public-key identifier. The desktop shell still reports the update gate as planned until real channel metadata is configured for a release build.

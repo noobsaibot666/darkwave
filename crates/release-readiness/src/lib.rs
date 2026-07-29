@@ -188,6 +188,65 @@ pub struct ReleaseCandidate {
     pub signing_notarization: GateState,
 }
 
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct ReleaseReadinessConfig {
+    pub macos_audit: GateState,
+    pub windows_audit: GateState,
+    pub accessibility_audit: GateState,
+    pub performance_profile: GateState,
+    pub crash_recovery: GateState,
+    pub onboarding_docs: GateState,
+    pub codec_distribution: Option<CodecDistributionConfig>,
+    pub update_channel: Option<UpdateChannelConfig>,
+    pub signing_notarization: Option<SigningNotarizationConfig>,
+}
+
+impl ReleaseReadinessConfig {
+    pub fn code_gates_passed() -> Self {
+        Self {
+            macos_audit: GateState::Passed,
+            windows_audit: GateState::Passed,
+            accessibility_audit: GateState::Passed,
+            performance_profile: GateState::Passed,
+            crash_recovery: GateState::Passed,
+            onboarding_docs: GateState::Passed,
+            codec_distribution: None,
+            update_channel: None,
+            signing_notarization: None,
+        }
+    }
+
+    pub fn with_codec_distribution(mut self, config: CodecDistributionConfig) -> Self {
+        self.codec_distribution = Some(config);
+        self
+    }
+
+    pub fn with_update_channel(mut self, config: UpdateChannelConfig) -> Self {
+        self.update_channel = Some(config);
+        self
+    }
+
+    pub fn with_signing_notarization(mut self, config: SigningNotarizationConfig) -> Self {
+        self.signing_notarization = Some(config);
+        self
+    }
+
+    pub fn candidate(&self) -> ReleaseCandidate {
+        ReleaseCandidate {
+            macos_audit: self.macos_audit,
+            windows_audit: self.windows_audit,
+            accessibility_audit: self.accessibility_audit,
+            performance_profile: self.performance_profile,
+            crash_recovery: self.crash_recovery,
+            onboarding_docs: self.onboarding_docs,
+            codec_packaging: codec_packaging_gate(self.codec_distribution.as_ref()),
+            codec_license_review: codec_license_review_gate(self.codec_distribution.as_ref()),
+            update_system: update_system_gate(self.update_channel.as_ref()),
+            signing_notarization: signing_notarization_gate(self.signing_notarization.as_ref()),
+        }
+    }
+}
+
 impl ReleaseCandidate {
     pub fn blockers(&self) -> Vec<ReleaseBlocker> {
         let gates = [
@@ -380,5 +439,46 @@ mod tests {
             codec_license_review_gate(Some(&incomplete)),
             GateState::Planned
         );
+    }
+
+    #[test]
+    fn release_readiness_config_keeps_distribution_blockers_without_release_metadata() {
+        let candidate = ReleaseReadinessConfig::code_gates_passed().candidate();
+
+        assert_eq!(
+            candidate.blockers(),
+            vec![
+                ReleaseBlocker::CodecPackaging,
+                ReleaseBlocker::CodecLicenseReview,
+                ReleaseBlocker::UpdateSystem,
+                ReleaseBlocker::SigningNotarization
+            ]
+        );
+    }
+
+    #[test]
+    fn release_readiness_config_passes_when_code_and_distribution_metadata_are_complete() {
+        let candidate = ReleaseReadinessConfig::code_gates_passed()
+            .with_codec_distribution(CodecDistributionConfig {
+                packaged_decoder_extensions: REQUIRED_PACKAGED_DECODER_EXTENSIONS
+                    .iter()
+                    .map(|extension| extension.to_string())
+                    .collect(),
+                license_review_reference: Some("LEGAL-CODEC-2026-07".to_string()),
+            })
+            .with_update_channel(UpdateChannelConfig {
+                channel: UpdateChannel::Stable,
+                manifest_url: "https://updates.darkwave.example/stable/latest.json".to_string(),
+                public_key_id: "darkwave-release-2026".to_string(),
+            })
+            .with_signing_notarization(SigningNotarizationConfig {
+                macos_developer_id: "Developer ID Application: Darkwave Audio GmbH".to_string(),
+                macos_team_id: "ABCD123456".to_string(),
+                windows_certificate_thumbprint: "00112233445566778899AABBCCDDEEFF00112233"
+                    .to_string(),
+            })
+            .candidate();
+
+        assert_eq!(candidate.blockers(), Vec::new());
     }
 }

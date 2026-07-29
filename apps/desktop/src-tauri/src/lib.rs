@@ -5,38 +5,25 @@ fn healthcheck() -> &'static str {
 
 #[tauri::command]
 fn release_blockers() -> Vec<&'static str> {
-    use release_readiness::{
-        codec_license_review_gate, codec_packaging_gate, signing_notarization_gate,
-        update_system_gate, GateState, ReleaseBlocker, ReleaseCandidate,
-    };
+    use release_readiness::{ReleaseBlocker, ReleaseReadinessConfig};
 
-    ReleaseCandidate {
-        macos_audit: GateState::Passed,
-        windows_audit: GateState::Passed,
-        accessibility_audit: GateState::Passed,
-        performance_profile: GateState::Passed,
-        crash_recovery: GateState::Passed,
-        onboarding_docs: GateState::Passed,
-        codec_packaging: codec_packaging_gate(None),
-        codec_license_review: codec_license_review_gate(None),
-        update_system: update_system_gate(None),
-        signing_notarization: signing_notarization_gate(None),
-    }
-    .blockers()
-    .into_iter()
-    .map(|blocker| match blocker {
-        ReleaseBlocker::MacosAudit => "macos_audit",
-        ReleaseBlocker::WindowsAudit => "windows_audit",
-        ReleaseBlocker::AccessibilityAudit => "accessibility_audit",
-        ReleaseBlocker::PerformanceProfile => "performance_profile",
-        ReleaseBlocker::CrashRecovery => "crash_recovery",
-        ReleaseBlocker::OnboardingDocs => "onboarding_docs",
-        ReleaseBlocker::CodecPackaging => "codec_packaging",
-        ReleaseBlocker::CodecLicenseReview => "codec_license_review",
-        ReleaseBlocker::UpdateSystem => "update_system",
-        ReleaseBlocker::SigningNotarization => "signing_notarization",
-    })
-    .collect()
+    ReleaseReadinessConfig::code_gates_passed()
+        .candidate()
+        .blockers()
+        .into_iter()
+        .map(|blocker| match blocker {
+            ReleaseBlocker::MacosAudit => "macos_audit",
+            ReleaseBlocker::WindowsAudit => "windows_audit",
+            ReleaseBlocker::AccessibilityAudit => "accessibility_audit",
+            ReleaseBlocker::PerformanceProfile => "performance_profile",
+            ReleaseBlocker::CrashRecovery => "crash_recovery",
+            ReleaseBlocker::OnboardingDocs => "onboarding_docs",
+            ReleaseBlocker::CodecPackaging => "codec_packaging",
+            ReleaseBlocker::CodecLicenseReview => "codec_license_review",
+            ReleaseBlocker::UpdateSystem => "update_system",
+            ReleaseBlocker::SigningNotarization => "signing_notarization",
+        })
+        .collect()
 }
 
 #[tauri::command]
