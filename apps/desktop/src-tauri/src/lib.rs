@@ -1,6 +1,26 @@
 use std::collections::HashSet;
+use std::path::PathBuf;
+use std::sync::Mutex;
 
+use import_pipeline::{ImportError, ImportMode};
 use release_readiness::{ReleaseBlocker, ReleaseReadinessConfig};
+use storage::{AssetRecord, Catalog, LibraryRecord, StorageError};
+use tauri::Manager;
+use uuid::Uuid;
+
+struct CatalogState(Mutex<Catalog>);
+
+#[derive(Debug, serde::Serialize)]
+struct ImportFailure {
+    filename: String,
+    reason: String,
+}
+
+#[derive(Debug, serde::Serialize)]
+struct ImportFolderResult {
+    imported: Vec<AssetRecord>,
+    failed: Vec<ImportFailure>,
+}
 
 #[derive(Clone, Debug, Eq, PartialEq, serde::Serialize)]
 struct ReleaseReadinessItem {
@@ -145,12 +165,134 @@ fn sample_media_root_status() -> (&'static str, bool) {
     (status, probe.reconnect_validation_required)
 }
 
+#[tauri::command]
+fn list_libraries(state: tauri::State<CatalogState>) -> Result<Vec<LibraryRecord>, String> {
+    let catalog = state.0.lock().expect("catalog mutex poisoned");
+    catalog.list_libraries().map_err(storage_error_message)
+}
+
+#[tauri::command]
+fn create_library(
+    state: tauri::State<CatalogState>,
+    name: String,
+    media_root: String,
+) -> Result<LibraryRecord, String> {
+    library_core::validate_library_draft(&library_core::LibraryDraft {
+        name: name.clone(),
+        media_root: media_root.clone(),
+    })
+    .map_err(|error| error.to_string())?;
+
+    let catalog = state.0.lock().expect("catalog mutex poisoned");
+    let library = catalog
+        .create_library(name, media_root)
+        .map_err(storage_error_message)?;
+    catalog
+        .seed_starter_taxonomy()
+        .map_err(storage_error_message)?;
+
+    Ok(library)
+}
+
+#[tauri::command]
+fn list_assets(
+    state: tauri::State<CatalogState>,
+    library_id: String,
+) -> Result<Vec<AssetRecord>, String> {
+    let library_id = parse_library_id(&library_id)?;
+    let catalog = state.0.lock().expect("catalog mutex poisoned");
+    catalog
+        .list_assets(library_id)
+        .map_err(storage_error_message)
+}
+
+#[tauri::command]
+fn search_assets(
+    state: tauri::State<CatalogState>,
+    library_id: String,
+    query: String,
+) -> Result<Vec<AssetRecord>, String> {
+    let library_id = parse_library_id(&library_id)?;
+    let catalog = state.0.lock().expect("catalog mutex poisoned");
+    catalog
+        .search_assets(library_id, storage::AssetSearchQuery::text(query))
+        .map_err(storage_error_message)
+}
+
+#[tauri::command]
+fn import_folder(
+    state: tauri::State<CatalogState>,
+    library_id: String,
+    folder_path: String,
+    mode: String,
+) -> Result<ImportFolderResult, String> {
+    let library_id = parse_library_id(&library_id)?;
+    let import_mode = match mode.as_str() {
+        "managed" => ImportMode::Managed,
+        "referenced" => ImportMode::Referenced,
+        other => return Err(format!("unknown import mode: {other}")),
+    };
+
+    let entries = std::fs::read_dir(&folder_path)
+        .map_err(|error| format!("could not read folder {folder_path}: {error}"))?;
+
+    let catalog = state.0.lock().expect("catalog mutex poisoned");
+    let mut imported = Vec::new();
+    let mut failed = Vec::new();
+
+    let mut paths: Vec<PathBuf> = entries
+        .filter_map(|entry| entry.ok())
+        .map(|entry| entry.path())
+        .filter(|path| path.is_file())
+        .collect();
+    paths.sort();
+
+    for path in paths {
+        let filename = path
+            .file_name()
+            .map(|name| name.to_string_lossy().to_string())
+            .unwrap_or_default();
+
+        match import_pipeline::import_file(&catalog, library_id, &path, import_mode) {
+            Ok(asset) => imported.push(asset),
+            Err(ImportError::UnsupportedFormat(_)) => {}
+            Err(error) => failed.push(ImportFailure {
+                filename,
+                reason: error.to_string(),
+            }),
+        }
+    }
+
+    Ok(ImportFolderResult { imported, failed })
+}
+
+fn parse_library_id(value: &str) -> Result<Uuid, String> {
+    Uuid::parse_str(value).map_err(|_| format!("invalid library id: {value}"))
+}
+
+fn storage_error_message(error: StorageError) -> String {
+    error.to_string()
+}
+
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
     tauri::Builder::default()
         .plugin(tauri_plugin_dialog::init())
         .plugin(tauri_plugin_fs::init())
         .plugin(tauri_plugin_opener::init())
+        .setup(|app| {
+            let app_data_dir = app
+                .path()
+                .app_data_dir()
+                .expect("resolve app data directory");
+            std::fs::create_dir_all(&app_data_dir).expect("create app data directory");
+
+            let catalog = Catalog::open(app_data_dir.join("catalog.sqlite"))
+                .expect("open local catalog database");
+            app.manage(CatalogState(Mutex::new(catalog)));
+
+            Ok(())
+        })
         .invoke_handler(tauri::generate_handler![
             healthcheck,
             release_blockers,
@@ -162,7 +304,12 @@ pub fn run() {
             sample_maintenance_summary,
             trash_retention_policy_days,
             backup_restore_requirements,
-            sample_media_root_status
+            sample_media_root_status,
+            list_libraries,
+            create_library,
+            list_assets,
+            search_assets,
+            import_folder
         ])
         .run(tauri::generate_context!())
         .expect("failed to run Darkwave desktop shell");
@@ -173,6 +320,17 @@ mod tests {
     #[test]
     fn healthcheck_returns_product_codename() {
         assert_eq!(super::healthcheck(), "Darkwave");
+    }
+
+    #[test]
+    fn parse_library_id_rejects_non_uuid_input() {
+        assert!(super::parse_library_id("not-a-uuid").is_err());
+    }
+
+    #[test]
+    fn parse_library_id_accepts_uuid_input() {
+        let id = uuid::Uuid::new_v4();
+        assert_eq!(super::parse_library_id(&id.to_string()), Ok(id));
     }
 
     #[test]

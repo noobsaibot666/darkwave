@@ -671,6 +671,7 @@ version = "0.1.0"
 dependencies = [
  "backup",
  "command-palette",
+ "import-pipeline",
  "library-core",
  "library-sync",
  "maintenance",
@@ -678,12 +679,14 @@ dependencies = [
  "release-readiness",
  "serde",
  "serde_json",
+ "storage",
  "tauri",
  "tauri-build",
  "tauri-plugin-dialog",
  "tauri-plugin-fs",
  "tauri-plugin-opener",
  "trash",
+ "uuid",
  "viewport",
  "workspace-state",
 ]

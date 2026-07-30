@@ -262,11 +262,18 @@ input:focus-visible {
   border-radius: 8px;
   background: #181a1f;
   color: #aeb6c2;
+  cursor: pointer;
 }
 
 .asset-row.selected {
   border-color: rgba(82, 199, 184, 0.55);
   background: #20242b;
+}
+
+.empty-browser {
+  padding: 24px 10px;
+  color: #717987;
+  font-size: 13px;
 }
 
 .asset-row strong {
@@ -569,4 +576,78 @@ dd {
   color: #aeb6c2;
   font-size: 12px;
   text-align: right;
+}
+
+.setup-shell {
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  height: 100vh;
+  background: #101114;
+}
+
+.setup-card {
+  display: flex;
+  width: 360px;
+  flex-direction: column;
+  gap: 12px;
+  padding: 28px;
+  border: 1px solid rgba(255, 255, 255, 0.1);
+  border-radius: 12px;
+  background: rgba(24, 26, 31, 0.9);
+}
+
+.setup-card h1 {
+  margin: 0;
+  font-size: 20px;
+}
+
+.setup-card p {
+  margin: 0 0 6px;
+  color: #aeb6c2;
+  font-size: 13px;
+}
+
+.setup-field {
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+  font-size: 12px;
+  color: #aeb6c2;
+}
+
+.setup-field input {
+  height: 36px;
+  padding: 0 10px;
+  border: 1px solid rgba(255, 255, 255, 0.1);
+  border-radius: 6px;
+  background: #181a1f;
+  color: #f2f4f8;
+}
+
+.setup-field-row {
+  display: flex;
+  gap: 8px;
+}
+
+.setup-field-row input {
+  flex: 1;
+  min-width: 0;
+}
+
+.setup-field-row button {
+  padding: 0 12px;
+  border: 1px solid rgba(255, 255, 255, 0.1);
+  border-radius: 6px;
+  background: #20242b;
+  color: #f2f4f8;
+}
+
+.setup-card .primary-action {
+  justify-content: center;
+  margin-top: 4px;
+}
+
+.setup-card .primary-action:disabled {
+  opacity: 0.5;
 }

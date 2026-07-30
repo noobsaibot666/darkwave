@@ -22,14 +22,14 @@ pub fn is_network_tolerant_catalog_path(path: &str) -> Result<bool, StorageError
     Ok(!path.contains("/Volumes/") && !path.starts_with("\\\\"))
 }
 
-#[derive(Clone, Debug, Eq, PartialEq)]
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 pub struct LibraryRecord {
     pub id: Uuid,
     pub name: String,
     pub media_root: String,
 }
 
-#[derive(Clone, Debug, Eq, PartialEq)]
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 pub enum AssetPath {
     Managed(String),
     Referenced(String),
@@ -48,7 +48,7 @@ pub struct NewAssetRecord {
     pub availability_state: AvailabilityState,
 }
 
-#[derive(Clone, Debug, Eq, PartialEq)]
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 pub struct AssetRecord {
     pub id: Uuid,
     pub library_id: Uuid,
@@ -64,7 +64,7 @@ pub struct AssetRecord {
     pub favorite: bool,
 }
 
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
 pub enum ReviewState {
     Unreviewed,
     Reviewed,
@@ -236,6 +236,23 @@ impl Catalog {
         )?;
 
         Ok(library)
+    }
+
+    pub fn list_libraries(&self) -> Result<Vec<LibraryRecord>, StorageError> {
+        let mut statement = self
+            .connection
+            .prepare("SELECT id, name, media_root FROM libraries ORDER BY created_at ASC")?;
+        let libraries = statement
+            .query_map([], |row| {
+                Ok(LibraryRecord {
+                    id: parse_uuid(row.get::<_, String>(0)?),
+                    name: row.get(1)?,
+                    media_root: row.get(2)?,
+                })
+            })?
+            .collect::<Result<Vec<_>, _>>()?;
+
+        Ok(libraries)
     }
 
     pub fn get_library(&self, id: Uuid) -> Result<Option<LibraryRecord>, StorageError> {
@@ -1511,6 +1528,29 @@ mod tests {
 
         assert_eq!(loaded.name, "Editor Library");
         assert_eq!(loaded.media_root, "/Volumes/TrueNAS/SFX");
+    }
+
+    #[test]
+    fn list_libraries_returns_all_libraries_in_creation_order() {
+        let catalog_path = unique_catalog_path("list-libraries");
+        let catalog = Catalog::open(&catalog_path).expect("open catalog");
+        let first = catalog
+            .create_library("Home Studio", "/Volumes/TrueNAS/SFX")
+            .expect("create first library");
+        let second = catalog
+            .create_library("Freelance Kit", "/Users/editor/Sounds")
+            .expect("create second library");
+
+        let libraries = catalog.list_libraries().expect("list libraries");
+
+        assert_eq!(
+            libraries
+                .iter()
+                .map(|library| library.id)
+                .collect::<Vec<_>>(),
+            vec![first.id, second.id]
+        );
+        assert_eq!(libraries[1].name, second.name);
     }
 
     #[test]

@@ -17,11 +17,14 @@ tauri-build = { version = "2", features = [] }
 [dependencies]
 backup = { path = "../../../crates/backup" }
 command-palette = { path = "../../../crates/command-palette" }
+import-pipeline = { path = "../../../crates/import-pipeline" }
 library-core = { path = "../../../crates/library-core" }
 library-sync = { path = "../../../crates/library-sync" }
 maintenance = { path = "../../../crates/maintenance" }
 preferences = { path = "../../../crates/preferences" }
 release-readiness = { path = "../../../crates/release-readiness" }
+storage = { path = "../../../crates/storage" }
+uuid.workspace = true
 viewport = { path = "../../../crates/viewport" }
 workspace-state = { path = "../../../crates/workspace-state" }
 tauri = { version = "2", features = [] }

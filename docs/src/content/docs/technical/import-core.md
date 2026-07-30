@@ -30,3 +30,5 @@ The import core is intentionally small and restart-safe.
 - Stores pending jobs.
 
 This preserves the product principle that import should feel immediate while analysis improves the asset progressively in the background.
+
+The desktop shell's `import_folder` command drives this pipeline directly: it lists the files in a user-chosen folder, calls `import_file` for each supported one, and returns both the imported assets and any per-file failures rather than aborting the whole import on the first error. It defaults to referenced imports so a first run never copies or moves the user's files; managed import is available but not yet the default from the UI. The background jobs enqueued by import are not processed yet — nothing currently consumes the `background_jobs` table.
