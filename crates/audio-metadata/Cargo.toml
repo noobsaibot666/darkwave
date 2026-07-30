@@ -7,5 +7,6 @@ repository.workspace = true
 rust-version.workspace = true
 
 [dependencies]
+symphonia = { version = "0.5.5", features = ["mp3", "aac", "flac", "isomp4", "ogg", "vorbis", "wav", "aiff"] }
 thiserror.workspace = true
 uuid.workspace = true

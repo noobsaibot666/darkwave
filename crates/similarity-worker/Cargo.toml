@@ -1,0 +1,21 @@
+[package]
+name = "similarity-worker"
+version = "0.1.0"
+edition.workspace = true
+# Not workspace.rust-version (1.80): bliss-audio's symphonia-all pulls in
+# symphonia 0.6, which needs rustc 1.85.
+rust-version = "1.85"
+repository.workspace = true
+# Deliberately NOT license.workspace (= "Proprietary"). bliss-rs is GPL-3.0,
+# so this crate is GPL-3.0 too and built/shipped as an isolated subprocess
+# rather than linked into the main, Proprietary-licensed app binary. See
+# README.md in this directory and docs/adr/0025-real-audio-analysis.md.
+license = "GPL-3.0-or-later"
+
+[[bin]]
+name = "similarity-worker"
+path = "src/main.rs"
+
+[dependencies]
+bliss-audio = { version = "0.11.4", default-features = false, features = ["analysis", "symphonia-all", "serde"] }
+serde_json.workspace = true

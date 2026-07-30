@@ -54,6 +54,17 @@ type AssetRecord = {
   embedded_title: string | null;
   embedded_genre: string | null;
   embedded_comment: string | null;
+  duration_ms: number | null;
+  sample_rate: number | null;
+  bit_depth: number | null;
+  channels: number | null;
+  loudness_lufs: number | null;
+  peak_db: number | null;
+  bpm: number | null;
+  bpm_confidence: number | null;
+  /** Best-effort detected pitch note name (e.g. "A4"), not a musical key. */
+  musical_key: string | null;
+  key_confidence: number | null;
 };
 
 type ImportFailure = {
@@ -350,6 +361,7 @@ export function App() {
   const [maintenanceReport, setMaintenanceReport] = useState<MaintenanceReport | null>(null);
   const [mediaRootStatus, setMediaRootStatus] = useState<{ status: string; reconnectRequired: boolean } | null>(null);
   const [exportStatus, setExportStatus] = useState<string | null>(null);
+  const [similarStatus, setSimilarStatus] = useState<string | null>(null);
   const [offlineControl, setOfflineControl] = useState<OfflineControlState | null>(null);
   const [reconnectStatus, setReconnectStatus] = useState<string | null>(null);
   const [trashItems, setTrashItems] = useState<TrashItem[]>([]);
@@ -674,6 +686,27 @@ export function App() {
       .catch(() => {});
   }, []);
 
+  const handleFindSimilar = useCallback(() => {
+    if (!selectedAssetId || !activeLibraryId) return;
+    setSimilarStatus("Finding similar sounds…");
+    invoke<AssetRecord[]>("similar_assets", {
+      libraryId: activeLibraryId,
+      assetId: selectedAssetId,
+      limit: 24
+    })
+      .then((results) => {
+        setAssets(results);
+        setSimilarStatus(
+          results.length > 0
+            ? `Showing ${results.length} similar sound${results.length === 1 ? "" : "s"}`
+            : "No other analyzed sounds to compare yet"
+        );
+      })
+      .catch(() =>
+        setSimilarStatus("This sound hasn't been analyzed yet — try again once import finishes processing")
+      );
+  }, [selectedAssetId, activeLibraryId]);
+
   const handleApplyTag = useCallback(
     (tag: TagRecord) => {
       if (bulkAssetIds.length === 0) return;
@@ -990,6 +1023,9 @@ export function App() {
       invoke<number>("process_pending_jobs")
         .then(() => refreshAssets(activeLibraryId, searchQuery, activeFilter))
         .catch(() => {});
+      invoke<number>("process_audio_analysis_jobs")
+        .then(() => refreshAssets(activeLibraryId, searchQuery, activeFilter))
+        .catch(() => {});
     } catch (error) {
       setImportStatus(`Import failed: ${String(error)}`);
     }
@@ -1002,6 +1038,9 @@ export function App() {
       .then((result) => {
         if (result.imported.length > 0) {
           invoke<number>("process_pending_jobs").catch(() => {});
+          invoke<number>("process_audio_analysis_jobs")
+            .then(() => refreshAssets(activeLibraryId, searchQuery, activeFilter))
+            .catch(() => {});
         }
         setRefreshStatus(
           result.imported.length > 0
@@ -1623,6 +1662,39 @@ export function App() {
             {selectedAsset.embedded_title ? <div className="status-line">Title: {selectedAsset.embedded_title}</div> : null}
             {selectedAsset.embedded_genre ? <div className="status-line">Genre: {selectedAsset.embedded_genre}</div> : null}
             {selectedAsset.embedded_comment ? <div className="status-line">Comment: {selectedAsset.embedded_comment}</div> : null}
+          </CollapsibleSection>
+        ) : null}
+        {selectedAsset &&
+        (selectedAsset.bpm != null ||
+          selectedAsset.musical_key != null ||
+          selectedAsset.duration_ms != null) ? (
+          <CollapsibleSection
+            id="detected"
+            title="Detected Audio Attributes"
+            collapsed={collapsedSections.has("detected")}
+            onToggle={toggleSection}
+          >
+            {selectedAsset.duration_ms != null ? (
+              <div className="status-line">Duration: {formatTime(selectedAsset.duration_ms / 1000)}</div>
+            ) : null}
+            {selectedAsset.sample_rate != null ? (
+              <div className="status-line">
+                {(selectedAsset.sample_rate / 1000).toFixed(1)} kHz
+                {selectedAsset.channels != null ? ` · ${selectedAsset.channels === 1 ? "Mono" : selectedAsset.channels === 2 ? "Stereo" : `${selectedAsset.channels}ch`}` : ""}
+              </div>
+            ) : null}
+            {selectedAsset.bpm != null ? (
+              <div className="status-line">
+                ~{Math.round(selectedAsset.bpm)} BPM (best-effort)
+              </div>
+            ) : null}
+            {selectedAsset.musical_key != null ? (
+              <div className="status-line">Detected pitch: {selectedAsset.musical_key} (best-effort, not a musical key)</div>
+            ) : null}
+            <button type="button" className="text-button" onClick={handleFindSimilar}>
+              Find Similar Sounds
+            </button>
+            {similarStatus ? <div className="status-line">{similarStatus}</div> : null}
           </CollapsibleSection>
         ) : null}
         <CollapsibleSection id="source" title="Source & License" collapsed={collapsedSections.has("source")} onToggle={toggleSection}>

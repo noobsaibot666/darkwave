@@ -50,7 +50,7 @@ pub struct NewAssetRecord {
     pub availability_state: AvailabilityState,
 }
 
-#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 pub struct AssetRecord {
     pub id: Uuid,
     pub library_id: Uuid,
@@ -67,6 +67,37 @@ pub struct AssetRecord {
     pub embedded_title: Option<String>,
     pub embedded_genre: Option<String>,
     pub embedded_comment: Option<String>,
+    pub duration_ms: Option<i64>,
+    pub sample_rate: Option<i64>,
+    pub bit_depth: Option<i64>,
+    pub channels: Option<i64>,
+    pub loudness_lufs: Option<f64>,
+    pub peak_db: Option<f64>,
+    pub bpm: Option<f64>,
+    pub bpm_confidence: Option<f64>,
+    /// Best-effort detected pitch note name (e.g. "A4"), not a musical key —
+    /// see docs/adr/0025-real-audio-analysis.md.
+    pub musical_key: Option<String>,
+    pub key_confidence: Option<f64>,
+}
+
+/// Fields written by the `AudioAnalysis` background job. `None` leaves the
+/// corresponding column unchanged is NOT the semantics here — every field is
+/// written as given, so pass the asset's existing value through for anything
+/// the caller doesn't want to clear.
+#[derive(Clone, Debug, Default, PartialEq)]
+pub struct AudioAnalysisUpdate {
+    pub duration_ms: Option<i64>,
+    pub sample_rate: Option<i64>,
+    pub bit_depth: Option<i64>,
+    pub channels: Option<i64>,
+    pub loudness_lufs: Option<f64>,
+    pub peak_db: Option<f64>,
+    pub bpm: Option<f64>,
+    pub bpm_confidence: Option<f64>,
+    pub musical_key: Option<String>,
+    pub key_confidence: Option<f64>,
+    pub perceptual_fingerprint: Option<String>,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
@@ -80,6 +111,7 @@ pub enum JobKind {
     MetadataExtraction,
     Hashing,
     WaveformGeneration,
+    AudioAnalysis,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -323,7 +355,9 @@ impl Catalog {
         let mut statement = self.connection.prepare(
             "SELECT id, library_id, original_filename, display_name, relative_path, referenced_path,
                 storage_mode, content_hash, media_type, file_size, availability_state, review_state, favorite,
-                    embedded_title, embedded_genre, embedded_comment
+                    embedded_title, embedded_genre, embedded_comment,
+                    duration_ms, sample_rate, bit_depth, channels, loudness_lufs, peak_db,
+                    bpm, bpm_confidence, musical_key, key_confidence
              FROM assets
              WHERE library_id = ?1
                AND NOT EXISTS (
@@ -463,6 +497,62 @@ impl Catalog {
             params![title, genre, comment, asset_id.to_string()],
         )?;
         Ok(())
+    }
+
+    pub fn set_audio_analysis(
+        &self,
+        asset_id: Uuid,
+        update: AudioAnalysisUpdate,
+    ) -> Result<(), StorageError> {
+        self.connection.execute(
+            "UPDATE assets SET
+                duration_ms = ?1, sample_rate = ?2, bit_depth = ?3, channels = ?4,
+                loudness_lufs = ?5, peak_db = ?6, bpm = ?7, bpm_confidence = ?8,
+                musical_key = ?9, key_confidence = ?10, perceptual_fingerprint = ?11
+             WHERE id = ?12",
+            params![
+                update.duration_ms,
+                update.sample_rate,
+                update.bit_depth,
+                update.channels,
+                update.loudness_lufs,
+                update.peak_db,
+                update.bpm,
+                update.bpm_confidence,
+                update.musical_key,
+                update.key_confidence,
+                update.perceptual_fingerprint,
+                asset_id.to_string(),
+            ],
+        )?;
+        Ok(())
+    }
+
+    /// (asset_id, perceptual_fingerprint JSON) pairs for every non-trashed
+    /// asset in the library that has been analyzed. Used by similarity
+    /// search — brute-force Euclidean distance over these, no vector index
+    /// needed at desktop-library scale.
+    pub fn perceptual_fingerprints(
+        &self,
+        library_id: Uuid,
+    ) -> Result<Vec<(Uuid, String)>, StorageError> {
+        let mut statement = self.connection.prepare(
+            "SELECT id, perceptual_fingerprint FROM assets
+             WHERE library_id = ?1 AND perceptual_fingerprint IS NOT NULL
+               AND NOT EXISTS (
+                 SELECT 1 FROM trash_items
+                 WHERE trash_items.asset_id = assets.id AND trash_items.state = 'in_trash'
+               )",
+        )?;
+        let rows = statement
+            .query_map(params![library_id.to_string()], |row| {
+                Ok((
+                    parse_uuid(row.get::<_, String>(0)?),
+                    row.get::<_, String>(1)?,
+                ))
+            })?
+            .collect::<Result<Vec<_>, _>>()?;
+        Ok(rows)
     }
 
     pub fn seed_starter_taxonomy(&self) -> Result<(), StorageError> {
@@ -730,7 +820,10 @@ impl Catalog {
             "SELECT assets.id, assets.library_id, assets.original_filename, assets.display_name,
                 assets.relative_path, assets.referenced_path, assets.storage_mode, assets.content_hash,
                 assets.media_type, assets.file_size, assets.availability_state, assets.review_state, assets.favorite,
-                assets.embedded_title, assets.embedded_genre, assets.embedded_comment
+                assets.embedded_title, assets.embedded_genre, assets.embedded_comment,
+                assets.duration_ms, assets.sample_rate, assets.bit_depth, assets.channels,
+                assets.loudness_lufs, assets.peak_db, assets.bpm, assets.bpm_confidence,
+                assets.musical_key, assets.key_confidence
              FROM assets
              INNER JOIN collection_assets ON collection_assets.asset_id = assets.id
              WHERE collection_assets.collection_id = ?1
@@ -768,6 +861,23 @@ impl Catalog {
         Ok(())
     }
 
+    /// Sets media_type directly — used by the AudioAnalysis job to flag real
+    /// content-detected silence/corruption as "needs_review", the same
+    /// pseudo-category the size-based import check already uses. Only ever
+    /// called to set that flag, never to clear it, so it can't undo a
+    /// user's own corrections.
+    pub fn set_media_type(
+        &self,
+        asset_id: Uuid,
+        media_type: impl AsRef<str>,
+    ) -> Result<(), StorageError> {
+        self.connection.execute(
+            "UPDATE assets SET media_type = ?1 WHERE id = ?2",
+            params![media_type.as_ref(), asset_id.to_string()],
+        )?;
+        Ok(())
+    }
+
     pub fn search_assets(
         &self,
         library_id: Uuid,
@@ -779,7 +889,10 @@ impl Catalog {
             "SELECT assets.id, assets.library_id, assets.original_filename, assets.display_name,
                 assets.relative_path, assets.referenced_path, assets.storage_mode, assets.content_hash,
                 assets.media_type, assets.file_size, assets.availability_state, assets.review_state, assets.favorite,
-                assets.embedded_title, assets.embedded_genre, assets.embedded_comment
+                assets.embedded_title, assets.embedded_genre, assets.embedded_comment,
+                assets.duration_ms, assets.sample_rate, assets.bit_depth, assets.channels,
+                assets.loudness_lufs, assets.peak_db, assets.bpm, assets.bpm_confidence,
+                assets.musical_key, assets.key_confidence
              FROM assets",
         );
         let mut query_params = vec![library_id.to_string()];
@@ -1516,7 +1629,9 @@ impl Catalog {
             .query_row(
                 "SELECT id, library_id, original_filename, display_name, relative_path, referenced_path,
                     storage_mode, content_hash, media_type, file_size, availability_state, review_state, favorite,
-                    embedded_title, embedded_genre, embedded_comment
+                    embedded_title, embedded_genre, embedded_comment,
+                    duration_ms, sample_rate, bit_depth, channels, loudness_lufs, peak_db,
+                    bpm, bpm_confidence, musical_key, key_confidence
                  FROM assets WHERE id = ?1",
                 params![id.to_string()],
                 asset_from_row,
@@ -1535,7 +1650,9 @@ impl Catalog {
             .query_row(
                 "SELECT id, library_id, original_filename, display_name, relative_path, referenced_path,
                     storage_mode, content_hash, media_type, file_size, availability_state, review_state, favorite,
-                    embedded_title, embedded_genre, embedded_comment
+                    embedded_title, embedded_genre, embedded_comment,
+                    duration_ms, sample_rate, bit_depth, channels, loudness_lufs, peak_db,
+                    bpm, bpm_confidence, musical_key, key_confidence
                  FROM assets
                  WHERE library_id = ?1 AND content_hash = ?2 AND file_size = ?3
                  LIMIT 1",
@@ -1581,6 +1698,16 @@ fn asset_from_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<AssetRecord> {
         embedded_title: row.get(13)?,
         embedded_genre: row.get(14)?,
         embedded_comment: row.get(15)?,
+        duration_ms: row.get(16)?,
+        sample_rate: row.get(17)?,
+        bit_depth: row.get(18)?,
+        channels: row.get(19)?,
+        loudness_lufs: row.get(20)?,
+        peak_db: row.get(21)?,
+        bpm: row.get(22)?,
+        bpm_confidence: row.get(23)?,
+        musical_key: row.get(24)?,
+        key_confidence: row.get(25)?,
     })
 }
 
@@ -1806,6 +1933,7 @@ fn job_kind_to_db(kind: &JobKind) -> &'static str {
         JobKind::MetadataExtraction => "metadata_extraction",
         JobKind::Hashing => "hashing",
         JobKind::WaveformGeneration => "waveform_generation",
+        JobKind::AudioAnalysis => "audio_analysis",
     }
 }
 
@@ -1813,6 +1941,7 @@ fn job_kind_from_db(value: &str) -> JobKind {
     match value {
         "hashing" => JobKind::Hashing,
         "waveform_generation" => JobKind::WaveformGeneration,
+        "audio_analysis" => JobKind::AudioAnalysis,
         _ => JobKind::MetadataExtraction,
     }
 }

@@ -827,11 +827,20 @@ fn asset_playback_path(
         .get_asset(parsed_id)
         .map_err(storage_error_message)?
         .ok_or_else(|| "asset not found".to_string())?;
-    let resolved = resolve_asset_path(&catalog, &asset)?;
-    drop(catalog);
+    local_asset_path(&app, &catalog, &asset)
+}
 
-    if let Ok(cache_dir) = preview_cache_dir(&app) {
-        let cached_path = cached_file_path(&cache_dir, &asset);
+/// Resolves an asset's path, preferring a locally cached copy over the
+/// (possibly NAS-backed) original when one exists.
+fn local_asset_path(
+    app: &tauri::AppHandle,
+    catalog: &Catalog,
+    asset: &AssetRecord,
+) -> Result<String, String> {
+    let resolved = resolve_asset_path(catalog, asset)?;
+
+    if let Ok(cache_dir) = preview_cache_dir(app) {
+        let cached_path = cached_file_path(&cache_dir, asset);
         if cached_path.exists() {
             return Ok(cached_path.to_string_lossy().to_string());
         }
@@ -1003,6 +1012,216 @@ fn process_pending_jobs(state: tauri::State<CatalogState>) -> Result<usize, Stri
     }
 
     Ok(processed)
+}
+
+/// Real, content-based needs-review detection, best-effort action-tag
+/// suggestions, tempo/pitch estimates, and (via the isolated GPL subprocess)
+/// a similarity feature vector — see docs/adr/0025-real-audio-analysis.md.
+///
+/// The catalog mutex is only ever held for brief, synchronous reads/writes
+/// around this — never across decode, DSP, or the subprocess await, which
+/// together can take real time per asset. Holding the mutex across slow
+/// work is the exact bug this project hit twice before (ADR 0023/0024).
+#[tauri::command]
+async fn process_audio_analysis_jobs(
+    app: tauri::AppHandle,
+    state: tauri::State<'_, CatalogState>,
+) -> Result<usize, String> {
+    let jobs = {
+        let catalog = state.0.lock().expect("catalog mutex poisoned");
+        catalog
+            .pending_jobs_of_kind(JobKind::AudioAnalysis, 20)
+            .map_err(storage_error_message)?
+    };
+
+    let mut processed = 0usize;
+    for job in jobs {
+        let asset = {
+            let catalog = state.0.lock().expect("catalog mutex poisoned");
+            catalog.get_asset(job.asset_id).map_err(storage_error_message)?
+        };
+        let Some(asset) = asset else {
+            let catalog = state.0.lock().expect("catalog mutex poisoned");
+            catalog.fail_job(job.id).map_err(storage_error_message)?;
+            processed += 1;
+            continue;
+        };
+
+        let local_path = {
+            let catalog = state.0.lock().expect("catalog mutex poisoned");
+            local_asset_path(&app, &catalog, &asset)
+        };
+        // Referenced/NAS assets not yet warmed into the local cache: leave
+        // the job pending rather than failing it, so a later warm+retry can
+        // pick it up (mirrors how playback already treats an uncached path).
+        let Ok(local_path) = local_path else {
+            processed += 1;
+            continue;
+        };
+        if !std::path::Path::new(&local_path).exists() {
+            processed += 1;
+            continue;
+        }
+
+        let outcome = analyze_asset_audio(&app, &local_path).await;
+
+        let catalog = state.0.lock().expect("catalog mutex poisoned");
+        match outcome {
+            Ok(outcome) => {
+                catalog
+                    .set_audio_analysis(job.asset_id, outcome.update)
+                    .map_err(storage_error_message)?;
+
+                if outcome.needs_review {
+                    catalog
+                        .set_media_type(job.asset_id, "needs_review")
+                        .map_err(storage_error_message)?;
+                }
+
+                for tag_name in outcome.suggested_tags {
+                    let tag = catalog
+                        .create_tag(tag_name, "action", true)
+                        .map_err(storage_error_message)?;
+                    catalog
+                        .suggest_tag_for_asset(job.asset_id, tag.id, TagOrigin::AcousticModel, 0.6)
+                        .map_err(storage_error_message)?;
+                }
+
+                catalog.complete_job(job.id).map_err(storage_error_message)?;
+            }
+            Err(_) => {
+                catalog.fail_job(job.id).map_err(storage_error_message)?;
+            }
+        }
+        processed += 1;
+    }
+
+    Ok(processed)
+}
+
+struct AudioAnalysisOutcome {
+    needs_review: bool,
+    suggested_tags: Vec<&'static str>,
+    update: storage::AudioAnalysisUpdate,
+}
+
+async fn analyze_asset_audio(app: &tauri::AppHandle, path: &str) -> Result<AudioAnalysisOutcome, String> {
+    let buffer =
+        audio_metadata::decode_any_supported_audio(path).map_err(|error| format!("{error:?}"))?;
+
+    let needs_review = audio_analysis::is_likely_silent_or_corrupt(&buffer);
+    let measurements = audio_analysis::measure(&buffer);
+    let suggested_tags = audio_analysis::suggest_action_tags(&buffer, measurements)
+        .into_iter()
+        .map(|tag| tag.as_str())
+        .collect::<Vec<_>>();
+    let tempo = audio_analysis::estimate_tempo(&buffer);
+    let pitch = audio_analysis::estimate_pitch(&buffer);
+
+    let channels = buffer.channels.max(1) as u64;
+    let duration_ms = if buffer.sample_rate > 0 {
+        Some((buffer.samples.len() as f64 / channels as f64 / buffer.sample_rate as f64 * 1000.0) as i64)
+    } else {
+        None
+    };
+
+    let perceptual_fingerprint = run_similarity_worker(app, path).await;
+
+    let update = storage::AudioAnalysisUpdate {
+        duration_ms,
+        sample_rate: Some(buffer.sample_rate as i64),
+        bit_depth: None,
+        channels: Some(buffer.channels as i64),
+        loudness_lufs: None,
+        peak_db: Some(measurements.peak_db as f64),
+        bpm: tempo.map(|estimate| estimate.bpm as f64),
+        bpm_confidence: tempo.map(|estimate| estimate.confidence as f64),
+        musical_key: pitch.as_ref().map(|estimate| estimate.note_name.clone()),
+        key_confidence: pitch.as_ref().map(|estimate| estimate.clarity as f64),
+        perceptual_fingerprint,
+    };
+
+    Ok(AudioAnalysisOutcome {
+        needs_review,
+        suggested_tags,
+        update,
+    })
+}
+
+/// Spawns the GPL-isolated similarity-worker subprocess and parses its
+/// stdout. Returns `None` on any failure (missing sidecar, decode error,
+/// malformed output) — similarity is a nice-to-have, never a reason to fail
+/// the whole analysis job.
+async fn run_similarity_worker(app: &tauri::AppHandle, path: &str) -> Option<String> {
+    use tauri_plugin_shell::ShellExt;
+
+    let sidecar = app.shell().sidecar("similarity-worker").ok()?;
+    let output = sidecar.args([path]).output().await.ok()?;
+    if !output.status.success() {
+        return None;
+    }
+
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let parsed: serde_json::Value = serde_json::from_str(stdout.trim()).ok()?;
+    parsed
+        .get("analysis")
+        .filter(|value| value.is_array())
+        .map(|value| value.to_string())
+}
+
+/// Loads every non-trashed asset in the library with a stored similarity
+/// vector, ranks by Euclidean distance from the target asset, and returns
+/// the closest matches. Brute-force in memory — fine at desktop-library
+/// scale, no vector index needed.
+#[tauri::command]
+fn similar_assets(
+    state: tauri::State<CatalogState>,
+    library_id: String,
+    asset_id: String,
+    limit: usize,
+) -> Result<Vec<AssetRecord>, String> {
+    let library_id = parse_uuid_field(&library_id, "library id")?;
+    let asset_id = parse_uuid_field(&asset_id, "asset id")?;
+    let catalog = state.0.lock().expect("catalog mutex poisoned");
+
+    let fingerprints = catalog
+        .perceptual_fingerprints(library_id)
+        .map_err(storage_error_message)?;
+
+    let target_vector = fingerprints
+        .iter()
+        .find(|(id, _)| *id == asset_id)
+        .and_then(|(_, json)| serde_json::from_str::<Vec<f32>>(json).ok())
+        .ok_or_else(|| "asset has not been analyzed yet".to_string())?;
+
+    let mut ranked: Vec<(Uuid, f32)> = fingerprints
+        .into_iter()
+        .filter(|(id, _)| *id != asset_id)
+        .filter_map(|(id, json)| {
+            let vector = serde_json::from_str::<Vec<f32>>(&json).ok()?;
+            if vector.len() != target_vector.len() {
+                return None;
+            }
+            let distance = euclidean_distance(&target_vector, &vector);
+            Some((id, distance))
+        })
+        .collect();
+
+    ranked.sort_by(|a, b| a.1.total_cmp(&b.1));
+    ranked.truncate(limit);
+
+    Ok(ranked
+        .into_iter()
+        .filter_map(|(id, _)| catalog.get_asset(id).ok().flatten())
+        .collect())
+}
+
+fn euclidean_distance(a: &[f32], b: &[f32]) -> f32 {
+    a.iter()
+        .zip(b.iter())
+        .map(|(x, y)| (x - y).powi(2))
+        .sum::<f32>()
+        .sqrt()
 }
 
 #[tauri::command]
@@ -1314,6 +1533,7 @@ pub fn run() {
         .plugin(tauri_plugin_dialog::init())
         .plugin(tauri_plugin_fs::init())
         .plugin(tauri_plugin_opener::init())
+        .plugin(tauri_plugin_shell::init())
         .setup(|app| {
             let app_data_dir = app
                 .path()
@@ -1463,6 +1683,8 @@ pub fn run() {
             backup_library,
             restore_library,
             process_pending_jobs,
+            process_audio_analysis_jobs,
+            similar_assets,
             mark_waveform_ready,
             trash_duplicate_group,
             explain_search_query,

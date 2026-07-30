@@ -1,6 +1,9 @@
 use std::path::Path;
 use thiserror::Error;
 
+mod symphonia_decoder;
+pub use symphonia_decoder::SymphoniaDecoder;
+
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct FileMetadata {
     pub extension: String,
@@ -53,6 +56,8 @@ pub enum MetadataError {
     PackagedDecoderUnavailable(String),
     #[error("invalid wav data")]
     InvalidWav,
+    #[error("decode failed: {0}")]
+    DecodeFailed(String),
     #[error("metadata read failed: {0}")]
     Io(#[from] std::io::Error),
 }
@@ -69,7 +74,10 @@ impl PartialEq for MetadataError {
             | (
                 MetadataError::PackagedDecoderUnavailable(left),
                 MetadataError::PackagedDecoderUnavailable(right),
-            ) => left == right,
+            )
+            | (MetadataError::DecodeFailed(left), MetadataError::DecodeFailed(right)) => {
+                left == right
+            }
             _ => false,
         }
     }
@@ -147,6 +155,13 @@ pub fn decode_wav_pcm(path: impl AsRef<Path>) -> Result<DecodedAudioBuffer, Meta
 
     let bytes = std::fs::read(path)?;
     parse_wav_pcm(&bytes)
+}
+
+/// Decodes any MVP-supported extension (WAV via the built-in parser, every
+/// other packaged format via Symphonia) without callers needing to wire up
+/// their own `PackagedAudioDecoder`.
+pub fn decode_any_supported_audio(path: impl AsRef<Path>) -> Result<DecodedAudioBuffer, MetadataError> {
+    decode_supported_audio(path, Some(&SymphoniaDecoder))
 }
 
 pub fn decode_supported_audio(
@@ -463,6 +478,86 @@ mod tests {
                 conversion_available: true,
             }
         );
+    }
+
+    #[test]
+    fn symphonia_decoder_decodes_aiff_pcm() {
+        let mut path = std::env::temp_dir();
+        path.push(format!("darkwave-symphonia-{}.aiff", Uuid::new_v4()));
+        fs::write(&path, aiff_16_bit_fixture()).expect("fixture");
+
+        let decoded =
+            decode_supported_audio(&path, Some(&SymphoniaDecoder)).expect("decode aiff");
+
+        assert_eq!(decoded.sample_rate, 48_000);
+        assert_eq!(decoded.channels, 1);
+        assert_eq!(decoded.samples.len(), 3);
+        assert!(decoded.samples[0] < -0.99);
+        assert_eq!(decoded.samples[1], 0.0);
+        assert!(decoded.samples[2] > 0.99);
+    }
+
+    #[test]
+    fn symphonia_decoder_reports_decode_failure_for_garbage() {
+        let mut path = std::env::temp_dir();
+        path.push(format!("darkwave-symphonia-{}.mp3", Uuid::new_v4()));
+        fs::write(&path, b"not actually mp3 data").expect("fixture");
+
+        let error = decode_supported_audio(&path, Some(&SymphoniaDecoder))
+            .expect_err("garbage mp3 should fail to decode");
+
+        assert!(matches!(error, MetadataError::DecodeFailed(_)));
+    }
+
+    /// Minimal single-channel, 16-bit, 48kHz AIFF fixture with three sample
+    /// frames, used to exercise the real Symphonia decode path (AIFF is
+    /// simple enough to hand-construct, unlike mp3/flac/ogg).
+    fn aiff_16_bit_fixture() -> Vec<u8> {
+        let samples = [-32768i16, 0, 32767];
+
+        let mut ssnd_payload = Vec::new();
+        ssnd_payload.extend_from_slice(&0u32.to_be_bytes()); // offset
+        ssnd_payload.extend_from_slice(&0u32.to_be_bytes()); // block size
+        for sample in samples {
+            ssnd_payload.extend_from_slice(&sample.to_be_bytes());
+        }
+
+        let mut comm_payload = Vec::new();
+        comm_payload.extend_from_slice(&1u16.to_be_bytes()); // channels
+        comm_payload.extend_from_slice(&(samples.len() as u32).to_be_bytes()); // frames
+        comm_payload.extend_from_slice(&16u16.to_be_bytes()); // bits per sample
+        comm_payload.extend_from_slice(&f64_to_ieee_extended(48_000.0));
+
+        let mut form_payload = Vec::new();
+        form_payload.extend_from_slice(b"AIFF");
+        form_payload.extend_from_slice(b"COMM");
+        form_payload.extend_from_slice(&(comm_payload.len() as u32).to_be_bytes());
+        form_payload.extend_from_slice(&comm_payload);
+        form_payload.extend_from_slice(b"SSND");
+        form_payload.extend_from_slice(&(ssnd_payload.len() as u32).to_be_bytes());
+        form_payload.extend_from_slice(&ssnd_payload);
+
+        let mut aiff = Vec::new();
+        aiff.extend_from_slice(b"FORM");
+        aiff.extend_from_slice(&(form_payload.len() as u32).to_be_bytes());
+        aiff.extend_from_slice(&form_payload);
+        aiff
+    }
+
+    /// Encodes a non-negative integer-valued f64 as the 80-bit IEEE 754
+    /// extended precision format AIFF's COMM chunk requires for sample rate.
+    fn f64_to_ieee_extended(value: f64) -> [u8; 10] {
+        assert!(value > 0.0, "fixture only needs the positive case");
+        let integer = value as u64;
+        let highest_bit = 63 - integer.leading_zeros();
+        let exponent: u16 = 16383 + highest_bit as u16;
+        let mantissa = integer << (63 - highest_bit);
+
+        let mut bytes = [0u8; 10];
+        bytes[0] = (exponent >> 8) as u8;
+        bytes[1] = (exponent & 0xFF) as u8;
+        bytes[2..10].copy_from_slice(&mantissa.to_be_bytes());
+        bytes
     }
 
     fn wav_16_bit_fixture() -> Vec<u8> {

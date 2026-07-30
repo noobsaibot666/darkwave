@@ -7,6 +7,16 @@
     "core:default",
     "dialog:default",
     "fs:default",
-    "opener:default"
+    "opener:default",
+    {
+      "identifier": "shell:allow-execute",
+      "allow": [
+        {
+          "name": "binaries/similarity-worker",
+          "sidecar": true,
+          "args": true
+        }
+      ]
+    }
   ]
 }

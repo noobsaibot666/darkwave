@@ -21,8 +21,7 @@ When a supported audio file is imported, Darkwave:
 - Discovers watched-folder candidates only after supported audio files have stabilized.
 - Maintains watched-folder size snapshots across polls so new files are imported only after a later stable scan.
 - Ingests platform filesystem notifications and emits import candidates only after repeat stable events.
-- Decodes WAV PCM files for cached-preview playback preparation.
-- Supports a packaged-decoder provider interface for compressed MVP formats once release decoder artifacts are installed.
+- Decodes WAV PCM files natively, and every other MVP-supported format (mp3, flac, aac, m4a, ogg, aiff) via a real Symphonia-backed decoder.
 - Reports codec capability for imported extensions: native WAV PCM, packaged-decoder formats, or unsupported with conversion available.
 
 Watched folders ignore incomplete browser download files such as `.crdownload`, `.download`, `.part`, and `.tmp`. A watched file is considered ready only after its file size has stabilized.
@@ -41,6 +40,33 @@ Two size-based checks run automatically as part of import, before any manual tag
 - Files at or below roughly 5 MB that filename and embedded-metadata analysis didn't already classify default to **Sound Effect** rather than a generic "other" category, since a real music track is essentially never that small.
 
 Both are available as smart filters in the sidebar.
+
+## Real audio-content analysis
+
+After the fast checks above, a background job decodes each imported file's
+actual audio content and runs a further pass — this augments the size-based
+checks rather than replacing them, so a file can still be flagged either way:
+
+- **Real needs-review detection.** Silence or nothing decodable across the
+  whole file gets the same "Needs Review" flag the size check uses — this
+  catches a corrupt-but-large file that a size check alone never could.
+- **Content-based action tags.** Real signal shape — not filename guessing —
+  suggests **Impact** (a short, sharp, loud hit), **Whoosh** (broadband
+  energy without a sharp transient), or **Rise** (energy trending upward
+  across the clip) as pending tag suggestions in the inspector. These are
+  best-effort rule-based heuristics, not machine learning.
+- **Detected tempo and pitch**, shown in the inspector's "Detected Audio
+  Attributes" section when available: a best-effort BPM estimate, and a
+  best-effort dominant pitch (labeled as pitch, not a musical key — it's a
+  monophonic estimate and won't reliably read dense polyphonic music).
+- **A similarity feature vector**, powering Find Similar Sounds (see
+  Organizing).
+
+This pass only runs once a local copy of the file is available (immediately
+for managed/local imports; after the preview cache warms for referenced
+NAS-backed files), and never blocks import itself — sounds are browsable,
+taggable, and playable immediately, with detected attributes filling in
+shortly after.
 
 ## Refresh and the local cache
 
