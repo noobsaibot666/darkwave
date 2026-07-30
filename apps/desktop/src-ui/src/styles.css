@@ -112,6 +112,8 @@ button.panel-handle-right:active:not(:disabled) {
 
 .sidebar,
 .inspector {
+  display: flex;
+  flex-direction: column;
   padding: 18px 16px;
   overflow: hidden;
   border-color: rgba(243, 240, 231, 0.08);
@@ -137,8 +139,11 @@ button.panel-handle-right:active:not(:disabled) {
 
 .panel-body {
   display: flex;
+  flex: 1;
+  min-height: 0;
   flex-direction: column;
   gap: 12px;
+  overflow-y: auto;
   opacity: 1;
   transition: opacity 180ms var(--ease-soft);
 }
