@@ -2130,7 +2130,10 @@ export function App() {
         </CollapsibleSection>
         </div>
       </aside>
-      <footer className={sidebarCollapsed ? "transport sidebar-collapsed" : "transport"} aria-label="Transport">
+      <footer
+        className={`transport${sidebarCollapsed ? " sidebar-collapsed" : ""}${inspectorCollapsed ? " inspector-collapsed" : ""}`}
+        aria-label="Transport"
+      >
         <button className="icon-button" aria-label="Previous" onClick={() => playRelative(-1)}>
           <SkipBack size={17} />
         </button>

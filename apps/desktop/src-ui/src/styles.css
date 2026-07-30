@@ -1065,7 +1065,7 @@ dd {
 
 .transport {
   position: fixed;
-  right: 18px;
+  right: 330px;
   bottom: 16px;
   left: 250px;
   display: grid;
@@ -1078,7 +1078,7 @@ dd {
   border-radius: var(--radius-lg);
   background: rgba(29, 26, 21, 0.78);
   backdrop-filter: blur(24px) saturate(1.4);
-  transition: left 320ms var(--ease-soft);
+  transition: left 320ms var(--ease-soft), right 320ms var(--ease-soft);
   box-shadow: 0 12px 32px rgba(0, 0, 0, 0.28);
 }
 
@@ -1184,6 +1184,10 @@ dd {
 
 .transport.sidebar-collapsed {
   left: 18px;
+}
+
+.transport.inspector-collapsed {
+  right: 18px;
 }
 
 .new-project-button {
