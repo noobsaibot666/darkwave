@@ -1574,6 +1574,24 @@ export function App() {
           <button type="button" className="text-button new-project-button" onClick={() => setNewProjectModalOpen(true)}>
             + New Project
           </button>
+          <CollapsibleSection id="release" title="Release Readiness" collapsed={collapsedSections.has("release")} onToggle={toggleSection}>
+            <div className="release-grid">
+              {releaseItems.map((item) => (
+                <div className="release-item" key={item.label}>
+                  <span>{item.label}</span>
+                  <mark className={item.state === "Passed" ? "passed" : "planned"}>{item.state}</mark>
+                </div>
+              ))}
+            </div>
+            <div className="status-line">
+              <ShieldCheck size={15} />
+              Distribution gates tracked
+            </div>
+            <div className="status-line">
+              <Bell size={15} />
+              {updateChannelState === "Passed" ? "Update channel ready" : "Update channel planned"}
+            </div>
+          </CollapsibleSection>
         </div>
       </aside>
       <section className="workspace">
@@ -2023,24 +2041,6 @@ export function App() {
             <span className="empty-hint">Select a sound to edit source and license</span>
           )}
           {exportStatus ? <div className="status-line">{exportStatus}</div> : null}
-        </CollapsibleSection>
-        <CollapsibleSection id="release" title="Release Readiness" collapsed={collapsedSections.has("release")} onToggle={toggleSection}>
-          <div className="release-grid">
-            {releaseItems.map((item) => (
-              <div className="release-item" key={item.label}>
-                <span>{item.label}</span>
-                <mark className={item.state === "Passed" ? "passed" : "planned"}>{item.state}</mark>
-              </div>
-            ))}
-          </div>
-          <div className="status-line">
-            <ShieldCheck size={15} />
-            Distribution gates tracked
-          </div>
-          <div className="status-line">
-            <Bell size={15} />
-            {updateChannelState === "Passed" ? "Update channel ready" : "Update channel planned"}
-          </div>
         </CollapsibleSection>
         <CollapsibleSection id="maintenance" title="Maintenance" collapsed={collapsedSections.has("maintenance")} onToggle={toggleSection}>
           <div className="maintenance-list">

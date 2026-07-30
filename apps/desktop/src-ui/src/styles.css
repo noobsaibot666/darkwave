@@ -142,13 +142,13 @@ button.panel-handle-right:active:not(:disabled) {
   flex: 1;
   min-height: 0;
   flex-direction: column;
-  gap: 12px;
   overflow-y: auto;
   opacity: 1;
   transition: opacity 180ms var(--ease-soft);
 }
 
 .panel-body > section {
+  margin-top: 12px;
   border-radius: 20px;
   border: 1px solid rgba(243, 240, 231, 0.08);
   background: rgba(43, 43, 43, 0.5);
@@ -688,9 +688,10 @@ h2 {
 }
 
 .tag-grid {
-  display: flex;
-  flex-wrap: wrap;
+  display: grid;
+  grid-template-columns: repeat(3, minmax(0, 1fr));
   gap: 9px;
+  min-width: 0;
 }
 
 .tag-grid button,
@@ -704,6 +705,7 @@ h2 {
   background: rgba(255, 92, 0, 0.1);
   color: #ffdcc2;
   font-size: 12px;
+  text-align: center;
   text-overflow: ellipsis;
   white-space: nowrap;
 }
@@ -717,6 +719,7 @@ h2 {
   display: grid;
   grid-template-columns: repeat(2, minmax(0, 1fr));
   gap: 9px;
+  min-width: 0;
 }
 
 .duplicate-actions {
@@ -1028,6 +1031,7 @@ dd {
 .setup-field-row {
   display: flex;
   gap: 8px;
+  min-width: 0;
 }
 
 .setup-field-row input {
