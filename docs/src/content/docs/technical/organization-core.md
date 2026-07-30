@@ -1,6 +1,6 @@
 ---
 title: Organization Core
-description: Tags, collections, projects, review state, and undo in the local catalog.
+description: Tags, collections, projects, review state, undo, and redo in the local catalog.
 ---
 
 The organization core lives in the local SQLite catalog.
@@ -16,5 +16,6 @@ Implemented catalog behavior:
 - List assets in a collection.
 - Mark assets as favorite or reviewed.
 - Undo bulk tag application and collection membership operations.
+- Redo bulk tag application and collection membership operations after undo.
 
 This supports the future UI model where selected assets can be dragged onto tags, collections, projects, categories, and quick targets without opening dialogs.

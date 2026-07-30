@@ -452,7 +452,12 @@ impl Catalog {
 
         self.record_undo(
             "remove_asset_tags",
-            &format!("{}|{}", tag_id, join_uuids(asset_ids)),
+            &format!(
+                "{}|{}|{}",
+                tag_id,
+                tag_origin_to_db(origin),
+                join_uuids(asset_ids)
+            ),
         )
     }
 
@@ -943,17 +948,18 @@ impl Catalog {
             return Ok(());
         };
 
-        let (owner_id, asset_ids) = split_owner_and_assets(&payload);
         match kind.as_str() {
             "remove_asset_tags" => {
+                let (tag_id, _origin, asset_ids) = split_tag_owner_origin_and_assets(&payload);
                 for asset_id in asset_ids {
                     self.connection.execute(
                         "DELETE FROM asset_tags WHERE tag_id = ?1 AND asset_id = ?2",
-                        params![owner_id.to_string(), asset_id.to_string()],
+                        params![tag_id.to_string(), asset_id.to_string()],
                     )?;
                 }
             }
             "remove_collection_assets" => {
+                let (owner_id, asset_ids) = split_owner_and_assets(&payload);
                 for asset_id in asset_ids {
                     self.connection.execute(
                         "DELETE FROM collection_assets WHERE collection_id = ?1 AND asset_id = ?2",
@@ -967,6 +973,53 @@ impl Catalog {
         self.connection.execute(
             "UPDATE undo_actions SET applied_at = ?1 WHERE id = ?2",
             params![Utc::now().to_rfc3339(), undo_id.to_string()],
+        )?;
+
+        Ok(())
+    }
+
+    pub fn redo(&self, undo_id: Uuid) -> Result<(), StorageError> {
+        let undo = self
+            .connection
+            .query_row(
+                "SELECT kind, payload FROM undo_actions WHERE id = ?1 AND applied_at IS NOT NULL",
+                params![undo_id.to_string()],
+                |row| Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?)),
+            )
+            .optional()?;
+
+        let Some((kind, payload)) = undo else {
+            return Ok(());
+        };
+
+        let now = Utc::now().to_rfc3339();
+        match kind.as_str() {
+            "remove_asset_tags" => {
+                let (tag_id, origin, asset_ids) = split_tag_owner_origin_and_assets(&payload);
+                for asset_id in asset_ids {
+                    self.connection.execute(
+                        "INSERT OR IGNORE INTO asset_tags (asset_id, tag_id, origin, confidence, approval_state, created_at)
+                         VALUES (?1, ?2, ?3, 1.0, 'accepted', ?4)",
+                        params![asset_id.to_string(), tag_id.to_string(), origin, now],
+                    )?;
+                }
+            }
+            "remove_collection_assets" => {
+                let (owner_id, asset_ids) = split_owner_and_assets(&payload);
+                for asset_id in asset_ids {
+                    self.connection.execute(
+                        "INSERT OR IGNORE INTO collection_assets (collection_id, asset_id, created_at)
+                         VALUES (?1, ?2, ?3)",
+                        params![owner_id.to_string(), asset_id.to_string(), now],
+                    )?;
+                }
+            }
+            _ => {}
+        }
+
+        self.connection.execute(
+            "UPDATE undo_actions SET applied_at = NULL WHERE id = ?1",
+            params![undo_id.to_string()],
         )?;
 
         Ok(())
@@ -1387,6 +1440,28 @@ fn split_owner_and_assets(payload: &str) -> (Uuid, Vec<Uuid>) {
     )
 }
 
+fn split_tag_owner_origin_and_assets(payload: &str) -> (Uuid, String, Vec<Uuid>) {
+    let mut parts = payload.splitn(3, '|');
+    let tag_id = parts.next().expect("undo payload contains tag id");
+    let second = parts.next().expect("undo payload contains asset ids");
+    let third = parts.next();
+    let (origin, assets) = match third {
+        Some(assets) => (second.to_string(), assets),
+        None => ("manual".to_string(), second),
+    };
+    let asset_ids = assets
+        .split(',')
+        .filter(|value| !value.is_empty())
+        .map(|value| Uuid::parse_str(value).expect("undo payload contains valid asset uuid"))
+        .collect();
+
+    (
+        Uuid::parse_str(tag_id).expect("undo payload contains valid tag uuid"),
+        origin,
+        asset_ids,
+    )
+}
+
 fn job_kind_to_db(kind: &JobKind) -> &'static str {
     match kind {
         JobKind::MetadataExtraction => "metadata_extraction",
@@ -1558,6 +1633,56 @@ mod tests {
     }
 
     #[test]
+    fn bulk_tagging_assets_can_be_redone_after_undo() {
+        let catalog_path = unique_catalog_path("tag-redo");
+        let catalog = Catalog::open(&catalog_path).expect("open catalog");
+        let library = catalog.create_library("Org", "/library").expect("library");
+        let first = test_asset(&catalog, library.id, "one.wav", "hash-one");
+        let second = test_asset(&catalog, library.id, "two.wav", "hash-two");
+        let tag = catalog.create_tag("Impact", "action", true).expect("tag");
+        let undo_id = catalog
+            .apply_tag_to_assets(&[first.id, second.id], tag.id, TagOrigin::Manual)
+            .expect("apply tag");
+
+        catalog.undo(undo_id).expect("undo");
+        catalog.redo(undo_id).expect("redo");
+
+        assert_eq!(
+            catalog.tags_for_asset(first.id).expect("first tags"),
+            vec![tag.clone()]
+        );
+        assert_eq!(
+            catalog.tags_for_asset(second.id).expect("second tags"),
+            vec![tag]
+        );
+    }
+
+    #[test]
+    fn redo_preserves_bulk_tag_origin() {
+        let catalog_path = unique_catalog_path("tag-redo-origin");
+        let catalog = Catalog::open(&catalog_path).expect("open catalog");
+        let library = catalog.create_library("Org", "/library").expect("library");
+        let asset = test_asset(&catalog, library.id, "one.wav", "hash-one");
+        let tag = catalog.create_tag("Impact", "action", true).expect("tag");
+        let undo_id = catalog
+            .apply_tag_to_assets(&[asset.id], tag.id, TagOrigin::UserCorrection)
+            .expect("apply tag");
+
+        catalog.undo(undo_id).expect("undo");
+        catalog.redo(undo_id).expect("redo");
+
+        let origin: String = catalog
+            .connection
+            .query_row(
+                "SELECT origin FROM asset_tags WHERE asset_id = ?1 AND tag_id = ?2",
+                params![asset.id.to_string(), tag.id.to_string()],
+                |row| row.get(0),
+            )
+            .expect("origin");
+        assert_eq!(origin, "user_correction");
+    }
+
+    #[test]
     fn project_collection_membership_and_favorite_state_are_undoable() {
         let catalog_path = unique_catalog_path("collection-favorite");
         let catalog = Catalog::open(&catalog_path).expect("open catalog");
@@ -1591,6 +1716,33 @@ mod tests {
             .assets_in_collection(project.id)
             .expect("collection assets")
             .is_empty());
+    }
+
+    #[test]
+    fn project_collection_membership_can_be_redone_after_undo() {
+        let catalog_path = unique_catalog_path("collection-redo");
+        let catalog = Catalog::open(&catalog_path).expect("open catalog");
+        let library = catalog.create_library("Org", "/library").expect("library");
+        let asset = test_asset(&catalog, library.id, "hit.wav", "hash-hit");
+        let project = catalog
+            .create_collection(library.id, "Film Trailer", CollectionType::Project)
+            .expect("project");
+        let undo_id = catalog
+            .add_assets_to_collection(project.id, &[asset.id])
+            .expect("membership");
+
+        catalog.undo(undo_id).expect("undo");
+        catalog.redo(undo_id).expect("redo");
+
+        assert_eq!(
+            catalog
+                .assets_in_collection(project.id)
+                .expect("collection assets")
+                .iter()
+                .map(|asset| asset.id)
+                .collect::<Vec<_>>(),
+            vec![asset.id]
+        );
     }
 
     fn test_asset(catalog: &Catalog, library_id: Uuid, filename: &str, hash: &str) -> AssetRecord {

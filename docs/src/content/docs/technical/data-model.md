@@ -16,7 +16,7 @@ The initial SQLite migration defines:
 - Library sync records
 - FTS index for asset text search
 - Background jobs for restart-safe import and analysis work
-- Undo actions for recoverable metadata relationship changes
+- Undo actions for recoverable metadata relationship changes, including redo after an undo is applied
 - Smart collection query definitions
 - Suggested tag approval state and origin
 - Portable manifest asset snapshots
