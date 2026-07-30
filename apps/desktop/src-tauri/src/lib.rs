@@ -1533,12 +1533,111 @@ fn create_project(
     state: tauri::State<CatalogState>,
     library_id: String,
     name: String,
+    export_path: Option<String>,
 ) -> Result<CollectionRecord, String> {
     let library_id = parse_uuid_field(&library_id, "library id")?;
     let catalog = state.0.lock().expect("catalog mutex poisoned");
-    catalog
+    let project = catalog
         .create_collection(library_id, name, CollectionType::Project)
-        .map_err(storage_error_message)
+        .map_err(storage_error_message)?;
+
+    if export_path.is_none() {
+        return Ok(project);
+    }
+    catalog
+        .set_collection_export_path(project.id, export_path.as_deref())
+        .map_err(storage_error_message)?;
+    catalog
+        .get_collection(project.id)
+        .map_err(storage_error_message)?
+        .ok_or_else(|| "project not found after creation".to_string())
+}
+
+#[tauri::command]
+fn set_project_export_path(
+    state: tauri::State<CatalogState>,
+    project_id: String,
+    export_path: Option<String>,
+) -> Result<CollectionRecord, String> {
+    let project_id = parse_uuid_field(&project_id, "project id")?;
+    let catalog = state.0.lock().expect("catalog mutex poisoned");
+    catalog
+        .set_collection_export_path(project_id, export_path.as_deref())
+        .map_err(storage_error_message)?;
+    catalog
+        .get_collection(project_id)
+        .map_err(storage_error_message)?
+        .ok_or_else(|| "project not found".to_string())
+}
+
+/// The "editor's dream" button: copies one sound straight into a project's
+/// configured folder (e.g. a DaVinci Resolve watch folder) so it can be
+/// dragged into a timeline immediately, without an export-destination
+/// dialog. Reuses the same editorial export pipeline as
+/// `export_selected_asset`, just with the destination pre-resolved from the
+/// project's `export_path` instead of a user-picked folder.
+#[tauri::command]
+fn export_asset_to_project(
+    state: tauri::State<CatalogState>,
+    asset_id: String,
+    project_id: String,
+) -> Result<String, String> {
+    let asset_id = parse_uuid_field(&asset_id, "asset id")?;
+    let project_id = parse_uuid_field(&project_id, "project id")?;
+    let catalog = state.0.lock().expect("catalog mutex poisoned");
+
+    let project = catalog
+        .get_collection(project_id)
+        .map_err(storage_error_message)?
+        .ok_or_else(|| "project not found".to_string())?;
+    let destination_folder = project
+        .export_path
+        .ok_or_else(|| "this project has no DaVinci Resolve folder configured".to_string())?;
+
+    let asset = catalog
+        .get_asset(asset_id)
+        .map_err(storage_error_message)?
+        .ok_or_else(|| "asset not found".to_string())?;
+
+    let source_path = match &asset.path {
+        AssetPath::Referenced(path) => path.clone(),
+        AssetPath::Managed(relative_path) => {
+            let library = catalog
+                .get_library(asset.library_id)
+                .map_err(storage_error_message)?
+                .ok_or_else(|| "library not found".to_string())?;
+            format!(
+                "{}/{}",
+                library.media_root.trim_end_matches('/'),
+                relative_path
+            )
+        }
+    };
+
+    let plan = export_pipeline::plan_editorial_export(export_pipeline::ExportRequest {
+        source_path: source_path.clone(),
+        project_media_dir: destination_folder,
+        asset_display_name: asset.display_name,
+        preset: export_pipeline::ExportPreset::Original,
+        range: None,
+        intent: export_pipeline::default_editorial_export_intent(),
+    })
+    .map_err(|error| format!("{error:?}"))?;
+
+    let destination_path = export_pipeline::execute_original_copy_export(&plan)
+        .map_err(|error| format!("{error:?}"))?
+        .destination_path;
+
+    catalog
+        .record_usage_event(
+            asset_id,
+            Some(project_id),
+            storage::UsageEventType::Exported,
+            &destination_path,
+        )
+        .map_err(storage_error_message)?;
+
+    Ok(destination_path)
 }
 
 #[tauri::command]
@@ -1897,6 +1996,8 @@ pub fn run() {
             redo_action,
             list_collections,
             create_project,
+            set_project_export_path,
+            export_asset_to_project,
             add_to_collection,
             assets_in_collection,
             search_assets_advanced,

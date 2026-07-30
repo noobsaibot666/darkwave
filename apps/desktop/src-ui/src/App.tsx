@@ -7,6 +7,7 @@ import {
   ChevronDown,
   ChevronLeft,
   ChevronRight,
+  Clapperboard,
   Contrast,
   Gauge,
   Import,
@@ -120,6 +121,7 @@ type CollectionRecord = {
   name: string;
   collection_type: "Manual" | "Smart" | "Project";
   query_definition: string | null;
+  export_path: string | null;
 };
 
 type SourceRecordDraft = {
@@ -395,6 +397,9 @@ export function App() {
 
   const [collections, setCollections] = useState<CollectionRecord[]>([]);
   const [newProjectName, setNewProjectName] = useState("");
+  const [newProjectExportPath, setNewProjectExportPath] = useState("");
+  const [lastExportProjectId, setLastExportProjectId] = useState<string | null>(null);
+  const [drExportStatus, setDrExportStatus] = useState<string | null>(null);
 
   const [undoStack, setUndoStack] = useState<{ id: string; label: string }[]>([]);
   const [redoStack, setRedoStack] = useState<{ id: string; label: string }[]>([]);
@@ -926,13 +931,45 @@ export function App() {
 
   const handleCreateProject = useCallback(() => {
     if (!activeLibraryId || !newProjectName.trim()) return;
-    invoke<CollectionRecord>("create_project", { libraryId: activeLibraryId, name: newProjectName.trim() })
+    invoke<CollectionRecord>("create_project", {
+      libraryId: activeLibraryId,
+      name: newProjectName.trim(),
+      exportPath: newProjectExportPath.trim() || null
+    })
       .then((project) => {
         setCollections((previous) => [...previous, project]);
         setNewProjectName("");
+        setNewProjectExportPath("");
       })
       .catch(() => {});
-  }, [activeLibraryId, newProjectName]);
+  }, [activeLibraryId, newProjectName, newProjectExportPath]);
+
+  const handleChooseProjectExportPath = useCallback(async () => {
+    const selected = await openDialog({
+      directory: true,
+      multiple: false,
+      title: "Choose a DaVinci Resolve sounds folder"
+    });
+    if (typeof selected === "string") setNewProjectExportPath(selected);
+  }, []);
+
+  const handleExportToProject = useCallback(
+    (project: CollectionRecord, assetIds: string[]) => {
+      if (assetIds.length === 0 || !project.export_path) return;
+      setDrExportStatus(`Sending to ${project.name}…`);
+      Promise.all(assetIds.map((assetId) => invoke<string>("export_asset_to_project", { assetId, projectId: project.id })))
+        .then((destinations) => {
+          setLastExportProjectId(project.id);
+          setDrExportStatus(
+            destinations.length === 1
+              ? `Sent to ${project.name}`
+              : `Sent ${destinations.length} sounds to ${project.name}`
+          );
+        })
+        .catch((error) => setDrExportStatus(`Send to ${project.name} failed: ${String(error)}`));
+    },
+    []
+  );
 
   const handleCreateSmartCollection = useCallback(() => {
     if (!activeLibraryId || !smartCollectionName.trim()) return;
@@ -1466,6 +1503,8 @@ export function App() {
   }
 
   const waveformActiveIndex = peaks && duration > 0 ? Math.floor((currentTime / duration) * peaks.length) : -1;
+  const drTargetAssetId = playingAssetId ?? selectedAssetId;
+  const drTargetProject = collections.find((project) => project.id === lastExportProjectId) ?? null;
 
   return (
     <main
@@ -1562,18 +1601,42 @@ export function App() {
           ))}
           <div className="nav-heading">Projects</div>
           {collections.map((project) => (
-            <button
-              className={
-                typeof activeFilter === "object" && "project" in activeFilter && activeFilter.project === project.id
-                  ? "nav-item active"
-                  : "nav-item"
-              }
-              key={project.id}
-              onClick={() => setActiveFilter({ project: project.id, smart: project.collection_type === "Smart" })}
-            >
-              {project.collection_type === "Smart" ? <Zap size={11} /> : null}
-              {project.name}
-            </button>
+            <div className="nav-item-row" key={project.id}>
+              <button
+                className={
+                  typeof activeFilter === "object" && "project" in activeFilter && activeFilter.project === project.id
+                    ? "nav-item active"
+                    : "nav-item"
+                }
+                onClick={() => setActiveFilter({ project: project.id, smart: project.collection_type === "Smart" })}
+              >
+                {project.collection_type === "Smart" ? <Zap size={11} /> : null}
+                {project.name}
+              </button>
+              {project.collection_type === "Project" ? (
+                <button
+                  type="button"
+                  className={project.export_path ? "dr-button" : "dr-button disabled"}
+                  aria-label={
+                    project.export_path
+                      ? `Send selected to ${project.name}'s DaVinci Resolve folder`
+                      : `${project.name} has no DaVinci Resolve folder configured yet`
+                  }
+                  title={
+                    project.export_path
+                      ? `Send selected to ${project.name} (${project.export_path})`
+                      : "Set a DaVinci Resolve sounds folder for this project to enable quick export"
+                  }
+                  disabled={!project.export_path || bulkAssetIds.length === 0}
+                  onClick={(event) => {
+                    event.stopPropagation();
+                    handleExportToProject(project, bulkAssetIds);
+                  }}
+                >
+                  <Clapperboard size={13} />
+                </button>
+              ) : null}
+            </div>
           ))}
           <button type="button" className="text-button new-project-button" onClick={() => setNewProjectModalOpen(true)}>
             + New Project
@@ -2208,6 +2271,28 @@ export function App() {
         <span className="time">
           {formatTime(currentTime)} / {formatTime(duration)}
         </span>
+        <button
+          type="button"
+          className={drTargetProject ? "dr-button" : "dr-button disabled"}
+          aria-label={
+            drTargetProject
+              ? `Send to ${drTargetProject.name}'s DaVinci Resolve folder`
+              : "Send selected to a project's DaVinci Resolve folder — click a project's DR button first to set the target"
+          }
+          title={
+            drTargetProject
+              ? `Send to ${drTargetProject.name} (${drTargetProject.export_path})`
+              : "No DaVinci Resolve target yet — click a project's DR button in the sidebar first"
+          }
+          disabled={!drTargetProject || !drTargetAssetId}
+          onClick={() => {
+            if (drTargetProject && drTargetAssetId) handleExportToProject(drTargetProject, [drTargetAssetId]);
+          }}
+        >
+          <Clapperboard size={16} />
+          DR
+        </button>
+        {drExportStatus ? <span className="dr-status">{drExportStatus}</span> : null}
       </footer>
       <AnimatePresence>
       {settingsOpen ? (
@@ -2442,6 +2527,19 @@ export function App() {
                   }
                 }}
               />
+              <label className="setup-field">
+                <span>DaVinci Resolve sounds folder (optional)</span>
+                <div className="setup-field-row">
+                  <input
+                    placeholder="/Volumes/Edit/MyFilm/Sounds"
+                    value={newProjectExportPath}
+                    onChange={(event) => setNewProjectExportPath(event.target.value)}
+                  />
+                  <button type="button" onClick={handleChooseProjectExportPath}>
+                    Browse
+                  </button>
+                </div>
+              </label>
               <button
                 type="button"
                 className="primary-action"

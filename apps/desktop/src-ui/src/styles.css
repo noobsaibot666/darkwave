@@ -186,6 +186,62 @@ button.panel-handle-right:active:not(:disabled) {
   color: #f3f0e7;
 }
 
+.nav-item-row {
+  display: flex;
+  align-items: center;
+  gap: 4px;
+  margin-bottom: 3px;
+}
+
+.nav-item-row .nav-item {
+  flex: 1;
+  min-width: 0;
+  margin-bottom: 0;
+}
+
+.nav-item-row .dr-button {
+  width: 28px;
+  height: 28px;
+  padding: 0;
+  flex: 0 0 auto;
+  justify-content: center;
+  border-radius: 8px;
+}
+
+.dr-button {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  height: 34px;
+  padding: 0 12px;
+  border: 1px solid rgba(255, 92, 0, 0.35);
+  border-radius: var(--radius-sm);
+  background: rgba(255, 92, 0, 0.12);
+  color: #ffa366;
+  font-size: 12px;
+  font-weight: 700;
+  white-space: nowrap;
+  transition: background-color 140ms var(--ease-soft);
+}
+
+.dr-button:hover:not(:disabled) {
+  background: rgba(255, 92, 0, 0.22);
+}
+
+.dr-button.disabled,
+.dr-button:disabled {
+  opacity: 0.35;
+  cursor: default;
+}
+
+.dr-status {
+  font-size: 11px;
+  color: #8a7d6d;
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+
 .nav-heading {
   margin: 14px 0 4px;
   padding: 0 10px;
@@ -1069,7 +1125,7 @@ dd {
   bottom: 16px;
   left: 250px;
   display: grid;
-  grid-template-columns: 34px 40px 34px 34px minmax(160px, 1fr) 84px;
+  grid-template-columns: 34px 40px 34px 34px minmax(160px, 1fr) 84px auto auto;
   gap: 12px;
   align-items: center;
   height: 64px;

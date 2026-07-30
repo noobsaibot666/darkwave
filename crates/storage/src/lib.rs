@@ -168,6 +168,10 @@ pub struct CollectionRecord {
     pub name: String,
     pub collection_type: CollectionType,
     pub query_definition: Option<String>,
+    /// Folder on disk this project's sounds get quick-exported to (e.g. a
+    /// DaVinci Resolve "Sounds" watch folder), so an editor can drag them
+    /// straight into a timeline. `None` until the editor configures one.
+    pub export_path: Option<String>,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
@@ -767,6 +771,7 @@ impl Catalog {
             name: name.as_ref().to_string(),
             collection_type,
             query_definition: None,
+            export_path: None,
         };
         let now = Utc::now().to_rfc3339();
 
@@ -797,6 +802,7 @@ impl Catalog {
             name: name.as_ref().to_string(),
             collection_type: CollectionType::Smart,
             query_definition: Some(serde_json::to_string(query).expect("query serializes")),
+            export_path: None,
         };
         let now = Utc::now().to_rfc3339();
 
@@ -821,12 +827,28 @@ impl Catalog {
     ) -> Result<Option<CollectionRecord>, StorageError> {
         self.connection
             .query_row(
-                "SELECT id, library_id, name, type, query_definition FROM collections WHERE id = ?1",
+                "SELECT id, library_id, name, type, query_definition, export_path FROM collections WHERE id = ?1",
                 params![collection_id.to_string()],
                 collection_from_row,
             )
             .optional()
             .map_err(StorageError::from)
+    }
+
+    /// Sets (or clears, with `None`) the folder a project's sounds are
+    /// quick-exported to for the DR button. `Some("")` is treated the same
+    /// as `None` so clearing the field from a text input works naturally.
+    pub fn set_collection_export_path(
+        &self,
+        collection_id: Uuid,
+        export_path: Option<&str>,
+    ) -> Result<(), StorageError> {
+        let export_path = export_path.filter(|path| !path.trim().is_empty());
+        self.connection.execute(
+            "UPDATE collections SET export_path = ?1 WHERE id = ?2",
+            params![export_path, collection_id.to_string()],
+        )?;
+        Ok(())
     }
 
     pub fn pending_job_count(&self, kind: JobKind) -> Result<usize, StorageError> {
@@ -863,7 +885,7 @@ impl Catalog {
         library_id: Uuid,
     ) -> Result<Vec<CollectionRecord>, StorageError> {
         let mut statement = self.connection.prepare(
-            "SELECT id, library_id, name, type, query_definition FROM collections
+            "SELECT id, library_id, name, type, query_definition, export_path FROM collections
              WHERE library_id = ?1 ORDER BY created_at ASC",
         )?;
 
@@ -1754,6 +1776,34 @@ impl Catalog {
             ",
         )?;
 
+        // `CREATE TABLE IF NOT EXISTS` above doesn't touch columns on a table
+        // that already exists from an earlier app version, so new columns on
+        // existing tables need an explicit, idempotent ADD COLUMN step.
+        self.ensure_column("collections", "export_path", "TEXT")?;
+
+        Ok(())
+    }
+
+    /// Adds `column` to `table` if it isn't already there. `table`/`column`/
+    /// `sql_type` must be trusted, internally-controlled literals — they're
+    /// interpolated directly since SQLite doesn't allow binding identifiers
+    /// as query parameters (including inside PRAGMA).
+    fn ensure_column(&self, table: &str, column: &str, sql_type: &str) -> Result<(), StorageError> {
+        let mut statement = self
+            .connection
+            .prepare(&format!("PRAGMA table_info({table})"))?;
+        let has_column = statement
+            .query_map([], |row| row.get::<_, String>(1))?
+            .collect::<Result<Vec<_>, _>>()?
+            .iter()
+            .any(|name| name == column);
+
+        if !has_column {
+            self.connection.execute_batch(&format!(
+                "ALTER TABLE {table} ADD COLUMN {column} {sql_type}"
+            ))?;
+        }
+
         Ok(())
     }
 
@@ -1861,6 +1911,7 @@ fn collection_from_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<CollectionRe
         name: row.get(2)?,
         collection_type: collection_type_from_db(&row.get::<_, String>(3)?),
         query_definition: row.get(4)?,
+        export_path: row.get(5)?,
     })
 }
 
@@ -3020,6 +3071,56 @@ mod tests {
             collections.iter().map(|c| c.id).collect::<Vec<_>>(),
             vec![project.id]
         );
+    }
+
+    #[test]
+    fn project_export_path_defaults_to_none_and_can_be_set_and_cleared() {
+        let catalog_path = unique_catalog_path("project-export-path");
+        let catalog = Catalog::open(&catalog_path).expect("open catalog");
+        let library = catalog.create_library("One", "/library").expect("library");
+        let project = catalog
+            .create_collection(library.id, "Trailer", CollectionType::Project)
+            .expect("project");
+        assert_eq!(project.export_path, None);
+
+        catalog
+            .set_collection_export_path(project.id, Some("/Volumes/Edit/Trailer/Sounds"))
+            .expect("set export path");
+        let reloaded = catalog
+            .get_collection(project.id)
+            .expect("get collection")
+            .expect("collection exists");
+        assert_eq!(
+            reloaded.export_path.as_deref(),
+            Some("/Volumes/Edit/Trailer/Sounds")
+        );
+
+        // Blank strings are treated the same as clearing the field, so a
+        // text input the editor empties out behaves as "unset" rather than
+        // storing an empty string.
+        catalog
+            .set_collection_export_path(project.id, Some("   "))
+            .expect("clear export path with blank string");
+        let cleared = catalog
+            .get_collection(project.id)
+            .expect("get collection")
+            .expect("collection exists");
+        assert_eq!(cleared.export_path, None);
+    }
+
+    #[test]
+    fn migrate_is_idempotent_when_export_path_column_already_exists() {
+        let catalog_path = unique_catalog_path("migrate-idempotent");
+        {
+            let catalog = Catalog::open(&catalog_path).expect("open catalog");
+            catalog.create_library("One", "/library").expect("library");
+        }
+
+        // Reopening runs `migrate()` again against a database that already
+        // has the export_path column — must not error on a duplicate ALTER.
+        let catalog = Catalog::open(&catalog_path).expect("reopen catalog");
+        let libraries = catalog.list_libraries().expect("list libraries");
+        assert_eq!(libraries.len(), 1);
     }
 
     #[test]
