@@ -16,6 +16,7 @@ import {
   Music,
   Pause,
   Play,
+  Plus,
   RefreshCw,
   Repeat,
   Save,
@@ -1557,7 +1558,7 @@ export function App() {
         onPause={() => setIsPlaying(false)}
         onTimeUpdate={(event) => setCurrentTime(event.currentTarget.currentTime)}
         onLoadedMetadata={(event) => setDuration(event.currentTarget.duration)}
-        onEnded={() => playRelative(1)}
+        onEnded={() => setIsPlaying(false)}
       />
       <button
         type="button"
@@ -1579,10 +1580,6 @@ export function App() {
       </button>
       <aside className={sidebarCollapsed ? "sidebar collapsed" : "sidebar"} aria-label="Library">
         <div className="panel-body">
-          <div className="virtualization-bar" aria-label="Browser performance">
-            <span>{visibleAssets.length} row{visibleAssets.length === 1 ? "" : "s"}</span>
-            <span>Not yet virtualized</span>
-          </div>
           {libraries.length > 1 ? (
             <select
               className="library-select"
@@ -1633,7 +1630,18 @@ export function App() {
               ) : null}
             </div>
           ))}
-          <div className="nav-heading">Projects</div>
+          <div className="nav-heading-row">
+            <span className="nav-heading">Projects</span>
+            <button
+              type="button"
+              className="nav-heading-add"
+              aria-label="New project"
+              title="New project"
+              onClick={() => setNewProjectModalOpen(true)}
+            >
+              <Plus size={12} />
+            </button>
+          </div>
           {collections.map((project) => (
             <div className="nav-item-row" key={project.id}>
               <button
@@ -1672,9 +1680,6 @@ export function App() {
               ) : null}
             </div>
           ))}
-          <button type="button" className="text-button new-project-button" onClick={() => setNewProjectModalOpen(true)}>
-            + New Project
-          </button>
           <CollapsibleSection id="release" title="Release Readiness" collapsed={collapsedSections.has("release")} onToggle={toggleSection}>
             <div className="release-grid">
               {releaseItems.map((item) => (
@@ -1693,6 +1698,10 @@ export function App() {
               {updateChannelState === "Passed" ? "Update channel ready" : "Update channel planned"}
             </div>
           </CollapsibleSection>
+          <div className="virtualization-bar" aria-label="Browser performance">
+            <span>{visibleAssets.length} row{visibleAssets.length === 1 ? "" : "s"}</span>
+            <span>Not yet virtualized</span>
+          </div>
         </div>
       </aside>
       <section className="workspace">

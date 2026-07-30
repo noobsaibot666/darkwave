@@ -157,6 +157,45 @@ button.panel-handle-right:active:not(:disabled) {
   overflow: hidden;
 }
 
+/* The sidebar is a plain nav list everywhere else, so a foldable
+   section there (e.g. Release Readiness) drops the glass-card chrome
+   and reads as just another labeled part of the list instead. */
+.sidebar .panel-body > section {
+  margin-top: 10px;
+  border: none;
+  border-radius: 0;
+  background: none;
+  backdrop-filter: none;
+  overflow: visible;
+}
+
+.sidebar .section-header {
+  padding: 0 10px 4px;
+}
+
+.sidebar .section-header h2 {
+  color: #8a7d6d;
+  font-size: 10px;
+  font-weight: 700;
+  text-transform: uppercase;
+}
+
+.sidebar .section-toggle {
+  width: 18px;
+  height: 18px;
+  background: transparent;
+  color: #8a7d6d;
+}
+
+.sidebar .section-toggle:hover {
+  background: #2b2b2b;
+  color: #f3f0e7;
+}
+
+.sidebar .section-body {
+  padding: 0 10px;
+}
+
 .sidebar.collapsed .panel-body,
 .inspector.collapsed .panel-body {
   opacity: 0;
@@ -249,6 +288,38 @@ button.panel-handle-right:active:not(:disabled) {
   font-size: 10px;
   font-weight: 700;
   text-transform: uppercase;
+}
+
+.nav-heading-row {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  margin: 14px 0 4px;
+  padding: 0 10px;
+}
+
+.nav-heading-row .nav-heading {
+  margin: 0;
+  padding: 0;
+}
+
+.nav-heading-add {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  width: 18px;
+  height: 18px;
+  flex: 0 0 auto;
+  border: none;
+  border-radius: 5px;
+  background: transparent;
+  color: #8a7d6d;
+  transition: background-color 140ms var(--ease-soft), color 140ms var(--ease-soft);
+}
+
+.nav-heading-add:hover {
+  background: #2b2b2b;
+  color: #f3f0e7;
 }
 
 .library-select {
@@ -553,12 +624,13 @@ button:disabled,
 .virtualization-bar {
   display: flex;
   flex-wrap: wrap;
-  gap: 8px;
+  gap: 6px;
   align-items: center;
-  min-height: 30px;
-  margin-bottom: 12px;
+  min-height: 22px;
+  margin-top: auto;
+  padding-top: 10px;
   color: #8a7d6d;
-  font-size: 11px;
+  font-size: 9px;
   font-weight: 700;
   text-transform: uppercase;
 }
@@ -566,8 +638,8 @@ button:disabled,
 .virtualization-bar span {
   display: inline-flex;
   align-items: center;
-  min-height: 24px;
-  padding: 0 8px;
+  min-height: 18px;
+  padding: 0 6px;
   border-radius: 5px;
   background: #17130f;
 }
@@ -1258,13 +1330,6 @@ dd {
 
 .transport.inspector-collapsed {
   right: 18px;
-}
-
-.new-project-button {
-  width: 100%;
-  margin-top: 12px;
-  justify-content: center;
-  text-align: center;
 }
 
 .section-header {
