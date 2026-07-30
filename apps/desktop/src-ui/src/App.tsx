@@ -1506,6 +1506,10 @@ export function App() {
       </button>
       <aside className={sidebarCollapsed ? "sidebar collapsed" : "sidebar"} aria-label="Library">
         <div className="panel-body">
+          <div className="virtualization-bar" aria-label="Browser performance">
+            <span>{visibleAssets.length} row{visibleAssets.length === 1 ? "" : "s"}</span>
+            <span>Not yet virtualized</span>
+          </div>
           {libraries.length > 1 ? (
             <select
               className="library-select"
@@ -1772,10 +1776,6 @@ export function App() {
           ) : null}
         </section>
         <section className="browser" aria-label="Sound browser" data-density={preferences?.browser_density ?? "Comfortable"}>
-          <div className="virtualization-bar" aria-label="Browser performance">
-            <span>{visibleAssets.length} row{visibleAssets.length === 1 ? "" : "s"}</span>
-            <span>Not yet virtualized</span>
-          </div>
           <div className="browser-header">
             <span>Name</span>
             <span>Type</span>
