@@ -12,6 +12,8 @@ pub enum StorageError {
     RelativePath,
     #[error("sqlite error: {0}")]
     Sqlite(#[from] rusqlite::Error),
+    #[error("asset not found")]
+    AssetNotFound,
 }
 
 pub fn is_network_tolerant_catalog_path(path: &str) -> Result<bool, StorageError> {
@@ -320,6 +322,10 @@ impl Catalog {
                 storage_mode, content_hash, media_type, file_size, availability_state, review_state, favorite
              FROM assets
              WHERE library_id = ?1
+               AND NOT EXISTS (
+                 SELECT 1 FROM trash_items
+                 WHERE trash_items.asset_id = assets.id AND trash_items.state = 'in_trash'
+               )
              ORDER BY date_added ASC",
         )?;
 
@@ -680,7 +686,13 @@ impl Catalog {
             sql.push_str(" INNER JOIN assets_fts ON assets_fts.rowid = assets.rowid");
         }
 
-        sql.push_str(" WHERE assets.library_id = ?");
+        sql.push_str(
+            " WHERE assets.library_id = ?
+               AND NOT EXISTS (
+                 SELECT 1 FROM trash_items
+                 WHERE trash_items.asset_id = assets.id AND trash_items.state = 'in_trash'
+               )",
+        );
 
         if use_fts {
             sql.push_str(" AND assets_fts MATCH ?");
@@ -1096,6 +1108,105 @@ impl Catalog {
             .map_err(StorageError::from)
     }
 
+    pub fn move_asset_to_trash(
+        &self,
+        asset_id: Uuid,
+        reason: impl AsRef<str>,
+        now_ms: u64,
+    ) -> Result<trash::TrashItem, StorageError> {
+        let asset = self
+            .get_asset(asset_id)?
+            .ok_or(StorageError::AssetNotFound)?;
+        let original_path = match asset.path {
+            AssetPath::Managed(path) | AssetPath::Referenced(path) => path,
+        };
+        let item = trash::TrashItem::for_asset(
+            asset_id,
+            original_path,
+            now_ms,
+            reason.as_ref().to_string(),
+        );
+
+        self.connection.execute(
+            "INSERT OR REPLACE INTO trash_items (asset_id, original_path, trashed_at_ms, reason, state, file_deleted)
+             VALUES (?1, ?2, ?3, ?4, 'in_trash', 0)",
+            params![
+                item.asset_id.to_string(),
+                item.original_path,
+                item.trashed_at_ms as i64,
+                item.reason,
+            ],
+        )?;
+
+        Ok(item)
+    }
+
+    pub fn list_trash_items(
+        &self,
+        library_id: Uuid,
+    ) -> Result<Vec<trash::TrashItem>, StorageError> {
+        let mut statement = self.connection.prepare(
+            "SELECT trash_items.asset_id, trash_items.original_path, trash_items.trashed_at_ms,
+                trash_items.reason, trash_items.state, trash_items.file_deleted
+             FROM trash_items
+             INNER JOIN assets ON assets.id = trash_items.asset_id
+             WHERE assets.library_id = ?1 AND trash_items.state = 'in_trash'
+             ORDER BY trash_items.trashed_at_ms DESC",
+        )?;
+
+        let items = statement
+            .query_map(params![library_id.to_string()], trash_item_from_row)?
+            .collect::<Result<Vec<_>, _>>()
+            .map_err(StorageError::from)?;
+
+        Ok(items)
+    }
+
+    pub fn restore_asset_from_trash(&self, asset_id: Uuid) -> Result<(), StorageError> {
+        self.connection.execute(
+            "UPDATE trash_items SET state = 'restored' WHERE asset_id = ?1",
+            params![asset_id.to_string()],
+        )?;
+
+        Ok(())
+    }
+
+    pub fn purge_trash_item(
+        &self,
+        asset_id: Uuid,
+        now_ms: u64,
+        retention_ms: u64,
+    ) -> Result<bool, StorageError> {
+        let item = self
+            .connection
+            .query_row(
+                "SELECT asset_id, original_path, trashed_at_ms, reason, state, file_deleted
+                 FROM trash_items WHERE asset_id = ?1",
+                params![asset_id.to_string()],
+                trash_item_from_row,
+            )
+            .optional()?;
+
+        let Some(item) = item else {
+            return Ok(false);
+        };
+
+        if !item.is_purge_allowed(now_ms, retention_ms, true) {
+            return Ok(false);
+        }
+
+        self.connection.execute(
+            "UPDATE trash_items SET state = 'purged' WHERE asset_id = ?1",
+            params![asset_id.to_string()],
+        )?;
+        self.connection.execute(
+            "DELETE FROM assets WHERE id = ?1",
+            params![asset_id.to_string()],
+        )?;
+
+        Ok(true)
+    }
+
     fn migrate(&self) -> Result<(), StorageError> {
         self.connection.execute_batch(
             "
@@ -1172,6 +1283,15 @@ impl Catalog {
               approval_state TEXT NOT NULL,
               created_at TEXT NOT NULL,
               PRIMARY KEY (asset_id, tag_id, origin)
+            );
+
+            CREATE TABLE IF NOT EXISTS trash_items (
+              asset_id TEXT PRIMARY KEY REFERENCES assets(id) ON DELETE CASCADE,
+              original_path TEXT NOT NULL,
+              trashed_at_ms INTEGER NOT NULL,
+              reason TEXT NOT NULL,
+              state TEXT NOT NULL DEFAULT 'in_trash',
+              file_deleted INTEGER NOT NULL DEFAULT 0
             );
 
             CREATE TABLE IF NOT EXISTS collections (
@@ -1353,6 +1473,25 @@ fn collection_from_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<CollectionRe
         collection_type: collection_type_from_db(&row.get::<_, String>(3)?),
         query_definition: row.get(4)?,
     })
+}
+
+fn trash_item_from_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<trash::TrashItem> {
+    Ok(trash::TrashItem {
+        asset_id: parse_uuid(row.get::<_, String>(0)?),
+        original_path: row.get(1)?,
+        trashed_at_ms: row.get::<_, i64>(2)? as u64,
+        reason: row.get(3)?,
+        state: trash_state_from_db(&row.get::<_, String>(4)?),
+        file_deleted: row.get::<_, i64>(5)? != 0,
+    })
+}
+
+fn trash_state_from_db(value: &str) -> trash::TrashState {
+    match value {
+        "restored" => trash::TrashState::Restored,
+        "purged" => trash::TrashState::Purged,
+        _ => trash::TrashState::InTrash,
+    }
 }
 
 fn parse_uuid(value: String) -> Uuid {
@@ -2357,6 +2496,91 @@ mod tests {
         let asset = test_asset(&catalog, library.id, "no-source.wav", "hash-no-source");
 
         assert_eq!(catalog.get_source_record(asset.id).expect("query"), None);
+    }
+
+    #[test]
+    fn trashed_asset_is_hidden_from_list_and_search_until_restored() {
+        let catalog_path = unique_catalog_path("trash-hide");
+        let catalog = Catalog::open(&catalog_path).expect("open catalog");
+        let library = catalog
+            .create_library("Trash", "/library")
+            .expect("library");
+        let asset = test_asset(&catalog, library.id, "unwanted.wav", "hash-trash-hide");
+
+        catalog
+            .move_asset_to_trash(asset.id, "duplicate review", 1_000)
+            .expect("trash asset");
+
+        assert!(catalog.list_assets(library.id).expect("list").is_empty());
+        assert!(catalog
+            .search_assets(library.id, AssetSearchQuery::text(""))
+            .expect("search")
+            .is_empty());
+
+        catalog.restore_asset_from_trash(asset.id).expect("restore");
+
+        assert_eq!(
+            catalog
+                .list_assets(library.id)
+                .expect("list after restore")
+                .iter()
+                .map(|entry| entry.id)
+                .collect::<Vec<_>>(),
+            vec![asset.id]
+        );
+    }
+
+    #[test]
+    fn list_trash_items_reports_only_items_currently_in_trash() {
+        let catalog_path = unique_catalog_path("trash-list");
+        let catalog = Catalog::open(&catalog_path).expect("open catalog");
+        let library = catalog
+            .create_library("Trash", "/library")
+            .expect("library");
+        let kept = test_asset(&catalog, library.id, "kept.wav", "hash-trash-kept");
+        let trashed = test_asset(&catalog, library.id, "trashed.wav", "hash-trash-trashed");
+
+        catalog
+            .move_asset_to_trash(trashed.id, "duplicate", 2_000)
+            .expect("trash asset");
+        catalog
+            .move_asset_to_trash(kept.id, "mistake", 1_000)
+            .expect("trash then restore");
+        catalog
+            .restore_asset_from_trash(kept.id)
+            .expect("restore kept asset");
+
+        let items = catalog.list_trash_items(library.id).expect("list trash");
+
+        assert_eq!(
+            items.iter().map(|item| item.asset_id).collect::<Vec<_>>(),
+            vec![trashed.id]
+        );
+        assert_eq!(items[0].reason, "duplicate");
+    }
+
+    #[test]
+    fn purge_trash_item_requires_retention_age_then_deletes_asset() {
+        let catalog_path = unique_catalog_path("trash-purge");
+        let catalog = Catalog::open(&catalog_path).expect("open catalog");
+        let library = catalog
+            .create_library("Trash", "/library")
+            .expect("library");
+        let asset = test_asset(&catalog, library.id, "old.wav", "hash-trash-purge");
+
+        catalog
+            .move_asset_to_trash(asset.id, "cleanup", 1_000)
+            .expect("trash asset");
+
+        assert!(!catalog
+            .purge_trash_item(asset.id, 1_000 + 6_000, 7_000)
+            .expect("too early"));
+        assert!(catalog.get_asset(asset.id).expect("query").is_some());
+
+        assert!(catalog
+            .purge_trash_item(asset.id, 1_000 + 7_000, 7_000)
+            .expect("purge"));
+        assert!(catalog.get_asset(asset.id).expect("query").is_none());
     }
 
     fn unique_catalog_path(name: &str) -> PathBuf {

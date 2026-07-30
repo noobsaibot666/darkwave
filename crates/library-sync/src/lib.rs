@@ -95,7 +95,7 @@ pub struct ReconnectValidationScheduler {
     pub entries: Vec<QueuedReconnectValidation>,
 }
 
-#[derive(Clone, Debug, Eq, PartialEq)]
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 pub struct OfflineControlState {
     pub media_root: String,
     pub catalog_only: bool,
@@ -103,7 +103,7 @@ pub struct OfflineControlState {
     pub reconnect_requested: bool,
 }
 
-#[derive(Clone, Debug, Eq, PartialEq)]
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 pub enum OfflineControlCommand {
     UseCatalogOnly,
     RetryReconnect,

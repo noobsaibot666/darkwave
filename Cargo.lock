@@ -3353,6 +3353,7 @@ dependencies = [
  "serde_json",
  "shared-types",
  "thiserror 2.0.19",
+ "trash",
  "uuid",
 ]
 

@@ -116,6 +116,29 @@ type ActiveFilter =
   | "ambience"
   | { project: string };
 
+type TrashItem = {
+  asset_id: string;
+  original_path: string;
+  trashed_at_ms: number;
+  reason: string;
+  state: "InTrash" | "Restored" | "Purged";
+  file_deleted: boolean;
+};
+
+type OfflineControlState = {
+  media_root: string;
+  catalog_only: boolean;
+  validation_paused: boolean;
+  reconnect_requested: boolean;
+};
+
+type OfflineControlCommand =
+  | "UseCatalogOnly"
+  | "RetryReconnect"
+  | "PauseValidation"
+  | "ResumeValidation"
+  | { RelinkMediaRoot: { media_root: string } };
+
 function formatFileSize(bytes: number): string {
   if (bytes < 1024) return `${bytes} B`;
   if (bytes < 1024 * 1024) return `${(bytes / 1024).toFixed(1)} KB`;
@@ -223,8 +246,11 @@ export function App() {
   const [maintenanceReport, setMaintenanceReport] = useState<MaintenanceReport | null>(null);
   const [mediaRootStatus, setMediaRootStatus] = useState<{ status: string; reconnectRequired: boolean } | null>(null);
   const [exportStatus, setExportStatus] = useState<string | null>(null);
+  const [offlineControl, setOfflineControl] = useState<OfflineControlState | null>(null);
+  const [trashItems, setTrashItems] = useState<TrashItem[]>([]);
 
   const [preferences, setPreferences] = useState<AppPreferences | null>(null);
+  const [trashRetentionDays, setTrashRetentionDays] = useState(30);
 
   const audioRef = useRef<HTMLAudioElement | null>(null);
   const [playingAssetId, setPlayingAssetId] = useState<string | null>(null);
@@ -273,6 +299,12 @@ export function App() {
       .catch(() => setCollections([]));
   }, []);
 
+  const refreshTrashItems = useCallback((libraryId: string) => {
+    invoke<TrashItem[]>("list_trash_items", { libraryId })
+      .then(setTrashItems)
+      .catch(() => setTrashItems([]));
+  }, []);
+
   const refreshAssetTags = useCallback((assetId: string) => {
     invoke<TagRecord[]>("tags_for_asset", { assetId }).then(setAppliedTags).catch(() => setAppliedTags([]));
     invoke<TagRecord[]>("suggested_tags_for_asset", { assetId })
@@ -309,6 +341,10 @@ export function App() {
   }, []);
 
   useEffect(() => {
+    invoke<number>("trash_retention_policy_days").then(setTrashRetentionDays).catch(() => {});
+  }, []);
+
+  useEffect(() => {
     invoke<LibraryRecord[]>("list_libraries")
       .then((loaded) => {
         setLibraries(loaded);
@@ -326,10 +362,24 @@ export function App() {
     if (!activeLibraryId) return;
     refreshCollections(activeLibraryId);
     refreshMaintenance(activeLibraryId);
+    refreshTrashItems(activeLibraryId);
     invoke<[string, boolean]>("media_root_status", { libraryId: activeLibraryId })
       .then(([status, reconnectRequired]) => setMediaRootStatus({ status, reconnectRequired }))
       .catch(() => setMediaRootStatus(null));
-  }, [activeLibraryId, refreshCollections, refreshMaintenance]);
+  }, [activeLibraryId, refreshCollections, refreshMaintenance, refreshTrashItems]);
+
+  useEffect(() => {
+    if (activeLibrary) {
+      setOfflineControl({
+        media_root: activeLibrary.media_root,
+        catalog_only: false,
+        validation_paused: false,
+        reconnect_requested: false
+      });
+    } else {
+      setOfflineControl(null);
+    }
+  }, [activeLibrary]);
 
   useEffect(() => {
     if (!activeLibraryId) return;
@@ -523,6 +573,53 @@ export function App() {
       .then(() => activeLibraryId && refreshMaintenance(activeLibraryId))
       .catch(() => {});
   }, [sourceDraft, activeLibraryId, refreshMaintenance]);
+
+  const handleMoveToTrash = useCallback(() => {
+    if (!selectedAssetId || !activeLibraryId) return;
+    invoke("move_to_trash", { assetId: selectedAssetId, reason: "manual" })
+      .then(() => {
+        setSelectedAssetId(null);
+        refreshAssets(activeLibraryId, searchQuery, activeFilter);
+        refreshTrashItems(activeLibraryId);
+        refreshMaintenance(activeLibraryId);
+      })
+      .catch(() => {});
+  }, [selectedAssetId, activeLibraryId, searchQuery, activeFilter, refreshAssets, refreshTrashItems, refreshMaintenance]);
+
+  const handleRestoreFromTrash = useCallback(
+    (item: TrashItem) => {
+      if (!activeLibraryId) return;
+      invoke("restore_from_trash", { assetId: item.asset_id })
+        .then(() => {
+          refreshAssets(activeLibraryId, searchQuery, activeFilter);
+          refreshTrashItems(activeLibraryId);
+        })
+        .catch(() => {});
+    },
+    [activeLibraryId, searchQuery, activeFilter, refreshAssets, refreshTrashItems]
+  );
+
+  const handlePurgeTrashItem = useCallback(
+    (item: TrashItem) => {
+      if (!activeLibraryId) return;
+      invoke<boolean>("purge_from_trash", { assetId: item.asset_id })
+        .then((purged) => {
+          if (purged && activeLibraryId) refreshTrashItems(activeLibraryId);
+        })
+        .catch(() => {});
+    },
+    [activeLibraryId, refreshTrashItems]
+  );
+
+  const handleOfflineCommand = useCallback(
+    (command: OfflineControlCommand) => {
+      if (!offlineControl) return;
+      invoke<OfflineControlState>("apply_offline_control", { offlineState: offlineControl, command })
+        .then(setOfflineControl)
+        .catch(() => {});
+    },
+    [offlineControl]
+  );
 
   const handleChooseMediaRoot = async () => {
     const selected = await openDialog({ directory: true, multiple: false, title: "Choose media location" });
@@ -904,6 +1001,9 @@ export function App() {
               />
               <span>Mark reviewed</span>
             </label>
+            <button type="button" className="text-button" onClick={handleMoveToTrash}>
+              Move to Trash
+            </button>
           </section>
         ) : null}
         <section id="tags-section">
@@ -1101,6 +1201,56 @@ export function App() {
                 ))}
             </div>
           ) : null}
+        </section>
+        <section>
+          <h2>NAS &amp; Offline</h2>
+          {offlineControl ? (
+            <>
+              <div className="status-line">
+                {offlineControl.media_root} — {mediaRootStatus?.status ?? "unknown"}
+                {offlineControl.catalog_only ? " (catalog only)" : ""}
+              </div>
+              <div className="drop-target-grid">
+                <button type="button" onClick={() => handleOfflineCommand("UseCatalogOnly")}>
+                  Use Catalog Only
+                </button>
+                <button type="button" onClick={() => handleOfflineCommand("RetryReconnect")}>
+                  Retry Reconnect
+                </button>
+                <button
+                  type="button"
+                  onClick={() =>
+                    handleOfflineCommand(offlineControl.validation_paused ? "ResumeValidation" : "PauseValidation")
+                  }
+                >
+                  {offlineControl.validation_paused ? "Resume Validation" : "Pause Validation"}
+                </button>
+              </div>
+            </>
+          ) : (
+            <span className="empty-hint">No library selected</span>
+          )}
+        </section>
+        <section>
+          <h2>Trash</h2>
+          <div className="status-line">{trashRetentionDays} day retention before explicit purge</div>
+          {trashItems.length === 0 ? (
+            <span className="empty-hint">Trash is empty</span>
+          ) : (
+            <div className="settings-stack">
+              {trashItems.map((item) => (
+                <div className="maintenance-row" key={item.asset_id}>
+                  <span>{item.original_path.split("/").pop()}</span>
+                  <button type="button" onClick={() => handleRestoreFromTrash(item)}>
+                    Restore
+                  </button>
+                  <button type="button" onClick={() => handlePurgeTrashItem(item)}>
+                    Purge
+                  </button>
+                </div>
+              ))}
+            </div>
+          )}
         </section>
       </aside>
       <footer className="transport" aria-label="Transport">

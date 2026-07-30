@@ -28,9 +28,11 @@ Add real Tauri commands backed directly by existing, already-tested crate logic:
 
 The command palette's five buttons now call real handlers (import, focus search, scroll to the tag/settings sections, export selected) instead of being inert.
 
+A follow-up within the same pass added Trash (`move_asset_to_trash`, `list_trash_items`, `restore_asset_from_trash`, `purge_trash_item` in `storage`, backed by a new `trash_items` table; `list_assets`/`search_assets` now exclude trashed assets) and NAS offline controls (`media_root_status` against the real library path, `apply_offline_control` as a stateless wrapper around `library_sync::OfflineControlState::apply`).
+
 ## Consequences
 
-- Every interactive element in the desktop shell either does something real or is explicitly disabled with a tooltip saying it isn't wired yet (Trash, backup/restore, NAS offline controls, duplicate-group actions beyond listing, and native drag-and-drop remain in that state after this pass).
+- Every interactive element in the desktop shell either does something real or is explicitly disabled with a tooltip saying it isn't wired yet (backup/restore, duplicate-group actions beyond listing, and native drag-and-drop remain in that state after this pass).
 - Per-row waveform bars in the asset browser were replaced with a neutral icon rather than fake random data; only the transport bar, for whatever is currently loaded, renders real computed peaks. Decoding every visible row's audio for a cosmetic mini-waveform was judged not worth the performance cost for an MVP with no background waveform cache yet.
 - Tag removal (as opposed to applying a tag or undoing the last apply) has no dedicated command yet — applied tags are shown but not individually removable outside of undo.
 - The maintenance report's duplicate detection is exact-hash-only; likely-duplicate detection needs real audio fingerprint extraction, which doesn't exist anywhere in the codebase yet.

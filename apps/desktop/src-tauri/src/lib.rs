@@ -235,6 +235,57 @@ fn trash_retention_policy_days() -> u64 {
     30
 }
 
+fn current_time_ms() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .expect("system clock before unix epoch")
+        .as_millis() as u64
+}
+
+#[tauri::command]
+fn move_to_trash(
+    state: tauri::State<CatalogState>,
+    asset_id: String,
+    reason: String,
+) -> Result<trash::TrashItem, String> {
+    let asset_id = parse_uuid_field(&asset_id, "asset id")?;
+    let catalog = state.0.lock().expect("catalog mutex poisoned");
+    catalog
+        .move_asset_to_trash(asset_id, reason, current_time_ms())
+        .map_err(storage_error_message)
+}
+
+#[tauri::command]
+fn list_trash_items(
+    state: tauri::State<CatalogState>,
+    library_id: String,
+) -> Result<Vec<trash::TrashItem>, String> {
+    let library_id = parse_uuid_field(&library_id, "library id")?;
+    let catalog = state.0.lock().expect("catalog mutex poisoned");
+    catalog
+        .list_trash_items(library_id)
+        .map_err(storage_error_message)
+}
+
+#[tauri::command]
+fn restore_from_trash(state: tauri::State<CatalogState>, asset_id: String) -> Result<(), String> {
+    let asset_id = parse_uuid_field(&asset_id, "asset id")?;
+    let catalog = state.0.lock().expect("catalog mutex poisoned");
+    catalog
+        .restore_asset_from_trash(asset_id)
+        .map_err(storage_error_message)
+}
+
+#[tauri::command]
+fn purge_from_trash(state: tauri::State<CatalogState>, asset_id: String) -> Result<bool, String> {
+    let asset_id = parse_uuid_field(&asset_id, "asset id")?;
+    let retention_ms = trash_retention_policy_days() * 24 * 60 * 60 * 1000;
+    let catalog = state.0.lock().expect("catalog mutex poisoned");
+    catalog
+        .purge_trash_item(asset_id, current_time_ms(), retention_ms)
+        .map_err(storage_error_message)
+}
+
 #[tauri::command]
 fn backup_restore_requirements() -> Vec<&'static str> {
     vec!["catalog_snapshot", "portable_manifest", "media_root"]
@@ -262,6 +313,15 @@ fn media_root_status(
     .to_string();
 
     Ok((status, probe.reconnect_validation_required))
+}
+
+#[tauri::command]
+fn apply_offline_control(
+    mut offline_state: library_sync::OfflineControlState,
+    command: library_sync::OfflineControlCommand,
+) -> library_sync::OfflineControlState {
+    offline_state.apply(command);
+    offline_state
 }
 
 #[tauri::command]
@@ -735,7 +795,12 @@ pub fn run() {
             set_source_record,
             export_selected_asset,
             load_app_preferences,
-            save_app_preferences
+            save_app_preferences,
+            move_to_trash,
+            list_trash_items,
+            restore_from_trash,
+            purge_from_trash,
+            apply_offline_control
         ])
         .run(tauri::generate_context!())
         .expect("failed to run Darkwave desktop shell");
