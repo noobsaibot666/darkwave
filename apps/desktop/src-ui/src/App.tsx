@@ -307,6 +307,32 @@ const maintenanceLabels: Record<string, string> = {
   DuplicateContent: "Duplicates"
 };
 
+type PlayerMood = "soundtrack" | "soundtrack-voice" | "voice-over" | "sfx";
+
+const playerMoodTheme: Record<PlayerMood, { from: string; to: string; glow: string }> = {
+  soundtrack: { from: "#4ade9c", to: "#0ea968", glow: "rgba(14, 169, 104, 0.45)" },
+  "soundtrack-voice": { from: "#c4a6fa", to: "#8b5cf6", glow: "rgba(139, 92, 246, 0.45)" },
+  "voice-over": { from: "#7c90f5", to: "#4c5fe0", glow: "rgba(76, 95, 224, 0.45)" },
+  sfx: { from: "#ff8a73", to: "#f2543a", glow: "rgba(242, 84, 58, 0.45)" }
+};
+
+// Derives a playback "mood" from the sound's applied tags (falling back to
+// media_type) — there's no dedicated speech/music classifier yet, so this
+// reuses the app's existing tagging system as the classification signal.
+function classifyPlayerMood(asset: AssetRecord | null, tags: TagRecord[]): PlayerMood | null {
+  if (!asset) return null;
+  const names = tags.map((tag) => tag.name.toLowerCase());
+  const hasMusic = names.some((name) => name.includes("music")) || asset.media_type === "music";
+  const hasVoice = names.some((name) => name.includes("voice") || name.includes("dialogue"));
+  const hasSfx = names.some((name) => name.includes("sound effect")) || asset.media_type === "sound_effect";
+
+  if (hasMusic && hasVoice) return "soundtrack-voice";
+  if (hasMusic) return "soundtrack";
+  if (hasVoice) return "voice-over";
+  if (hasSfx) return "sfx";
+  return null;
+}
+
 function CollapsibleSection({
   id,
   title,
@@ -1505,6 +1531,14 @@ export function App() {
   const waveformActiveIndex = peaks && duration > 0 ? Math.floor((currentTime / duration) * peaks.length) : -1;
   const drTargetAssetId = playingAssetId ?? selectedAssetId;
   const drTargetProject = collections.find((project) => project.id === lastExportProjectId) ?? null;
+  const playerMood = classifyPlayerMood(selectedAsset, appliedTags);
+  const playerMoodStyle = playerMood
+    ? ({
+        "--player-accent-from": playerMoodTheme[playerMood].from,
+        "--player-accent-to": playerMoodTheme[playerMood].to,
+        "--player-glow-color": playerMoodTheme[playerMood].glow
+      } as CSSProperties)
+    : undefined;
 
   return (
     <main
@@ -2194,8 +2228,9 @@ export function App() {
         </div>
       </aside>
       <footer
-        className={`transport${sidebarCollapsed ? " sidebar-collapsed" : ""}${inspectorCollapsed ? " inspector-collapsed" : ""}`}
+        className={`transport${sidebarCollapsed ? " sidebar-collapsed" : ""}${inspectorCollapsed ? " inspector-collapsed" : ""}${isPlaying ? " is-playing" : ""}`}
         aria-label="Transport"
+        style={playerMoodStyle}
       >
         <button className="icon-button" aria-label="Previous" onClick={() => playRelative(-1)}>
           <SkipBack size={17} />
