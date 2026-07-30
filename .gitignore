@@ -11,3 +11,4 @@ target/
 *.db
 apps/desktop/src-tauri/gen/
 apps/desktop/src-tauri/binaries/
+.claude/settings.local.json

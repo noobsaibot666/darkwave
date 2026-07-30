@@ -1,0 +1,16 @@
+{
+  "permissions": {
+    "allow": [
+      "Bash(cargo build *)",
+      "Bash(cargo fmt *)",
+      "Bash(cargo clippy *)",
+      "Bash(npx astro *)",
+      "Bash(gh --version)",
+      "Bash(python3 -c \"import PIL; print\\(PIL.__version__\\)\")",
+      "Bash(rm -rf src-tauri/icons/android src-tauri/icons/ios src-tauri/icons/Square*Logo.png src-tauri/icons/StoreLogo.png *)"
+    ],
+    "additionalDirectories": [
+      "/Users/alan/_localDEV/_creative/_darkwave/apps/desktop/src-tauri/icons"
+    ]
+  }
+}
