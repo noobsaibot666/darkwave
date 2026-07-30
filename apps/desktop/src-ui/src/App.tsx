@@ -373,7 +373,7 @@ export function App() {
   const [filterMenuOpen, setFilterMenuOpen] = useState(false);
   const [sfxSubcategoriesOpen, setSfxSubcategoriesOpen] = useState(false);
   const [collapsedSections, setCollapsedSections] = useState<Set<string>>(
-    () => new Set(["projects", "embedded", "detected", "source", "release", "maintenance", "nas", "trash", "backup"])
+    () => new Set(["projects", "embedded", "detected", "source", "release", "maintenance", "nas", "backup"])
   );
   const [refreshStatus, setRefreshStatus] = useState<string | null>(null);
   const [newProjectModalOpen, setNewProjectModalOpen] = useState(false);
@@ -1958,8 +1958,18 @@ export function App() {
             {collections
               .filter((project) => project.collection_type !== "Smart")
               .map((project) => (
-                <button key={project.id} onClick={() => handleAddSelectedToProject(project)} disabled={bulkAssetIds.length === 0}>
-                  + {project.name}
+                <button
+                  key={project.id}
+                  className="project-chip"
+                  title={`Add selected to ${project.name}`}
+                  aria-label={`Add selected to ${project.name}`}
+                  onClick={() => handleAddSelectedToProject(project)}
+                  disabled={bulkAssetIds.length === 0}
+                >
+                  <span className="project-thumb">
+                    <Music size={12} />
+                  </span>
+                  <span className="project-chip-label">{project.name}</span>
                 </button>
               ))}
           </div>
@@ -1986,24 +1996,36 @@ export function App() {
             collapsed={collapsedSections.has("detected")}
             onToggle={toggleSection}
           >
-            {selectedAsset.duration_ms != null ? (
-              <div className="status-line">Duration: {formatTime(selectedAsset.duration_ms / 1000)}</div>
-            ) : null}
-            {selectedAsset.sample_rate != null ? (
-              <div className="status-line">
-                {(selectedAsset.sample_rate / 1000).toFixed(1)} kHz
-                {selectedAsset.channels != null ? ` · ${selectedAsset.channels === 1 ? "Mono" : selectedAsset.channels === 2 ? "Stereo" : `${selectedAsset.channels}ch`}` : ""}
-              </div>
-            ) : null}
-            {selectedAsset.bpm != null ? (
-              <div className="status-line">
-                ~{Math.round(selectedAsset.bpm)} BPM (best-effort)
-              </div>
-            ) : null}
-            {selectedAsset.musical_key != null ? (
-              <div className="status-line">Detected pitch: {selectedAsset.musical_key} (best-effort, not a musical key)</div>
-            ) : null}
-            <button type="button" className="text-button" onClick={handleFindSimilar}>
+            <div className="attribute-grid">
+              {selectedAsset.duration_ms != null ? (
+                <div className="attribute-pill">
+                  <span className="attribute-label">Duration</span>
+                  <strong className="attribute-value">{formatTime(selectedAsset.duration_ms / 1000)}</strong>
+                </div>
+              ) : null}
+              {selectedAsset.sample_rate != null ? (
+                <div className="attribute-pill">
+                  <span className="attribute-label">Sample rate</span>
+                  <strong className="attribute-value">
+                    {(selectedAsset.sample_rate / 1000).toFixed(1)} kHz
+                    {selectedAsset.channels != null ? ` · ${selectedAsset.channels === 1 ? "Mono" : selectedAsset.channels === 2 ? "Stereo" : `${selectedAsset.channels}ch`}` : ""}
+                  </strong>
+                </div>
+              ) : null}
+              {selectedAsset.bpm != null ? (
+                <div className="attribute-pill" title="Best-effort estimate">
+                  <span className="attribute-label">Tempo</span>
+                  <strong className="attribute-value">~{Math.round(selectedAsset.bpm)} BPM</strong>
+                </div>
+              ) : null}
+              {selectedAsset.musical_key != null ? (
+                <div className="attribute-pill" title="Best-effort estimate, not a musical key">
+                  <span className="attribute-label">Pitch</span>
+                  <strong className="attribute-value">{selectedAsset.musical_key}</strong>
+                </div>
+              ) : null}
+            </div>
+            <button type="button" className="primary-action" onClick={handleFindSimilar}>
               Find Similar Sounds
             </button>
             {similarStatus ? <div className="status-line">{similarStatus}</div> : null}
@@ -2012,26 +2034,28 @@ export function App() {
         <CollapsibleSection id="source" title="Source & License" collapsed={collapsedSections.has("source")} onToggle={toggleSection}>
           {sourceDraft ? (
             <>
-              <input
-                placeholder="Provider"
-                value={sourceDraft.provider ?? ""}
-                onChange={(event) => setSourceDraft({ ...sourceDraft, provider: event.target.value || null })}
-              />
-              <input
-                placeholder="Source URL"
-                value={sourceDraft.source_url ?? ""}
-                onChange={(event) => setSourceDraft({ ...sourceDraft, source_url: event.target.value || null })}
-              />
-              <input
-                placeholder="License type"
-                value={sourceDraft.license_type ?? ""}
-                onChange={(event) => setSourceDraft({ ...sourceDraft, license_type: event.target.value || null })}
-              />
-              <input
-                placeholder="License status"
-                value={sourceDraft.license_status ?? ""}
-                onChange={(event) => setSourceDraft({ ...sourceDraft, license_status: event.target.value || null })}
-              />
+              <div className="source-fields">
+                <input
+                  placeholder="Provider"
+                  value={sourceDraft.provider ?? ""}
+                  onChange={(event) => setSourceDraft({ ...sourceDraft, provider: event.target.value || null })}
+                />
+                <input
+                  placeholder="Source URL"
+                  value={sourceDraft.source_url ?? ""}
+                  onChange={(event) => setSourceDraft({ ...sourceDraft, source_url: event.target.value || null })}
+                />
+                <input
+                  placeholder="License type"
+                  value={sourceDraft.license_type ?? ""}
+                  onChange={(event) => setSourceDraft({ ...sourceDraft, license_type: event.target.value || null })}
+                />
+                <input
+                  placeholder="License status"
+                  value={sourceDraft.license_status ?? ""}
+                  onChange={(event) => setSourceDraft({ ...sourceDraft, license_status: event.target.value || null })}
+                />
+              </div>
               <button type="button" className="primary-action" onClick={handleSaveSource}>
                 <Save size={15} />
                 Save source
@@ -2052,18 +2076,18 @@ export function App() {
             ))}
           </div>
           {maintenanceReport && maintenanceReport.findings.some((finding) => finding.kind === "DuplicateContent") ? (
-            <>
+            <div className="maintenance-list">
               {maintenanceReport.findings
                 .filter((finding) => finding.kind === "DuplicateContent")
                 .map((finding, index) => (
-                  <div className="status-line" key={index}>
-                    {finding.asset_ids.length} duplicate files sharing content
+                  <div className="maintenance-row" key={index}>
+                    <span>{finding.asset_ids.length} duplicate files sharing content</span>
                     <button type="button" className="text-button" onClick={() => handleTrashDuplicateGroup(finding.asset_ids)}>
                       Keep oldest, trash rest
                     </button>
                   </div>
                 ))}
-            </>
+            </div>
           ) : null}
         </CollapsibleSection>
         <CollapsibleSection id="nas" title="NAS & Offline" collapsed={collapsedSections.has("nas")} onToggle={toggleSection}>
@@ -2073,7 +2097,7 @@ export function App() {
                 {offlineControl.media_root} — {mediaRootStatus?.status ?? "unknown"}
                 {offlineControl.catalog_only ? " (catalog only)" : ""}
               </div>
-              <div className="drop-target-grid">
+              <div className="action-list">
                 <button type="button" onClick={() => handleOfflineCommand("UseCatalogOnly")}>
                   Use Catalog Only
                 </button>
@@ -2093,26 +2117,6 @@ export function App() {
             </>
           ) : (
             <span className="empty-hint">No library selected</span>
-          )}
-        </CollapsibleSection>
-        <CollapsibleSection id="trash" title="Trash" collapsed={collapsedSections.has("trash")} onToggle={toggleSection}>
-          <div className="status-line">{trashRetentionDays} day retention before explicit purge</div>
-          {trashItems.length === 0 ? (
-            <span className="empty-hint">Trash is empty</span>
-          ) : (
-            <>
-              {trashItems.map((item) => (
-                <div className="maintenance-row" key={item.asset_id}>
-                  <span>{item.original_path.split("/").pop()}</span>
-                  <button type="button" onClick={() => handleRestoreFromTrash(item)}>
-                    Restore
-                  </button>
-                  <button type="button" onClick={() => handlePurgeTrashItem(item)}>
-                    Purge
-                  </button>
-                </div>
-              ))}
-            </>
           )}
         </CollapsibleSection>
         <CollapsibleSection id="backup" title="Backup" collapsed={collapsedSections.has("backup")} onToggle={toggleSection}>
@@ -2370,6 +2374,28 @@ export function App() {
                   />
                 </label>
               </div>
+            </div>
+
+            <div className="settings-section">
+              <h2>Trash</h2>
+              <div className="status-line">{trashRetentionDays} day retention before explicit purge</div>
+              {trashItems.length === 0 ? (
+                <span className="empty-hint">Trash is empty</span>
+              ) : (
+                <div className="maintenance-list">
+                  {trashItems.map((item) => (
+                    <div className="maintenance-row" key={item.asset_id}>
+                      <span>{item.original_path.split("/").pop()}</span>
+                      <button type="button" className="text-button" onClick={() => handleRestoreFromTrash(item)}>
+                        Restore
+                      </button>
+                      <button type="button" className="text-button" onClick={() => handlePurgeTrashItem(item)}>
+                        Purge
+                      </button>
+                    </div>
+                  ))}
+                </div>
+              )}
             </div>
           </motion.div>
         </motion.div>
