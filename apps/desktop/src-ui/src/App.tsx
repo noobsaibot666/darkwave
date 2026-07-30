@@ -139,6 +139,15 @@ type OfflineControlCommand =
   | "ResumeValidation"
   | { RelinkMediaRoot: { media_root: string } };
 
+type BackupPackage = {
+  library_id: string;
+  manifest_revision: number;
+  media_root: string;
+  catalog_snapshot_path: string;
+  manifest_path: string;
+  created_at_ms: number;
+};
+
 function formatFileSize(bytes: number): string {
   if (bytes < 1024) return `${bytes} B`;
   if (bytes < 1024 * 1024) return `${(bytes / 1024).toFixed(1)} KB`;
@@ -248,6 +257,7 @@ export function App() {
   const [exportStatus, setExportStatus] = useState<string | null>(null);
   const [offlineControl, setOfflineControl] = useState<OfflineControlState | null>(null);
   const [trashItems, setTrashItems] = useState<TrashItem[]>([]);
+  const [backupStatus, setBackupStatus] = useState<string | null>(null);
 
   const [preferences, setPreferences] = useState<AppPreferences | null>(null);
   const [trashRetentionDays, setTrashRetentionDays] = useState(30);
@@ -620,6 +630,23 @@ export function App() {
     },
     [offlineControl]
   );
+
+  const handleBackupLibrary = useCallback(async () => {
+    if (!activeLibraryId) return;
+    const destination = await openDialog({ directory: true, multiple: false, title: "Choose backup destination" });
+    if (typeof destination !== "string") return;
+
+    setBackupStatus("Backing up…");
+    try {
+      const backupPackage = await invoke<BackupPackage>("backup_library", {
+        libraryId: activeLibraryId,
+        backupDir: destination
+      });
+      setBackupStatus(`Backed up to ${backupPackage.catalog_snapshot_path}`);
+    } catch (error) {
+      setBackupStatus(`Backup failed: ${String(error)}`);
+    }
+  }, [activeLibraryId]);
 
   const handleChooseMediaRoot = async () => {
     const selected = await openDialog({ directory: true, multiple: false, title: "Choose media location" });
@@ -1251,6 +1278,16 @@ export function App() {
               ))}
             </div>
           )}
+        </section>
+        <section>
+          <h2>Backup</h2>
+          <button type="button" className="text-button" onClick={handleBackupLibrary} disabled={!activeLibraryId}>
+            Back Up Library
+          </button>
+          <div className="status-line">{backupStatus ?? "Copies the catalog snapshot and manifest to a folder you choose"}</div>
+          <div className="status-line" title="Restoring would overwrite the live, currently-open catalog database">
+            Restore not wired up yet — data-safety risk, see ADR 0020
+          </div>
         </section>
       </aside>
       <footer className="transport" aria-label="Transport">

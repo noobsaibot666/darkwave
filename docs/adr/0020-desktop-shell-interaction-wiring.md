@@ -30,9 +30,11 @@ The command palette's five buttons now call real handlers (import, focus search,
 
 A follow-up within the same pass added Trash (`move_asset_to_trash`, `list_trash_items`, `restore_asset_from_trash`, `purge_trash_item` in `storage`, backed by a new `trash_items` table; `list_assets`/`search_assets` now exclude trashed assets) and NAS offline controls (`media_root_status` against the real library path, `apply_offline_control` as a stateless wrapper around `library_sync::OfflineControlState::apply`).
 
+A second follow-up added backup creation: `backup_library` builds a `PortableManifest` from the live asset list (there was no separately-maintained manifest file to source it from), writes it beside the catalog, and copies both into a user-chosen folder through `backup::create_backup`. Restore was deliberately left unwired: applying a `RestorePlan` means overwriting `catalog.sqlite` while the running app still holds it open behind `CatalogState`'s `Mutex`, which is a real data-integrity risk (a corrupted or torn write to a database the app is actively querying) that needs a proper "close catalog, restore, relaunch" flow, not a same-session file copy. The button exists and is disabled with that reasoning shown, rather than either faking it or silently omitting it.
+
 ## Consequences
 
-- Every interactive element in the desktop shell either does something real or is explicitly disabled with a tooltip saying it isn't wired yet (backup/restore, duplicate-group actions beyond listing, and native drag-and-drop remain in that state after this pass).
+- Every interactive element in the desktop shell either does something real or is explicitly disabled with a tooltip saying it isn't wired yet (restore, duplicate-group actions beyond listing, and native drag-and-drop remain in that state after this pass).
 - Per-row waveform bars in the asset browser were replaced with a neutral icon rather than fake random data; only the transport bar, for whatever is currently loaded, renders real computed peaks. Decoding every visible row's audio for a cosmetic mini-waveform was judged not worth the performance cost for an MVP with no background waveform cache yet.
 - Tag removal (as opposed to applying a tag or undoing the last apply) has no dedicated command yet — applied tags are shown but not individually removable outside of undo.
 - The maintenance report's duplicate detection is exact-hash-only; likely-duplicate detection needs real audio fingerprint extraction, which doesn't exist anywhere in the codebase yet.

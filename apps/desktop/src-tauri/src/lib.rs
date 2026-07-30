@@ -134,6 +134,73 @@ fn preferences_path(app: &tauri::AppHandle) -> Result<PathBuf, String> {
 }
 
 #[tauri::command]
+fn backup_library(
+    app: tauri::AppHandle,
+    state: tauri::State<CatalogState>,
+    library_id: String,
+    backup_dir: String,
+) -> Result<backup::BackupPackage, String> {
+    let library_id = parse_uuid_field(&library_id, "library id")?;
+    let catalog = state.0.lock().expect("catalog mutex poisoned");
+    let library = catalog
+        .get_library(library_id)
+        .map_err(storage_error_message)?
+        .ok_or_else(|| "library not found".to_string())?;
+    let assets = catalog
+        .list_assets(library_id)
+        .map_err(storage_error_message)?;
+    drop(catalog);
+
+    let manifest = assets
+        .iter()
+        .filter_map(|asset| {
+            let relative_path = match &asset.path {
+                AssetPath::Managed(path) | AssetPath::Referenced(path) => path.clone(),
+            };
+            asset
+                .content_hash
+                .clone()
+                .map(|content_hash| library_sync::ManifestAsset {
+                    id: asset.id,
+                    relative_path,
+                    content_hash,
+                })
+        })
+        .fold(
+            library_sync::PortableManifest::new(library_id, 1),
+            |manifest, asset| manifest.with_asset(asset),
+        );
+
+    let app_data_dir = app
+        .path()
+        .app_data_dir()
+        .map_err(|error| format!("resolve app data directory: {error}"))?;
+    let catalog_path = app_data_dir.join("catalog.sqlite");
+    let manifest_path = app_data_dir.join("library.darkwave-manifest.json");
+    library_sync::write_manifest_file(&manifest, &manifest_path)
+        .map_err(|error| format!("{error:?}"))?;
+
+    std::fs::create_dir_all(&backup_dir)
+        .map_err(|error| format!("create backup directory {backup_dir}: {error}"))?;
+
+    let source = backup::BackupSource {
+        catalog_path: catalog_path.to_string_lossy().to_string(),
+        manifest_path: manifest_path.to_string_lossy().to_string(),
+        backup_dir,
+    };
+
+    backup::create_backup(
+        library_id,
+        1,
+        library.media_root,
+        &source,
+        current_time_ms(),
+        |from, to| std::fs::copy(from, to).is_ok(),
+    )
+    .map_err(|error| format!("{error:?}"))
+}
+
+#[tauri::command]
 fn supported_drag_targets() -> Vec<&'static str> {
     vec![
         "tag",
@@ -800,7 +867,8 @@ pub fn run() {
             list_trash_items,
             restore_from_trash,
             purge_from_trash,
-            apply_offline_control
+            apply_offline_control,
+            backup_library
         ])
         .run(tauri::generate_context!())
         .expect("failed to run Darkwave desktop shell");
