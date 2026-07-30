@@ -1,5 +1,17 @@
 # Audio Library Application — Product & Development Plan
 
+## Implementation Status (updated 2026-07-30)
+
+This plan is the original product/development spec. It is not rewritten as implementation progresses — instead, Section 19 (MVP Scope) and Section 20 (Delivery Milestones) below are annotated in place so this document stays the single source of truth for both intent and status. Everything else in the document (product definition, principles, taxonomy, design system, data model, etc.) remains the target spec, not a record of what exists yet.
+
+Legend: **[Done]** built and wired end-to-end · **[Partial]** real, tested logic exists but isn't fully wired or the deliverable is incomplete · **[Not started]** no implementation yet.
+
+Product name: the app is currently branded **Darkwave** in the codebase, not the placeholder "Resonant" from Section 1.
+
+High-level state: the desktop shell (Tauri + Rust + React) has a working end-to-end vertical slice — create a library, import a folder, browse/search/play/tag/organize/export, back up and restore, work offline and reconnect a NAS-backed media root. Every interactive control either does something real or is explicitly disabled with a reason; there are no cosmetic-only UI elements. What's missing is concentrated in three areas the plan explicitly treats as later-stage: the smart-analysis pipeline beyond filename/embedded-metadata rules (no audio measurements, classification, or fingerprinting/embeddings), the full background job system (persistent queue exists, but no priority/pause/retry/throttling), and release readiness (signing, notarization, auto-update, licensing review are all still "Planned", not built). Detailed status is in Sections 19 and 20. Reasoning for every deliberate deferral is captured in `docs/adr/0019` through `docs/adr/0022`.
+
+One caveat worth surfacing explicitly: the in-app "Release Readiness" panel (Section 20, Milestone 0/7) sources macOS audit, Windows audit, accessibility audit, performance profile, crash recovery, and onboarding docs from `ReleaseReadinessConfig::code_gates_passed()` — a hardcoded default that marks all of them `Passed`. None of those audits have actually been performed; the name means "the code exists and builds," not "the audit ran." Only codec packaging, codec license review, update system, and signing/notarization are driven by real optional config and correctly show `Planned`. Treat the "Passed" gates as unverified, not as evidence.
+
 ## 1. Product Definition
 
 ### Working title
@@ -1365,28 +1377,28 @@ The MVP must solve the repeated-search problem without becoming an oversized aud
 
 ### Required for MVP
 
-- Create/open local or NAS-backed library.
-- Managed, referenced, and hybrid assets.
-- Drag-and-drop and folder import.
-- Watched Downloads folder.
-- Fast playback.
-- Precomputed waveform display.
-- Keyboard navigation.
-- Metadata extraction.
-- Filename-based smart suggestions.
-- Starter taxonomy.
-- Manual and suggested tags.
-- Collections and Smart Collections.
-- Search and filters.
-- Exact duplicate detection.
-- Drag assets into other applications.
-- Copy/export to project folder.
-- Source/license fields.
-- Local catalog with NAS media support.
-- Offline catalog and optional preview cache.
-- Missing-file relinking.
-- Settings and shortcuts.
-- Astro/Starlight documentation.
+- **[Done]** Create/open local or NAS-backed library — `create_library`/`list_libraries` wired; media root is any path, including an SMB/NAS mount.
+- **[Done]** Managed, referenced, and hybrid assets — both storage modes work end-to-end; a library naturally ends up hybrid once it has both.
+- **[Partial]** Drag-and-drop and folder import — folder import via file picker works; dragging files/folders onto the app window to import them is not wired (only import-triggered-by-dialog exists).
+- **[Not started]** Watched Downloads folder — the polling/debounce logic exists and is tested in `import-pipeline`, but nothing in the desktop shell runs a live filesystem watcher.
+- **[Done]** Fast playback — native `<audio>` element via the Tauri asset protocol.
+- **[Partial]** Precomputed waveform display — the transport bar shows real computed peaks; peaks are computed on demand client-side each time, not cached to disk, and per-row waveforms show a neutral icon rather than real data (performance tradeoff, see ADR 0020).
+- **[Partial]** Keyboard navigation — playback, favorite, search-focus, import, and export shortcuts are wired; Up/Down arrow-key row focus navigation (as opposed to Cmd/Ctrl-click and Shift-click selection) is not.
+- **[Done]** Metadata extraction — immediate metadata at import, embedded WAV title/genre/comment via an automatic background job (ADR 0021).
+- **[Done]** Filename-based smart suggestions — wired at import, shown for accept/reject in the inspector.
+- **[Done]** Starter taxonomy — seeded automatically on library creation.
+- **[Done]** Manual and suggested tags — apply, accept, reject, and remove are all wired with undo/redo.
+- **[Partial]** Collections and Smart Collections — manual Collections/Projects are fully wired; `create_smart_collection` (rule-based, stored query definition) exists in `storage` and is untouched by the desktop shell.
+- **[Done]** Search and filters — full-text search, natural-language query parsing (media-type inference), tag/media-type filters, and sidebar smart filters are all wired.
+- **[Done]** Exact duplicate detection — reported in Maintenance with a real "keep oldest, trash rest" action.
+- **[Not started]** Drag assets into other applications — `export-pipeline`'s external drag-payload builders exist and are tested but have no frontend HTML5-drag counterpart.
+- **[Done]** Copy/export to project folder — original-file export is wired, including bulk export for a multi-selection.
+- **[Done]** Source/license fields — per-asset editing plus a per-project CSV license report export.
+- **[Done]** Local catalog with NAS media support — media root probing and offline/online status are wired.
+- **[Partial]** Offline catalog and optional preview cache — the catalog stays fully browsable offline and availability state is accurate; there is no low-bitrate preview cache for offline auditioning.
+- **[Partial]** Missing-file relinking — reconnect validation now reports exactly which managed paths are still missing after a NAS comes back (ADR 0022); `storage::relink_asset` exists but there's no picker UI yet to act on that report.
+- **[Done]** Settings and shortcuts — preferences persist to disk; shortcut list and accessibility toggles are real.
+- **[Done]** Astro/Starlight documentation — the docs site builds clean (`astro check`: 0 errors/warnings/hints).
 
 ### Explicitly excluded from MVP
 
@@ -1408,149 +1420,165 @@ The MVP must solve the repeated-search problem without becoming an oversized aud
 
 ## Milestone 0 — Product foundation
 
+**Status: Done**, with one caveat — builds are unsigned.
+
 Deliverables:
 
-- Repository and workspace setup.
-- Architecture decision records.
-- Design tokens.
-- Database schema and migrations.
-- Tauri shell on macOS and Windows.
-- Astro/Starlight documentation site.
-- CI for both platforms.
+- **[Done]** Repository and workspace setup.
+- **[Done]** Architecture decision records — 22 ADRs in `docs/adr/`.
+- **[Done]** Design tokens — `packages/design-tokens`.
+- **[Done]** Database schema and migrations — `storage::Catalog::migrate`.
+- **[Done]** Tauri shell on macOS and Windows — CI matrix builds both (`macos-latest`, `windows-latest`).
+- **[Done]** Astro/Starlight documentation site.
+- **[Done]** CI for both platforms.
 
 Acceptance:
 
-- Empty signed-development builds launch on macOS and Windows.
-- Documentation builds locally and in CI.
+- **[Partial]** Empty signed-development builds launch on macOS and Windows — CI builds and launches on both, but nothing is code-signed (`tauri.conf.json` has no signing config, and `signing_notarization` reports `Planned` — see the release-readiness caveat above).
+- **[Done]** Documentation builds locally and in CI (`astro check`: 0 errors/warnings/hints).
 
 ## Milestone 1 — Library and import core
 
+**Status: Mostly done.** The file watcher and the full persistent-job-system requirements (§16.3) are the gaps.
+
 Deliverables:
 
-- Create/open library.
-- Local catalog.
-- Managed/referenced import.
-- File metadata extraction.
-- Persistent job queue.
-- File watcher.
-- Asset availability tracking.
+- **[Done]** Create/open library.
+- **[Done]** Local catalog.
+- **[Done]** Managed/referenced import.
+- **[Done]** File metadata extraction.
+- **[Partial]** Persistent job queue — jobs persist in SQLite and are enqueued/completed correctly (ADR 0021), but there's no priority scheduling, pause/resume, cancellation, retry policy, per-job progress, or CPU/battery throttling; processing only runs synchronously right after import, not as a standing background worker.
+- **[Not started]** File watcher — the debounce/stabilization logic is built and tested in `import-pipeline`, nothing in the desktop shell runs it against a live folder.
+- **[Done]** Asset availability tracking.
 
 Acceptance:
 
-- Import 10,000 mixed audio files without UI lockup.
-- Restart resumes incomplete jobs safely.
-- Duplicate import does not create unintended duplicate records.
+- **[Not verified]** Import 10,000 mixed audio files without UI lockup — no benchmark has been run at this scale.
+- **[Partial]** Restart resumes incomplete jobs safely — the jobs table survives a restart, but nothing automatically drains it on launch; it only runs after a subsequent import.
+- **[Done]** Duplicate import does not create unintended duplicate records — tested via content-hash lookup.
 
 ## Milestone 2 — Playback and waveform
 
+**Status: Partial.** This is the least-built milestone relative to its original spec — the audio engine, virtualization, and seeking/looping are all substitutes or gaps rather than the planned implementation.
+
 Deliverables:
 
-- Audio engine.
-- Previous/next playback.
-- Seeking and looping.
-- Waveform peak generation.
-- Virtualized browser rows.
-- Persistent transport.
-- Output device settings.
+- **[Partial]** Audio engine — a native `<audio>` element via the Tauri asset protocol is used instead of the planned Rust rodio/cpal/Symphonia engine; a deliberate MVP tradeoff (ADR 0004, revisited in ADR 0019/0020), not an oversight.
+- **[Done]** Previous/next playback.
+- **[Not started]** Seeking and looping — no scrub interaction on the waveform and no loop toggle are wired.
+- **[Partial]** Waveform peak generation — real peaks are computed client-side for whichever asset is currently loaded; nothing is cached to disk, and per-row waveforms show a neutral icon, not real data.
+- **[Not started]** Virtualized browser rows — the row list renders every visible asset directly; the UI itself honestly labels this "Not yet virtualized" rather than faking it.
+- **[Done]** Persistent transport.
+- **[Not started]** Output device settings — no device picker.
 
 Acceptance:
 
-- Typical local files begin in under 100 ms on reference hardware.
-- Rapid arrow-key navigation does not create overlapping playback.
-- Browser remains smooth with 50,000 indexed rows.
+- **[Not verified]** Typical local files begin in under 100 ms on reference hardware.
+- **[Not verified]** Rapid arrow-key navigation does not create overlapping playback — moot in part, since arrow-key row navigation itself isn't wired yet (only Next/Previous-asset shortcuts, which advance playback, exist).
+- **[Not verified]** Browser remains smooth with 50,000 indexed rows — likely would not hold given no virtualization; untested either way.
 
 ## Milestone 3 — Organization workspace
 
+**Status: Done.** This milestone is where this development pass concentrated the most effort (drag-to-classify is a deliberate substitution, not a gap).
+
 Deliverables:
 
-- Tags.
-- Starter taxonomy.
-- Collections.
-- Projects.
-- Drag-to-classify.
-- Multi-select.
-- Bulk actions.
-- Undo.
-- Favorites and review states.
+- **[Done]** Tags.
+- **[Done]** Starter taxonomy.
+- **[Partial]** Collections — manual Collections/Projects are fully wired; Smart Collections (rule-based, stored query) exist in `storage` and are unused by the shell.
+- **[Done]** Projects.
+- **[Not started, by substitution]** Drag-to-classify — click-to-apply (tag buttons, project buttons) covers the same functional surface; no HTML5 drag interaction exists. `workspace-state`'s `DragPayload`/`DragTarget` are tested but never dispatched from the frontend.
+- **[Done]** Multi-select — click / Cmd-click / Shift-click / Cmd+A, backed by `workspace-state::BrowserState`.
+- **[Done]** Bulk actions — tag, add-to-project, favorite, export, and trash all operate over a multi-selection.
+- **[Partial]** Undo — tag apply/remove and collection-add are undoable; favorite/reviewed toggles and trash moves are not on the undo stack (trash has its own restore path instead).
+- **[Done]** Favorites and review states.
 
 Acceptance:
 
-- User can classify 100 selected assets through drag-and-drop or shortcuts without opening dialogs.
-- All metadata operations are undoable.
+- **[Partial]** User can classify 100 selected assets through drag-and-drop or shortcuts without opening dialogs — true via click-multi-select plus tag buttons; false via literal drag-and-drop, which isn't built.
+- **[Partial]** All metadata operations are undoable — true for tags and collection membership; false for favorite/reviewed/trash (see above).
 
 ## Milestone 4 — Search and smart import
 
+**Status: Mostly done.** Smart Collections and the wider faceted-filter set from §11.2 are the gaps.
+
 Deliverables:
 
-- FTS search.
-- Faceted filters.
-- Saved Smart Collections.
-- Filename parser.
-- Embedded metadata mapping.
-- Suggested tags with confidence.
-- Tag approval/rejection.
+- **[Done]** FTS search.
+- **[Partial]** Faceted filters — media-type and tag filters exist; duration/BPM/key/energy/loudness/source/license/date-added/last-used/times-used filters from §11.2 do not.
+- **[Not started]** Saved Smart Collections — `create_smart_collection` exists in `storage`, unused by the shell.
+- **[Done]** Filename parser.
+- **[Done]** Embedded metadata mapping — WAV title/genre/comment extraction now runs automatically after import (ADR 0021) and feeds both tag suggestions and a direct inspector display.
+- **[Done]** Suggested tags with confidence.
+- **[Done]** Tag approval/rejection.
 
 Acceptance:
 
-- Search updates interactively on a 100,000-asset test catalog.
-- Suggestions are traceable to their origin.
-- Rejected tags do not immediately reappear without new evidence.
+- **[Partial]** Search updates interactively on a 100,000-asset test catalog — a profiling test for this exists (`large_catalog_search_profile_exercises_one_hundred_thousand_assets`) but is `#[ignore]`d by default and not run in CI, so it's not continuously verified.
+- **[Done]** Suggestions are traceable to their origin — `TagOrigin` is tracked and returned.
+- **[Done]** Rejected tags do not immediately reappear without new evidence — tested.
 
 ## Milestone 5 — NAS and resilience
 
+**Status: Partial, substantially improved this pass.** Reconnect validation and backup/restore are now real; writer leases remain the one deliberately-unwired piece.
+
 Deliverables:
 
-- Shared media location.
-- Local cache.
-- Portable manifest.
-- Single-writer lease.
-- Offline behavior.
-- Reconnect validation.
-- Missing/moved asset relinking.
-- Backup and restore.
+- **[Done]** Shared media location.
+- **[Done]** Local cache.
+- **[Partial]** Portable manifest — built in memory on demand (for backup and for reconnect validation) rather than continuously maintained on disk as §9.3 specifies.
+- **[Not started]** Single-writer lease — `acquire_lease_file`/`release_lease_file`/`lease_state` are implemented and tested but have no caller; the app has no device-identity concept yet to key a lease off of (ADR 0022).
+- **[Done]** Offline behavior — Use Catalog Only / pause / resume validation all wired.
+- **[Done]** Reconnect validation — `validate_reconnect` re-checks real availability and reports missing managed paths (ADR 0022).
+- **[Partial]** Missing/moved asset relinking — detection is real (see above); `storage::relink_asset` exists but there's no picker UI to act on a missing-path report yet.
+- **[Done]** Backup and restore — restore uses a stage-then-atomic-rename swap under the same mutex the app already serializes catalog access through (ADR 0021).
 
 Acceptance:
 
-- Disconnecting the NAS does not crash or freeze the app.
-- Catalog and waveforms remain browsable offline.
-- Reconnection does not require a full rescan.
-- Conflicting writers are prevented or opened read-only.
+- **[Not verified]** Disconnecting the NAS does not crash or freeze the app — the architecture doesn't block on media-root reachability, but this hasn't been exercised against a real NAS disconnect.
+- **[Partial]** Catalog and waveforms remain browsable offline — the catalog itself, yes; waveforms specifically require decoding the actual file, so an offline/missing asset has no waveform, which is correct behavior, not a bug, but worth noting as a limit on the claim.
+- **[Done]** Reconnection does not require a full rescan — validation checks known manifest paths only.
+- **[Not started]** Conflicting writers are prevented or opened read-only — no writer-lease UI (see above).
 
 ## Milestone 6 — Editorial export workflow
 
+**Status: Partial.** Original-copy export and the license report are real; format conversion and OS-level drag export are not built.
+
 Deliverables:
 
-- External drag-and-drop.
-- Copy to project media folder.
-- Export presets.
-- Optional WAV conversion.
-- Usage history.
-- Project source/license report.
+- **[Not started]** External drag-and-drop — `export-pipeline`'s drag-payload builders are tested but have no frontend HTML5-drag counterpart.
+- **[Done]** Copy to project media folder.
+- **[Not started]** Export presets — no format/preset picker; only original-copy export exists.
+- **[Not started]** Optional WAV conversion — `render_wav_export` (24-bit re-encode) exists and is tested, unwired (needs a format-choice UI, ADR 0022).
+- **[Partial]** Usage history — every export records a `UsageEvent`, and that history feeds the license report, but there's no dedicated screen to browse usage history on its own.
+- **[Done]** Project source/license report — CSV export wired this pass.
 
 Acceptance:
 
-- Assets can be dragged into major target applications on both platforms.
-- Exports preserve traceability to the library asset.
+- **[Not started]** Assets can be dragged into major target applications on both platforms.
+- **[Done]** Exports preserve traceability to the library asset — usage events and source records are both keyed by `asset_id`.
 
 ## Milestone 7 — Product polish and release readiness
 
+**Status: Not started**, aside from reduced-motion/transparency. This milestone was never in scope for this development pass, and the in-app Release Readiness panel currently overstates progress here — see the caveat at the top of this document.
+
 Deliverables:
 
-- Complete platform-aware design implementation.
-- Reduced motion/transparency.
-- Accessibility audit.
-- Performance profiling.
-- Crash recovery.
-- Onboarding.
-- Update system.
-- Signing and notarization.
-- User and developer documentation.
+- **[Not started]** Complete platform-aware design implementation — one design applies to both platforms via the system font stack; no macOS-vs-Windows material/behavior differentiation beyond Tauri defaults.
+- **[Done]** Reduced motion/transparency — real toggles, persisted, applied via CSS classes.
+- **[Not started]** Accessibility audit — the release-readiness panel shows this `Passed`, but that's a hardcoded default, not a real audit.
+- **[Not started]** Performance profiling — same caveat; no benchmark has actually been run.
+- **[Not started]** Crash recovery — same caveat; not exercised.
+- **[Not started]** Onboarding — same caveat; the create-library screen exists but nothing beyond it.
+- **[Not started]** Update system.
+- **[Not started]** Signing and notarization.
+- **[Partial]** User and developer documentation — developer/technical docs are thorough and current; a dedicated user-guide walkthrough is thinner.
 
 Acceptance:
 
-- Release candidate passes test matrix.
-- No critical data-loss or playback-blocking defects.
-- Documentation covers install, library creation, NAS setup, backup, shortcuts, and troubleshooting.
+- **[Not started]** Release candidate passes test matrix — the test matrix (Section 22) has not been run.
+- **[Not verified]** No critical data-loss or playback-blocking defects — no known ones, but this hasn't been exercised at the scale or breadth Section 22 describes.
+- **[Partial]** Documentation covers install, library creation, NAS setup, backup, shortcuts, and troubleshooting — most of these exist in `docs/src/content/docs/user-guide/`; NAS setup and troubleshooting are thin.
 
 ---
 
