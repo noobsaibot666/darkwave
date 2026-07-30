@@ -8,7 +8,7 @@ Legend: **[Done]** built and wired end-to-end · **[Partial]** real, tested logi
 
 Product name: the app is currently branded **Darkwave** in the codebase, not the placeholder "Resonant" from Section 1.
 
-High-level state: the desktop shell (Tauri + Rust + React) has a working end-to-end vertical slice — create a library, import a folder, browse/search/play/tag/organize/export, back up and restore, work offline and reconnect a NAS-backed media root. Every interactive control either does something real or is explicitly disabled with a reason; there are no cosmetic-only UI elements. What's missing is concentrated in three areas the plan explicitly treats as later-stage: the smart-analysis pipeline beyond filename/embedded-metadata rules (no audio measurements, classification, or fingerprinting/embeddings), the full background job system (persistent queue exists, but no priority/pause/retry/throttling), and release readiness (signing, notarization, auto-update, licensing review are all still "Planned", not built). Detailed status is in Sections 19 and 20. Reasoning for every deliberate deferral is captured in `docs/adr/0019` through `docs/adr/0022`.
+High-level state: the desktop shell (Tauri + Rust + React) has a working end-to-end vertical slice — create a library, import a folder (manually, via a watched folder, or picked up from a prior session automatically), browse/search/filter by content-derived facets/play/tag/organize/export (including a real WAV-conversion preset)/back up and restore, work offline and reconnect a NAS-backed media root. Every interactive control either does something real or is explicitly disabled with a reason; there are no cosmetic-only UI elements. Real audio measurement, classification, and similarity now exist (ADR 0025) — decoded via Symphonia, with GPL-isolated similarity search — and the background job system has real priority ordering, atomic claiming, bounded retry, and a standing worker (ADR 0026), closing what was previously the "no audio measurements... no priority/pause/retry" gap. What's left is concentrated in release readiness (signing, notarization, auto-update, licensing review, a real accessibility/performance audit — all still "Planned" or "Not started") plus a handful of smaller, deliberately-scoped gaps (browser virtualization, OS-level drag-and-drop, output-device enforcement — blocked on a real WKWebView platform limitation, not an oversight). Detailed status is in Sections 19 and 20. Reasoning for every deliberate deferral is captured in `docs/adr/0019` through `docs/adr/0026`.
 
 One caveat worth surfacing explicitly: the in-app "Release Readiness" panel (Section 20, Milestone 0/7) sources macOS audit, Windows audit, accessibility audit, performance profile, crash recovery, and onboarding docs from `ReleaseReadinessConfig::code_gates_passed()` — a hardcoded default that marks all of them `Passed`. None of those audits have actually been performed; the name means "the code exists and builds," not "the audit ran." Only codec packaging, codec license review, update system, and signing/notarization are driven by real optional config and correctly show `Planned`. Treat the "Passed" gates as unverified, not as evidence.
 
@@ -1380,7 +1380,7 @@ The MVP must solve the repeated-search problem without becoming an oversized aud
 - **[Done]** Create/open local or NAS-backed library — `create_library`/`list_libraries` wired; media root is any path, including an SMB/NAS mount.
 - **[Done]** Managed, referenced, and hybrid assets — both storage modes work end-to-end; a library naturally ends up hybrid once it has both.
 - **[Partial]** Drag-and-drop and folder import — folder import via file picker works; dragging files/folders onto the app window to import them is not wired (only import-triggered-by-dialog exists).
-- **[Not started]** Watched Downloads folder — the polling/debounce logic exists and is tested in `import-pipeline`, but nothing in the desktop shell runs a live filesystem watcher.
+- **[Partial]** Watched Downloads folder — the standing background worker (ADR 0026) now owns a live `WatchedFolderPoller` and imports newly-stable files automatically, roughly every 20s; scoped to one configured folder importing into one chosen library (not multiple folders), with no dedicated progress UI beyond the next background refresh.
 - **[Done]** Fast playback — native `<audio>` element via the Tauri asset protocol.
 - **[Partial]** Precomputed waveform display — the transport bar shows real computed peaks; peaks are computed on demand client-side each time, not cached to disk, and per-row waveforms show a neutral icon rather than real data (performance tradeoff, see ADR 0020).
 - **[Partial]** Keyboard navigation — playback, favorite, search-focus, import, and export shortcuts are wired; Up/Down arrow-key row focus navigation (as opposed to Cmd/Ctrl-click and Shift-click selection) is not.
@@ -1388,7 +1388,7 @@ The MVP must solve the repeated-search problem without becoming an oversized aud
 - **[Done]** Filename-based smart suggestions — wired at import, shown for accept/reject in the inspector.
 - **[Done]** Starter taxonomy — seeded automatically on library creation.
 - **[Done]** Manual and suggested tags — apply, accept, reject, and remove are all wired with undo/redo.
-- **[Partial]** Collections and Smart Collections — manual Collections/Projects are fully wired; `create_smart_collection` (rule-based, stored query definition) exists in `storage` and is untouched by the desktop shell.
+- **[Done]** Collections and Smart Collections — manual Collections/Projects are fully wired; Smart Collections now evaluate live via `assets_in_smart_collection` (ADR 0026), created from the same range-filter panel used for ad-hoc search ("Save as Smart Collection").
 - **[Done]** Search and filters — full-text search, natural-language query parsing (media-type inference), tag/media-type filters, and sidebar smart filters are all wired.
 - **[Done]** Exact duplicate detection — reported in Maintenance with a real "keep oldest, trash rest" action.
 - **[Not started]** Drag assets into other applications — `export-pipeline`'s external drag-payload builders exist and are tested but have no frontend HTML5-drag counterpart.
@@ -1396,7 +1396,7 @@ The MVP must solve the repeated-search problem without becoming an oversized aud
 - **[Done]** Source/license fields — per-asset editing plus a per-project CSV license report export.
 - **[Done]** Local catalog with NAS media support — media root probing and offline/online status are wired.
 - **[Partial]** Offline catalog and optional preview cache — the catalog stays fully browsable offline and availability state is accurate; there is no low-bitrate preview cache for offline auditioning.
-- **[Partial]** Missing-file relinking — reconnect validation now reports exactly which managed paths are still missing after a NAS comes back (ADR 0022); `storage::relink_asset` exists but there's no picker UI yet to act on that report.
+- **[Done]** Missing-file relinking — reconnect validation reports exactly which managed paths are still missing after a NAS comes back (ADR 0022); a "Relink…" row action on Missing-filtered assets now acts on it directly (ADR 0026).
 - **[Done]** Settings and shortcuts — preferences persist to disk; shortcut list and accessibility toggles are real.
 - **[Done]** Astro/Starlight documentation — the docs site builds clean (`astro check`: 0 errors/warnings/hints).
 
@@ -1439,7 +1439,7 @@ Acceptance:
 
 ## Milestone 1 — Library and import core
 
-**Status: Mostly done.** The file watcher and the full persistent-job-system requirements (§16.3) are the gaps.
+**Status: Mostly done.** Priority scheduling and atomic job claiming are now real (ADR 0026); pause/resume and cancellation remain deliberately unbuilt (not meaningful at this app's scale).
 
 Deliverables:
 
@@ -1447,29 +1447,29 @@ Deliverables:
 - **[Done]** Local catalog.
 - **[Done]** Managed/referenced import.
 - **[Done]** File metadata extraction.
-- **[Partial]** Persistent job queue — jobs persist in SQLite and are enqueued/completed correctly (ADR 0021), but there's no priority scheduling, pause/resume, cancellation, retry policy, per-job progress, or CPU/battery throttling; processing only runs synchronously right after import, not as a standing background worker.
-- **[Not started]** File watcher — the debounce/stabilization logic is built and tested in `import-pipeline`, nothing in the desktop shell runs it against a live folder.
+- **[Partial]** Persistent job queue — jobs persist in SQLite, are enqueued/completed correctly (ADR 0021), have real priority ordering, atomic claiming (no more double-processing race, ADR 0026), and bounded retry (`requeue_failed_jobs`, cap of 3); a standing background worker now drains continuously rather than only right after import. Still no pause/resume, cancellation, per-job progress, or CPU/battery throttling — deliberately excluded, not meaningful at this app's scale.
+- **[Done]** File watcher — the standing worker now polls a configured watched folder and imports discovered files automatically (ADR 0026); scoped to one folder, not multiple.
 - **[Done]** Asset availability tracking.
 
 Acceptance:
 
 - **[Not verified]** Import 10,000 mixed audio files without UI lockup — no benchmark has been run at this scale.
-- **[Partial]** Restart resumes incomplete jobs safely — the jobs table survives a restart, but nothing automatically drains it on launch; it only runs after a subsequent import.
+- **[Done]** Restart resumes incomplete jobs safely — the standing background worker (ADR 0026) ticks continuously once the app is running, draining any pending jobs left over from a prior session without requiring a new import to trigger it.
 - **[Done]** Duplicate import does not create unintended duplicate records — tested via content-hash lookup.
 
 ## Milestone 2 — Playback and waveform
 
-**Status: Partial.** This is the least-built milestone relative to its original spec — the audio engine, virtualization, and seeking/looping are all substitutes or gaps rather than the planned implementation.
+**Status: Partial.** Seeking and looping are now real; the audio engine substitution and lack of virtualization remain the biggest gaps relative to the original spec.
 
 Deliverables:
 
 - **[Partial]** Audio engine — a native `<audio>` element via the Tauri asset protocol is used instead of the planned Rust rodio/cpal/Symphonia engine; a deliberate MVP tradeoff (ADR 0004, revisited in ADR 0019/0020), not an oversight.
 - **[Done]** Previous/next playback.
-- **[Not started]** Seeking and looping — no scrub interaction on the waveform and no loop toggle are wired.
+- **[Done]** Seeking and looping — click-to-seek on the waveform (ADR 0023) plus keyboard Arrow Left/Right nudging and a loop toggle (ADR 0026).
 - **[Partial]** Waveform peak generation — real peaks are computed client-side for whichever asset is currently loaded; nothing is cached to disk, and per-row waveforms show a neutral icon, not real data.
 - **[Not started]** Virtualized browser rows — the row list renders every visible asset directly; the UI itself honestly labels this "Not yet virtualized" rather than faking it.
 - **[Done]** Persistent transport.
-- **[Not started]** Output device settings — no device picker.
+- **[Not started]** Output device settings — `output_device` is stored and displayed but not enforced; a real platform blocker, not an oversight — WKWebView (macOS) has no `setSinkId` support at all, so a picker would silently do nothing on this project's own development platform (ADR 0026).
 
 Acceptance:
 
@@ -1485,7 +1485,7 @@ Deliverables:
 
 - **[Done]** Tags.
 - **[Done]** Starter taxonomy.
-- **[Partial]** Collections — manual Collections/Projects are fully wired; Smart Collections (rule-based, stored query) exist in `storage` and are unused by the shell.
+- **[Done]** Collections — manual Collections/Projects and Smart Collections (rule-based, stored query, now evaluated live via `assets_in_smart_collection`, ADR 0026) are both fully wired.
 - **[Done]** Projects.
 - **[Not started, by substitution]** Drag-to-classify — click-to-apply (tag buttons, project buttons) covers the same functional surface; no HTML5 drag interaction exists. `workspace-state`'s `DragPayload`/`DragTarget` are tested but never dispatched from the frontend.
 - **[Done]** Multi-select — click / Cmd-click / Shift-click / Cmd+A, backed by `workspace-state::BrowserState`.
@@ -1500,13 +1500,13 @@ Acceptance:
 
 ## Milestone 4 — Search and smart import
 
-**Status: Mostly done.** Smart Collections and the wider faceted-filter set from §11.2 are the gaps.
+**Status: Mostly done.** Smart Collections and duration/BPM/energy faceted filters are now real (ADR 0026); key/loudness/source/license/date-added/last-used/times-used filters from §11.2 remain the gap.
 
 Deliverables:
 
 - **[Done]** FTS search.
-- **[Partial]** Faceted filters — media-type and tag filters exist; duration/BPM/key/energy/loudness/source/license/date-added/last-used/times-used filters from §11.2 do not.
-- **[Not started]** Saved Smart Collections — `create_smart_collection` exists in `storage`, unused by the shell.
+- **[Partial]** Faceted filters — media-type, tag, duration, BPM, and peak_db/"energy" range filters exist (ADR 0026, built on the real per-asset audio-analysis data from ADR 0025); key/loudness/source/license/date-added/last-used/times-used filters from §11.2 still do not. A `musical_key` range filter was deliberately not built — pitch isn't a numerically meaningful range.
+- **[Done]** Saved Smart Collections — `assets_in_smart_collection` (ADR 0026) is the evaluation half `create_smart_collection` always lacked; "Save as Smart Collection" in the range-filter panel is the creation UI.
 - **[Done]** Filename parser.
 - **[Done]** Embedded metadata mapping — WAV title/genre/comment extraction now runs automatically after import (ADR 0021) and feeds both tag suggestions and a direct inspector display.
 - **[Done]** Suggested tags with confidence.
@@ -1530,7 +1530,7 @@ Deliverables:
 - **[Not started]** Single-writer lease — `acquire_lease_file`/`release_lease_file`/`lease_state` are implemented and tested but have no caller; the app has no device-identity concept yet to key a lease off of (ADR 0022).
 - **[Done]** Offline behavior — Use Catalog Only / pause / resume validation all wired.
 - **[Done]** Reconnect validation — `validate_reconnect` re-checks real availability and reports missing managed paths (ADR 0022).
-- **[Partial]** Missing/moved asset relinking — detection is real (see above); `storage::relink_asset` exists but there's no picker UI to act on a missing-path report yet.
+- **[Done]** Missing/moved asset relinking — detection is real (see above); a "Relink…" row action (ADR 0026) now acts on it directly.
 - **[Done]** Backup and restore — restore uses a stage-then-atomic-rename swap under the same mutex the app already serializes catalog access through (ADR 0021).
 
 Acceptance:
@@ -1542,14 +1542,14 @@ Acceptance:
 
 ## Milestone 6 — Editorial export workflow
 
-**Status: Partial.** Original-copy export and the license report are real; format conversion and OS-level drag export are not built.
+**Status: Partial.** Original-copy export, the license report, and WAV conversion are all real now; OS-level drag export is the remaining gap.
 
 Deliverables:
 
 - **[Not started]** External drag-and-drop — `export-pipeline`'s drag-payload builders are tested but have no frontend HTML5-drag counterpart.
 - **[Done]** Copy to project media folder.
-- **[Not started]** Export presets — no format/preset picker; only original-copy export exists.
-- **[Not started]** Optional WAV conversion — `render_wav_export` (24-bit re-encode) exists and is tested, unwired (needs a format-choice UI, ADR 0022).
+- **[Partial]** Export presets — a format dropdown (Original / WAV 24-bit) now exists (ADR 0026); no range/trim preset UI beyond the two formats.
+- **[Done]** Optional WAV conversion — `render_wav_export` (24-bit re-encode) is now wired end-to-end from the export command, decoding via the same Symphonia seam ADR 0025 built.
 - **[Partial]** Usage history — every export records a `UsageEvent`, and that history feeds the license report, but there's no dedicated screen to browse usage history on its own.
 - **[Done]** Project source/license report — CSV export wired this pass.
 

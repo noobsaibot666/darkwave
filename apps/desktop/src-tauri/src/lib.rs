@@ -602,6 +602,83 @@ fn explain_search_query(query: String) -> Vec<search::VisibleFilter> {
     search::parse_natural_language_query(&query).visible_filters
 }
 
+/// Faceted-filter shape the frontend sends for both a one-off search and a
+/// saved Smart Collection — the two ended up being the same feature, since
+/// `create_smart_collection` just stores an `AssetSearchQuery` for later
+/// re-evaluation. See docs for the finalization-pass ADR.
+#[derive(serde::Deserialize)]
+struct AssetSearchFilters {
+    text: Option<String>,
+    media_type: Option<String>,
+    tag_id: Option<String>,
+    duration_min_ms: Option<i64>,
+    duration_max_ms: Option<i64>,
+    bpm_min: Option<f64>,
+    bpm_max: Option<f64>,
+    peak_db_min: Option<f64>,
+    peak_db_max: Option<f64>,
+}
+
+fn build_search_query(filters: AssetSearchFilters) -> Result<storage::AssetSearchQuery, String> {
+    let tag_id = filters
+        .tag_id
+        .map(|id| parse_uuid_field(&id, "tag id"))
+        .transpose()?;
+
+    Ok(storage::AssetSearchQuery {
+        text: filters.text.unwrap_or_default(),
+        tag_id,
+        media_type: filters.media_type,
+        duration_min_ms: filters.duration_min_ms,
+        duration_max_ms: filters.duration_max_ms,
+        bpm_min: filters.bpm_min,
+        bpm_max: filters.bpm_max,
+        peak_db_min: filters.peak_db_min,
+        peak_db_max: filters.peak_db_max,
+    })
+}
+
+#[tauri::command]
+fn search_assets_advanced(
+    state: tauri::State<CatalogState>,
+    library_id: String,
+    filters: AssetSearchFilters,
+) -> Result<Vec<AssetRecord>, String> {
+    let library_id = parse_uuid_field(&library_id, "library id")?;
+    let query = build_search_query(filters)?;
+    let catalog = state.0.lock().expect("catalog mutex poisoned");
+    catalog
+        .search_assets(library_id, query)
+        .map_err(storage_error_message)
+}
+
+#[tauri::command]
+fn create_smart_collection(
+    state: tauri::State<CatalogState>,
+    library_id: String,
+    name: String,
+    filters: AssetSearchFilters,
+) -> Result<CollectionRecord, String> {
+    let library_id = parse_uuid_field(&library_id, "library id")?;
+    let query = build_search_query(filters)?;
+    let catalog = state.0.lock().expect("catalog mutex poisoned");
+    catalog
+        .create_smart_collection(library_id, name, &query)
+        .map_err(storage_error_message)
+}
+
+#[tauri::command]
+fn assets_in_smart_collection(
+    state: tauri::State<CatalogState>,
+    collection_id: String,
+) -> Result<Vec<AssetRecord>, String> {
+    let collection_id = parse_uuid_field(&collection_id, "collection id")?;
+    let catalog = state.0.lock().expect("catalog mutex poisoned");
+    catalog
+        .assets_in_smart_collection(collection_id)
+        .map_err(storage_error_message)
+}
+
 #[tauri::command]
 fn export_project_license_report(
     state: tauri::State<CatalogState>,
@@ -982,7 +1059,7 @@ fn mark_waveform_ready(state: tauri::State<CatalogState>, asset_id: String) -> R
 fn process_pending_jobs(state: tauri::State<CatalogState>) -> Result<usize, String> {
     let catalog = state.0.lock().expect("catalog mutex poisoned");
     let jobs = catalog
-        .pending_jobs_of_kind(JobKind::MetadataExtraction, 50)
+        .claim_pending_jobs(JobKind::MetadataExtraction, 50)
         .map_err(storage_error_message)?;
 
     let mut processed = 0usize;
@@ -1066,7 +1143,7 @@ async fn process_audio_analysis_jobs(
     let jobs = {
         let catalog = state.0.lock().expect("catalog mutex poisoned");
         catalog
-            .pending_jobs_of_kind(JobKind::AudioAnalysis, 20)
+            .claim_pending_jobs(JobKind::AudioAnalysis, 20)
             .map_err(storage_error_message)?
     };
 
@@ -1408,6 +1485,23 @@ fn set_reviewed(
         .map_err(storage_error_message)
 }
 
+/// Points a Missing asset at a new file location the user picked, flipping
+/// it back to a referenced/local asset. Wraps `storage::relink_asset`,
+/// which already did the whole availability-state flip — this is just the
+/// first caller.
+#[tauri::command]
+fn relink_asset(
+    state: tauri::State<CatalogState>,
+    asset_id: String,
+    new_path: String,
+) -> Result<(), String> {
+    let asset_id = parse_uuid_field(&asset_id, "asset id")?;
+    let catalog = state.0.lock().expect("catalog mutex poisoned");
+    catalog
+        .relink_asset(asset_id, new_path)
+        .map_err(storage_error_message)
+}
+
 #[tauri::command]
 fn undo_action(state: tauri::State<CatalogState>, undo_id: String) -> Result<(), String> {
     let undo_id = parse_uuid_field(&undo_id, "undo id")?;
@@ -1507,6 +1601,7 @@ fn export_selected_asset(
     state: tauri::State<CatalogState>,
     asset_id: String,
     destination_folder: String,
+    format: Option<String>,
 ) -> Result<String, String> {
     let asset_id = parse_uuid_field(&asset_id, "asset id")?;
     let catalog = state.0.lock().expect("catalog mutex poisoned");
@@ -1530,29 +1625,53 @@ fn export_selected_asset(
         }
     };
 
+    let preset = match format.as_deref() {
+        Some("wav24") => export_pipeline::ExportPreset::Wav48k24Bit,
+        _ => export_pipeline::ExportPreset::Original,
+    };
+
     let plan = export_pipeline::plan_editorial_export(export_pipeline::ExportRequest {
-        source_path,
+        source_path: source_path.clone(),
         project_media_dir: destination_folder,
         asset_display_name: asset.display_name,
-        preset: export_pipeline::ExportPreset::Original,
+        preset,
         range: None,
         intent: export_pipeline::default_editorial_export_intent(),
     })
     .map_err(|error| format!("{error:?}"))?;
 
-    let executed = export_pipeline::execute_original_copy_export(&plan)
+    let destination_path = if preset == export_pipeline::ExportPreset::Wav48k24Bit {
+        // decode_any_supported_audio is the same Symphonia-backed seam the
+        // audio-analysis job uses (docs/adr/0025) — reused here rather than
+        // building a second decode path just for export.
+        let decoded = audio_metadata::decode_any_supported_audio(&source_path)
+            .map_err(|error| format!("{error:?}"))?;
+        let rendered = export_pipeline::render_wav_export(
+            &plan,
+            &export_pipeline::DecodedPcmBuffer {
+                sample_rate: decoded.sample_rate,
+                channels: decoded.channels,
+                samples: decoded.samples,
+            },
+        )
         .map_err(|error| format!("{error:?}"))?;
+        rendered.destination_path
+    } else {
+        export_pipeline::execute_original_copy_export(&plan)
+            .map_err(|error| format!("{error:?}"))?
+            .destination_path
+    };
 
     catalog
         .record_usage_event(
             asset_id,
             None,
             storage::UsageEventType::Exported,
-            &executed.destination_path,
+            &destination_path,
         )
         .map_err(storage_error_message)?;
 
-    Ok(executed.destination_path)
+    Ok(destination_path)
 }
 
 fn parse_uuid_field(value: &str, label: &str) -> Result<Uuid, String> {
@@ -1580,6 +1699,79 @@ pub fn run() {
             let catalog = Catalog::open(app_data_dir.join("catalog.sqlite"))
                 .expect("open local catalog database");
             app.manage(CatalogState(Mutex::new(catalog)));
+
+            // Standing background worker: requeues jobs that failed with
+            // retries left, polls the configured watched folder (if any),
+            // then tells the frontend to drain whatever's pending. This is
+            // what actually fixes jobs only ever processing right after
+            // Import/Refresh — everywhere, not just those two triggers, and
+            // it's what makes watched-folder import a live feature instead
+            // of tested-but-never-invoked library code. A plain thread +
+            // sleep, not async/tokio: each tick's own work (a few SQL
+            // statements, one directory read) is fast and synchronous, so
+            // there's nothing here that benefits from an async runtime.
+            let worker_app_handle = app.handle().clone();
+            std::thread::spawn(move || {
+                use tauri::Emitter;
+                // Owned across ticks so its internal size-stabilization
+                // state persists between polls, same as import_pipeline's
+                // own design intends. Recreated if the configured path
+                // changes; cleared if watching is turned off.
+                let mut watched_poller: Option<(String, import_pipeline::WatchedFolderPoller)> =
+                    None;
+
+                loop {
+                    std::thread::sleep(std::time::Duration::from_secs(20));
+
+                    if let Some(state) = worker_app_handle.try_state::<CatalogState>() {
+                        let catalog = state.0.lock().expect("catalog mutex poisoned");
+                        const MAX_JOB_ATTEMPTS: i64 = 3;
+                        let _ = catalog.requeue_failed_jobs(MAX_JOB_ATTEMPTS);
+
+                        if let Ok(preferences_path) = preferences_path(&worker_app_handle) {
+                            if let Ok(preferences) = preferences::load_preferences(&preferences_path)
+                            {
+                                match (
+                                    preferences.watched_folder_path,
+                                    preferences
+                                        .watched_folder_library_id
+                                        .as_deref()
+                                        .and_then(|id| Uuid::parse_str(id).ok()),
+                                ) {
+                                    (Some(folder), Some(library_id)) => {
+                                        let poller = match &mut watched_poller {
+                                            Some((path, poller)) if *path == folder => poller,
+                                            _ => {
+                                                watched_poller = Some((
+                                                    folder.clone(),
+                                                    import_pipeline::WatchedFolderPoller::new(
+                                                        folder.clone(),
+                                                    ),
+                                                ));
+                                                &mut watched_poller.as_mut().expect("just set").1
+                                            }
+                                        };
+
+                                        if let Ok(candidates) = poller.poll() {
+                                            for candidate in candidates {
+                                                let _ = import_pipeline::import_file(
+                                                    &catalog,
+                                                    library_id,
+                                                    &candidate.path,
+                                                    import_pipeline::ImportMode::Referenced,
+                                                );
+                                            }
+                                        }
+                                    }
+                                    _ => watched_poller = None,
+                                }
+                            }
+                        }
+                    }
+
+                    let _ = worker_app_handle.emit("background-tick", ());
+                }
+            });
 
             let undo_item =
                 tauri::menu::MenuItem::with_id(app, "undo", "Undo", true, Some("CmdOrCtrl+Z"))?;
@@ -1700,12 +1892,16 @@ pub fn run() {
             reject_suggested_tag,
             set_favorite,
             set_reviewed,
+            relink_asset,
             undo_action,
             redo_action,
             list_collections,
             create_project,
             add_to_collection,
             assets_in_collection,
+            search_assets_advanced,
+            create_smart_collection,
+            assets_in_smart_collection,
             get_source_record,
             set_source_record,
             export_selected_asset,

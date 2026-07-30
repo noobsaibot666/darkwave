@@ -11,11 +11,13 @@ import {
   Contrast,
   Gauge,
   Import,
+  Link2,
   ListFilter,
   Music,
   Pause,
   Play,
   RefreshCw,
+  Repeat,
   Save,
   Search,
   Settings,
@@ -153,6 +155,8 @@ type AppPreferences = {
   shortcuts: { bindings: ShortcutBinding[] };
   reduced_motion: boolean;
   reduced_transparency: boolean;
+  watched_folder_path: string | null;
+  watched_folder_library_id: string | null;
 };
 
 type ActiveFilter =
@@ -164,8 +168,26 @@ type ActiveFilter =
   | "music"
   | "sound_effect"
   | "ambience"
-  | { project: string }
+  | { project: string; smart?: boolean }
   | { tag: string };
+
+/** Duration in seconds (converted to ms at the API boundary) since that's
+ * what a person actually types; BPM stays as-is. */
+type RangeFilters = {
+  durationMinSec?: number;
+  durationMaxSec?: number;
+  bpmMin?: number;
+  bpmMax?: number;
+};
+
+function hasActiveRangeFilters(filters: RangeFilters): boolean {
+  return (
+    filters.durationMinSec != null ||
+    filters.durationMaxSec != null ||
+    filters.bpmMin != null ||
+    filters.bpmMax != null
+  );
+}
 
 type TrashItem = {
   asset_id: string;
@@ -328,6 +350,9 @@ export function App() {
   const [selectedAssetId, setSelectedAssetId] = useState<string | null>(null);
   const [browserState, setBrowserState] = useState<BrowserState | null>(null);
   const [searchQuery, setSearchQuery] = useState("");
+  const [rangeFilters, setRangeFilters] = useState<RangeFilters>({});
+  const [smartCollectionModalOpen, setSmartCollectionModalOpen] = useState(false);
+  const [smartCollectionName, setSmartCollectionName] = useState("");
   const [queryFilters, setQueryFilters] = useState<VisibleFilter[]>([]);
   const [libraryName, setLibraryName] = useState("");
   const [libraryRoot, setLibraryRoot] = useState("");
@@ -368,6 +393,7 @@ export function App() {
   const [maintenanceReport, setMaintenanceReport] = useState<MaintenanceReport | null>(null);
   const [mediaRootStatus, setMediaRootStatus] = useState<{ status: string; reconnectRequired: boolean } | null>(null);
   const [exportStatus, setExportStatus] = useState<string | null>(null);
+  const [exportFormat, setExportFormat] = useState<"original" | "wav24">("original");
   const [similarStatus, setSimilarStatus] = useState<string | null>(null);
   const [jobProgress, setJobProgress] = useState<JobProgress[]>([]);
   const [offlineControl, setOfflineControl] = useState<OfflineControlState | null>(null);
@@ -384,6 +410,7 @@ export function App() {
   const [isPlaying, setIsPlaying] = useState(false);
   const [currentTime, setCurrentTime] = useState(0);
   const [duration, setDuration] = useState(0);
+  const [looping, setLooping] = useState(false);
   const [peaks, setPeaks] = useState<number[] | null>(null);
   const peakRequestId = useRef(0);
 
@@ -444,25 +471,41 @@ export function App() {
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [visibleAssets]);
 
-  const refreshAssets = useCallback((libraryId: string, query: string, filter: ActiveFilter) => {
-    if (typeof filter === "object" && "project" in filter) {
-      invoke<AssetRecord[]>("assets_in_collection", { collectionId: filter.project })
-        .then(setAssets)
-        .catch(() => setAssets([]));
-      return;
-    }
-    if (typeof filter === "object" && "tag" in filter) {
-      invoke<AssetRecord[]>("assets_for_tag", { libraryId, tagId: filter.tag })
-        .then(setAssets)
-        .catch(() => setAssets([]));
-      return;
-    }
-    const request = query.trim().length > 0
-      ? invoke<AssetRecord[]>("search_assets", { libraryId, query })
-      : invoke<AssetRecord[]>("list_assets", { libraryId });
+  const refreshAssets = useCallback(
+    (libraryId: string, query: string, filter: ActiveFilter) => {
+      if (typeof filter === "object" && "project" in filter) {
+        const command = filter.smart ? "assets_in_smart_collection" : "assets_in_collection";
+        invoke<AssetRecord[]>(command, { collectionId: filter.project })
+          .then(setAssets)
+          .catch(() => setAssets([]));
+        return;
+      }
+      if (typeof filter === "object" && "tag" in filter) {
+        invoke<AssetRecord[]>("assets_for_tag", { libraryId, tagId: filter.tag })
+          .then(setAssets)
+          .catch(() => setAssets([]));
+        return;
+      }
 
-    request.then(setAssets).catch(() => setAssets([]));
-  }, []);
+      const request = hasActiveRangeFilters(rangeFilters)
+        ? invoke<AssetRecord[]>("search_assets_advanced", {
+            libraryId,
+            filters: {
+              text: query,
+              duration_min_ms: rangeFilters.durationMinSec != null ? rangeFilters.durationMinSec * 1000 : null,
+              duration_max_ms: rangeFilters.durationMaxSec != null ? rangeFilters.durationMaxSec * 1000 : null,
+              bpm_min: rangeFilters.bpmMin ?? null,
+              bpm_max: rangeFilters.bpmMax ?? null
+            }
+          })
+        : query.trim().length > 0
+          ? invoke<AssetRecord[]>("search_assets", { libraryId, query })
+          : invoke<AssetRecord[]>("list_assets", { libraryId });
+
+      request.then(setAssets).catch(() => setAssets([]));
+    },
+    [rangeFilters]
+  );
 
   // Repeatedly drives process_pending_jobs/process_audio_analysis_jobs to
   // completion (each call only processes a capped batch) and tracks live
@@ -729,6 +772,24 @@ export function App() {
       .catch(() => {});
   }, []);
 
+  const handleRelinkAsset = useCallback(
+    async (asset: AssetRecord) => {
+      const newPath = await openDialog({
+        directory: false,
+        multiple: false,
+        title: `Locate "${asset.display_name}"`
+      });
+      if (typeof newPath !== "string") return;
+
+      invoke("relink_asset", { assetId: asset.id, newPath })
+        .then(() => {
+          if (activeLibraryId) refreshAssets(activeLibraryId, searchQuery, activeFilter);
+        })
+        .catch(() => {});
+    },
+    [activeLibraryId, searchQuery, activeFilter, refreshAssets]
+  );
+
   const handleToggleReviewed = useCallback((asset: AssetRecord) => {
     const reviewed = asset.review_state !== "Reviewed";
     invoke("set_reviewed", { assetId: asset.id, reviewed })
@@ -862,6 +923,26 @@ export function App() {
       })
       .catch(() => {});
   }, [activeLibraryId, newProjectName]);
+
+  const handleCreateSmartCollection = useCallback(() => {
+    if (!activeLibraryId || !smartCollectionName.trim()) return;
+    invoke<CollectionRecord>("create_smart_collection", {
+      libraryId: activeLibraryId,
+      name: smartCollectionName.trim(),
+      filters: {
+        text: searchQuery,
+        duration_min_ms: rangeFilters.durationMinSec != null ? rangeFilters.durationMinSec * 1000 : null,
+        duration_max_ms: rangeFilters.durationMaxSec != null ? rangeFilters.durationMaxSec * 1000 : null,
+        bpm_min: rangeFilters.bpmMin ?? null,
+        bpm_max: rangeFilters.bpmMax ?? null
+      }
+    })
+      .then((collection) => {
+        setCollections((previous) => [...previous, collection]);
+        setSmartCollectionName("");
+      })
+      .catch(() => {});
+  }, [activeLibraryId, smartCollectionName, searchQuery, rangeFilters]);
 
   const handleRowClick = useCallback(
     (asset: AssetRecord, index: number, event: MouseEvent) => {
@@ -1109,13 +1190,14 @@ export function App() {
     try {
       const destinationPath = await invoke<string>("export_selected_asset", {
         assetId: selectedAssetId,
-        destinationFolder: destination
+        destinationFolder: destination,
+        format: exportFormat === "wav24" ? "wav24" : null
       });
       setExportStatus(`Exported to ${destinationPath}`);
     } catch (error) {
       setExportStatus(`Export failed: ${String(error)}`);
     }
-  }, [selectedAssetId]);
+  }, [selectedAssetId, exportFormat]);
 
   const handleBulkFavorite = useCallback(() => {
     if (bulkAssetIds.length === 0 || !activeLibraryId) return;
@@ -1144,14 +1226,18 @@ export function App() {
     try {
       await Promise.all(
         bulkAssetIds.map((assetId) =>
-          invoke<string>("export_selected_asset", { assetId, destinationFolder: destination })
+          invoke<string>("export_selected_asset", {
+            assetId,
+            destinationFolder: destination,
+            format: exportFormat === "wav24" ? "wav24" : null
+          })
         )
       );
       setExportStatus(`Exported ${bulkAssetIds.length} sound${bulkAssetIds.length === 1 ? "" : "s"}`);
     } catch (error) {
       setExportStatus(`Export failed: ${String(error)}`);
     }
-  }, [bulkAssetIds]);
+  }, [bulkAssetIds, exportFormat]);
 
   const handleExportLicenseReport = useCallback(async () => {
     if (typeof activeFilter !== "object" || !("project" in activeFilter)) {
@@ -1184,6 +1270,18 @@ export function App() {
     };
   }, [handleExportLicenseReport]);
 
+  // The Rust-side standing worker (apps/desktop/src-tauri) ticks roughly
+  // every 20s, requeuing retryable failed jobs and emitting this event —
+  // this is what makes job processing actually run continuously in the
+  // background rather than only right after Import/Refresh.
+  useEffect(() => {
+    if (!activeLibraryId) return;
+    const unlistenBackgroundTick = listen("background-tick", () => runJobDrain(activeLibraryId));
+    return () => {
+      unlistenBackgroundTick.then((dispose) => dispose());
+    };
+  }, [activeLibraryId, runJobDrain]);
+
   const handleToggleReducedMotion = useCallback(() => {
     setPreferences((previous) => {
       if (!previous) return previous;
@@ -1197,6 +1295,28 @@ export function App() {
     setPreferences((previous) => {
       if (!previous) return previous;
       const next = { ...previous, reduced_transparency: !previous.reduced_transparency };
+      invoke("save_app_preferences", { preferences: next }).catch(() => {});
+      return next;
+    });
+  }, []);
+
+  const handleChooseWatchedFolder = useCallback(async () => {
+    if (!activeLibraryId) return;
+    const folder = await openDialog({ directory: true, multiple: false, title: "Choose a folder to watch" });
+    if (typeof folder !== "string") return;
+
+    setPreferences((previous) => {
+      if (!previous) return previous;
+      const next = { ...previous, watched_folder_path: folder, watched_folder_library_id: activeLibraryId };
+      invoke("save_app_preferences", { preferences: next }).catch(() => {});
+      return next;
+    });
+  }, [activeLibraryId]);
+
+  const handleClearWatchedFolder = useCallback(() => {
+    setPreferences((previous) => {
+      if (!previous) return previous;
+      const next = { ...previous, watched_folder_path: null, watched_folder_library_id: null };
       invoke("save_app_preferences", { preferences: next }).catch(() => {});
       return next;
     });
@@ -1343,6 +1463,7 @@ export function App() {
     >
       <audio
         ref={audioRef}
+        loop={looping}
         onPlay={() => setIsPlaying(true)}
         onPause={() => setIsPlaying(false)}
         onTimeUpdate={(event) => setCurrentTime(event.currentTarget.currentTime)}
@@ -1428,8 +1549,9 @@ export function App() {
                   : "nav-item"
               }
               key={project.id}
-              onClick={() => setActiveFilter({ project: project.id })}
+              onClick={() => setActiveFilter({ project: project.id, smart: project.collection_type === "Smart" })}
             >
+              {project.collection_type === "Smart" ? <Zap size={11} /> : null}
               {project.name}
             </button>
           ))}
@@ -1529,9 +1651,87 @@ export function App() {
           <button onClick={() => document.getElementById("tags-section")?.scrollIntoView({ behavior: "smooth" })}>
             Apply Tag
           </button>
+          <select
+            aria-label="Export format"
+            value={exportFormat}
+            onChange={(event) => setExportFormat(event.target.value === "wav24" ? "wav24" : "original")}
+          >
+            <option value="original">Original</option>
+            <option value="wav24">WAV (24-bit)</option>
+          </select>
           <button onClick={handleExportSelected} disabled={!selectedAssetId}>
             Export Selected
           </button>
+        </section>
+        <section className="filter-panel" aria-label="Range filters">
+          <ListFilter size={13} />
+          <label>
+            Duration
+            <input
+              type="number"
+              min={0}
+              placeholder="min s"
+              value={rangeFilters.durationMinSec ?? ""}
+              onChange={(event) =>
+                setRangeFilters((previous) => ({
+                  ...previous,
+                  durationMinSec: event.target.value === "" ? undefined : Number(event.target.value)
+                }))
+              }
+            />
+            <span>–</span>
+            <input
+              type="number"
+              min={0}
+              placeholder="max s"
+              value={rangeFilters.durationMaxSec ?? ""}
+              onChange={(event) =>
+                setRangeFilters((previous) => ({
+                  ...previous,
+                  durationMaxSec: event.target.value === "" ? undefined : Number(event.target.value)
+                }))
+              }
+            />
+          </label>
+          <label>
+            BPM
+            <input
+              type="number"
+              min={0}
+              placeholder="min"
+              value={rangeFilters.bpmMin ?? ""}
+              onChange={(event) =>
+                setRangeFilters((previous) => ({
+                  ...previous,
+                  bpmMin: event.target.value === "" ? undefined : Number(event.target.value)
+                }))
+              }
+            />
+            <span>–</span>
+            <input
+              type="number"
+              min={0}
+              placeholder="max"
+              value={rangeFilters.bpmMax ?? ""}
+              onChange={(event) =>
+                setRangeFilters((previous) => ({
+                  ...previous,
+                  bpmMax: event.target.value === "" ? undefined : Number(event.target.value)
+                }))
+              }
+            />
+          </label>
+          {hasActiveRangeFilters(rangeFilters) ? (
+            <>
+              <button type="button" className="text-button" onClick={() => setRangeFilters({})}>
+                Clear
+              </button>
+              <button type="button" className="text-button" onClick={() => setSmartCollectionModalOpen(true)}>
+                <Zap size={13} />
+                Save as Smart Collection
+              </button>
+            </>
+          ) : null}
         </section>
         <section className="browser" aria-label="Sound browser" data-density={preferences?.browser_density ?? "Comfortable"}>
           <div className="selection-bar" aria-label="Selection actions">
@@ -1598,6 +1798,20 @@ export function App() {
                 >
                   <Star size={15} fill={asset.favorite ? "currentColor" : "none"} />
                 </button>
+                {asset.availability_state === "Missing" ? (
+                  <button
+                    className="icon-button"
+                    aria-label={`Relink ${asset.display_name}`}
+                    onClick={(event) => {
+                      event.stopPropagation();
+                      handleRelinkAsset(asset);
+                    }}
+                  >
+                    <Link2 size={14} />
+                  </button>
+                ) : (
+                  <span />
+                )}
               </article>
               );
             })
@@ -1711,11 +1925,13 @@ export function App() {
         </CollapsibleSection>
         <CollapsibleSection id="projects" title="Projects" collapsed={collapsedSections.has("projects")} onToggle={toggleSection}>
           <div className="drop-target-grid">
-            {collections.map((project) => (
-              <button key={project.id} onClick={() => handleAddSelectedToProject(project)} disabled={bulkAssetIds.length === 0}>
-                + {project.name}
-              </button>
-            ))}
+            {collections
+              .filter((project) => project.collection_type !== "Smart")
+              .map((project) => (
+                <button key={project.id} onClick={() => handleAddSelectedToProject(project)} disabled={bulkAssetIds.length === 0}>
+                  + {project.name}
+                </button>
+              ))}
           </div>
         </CollapsibleSection>
         {selectedAsset && (selectedAsset.embedded_title || selectedAsset.embedded_genre || selectedAsset.embedded_comment) ? (
@@ -1908,6 +2124,14 @@ export function App() {
         <button className="icon-button" aria-label="Next" onClick={() => playRelative(1)}>
           <SkipForward size={17} />
         </button>
+        <button
+          className={looping ? "icon-button active" : "icon-button"}
+          aria-label={looping ? "Disable loop" : "Enable loop"}
+          aria-pressed={looping}
+          onClick={() => setLooping((previous) => !previous)}
+        >
+          <Repeat size={15} />
+        </button>
         <div
           className="transport-waveform"
           role="slider"
@@ -1922,6 +2146,18 @@ export function App() {
             const rect = event.currentTarget.getBoundingClientRect();
             const fraction = (event.clientX - rect.left) / rect.width;
             audio.currentTime = Math.max(0, Math.min(duration, fraction * duration));
+          }}
+          onKeyDown={(event) => {
+            const audio = audioRef.current;
+            if (!audio || !duration) return;
+            const seekStepSeconds = 5;
+            if (event.key === "ArrowLeft") {
+              event.preventDefault();
+              audio.currentTime = Math.max(0, audio.currentTime - seekStepSeconds);
+            } else if (event.key === "ArrowRight") {
+              event.preventDefault();
+              audio.currentTime = Math.min(duration, audio.currentTime + seekStepSeconds);
+            }
           }}
         >
           <div className="waveform-track">
@@ -1989,6 +2225,34 @@ export function App() {
             </div>
 
             <div className="settings-section">
+              <h2>Watched Folder</h2>
+              <div className="settings-grid">
+                <div className="settings-row">
+                  <Import size={14} />
+                  <span>Folder</span>
+                  <strong className="settings-value-path" title={preferences?.watched_folder_path ?? undefined}>
+                    {preferences?.watched_folder_path ?? "Not watching"}
+                  </strong>
+                </div>
+                <div className="status-line">
+                  New, stable files dropped here import automatically (as referenced files)
+                  into {preferences?.watched_folder_library_id === activeLibraryId
+                    ? activeLibrary?.name ?? "the active library"
+                    : "the library it was set up with"}
+                  , checked roughly every 20 seconds by the background worker.
+                </div>
+                <button type="button" className="text-button" onClick={handleChooseWatchedFolder} disabled={!activeLibraryId}>
+                  {preferences?.watched_folder_path ? "Change Folder…" : "Choose Folder…"}
+                </button>
+                {preferences?.watched_folder_path ? (
+                  <button type="button" className="text-button" onClick={handleClearWatchedFolder}>
+                    Stop Watching
+                  </button>
+                ) : null}
+              </div>
+            </div>
+
+            <div className="settings-section">
               <h2>Playback</h2>
               <div className="settings-grid">
                 <label className="settings-row">
@@ -2017,6 +2281,10 @@ export function App() {
                   <Volume2 size={14} />
                   <span>Output route</span>
                   <strong>{preferences?.output_device === "SystemDefault" ? "System default" : "Custom device"}</strong>
+                </div>
+                <div className="status-line">
+                  Output device selection isn't enforced yet on macOS — WKWebView doesn't
+                  support routing audio to a specific device.
                 </div>
               </div>
             </div>
@@ -2128,6 +2396,70 @@ export function App() {
                 }}
               >
                 Create Project
+              </button>
+            </div>
+          </motion.div>
+        </motion.div>
+      ) : null}
+      </AnimatePresence>
+      <AnimatePresence>
+      {smartCollectionModalOpen ? (
+        <motion.div
+          className="modal-overlay"
+          onClick={() => setSmartCollectionModalOpen(false)}
+          initial={{ opacity: 0 }}
+          animate={{ opacity: 1 }}
+          exit={{ opacity: 0 }}
+          transition={{ duration: 0.18 }}
+        >
+          <motion.div
+            className="modal-card"
+            onClick={(event) => event.stopPropagation()}
+            aria-label="Save as smart collection"
+            initial={{ opacity: 0, scale: 0.96, y: 10 }}
+            animate={{ opacity: 1, scale: 1, y: 0 }}
+            exit={{ opacity: 0, scale: 0.96, y: 10 }}
+            transition={{ duration: 0.2, ease: [0.4, 0, 0.2, 1] }}
+          >
+            <div className="modal-head">
+              <h1>Save as Smart Collection</h1>
+              <button
+                type="button"
+                className="icon-button"
+                aria-label="Close"
+                onClick={() => setSmartCollectionModalOpen(false)}
+              >
+                <X size={16} />
+              </button>
+            </div>
+            <div className="settings-stack">
+              <div className="status-line">
+                Saves the current search text and range filters as a live-updating collection
+                in the sidebar — it re-runs the filter each time you open it, rather than storing
+                a fixed list of sounds.
+              </div>
+              <input
+                autoFocus
+                placeholder="Smart collection name"
+                value={smartCollectionName}
+                onChange={(event) => setSmartCollectionName(event.target.value)}
+                onKeyDown={(event) => {
+                  if (event.key === "Enter" && smartCollectionName.trim()) {
+                    handleCreateSmartCollection();
+                    setSmartCollectionModalOpen(false);
+                  }
+                }}
+              />
+              <button
+                type="button"
+                className="primary-action"
+                disabled={!smartCollectionName.trim()}
+                onClick={() => {
+                  handleCreateSmartCollection();
+                  setSmartCollectionModalOpen(false);
+                }}
+              >
+                Save Smart Collection
               </button>
             </div>
           </motion.div>

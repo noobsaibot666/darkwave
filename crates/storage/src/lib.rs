@@ -14,6 +14,12 @@ pub enum StorageError {
     Sqlite(#[from] rusqlite::Error),
     #[error("asset not found")]
     AssetNotFound,
+    #[error("collection not found")]
+    CollectionNotFound,
+    #[error("collection is not a smart collection")]
+    NotASmartCollection,
+    #[error("smart collection query is invalid: {0}")]
+    InvalidSmartCollectionQuery(String),
 }
 
 pub fn is_network_tolerant_catalog_path(path: &str) -> Result<bool, StorageError> {
@@ -210,19 +216,27 @@ pub struct ProjectSourceReportRow {
     pub destination: Option<String>,
 }
 
-#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
 pub struct AssetSearchQuery {
     pub text: String,
     pub tag_id: Option<Uuid>,
     pub media_type: Option<String>,
+    pub duration_min_ms: Option<i64>,
+    pub duration_max_ms: Option<i64>,
+    pub bpm_min: Option<f64>,
+    pub bpm_max: Option<f64>,
+    /// Loudest-peak range in dBFS — the "energy" facet. `peak_db` is
+    /// already a real persisted column; a numeric range on `musical_key`
+    /// wouldn't be meaningful, so pitch has no range filter.
+    pub peak_db_min: Option<f64>,
+    pub peak_db_max: Option<f64>,
 }
 
 impl AssetSearchQuery {
     pub fn text(text: impl AsRef<str>) -> Self {
         Self {
             text: text.as_ref().to_string(),
-            tag_id: None,
-            media_type: None,
+            ..Self::default()
         }
     }
 
@@ -483,6 +497,56 @@ impl Catalog {
             .collect::<Result<Vec<_>, _>>()?;
 
         Ok(jobs)
+    }
+
+    /// Atomically selects up to `limit` pending jobs of `kind` and marks them
+    /// `'processing'` in one statement, so two overlapping callers (e.g. a
+    /// standing background worker and a frontend-triggered drain) can never
+    /// both claim and process the same job — unlike `pending_jobs_of_kind`,
+    /// which is a plain read with no such guarantee.
+    pub fn claim_pending_jobs(
+        &self,
+        kind: JobKind,
+        limit: usize,
+    ) -> Result<Vec<JobRecord>, StorageError> {
+        let mut statement = self.connection.prepare(
+            "UPDATE background_jobs SET state = 'processing', updated_at = ?1
+             WHERE id IN (
+               SELECT id FROM background_jobs WHERE state = 'pending' AND kind = ?2
+               ORDER BY priority ASC, created_at ASC LIMIT ?3
+             )
+             RETURNING id, asset_id, kind, priority",
+        )?;
+
+        let jobs = statement
+            .query_map(
+                params![Utc::now().to_rfc3339(), job_kind_to_db(&kind), limit as i64],
+                |row| {
+                    Ok(JobRecord {
+                        id: parse_uuid(row.get::<_, String>(0)?),
+                        asset_id: parse_uuid(row.get::<_, String>(1)?),
+                        kind: job_kind_from_db(&row.get::<_, String>(2)?),
+                        priority: row.get(3)?,
+                    })
+                },
+            )?
+            .collect::<Result<Vec<_>, _>>()?;
+
+        Ok(jobs)
+    }
+
+    /// Requeues jobs abandoned after a failure, up to `max_attempts` tries
+    /// total. Run periodically by the standing background worker rather than
+    /// immediately on failure, so a transient error (e.g. a momentarily
+    /// unreachable NAS path) gets a real gap before retrying.
+    pub fn requeue_failed_jobs(&self, max_attempts: i64) -> Result<usize, StorageError> {
+        let changed = self.connection.execute(
+            "UPDATE background_jobs SET state = 'pending', updated_at = ?1
+             WHERE state = 'failed' AND attempts < ?2",
+            params![Utc::now().to_rfc3339(), max_attempts],
+        )?;
+
+        Ok(changed)
     }
 
     pub fn set_embedded_metadata(
@@ -857,6 +921,31 @@ impl Catalog {
         Ok(assets)
     }
 
+    /// The "evaluate" half `create_smart_collection` never had: loads the
+    /// collection's stored query definition and re-runs it through
+    /// `search_assets`, returning live results rather than a static
+    /// membership list.
+    pub fn assets_in_smart_collection(
+        &self,
+        collection_id: Uuid,
+    ) -> Result<Vec<AssetRecord>, StorageError> {
+        let collection = self
+            .get_collection(collection_id)?
+            .ok_or(StorageError::CollectionNotFound)?;
+
+        if collection.collection_type != CollectionType::Smart {
+            return Err(StorageError::NotASmartCollection);
+        }
+
+        let query_definition = collection
+            .query_definition
+            .ok_or_else(|| StorageError::InvalidSmartCollectionQuery("missing query".to_string()))?;
+        let query: AssetSearchQuery = serde_json::from_str(&query_definition)
+            .map_err(|error| StorageError::InvalidSmartCollectionQuery(error.to_string()))?;
+
+        self.search_assets(collection.library_id, query)
+    }
+
     pub fn set_asset_flags(
         &self,
         asset_id: Uuid,
@@ -914,7 +1003,7 @@ impl Catalog {
                 assets.musical_key, assets.key_confidence
              FROM assets",
         );
-        let mut query_params = vec![library_id.to_string()];
+        let mut query_params: Vec<rusqlite::types::Value> = vec![library_id.to_string().into()];
 
         if use_fts {
             sql.push_str(" INNER JOIN assets_fts ON assets_fts.rowid = assets.rowid");
@@ -930,12 +1019,12 @@ impl Catalog {
 
         if use_fts {
             sql.push_str(" AND assets_fts MATCH ?");
-            query_params.push(fts_query(&text));
+            query_params.push(fts_query(&text).into());
         }
 
         if let Some(media_type) = query.media_type {
             sql.push_str(" AND assets.media_type = ?");
-            query_params.push(media_type);
+            query_params.push(media_type.into());
         }
 
         if let Some(tag_id) = query.tag_id {
@@ -947,7 +1036,32 @@ impl Catalog {
                       AND asset_tags.approval_state = 'accepted'
                 )",
             );
-            query_params.push(tag_id.to_string());
+            query_params.push(tag_id.to_string().into());
+        }
+
+        if let Some(min) = query.duration_min_ms {
+            sql.push_str(" AND assets.duration_ms >= ?");
+            query_params.push(min.into());
+        }
+        if let Some(max) = query.duration_max_ms {
+            sql.push_str(" AND assets.duration_ms <= ?");
+            query_params.push(max.into());
+        }
+        if let Some(min) = query.bpm_min {
+            sql.push_str(" AND assets.bpm >= ?");
+            query_params.push(min.into());
+        }
+        if let Some(max) = query.bpm_max {
+            sql.push_str(" AND assets.bpm <= ?");
+            query_params.push(max.into());
+        }
+        if let Some(min) = query.peak_db_min {
+            sql.push_str(" AND assets.peak_db >= ?");
+            query_params.push(min.into());
+        }
+        if let Some(max) = query.peak_db_max {
+            sql.push_str(" AND assets.peak_db <= ?");
+            query_params.push(max.into());
         }
 
         if use_fts {
@@ -2156,6 +2270,67 @@ mod tests {
     }
 
     #[test]
+    fn claim_pending_jobs_marks_them_processing_so_a_second_claim_finds_nothing() {
+        let catalog_path = unique_catalog_path("job-claim");
+        let catalog = Catalog::open(&catalog_path).expect("open catalog");
+        let library = catalog.create_library("Jobs", "/library").expect("library");
+        let asset = test_asset(&catalog, library.id, "tone.wav", "hash-job-claim");
+        catalog
+            .enqueue_job(asset.id, JobKind::AudioAnalysis, 40)
+            .expect("enqueue");
+
+        let first_claim = catalog
+            .claim_pending_jobs(JobKind::AudioAnalysis, 10)
+            .expect("first claim");
+        assert_eq!(first_claim.len(), 1);
+
+        let second_claim = catalog
+            .claim_pending_jobs(JobKind::AudioAnalysis, 10)
+            .expect("second claim");
+        assert!(
+            second_claim.is_empty(),
+            "a job already claimed as 'processing' must not be claimable again"
+        );
+
+        assert!(catalog
+            .pending_jobs_of_kind(JobKind::AudioAnalysis, 10)
+            .expect("pending jobs")
+            .is_empty());
+    }
+
+    #[test]
+    fn requeue_failed_jobs_respects_the_attempt_cap() {
+        let catalog_path = unique_catalog_path("job-requeue");
+        let catalog = Catalog::open(&catalog_path).expect("open catalog");
+        let library = catalog.create_library("Jobs", "/library").expect("library");
+        let asset = test_asset(&catalog, library.id, "tone.wav", "hash-job-requeue");
+        let job = catalog
+            .enqueue_job(asset.id, JobKind::AudioAnalysis, 40)
+            .expect("enqueue");
+
+        catalog.fail_job(job.id).expect("fail once");
+        let requeued = catalog.requeue_failed_jobs(3).expect("requeue");
+        assert_eq!(requeued, 1);
+        assert_eq!(
+            catalog
+                .pending_jobs_of_kind(JobKind::AudioAnalysis, 10)
+                .expect("pending jobs")
+                .len(),
+            1
+        );
+
+        // Fail it two more times (3 attempts total) — the cap should stop requeuing.
+        catalog.fail_job(job.id).expect("fail twice");
+        catalog.fail_job(job.id).expect("fail thrice");
+        let requeued_after_cap = catalog.requeue_failed_jobs(3).expect("requeue at cap");
+        assert_eq!(requeued_after_cap, 0);
+        assert!(catalog
+            .pending_jobs_of_kind(JobKind::AudioAnalysis, 10)
+            .expect("pending jobs")
+            .is_empty());
+    }
+
+    #[test]
     fn completing_a_job_removes_it_from_the_pending_queue() {
         let catalog_path = unique_catalog_path("job-complete");
         let catalog = Catalog::open(&catalog_path).expect("open catalog");
@@ -2726,6 +2901,104 @@ mod tests {
             .query_definition
             .expect("query")
             .contains("sound_effect"));
+    }
+
+    #[test]
+    fn search_assets_filters_by_duration_and_bpm_range() {
+        let catalog_path = unique_catalog_path("search-ranges");
+        let catalog = Catalog::open(&catalog_path).expect("open catalog");
+        let library = catalog.create_library("Ranges", "/library").expect("library");
+        let short_slow = test_asset(&catalog, library.id, "short.wav", "hash-short");
+        let long_fast = test_asset(&catalog, library.id, "long.wav", "hash-long");
+
+        catalog
+            .set_audio_analysis(
+                short_slow.id,
+                AudioAnalysisUpdate {
+                    duration_ms: Some(1_000),
+                    bpm: Some(80.0),
+                    ..Default::default()
+                },
+            )
+            .expect("analysis short");
+        catalog
+            .set_audio_analysis(
+                long_fast.id,
+                AudioAnalysisUpdate {
+                    duration_ms: Some(10_000),
+                    bpm: Some(160.0),
+                    ..Default::default()
+                },
+            )
+            .expect("analysis long");
+
+        let results = catalog
+            .search_assets(
+                library.id,
+                AssetSearchQuery {
+                    duration_min_ms: Some(5_000),
+                    bpm_min: Some(120.0),
+                    ..AssetSearchQuery::text("")
+                },
+            )
+            .expect("search");
+
+        assert_eq!(results.len(), 1);
+        assert_eq!(results[0].id, long_fast.id);
+    }
+
+    #[test]
+    fn assets_in_smart_collection_evaluates_the_stored_query() {
+        let catalog_path = unique_catalog_path("smart-collection-eval");
+        let catalog = Catalog::open(&catalog_path).expect("open catalog");
+        let library = catalog
+            .create_library("SmartEval", "/library")
+            .expect("library");
+        let matching = test_asset(&catalog, library.id, "match.wav", "hash-match");
+        let _non_matching = test_asset(&catalog, library.id, "other.wav", "hash-other");
+
+        catalog
+            .set_audio_analysis(
+                matching.id,
+                AudioAnalysisUpdate {
+                    bpm: Some(140.0),
+                    ..Default::default()
+                },
+            )
+            .expect("analysis");
+
+        let query = AssetSearchQuery {
+            bpm_min: Some(100.0),
+            ..AssetSearchQuery::text("")
+        };
+        let collection = catalog
+            .create_smart_collection(library.id, "Fast", &query)
+            .expect("smart collection");
+
+        let results = catalog
+            .assets_in_smart_collection(collection.id)
+            .expect("evaluate");
+
+        assert_eq!(results.len(), 1);
+        assert_eq!(results[0].id, matching.id);
+    }
+
+    #[test]
+    fn assets_in_smart_collection_rejects_a_manual_collection() {
+        let catalog_path = unique_catalog_path("smart-collection-reject");
+        let catalog = Catalog::open(&catalog_path).expect("open catalog");
+        let library = catalog
+            .create_library("Manual", "/library")
+            .expect("library");
+        let manual = catalog
+            .create_collection(library.id, "Not Smart", CollectionType::Manual)
+            .expect("collection");
+
+        let error = catalog
+            .assets_in_smart_collection(manual.id)
+            .expect_err("manual collection should be rejected");
+
+        assert!(matches!(error, StorageError::NotASmartCollection));
     }
 
     #[test]

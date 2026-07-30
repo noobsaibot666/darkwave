@@ -86,6 +86,16 @@ pub struct AppPreferences {
     pub reduced_motion: bool,
     #[serde(default)]
     pub reduced_transparency: bool,
+    /// A single folder (matching the plan's "Watched Downloads folder,"
+    /// singular) the standing background worker polls for new, stable
+    /// audio files and imports automatically. `None` disables watching.
+    #[serde(default)]
+    pub watched_folder_path: Option<String>,
+    /// Which library newly-discovered watched-folder files import into —
+    /// required alongside `watched_folder_path` since preferences are
+    /// global but import is always library-scoped.
+    #[serde(default)]
+    pub watched_folder_library_id: Option<String>,
 }
 
 impl ShortcutMap {
@@ -171,6 +181,8 @@ impl AppPreferences {
             shortcuts: ShortcutMap::default_audio_workspace(),
             reduced_motion: false,
             reduced_transparency: false,
+            watched_folder_path: None,
+            watched_folder_library_id: None,
         }
     }
 }
@@ -326,6 +338,8 @@ mod tests {
 
         assert!(!loaded.reduced_motion);
         assert!(!loaded.reduced_transparency);
+        assert_eq!(loaded.watched_folder_path, None);
+        assert_eq!(loaded.watched_folder_library_id, None);
     }
 
     #[test]
