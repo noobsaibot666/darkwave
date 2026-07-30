@@ -17,7 +17,8 @@ When a supported audio file is imported, Darkwave:
 - Avoids creating a second asset row when the same content hash and file size already exist in the same library.
 - Adds pending filename-based and metadata-based tag suggestions for review.
 - Can attach known source URL, provider, license, attribution, restrictions, and receipt context at import time.
-- Creates pending background jobs for embedded metadata extraction and waveform generation, processed automatically right after import and during playback respectively.
+- Creates pending background jobs for embedded metadata extraction, waveform generation, and audio-content analysis, drained continuously by a standing background worker (not just right after import) so jobs queued from any source — manual import, refresh, or the watched folder below — get processed without further action.
+- Can watch one configured folder (set in Settings, alongside the library it imports into) and import newly-stable files into that library automatically, on the same ~20-second cadence as the rest of the background worker — no manual import step needed for that folder.
 - Discovers watched-folder candidates only after supported audio files have stabilized.
 - Maintains watched-folder size snapshots across polls so new files are imported only after a later stable scan.
 - Ingests platform filesystem notifications and emits import candidates only after repeat stable events.
@@ -26,7 +27,7 @@ When a supported audio file is imported, Darkwave:
 
 Watched folders ignore incomplete browser download files such as `.crdownload`, `.download`, `.part`, and `.tmp`. A watched file is considered ready only after its file size has stabilized.
 
-Referenced imports remain catalog-only and keep pointing at their original file path. Arbitrary-format decoder artifacts and licensing review remain release-build requirements.
+Referenced imports remain catalog-only and keep pointing at their original file path. Licensing review remains a manual step; decoding itself has no release-build requirement — the same Symphonia-backed decoder handles every MVP-supported format in every build.
 
 ## Folder import is recursive
 
@@ -67,6 +68,17 @@ for managed/local imports; after the preview cache warms for referenced
 NAS-backed files), and never blocks import itself — sounds are browsable,
 taggable, and playable immediately, with detected attributes filling in
 shortly after.
+
+## Background job status
+
+Metadata extraction, waveform generation, and audio-content analysis all run
+as background jobs, and Darkwave shows their progress rather than leaving
+them invisible: a status panel appears with a per-kind loading bar
+whenever jobs are pending or processing, driven by the same standing worker
+that drains the queue every ~20 seconds. It clears on its own once the
+queue is empty. Jobs that fail (for example, a NAS path that's briefly
+unreachable) are retried automatically up to a small attempt limit rather
+than being abandoned after the first failure.
 
 ## Refresh and the local cache
 
