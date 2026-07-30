@@ -671,16 +671,20 @@ fn import_folder(
         .map_err(|error| format!("could not read folder {folder_path}: {error}"))?;
     paths.sort();
 
-    let catalog = state.0.lock().expect("catalog mutex poisoned");
     let mut imported = Vec::new();
     let mut failed = Vec::new();
 
+    // Lock per file rather than once for the whole scan: hashing each file (and, over a
+    // NAS mount, the network read behind it) can take a while, and holding the catalog
+    // mutex for the entire loop would block every other command — playback, browsing,
+    // tagging — until the whole folder finished importing.
     for path in paths {
         let filename = path
             .file_name()
             .map(|name| name.to_string_lossy().to_string())
             .unwrap_or_default();
 
+        let catalog = state.0.lock().expect("catalog mutex poisoned");
         match import_pipeline::import_file(&catalog, library_id, &path, import_mode) {
             Ok(asset) => imported.push(asset),
             Err(ImportError::UnsupportedFormat(_)) => {}
@@ -741,28 +745,31 @@ fn refresh_library(
     library_id: String,
 ) -> Result<ImportFolderResult, String> {
     let library_id = parse_uuid_field(&library_id, "library id")?;
-    let catalog = state.0.lock().expect("catalog mutex poisoned");
-    let library = catalog
-        .get_library(library_id)
-        .map_err(storage_error_message)?
-        .ok_or_else(|| "library not found".to_string())?;
 
-    let mut paths = collect_audio_files(std::path::Path::new(&library.media_root))
-        .map_err(|error| format!("could not read {}: {error}", library.media_root))?;
+    // Only hold the lock long enough to read the media root and the already-known
+    // paths; the (potentially slow, NAS-backed) directory walk and per-file hashing
+    // below must not hold it, or every other command blocks until the scan finishes.
+    let (media_root, known_paths) = {
+        let catalog = state.0.lock().expect("catalog mutex poisoned");
+        let library = catalog
+            .get_library(library_id)
+            .map_err(storage_error_message)?
+            .ok_or_else(|| "library not found".to_string())?;
+        let known_paths: HashSet<String> = catalog
+            .list_assets(library_id)
+            .map_err(storage_error_message)?
+            .into_iter()
+            .filter_map(|asset| match asset.path {
+                AssetPath::Referenced(path) => Some(path),
+                AssetPath::Managed(_) => None,
+            })
+            .collect();
+        (library.media_root, known_paths)
+    };
+
+    let mut paths = collect_audio_files(std::path::Path::new(&media_root))
+        .map_err(|error| format!("could not read {media_root}: {error}"))?;
     paths.sort();
-
-    // Re-hashing every file on every rescan would mean reading a NAS-backed library's
-    // entire contents over the network each time. Skip paths already cataloged as a
-    // referenced asset so only genuinely new files pay the read-and-hash cost.
-    let known_paths: HashSet<String> = catalog
-        .list_assets(library_id)
-        .map_err(storage_error_message)?
-        .into_iter()
-        .filter_map(|asset| match asset.path {
-            AssetPath::Referenced(path) => Some(path),
-            AssetPath::Managed(_) => None,
-        })
-        .collect();
 
     let mut imported = Vec::new();
     let mut failed = Vec::new();
@@ -777,6 +784,7 @@ fn refresh_library(
             .map(|name| name.to_string_lossy().to_string())
             .unwrap_or_default();
 
+        let catalog = state.0.lock().expect("catalog mutex poisoned");
         match import_pipeline::import_file(&catalog, library_id, &path, ImportMode::Referenced) {
             Ok(asset) => imported.push(asset),
             Err(ImportError::UnsupportedFormat(_)) => {}
@@ -809,17 +817,27 @@ fn assets_for_tag(
 
 #[tauri::command]
 fn asset_playback_path(
+    app: tauri::AppHandle,
     state: tauri::State<CatalogState>,
     asset_id: String,
 ) -> Result<String, String> {
-    let asset_id = parse_uuid_field(&asset_id, "asset id")?;
+    let parsed_id = parse_uuid_field(&asset_id, "asset id")?;
     let catalog = state.0.lock().expect("catalog mutex poisoned");
     let asset = catalog
-        .get_asset(asset_id)
+        .get_asset(parsed_id)
         .map_err(storage_error_message)?
         .ok_or_else(|| "asset not found".to_string())?;
+    let resolved = resolve_asset_path(&catalog, &asset)?;
+    drop(catalog);
 
-    resolve_asset_path(&catalog, &asset)
+    if let Ok(cache_dir) = preview_cache_dir(&app) {
+        let cached_path = cached_file_path(&cache_dir, &asset);
+        if cached_path.exists() {
+            return Ok(cached_path.to_string_lossy().to_string());
+        }
+    }
+
+    Ok(resolved)
 }
 
 fn resolve_asset_path(catalog: &Catalog, asset: &AssetRecord) -> Result<String, String> {
@@ -837,6 +855,109 @@ fn resolve_asset_path(catalog: &Catalog, asset: &AssetRecord) -> Result<String, 
             ))
         }
     }
+}
+
+fn asset_absolute_path(asset: &AssetRecord, media_root: &str) -> String {
+    match &asset.path {
+        AssetPath::Referenced(path) => path.clone(),
+        AssetPath::Managed(relative_path) => {
+            format!("{}/{}", media_root.trim_end_matches('/'), relative_path)
+        }
+    }
+}
+
+fn preview_cache_dir(app: &tauri::AppHandle) -> Result<PathBuf, String> {
+    let dir = app
+        .path()
+        .app_data_dir()
+        .map_err(|error| format!("resolve app data directory: {error}"))?
+        .join("preview-cache");
+    std::fs::create_dir_all(&dir)
+        .map_err(|error| format!("create preview cache directory: {error}"))?;
+    Ok(dir)
+}
+
+fn cached_file_path(cache_dir: &std::path::Path, asset: &AssetRecord) -> PathBuf {
+    let extension = std::path::Path::new(&asset.original_filename)
+        .extension()
+        .and_then(|extension| extension.to_str())
+        .unwrap_or("bin");
+    cache_dir.join(format!("{}.{}", asset.id, extension))
+}
+
+/// Copies referenced (typically NAS-backed) assets into a local cache directory for fast
+/// playback, up to the user's configured `preview_cache_limit_mb` budget. Only the initial
+/// asset listing holds the catalog mutex; the actual file copies (the slow, network-bound
+/// part) happen after it's released, for the same reason `refresh_library` locks per file
+/// rather than for the whole operation.
+#[tauri::command]
+fn warm_library_cache(app: tauri::AppHandle, state: tauri::State<CatalogState>, library_id: String) -> Result<usize, String> {
+    let library_id = parse_uuid_field(&library_id, "library id")?;
+    let (assets, media_root) = {
+        let catalog = state.0.lock().expect("catalog mutex poisoned");
+        let library = catalog
+            .get_library(library_id)
+            .map_err(storage_error_message)?
+            .ok_or_else(|| "library not found".to_string())?;
+        let assets = catalog
+            .list_assets(library_id)
+            .map_err(storage_error_message)?;
+        (assets, library.media_root)
+    };
+
+    let preferences_path = preferences_path(&app)?;
+    let budget_mb = preferences::load_preferences(&preferences_path)
+        .map(|preferences| preferences.preview_cache_limit_mb)
+        .unwrap_or(2048);
+    let budget_bytes = u64::from(budget_mb) * 1024 * 1024;
+
+    let cache_dir = preview_cache_dir(&app)?;
+    let mut used_bytes: u64 = std::fs::read_dir(&cache_dir)
+        .map(|entries| {
+            entries
+                .filter_map(|entry| entry.ok())
+                .filter_map(|entry| entry.metadata().ok())
+                .map(|metadata| metadata.len())
+                .sum()
+        })
+        .unwrap_or(0);
+
+    let mut cached_count = 0usize;
+    for asset in assets {
+        if used_bytes >= budget_bytes {
+            break;
+        }
+
+        let cache_path = cached_file_path(&cache_dir, &asset);
+        if cache_path.exists() {
+            continue;
+        }
+
+        let source_path = asset_absolute_path(&asset, &media_root);
+        let Ok(metadata) = std::fs::metadata(&source_path) else {
+            continue;
+        };
+        if used_bytes + metadata.len() > budget_bytes {
+            continue;
+        }
+
+        if std::fs::copy(&source_path, &cache_path).is_ok() {
+            used_bytes += metadata.len();
+            cached_count += 1;
+        }
+    }
+
+    Ok(cached_count)
+}
+
+#[tauri::command]
+fn purge_preview_cache(app: tauri::AppHandle) -> Result<(), String> {
+    let cache_dir = preview_cache_dir(&app)?;
+    for entry in std::fs::read_dir(&cache_dir).map_err(|error| format!("read cache directory: {error}"))? {
+        let entry = entry.map_err(|error| format!("read cache entry: {error}"))?;
+        let _ = std::fs::remove_file(entry.path());
+    }
+    Ok(())
 }
 
 #[tauri::command]
@@ -1227,6 +1348,26 @@ pub fn run() {
                 .separator()
                 .quit()
                 .build()?;
+            let license_report_item = tauri::menu::MenuItem::with_id(
+                app,
+                "export-license-report",
+                "Export License Report…",
+                true,
+                None::<&str>,
+            )?;
+            let library_menu = tauri::menu::SubmenuBuilder::new(app, "Library")
+                .item(&license_report_item)
+                .build()?;
+            let shortcuts_item = tauri::menu::MenuItem::with_id(
+                app,
+                "keyboard-shortcuts",
+                "Keyboard Shortcuts",
+                true,
+                Some("CmdOrCtrl+/"),
+            )?;
+            let help_menu = tauri::menu::SubmenuBuilder::new(app, "Help")
+                .item(&shortcuts_item)
+                .build()?;
             let window_menu = tauri::menu::SubmenuBuilder::new(app, "Window")
                 .minimize()
                 .close_window()
@@ -1234,7 +1375,9 @@ pub fn run() {
             let menu = tauri::menu::MenuBuilder::new(app)
                 .item(&app_menu)
                 .item(&edit_menu)
+                .item(&library_menu)
                 .item(&window_menu)
+                .item(&help_menu)
                 .build()?;
             app.set_menu(menu)?;
 
@@ -1249,7 +1392,24 @@ pub fn run() {
                 "redo" => {
                     let _ = app.emit("menu-redo", ());
                 }
+                "export-license-report" => {
+                    let _ = app.emit("menu-export-license-report", ());
+                }
+                "keyboard-shortcuts" => {
+                    let _ = app.emit("menu-keyboard-shortcuts", ());
+                }
                 _ => {}
+            }
+        })
+        .on_window_event(|window, event| {
+            if let tauri::WindowEvent::CloseRequested { .. } = event {
+                if let Ok(cache_dir) = preview_cache_dir(window.app_handle()) {
+                    if let Ok(entries) = std::fs::read_dir(&cache_dir) {
+                        for entry in entries.filter_map(|entry| entry.ok()) {
+                            let _ = std::fs::remove_file(entry.path());
+                        }
+                    }
+                }
             }
         })
         .invoke_handler(tauri::generate_handler![
@@ -1271,6 +1431,8 @@ pub fn run() {
             import_folder,
             refresh_library,
             assets_for_tag,
+            warm_library_cache,
+            purge_preview_cache,
             asset_playback_path,
             list_tags,
             create_tag,

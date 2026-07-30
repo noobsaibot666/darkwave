@@ -11,4 +11,8 @@ Use folder import for existing sound libraries and watched Downloads for new fil
 
 Keep backups of the library manifest and media root. If a NAS path moves, use relinking instead of re-importing the same files.
 
-Default settings use compact browser rows, the system audio output device, and a 16 GB preview cache. These defaults favor fast auditioning on large libraries.
+Default settings use compact browser rows, the system audio output device, and a 2 GB local playback cache. These defaults favor fast auditioning on large libraries without claiming more disk space than necessary; the cache limit is editable in Settings, and can be cleared on demand with the Purge Cache button there.
+
+The main window has three regions: a library sidebar on the left (smart filters, projects), the sound browser in the center, and a details inspector on the right. Both side panels can be hidden with the toggle in their own header — a thin collapsed strip stays in place as a handle to bring the panel back, and the center browser and transport bar resize to use the freed space.
+
+Undo/Redo, importing a project's license report, and the keyboard shortcut reference all live in the native menu bar (Edit, Library, and Help respectively) rather than as buttons in the workspace, so the canvas stays focused on the sounds themselves.

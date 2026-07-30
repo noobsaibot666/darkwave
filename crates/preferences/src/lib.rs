@@ -166,7 +166,7 @@ impl AppPreferences {
     pub fn default_for_editorial_audio() -> Self {
         Self {
             browser_density: BrowserDensity::Compact,
-            preview_cache_limit_mb: 16_384,
+            preview_cache_limit_mb: 2_048,
             output_device: OutputDevicePreference::SystemDefault,
             shortcuts: ShortcutMap::default_audio_workspace(),
             reduced_motion: false,
@@ -269,7 +269,7 @@ mod tests {
         let preferences = AppPreferences::default_for_editorial_audio();
 
         assert_eq!(preferences.browser_density, BrowserDensity::Compact);
-        assert_eq!(preferences.preview_cache_limit_mb, 16_384);
+        assert_eq!(preferences.preview_cache_limit_mb, 2_048);
         assert_eq!(
             preferences.output_device,
             OutputDevicePreference::SystemDefault
@@ -294,7 +294,7 @@ mod tests {
             load_preferences(unique_preferences_path("missing")).expect("load defaults");
 
         assert_eq!(preferences.browser_density, BrowserDensity::Compact);
-        assert_eq!(preferences.preview_cache_limit_mb, 16_384);
+        assert_eq!(preferences.preview_cache_limit_mb, 2_048);
         assert!(!preferences.reduced_motion);
         assert!(!preferences.reduced_transparency);
     }

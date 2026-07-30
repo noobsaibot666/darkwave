@@ -28,3 +28,22 @@ When a supported audio file is imported, Darkwave:
 Watched folders ignore incomplete browser download files such as `.crdownload`, `.download`, `.part`, and `.tmp`. A watched file is considered ready only after its file size has stabilized.
 
 Referenced imports remain catalog-only and keep pointing at their original file path. Arbitrary-format decoder artifacts and licensing review remain release-build requirements.
+
+## Folder import is recursive
+
+Choosing a folder to import walks every subfolder underneath it — real libraries are rarely flat, and a folder full of vendor/pack subfolders imports in one pass. Dotfiles and dot-directories (`.DS_Store`, `.git`, and similar) are skipped. Recognized audio extensions are intentionally broader than what the app can natively decode yet (adding formats like WMA, CAF, WV, APE, and Opus on top of the core WAV/AIFF/MP3/FLAC/AAC/OGG set): a file can be cataloged, tagged, and organized before Darkwave can play it.
+
+## Smart categorization on import
+
+Two size-based checks run automatically as part of import, before any manual tagging:
+
+- Files at or below roughly 8 KB are routed to a **Needs Review** category instead of being classified normally — that size is far too small to be real audio and typically means a placeholder, a sync stub, or a truncated download. The file is still imported and visible, just flagged.
+- Files at or below roughly 5 MB that filename and embedded-metadata analysis didn't already classify default to **Sound Effect** rather than a generic "other" category, since a real music track is essentially never that small.
+
+Both are available as smart filters in the sidebar.
+
+## Refresh and the local cache
+
+The Refresh action (top of the workspace) re-scans the active library's media root for files that aren't in the catalog yet — useful after dropping something into a NAS folder outside the app. It only reads and hashes files it doesn't already know about, so repeat scans are fast regardless of library size.
+
+Separately, opening a library warms a local playback cache (referenced/NAS-backed files only) up to the budget set in Settings, so recently-added sounds preview quickly. The cache is cleared automatically when the app closes, or on demand via the Purge Cache button in Settings.

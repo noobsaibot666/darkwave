@@ -1,5 +1,6 @@
 import { convertFileSrc, invoke } from "@tauri-apps/api/core";
 import { listen } from "@tauri-apps/api/event";
+import { AnimatePresence, motion } from "motion/react";
 import { open as openDialog, save as saveDialog, confirm as confirmDialog } from "@tauri-apps/plugin-dialog";
 import {
   Bell,
@@ -323,8 +324,10 @@ export function App() {
   const [settingsOpen, setSettingsOpen] = useState(false);
   const [filterMenuOpen, setFilterMenuOpen] = useState(false);
   const [sfxSubcategoriesOpen, setSfxSubcategoriesOpen] = useState(false);
-  const [collapsedSections, setCollapsedSections] = useState<Set<string>>(() => new Set(["shortcuts", "release"]));
+  const [collapsedSections, setCollapsedSections] = useState<Set<string>>(() => new Set(["release"]));
   const [refreshStatus, setRefreshStatus] = useState<string | null>(null);
+  const [newProjectModalOpen, setNewProjectModalOpen] = useState(false);
+  const [shortcutsOpen, setShortcutsOpen] = useState(false);
   const toggleSection = useCallback((id: string) => {
     setCollapsedSections((previous) => {
       const next = new Set(previous);
@@ -354,6 +357,7 @@ export function App() {
   const [reconnectStatus, setReconnectStatus] = useState<string | null>(null);
   const [trashItems, setTrashItems] = useState<TrashItem[]>([]);
   const [backupStatus, setBackupStatus] = useState<string | null>(null);
+  const [cacheStatus, setCacheStatus] = useState<string | null>(null);
 
   const [preferences, setPreferences] = useState<AppPreferences | null>(null);
   const [trashRetentionDays, setTrashRetentionDays] = useState(30);
@@ -522,6 +526,12 @@ export function App() {
     invoke<[string, boolean]>("media_root_status", { libraryId: activeLibraryId })
       .then(([status, reconnectRequired]) => setMediaRootStatus({ status, reconnectRequired }))
       .catch(() => setMediaRootStatus(null));
+
+    // Fire-and-forget: warms the local playback cache up to the configured budget so
+    // browsing feels fast. Bounded by preview_cache_limit_mb (unlike the mutex-holding
+    // full-library rescan mistake this app shipped once already — see ADR 0023's
+    // follow-up fix — this only ever copies as much as the user's cache budget allows).
+    invoke<number>("warm_library_cache", { libraryId: activeLibraryId }).catch(() => {});
   }, [activeLibraryId, refreshCollections, refreshMaintenance, refreshTrashItems]);
 
   useEffect(() => {
@@ -565,6 +575,12 @@ export function App() {
       setSelectedAssetId(null);
     }
   }, [assets, selectedAssetId]);
+
+  useEffect(() => {
+    if (!selectedAssetId) return;
+    const row = document.querySelector(`[data-asset-id="${selectedAssetId}"]`);
+    row?.scrollIntoView({ block: "nearest", behavior: "smooth" });
+  }, [selectedAssetId]);
 
   useEffect(() => {
     if (!selectedAssetId) {
@@ -930,6 +946,12 @@ export function App() {
     }
   }, []);
 
+  const handlePurgeCache = useCallback(() => {
+    invoke("purge_preview_cache")
+      .then(() => setCacheStatus("Cache cleared"))
+      .catch((error) => setCacheStatus(`Purge failed: ${String(error)}`));
+  }, []);
+
   const handleChooseMediaRoot = async () => {
     const selected = await openDialog({ directory: true, multiple: false, title: "Choose media location" });
     if (typeof selected === "string") setLibraryRoot(selected);
@@ -1048,7 +1070,10 @@ export function App() {
   }, [bulkAssetIds]);
 
   const handleExportLicenseReport = useCallback(async () => {
-    if (typeof activeFilter !== "object" || !("project" in activeFilter)) return;
+    if (typeof activeFilter !== "object" || !("project" in activeFilter)) {
+      setExportStatus("Select a project in the sidebar first, then use Library → Export License Report.");
+      return;
+    }
     const destination = await saveDialog({
       defaultPath: "license-report.csv",
       filters: [{ name: "CSV", extensions: ["csv"] }]
@@ -1065,6 +1090,15 @@ export function App() {
       setExportStatus(`License report export failed: ${String(error)}`);
     }
   }, [activeFilter]);
+
+  useEffect(() => {
+    const unlistenLicense = listen("menu-export-license-report", () => handleExportLicenseReport());
+    const unlistenShortcuts = listen("menu-keyboard-shortcuts", () => setShortcutsOpen((previous) => !previous));
+    return () => {
+      unlistenLicense.then((dispose) => dispose());
+      unlistenShortcuts.then((dispose) => dispose());
+    };
+  }, [handleExportLicenseReport]);
 
   const handleToggleReducedMotion = useCallback(() => {
     setPreferences((previous) => {
@@ -1224,81 +1258,88 @@ export function App() {
         onEnded={() => playRelative(1)}
       />
       <aside className={sidebarCollapsed ? "sidebar collapsed" : "sidebar"} aria-label="Library">
-        <div className="brand">Darkwave</div>
-        {libraries.length > 1 ? (
-          <select
-            className="library-select"
-            value={activeLibraryId ?? ""}
-            onChange={(event) => setActiveLibraryId(event.target.value)}
-          >
-            {libraries.map((library) => (
-              <option key={library.id} value={library.id}>
-                {library.name}
-              </option>
-            ))}
-          </select>
-        ) : null}
-        {smartFilters.map((filter) => (
-          <div key={filter.label}>
-            <button
-              className={activeFilter === filter.id ? "nav-item active" : "nav-item"}
-              onClick={() => setActiveFilter(filter.id)}
-            >
-              {filter.label}
-            </button>
-            {filter.id === "sound_effect" ? (
-              <>
-                <button
-                  className="nav-subitem"
-                  onClick={() => setSfxSubcategoriesOpen((previous) => !previous)}
-                >
-                  {sfxSubcategoriesOpen ? <ChevronDown size={11} /> : <ChevronRight size={11} />} By category
-                </button>
-                {sfxSubcategoriesOpen
-                  ? tags
-                      .filter((tag) => tag.facet === "action")
-                      .map((tag) => (
-                        <button
-                          key={tag.id}
-                          className={
-                            typeof activeFilter === "object" && "tag" in activeFilter && activeFilter.tag === tag.id
-                              ? "nav-subitem active"
-                              : "nav-subitem"
-                          }
-                          onClick={() => setActiveFilter({ tag: tag.id })}
-                        >
-                          {tag.name}
-                        </button>
-                      ))
-                  : null}
-              </>
-            ) : null}
-          </div>
-        ))}
-        <div className="nav-heading">Projects</div>
-        {collections.map((project) => (
-          <button
-            className={
-              typeof activeFilter === "object" && "project" in activeFilter && activeFilter.project === project.id
-                ? "nav-item active"
-                : "nav-item"
-            }
-            key={project.id}
-            onClick={() => setActiveFilter({ project: project.id })}
-          >
-            {project.name}
-          </button>
-        ))}
-      </aside>
-      <section className="workspace">
-        <header className="topbar">
+        <div className="panel-head">
+          <img src="/logo.png" alt="Darkwave" className="brand-mark" />
           <button
             className="icon-button panel-toggle"
             aria-label={sidebarCollapsed ? "Show library panel" : "Hide library panel"}
             onClick={() => setSidebarCollapsed((previous) => !previous)}
           >
-            {sidebarCollapsed ? <PanelLeftOpen size={17} /> : <PanelLeftClose size={17} />}
+            {sidebarCollapsed ? <PanelLeftOpen size={15} /> : <PanelLeftClose size={15} />}
           </button>
+        </div>
+        <div className="panel-body">
+          {libraries.length > 1 ? (
+            <select
+              className="library-select"
+              value={activeLibraryId ?? ""}
+              onChange={(event) => setActiveLibraryId(event.target.value)}
+            >
+              {libraries.map((library) => (
+                <option key={library.id} value={library.id}>
+                  {library.name}
+                </option>
+              ))}
+            </select>
+          ) : null}
+          {smartFilters.map((filter) => (
+            <div key={filter.label}>
+              <button
+                className={activeFilter === filter.id ? "nav-item active" : "nav-item"}
+                onClick={() => setActiveFilter(filter.id)}
+              >
+                {filter.label}
+              </button>
+              {filter.id === "sound_effect" ? (
+                <>
+                  <button
+                    className="nav-subitem"
+                    onClick={() => setSfxSubcategoriesOpen((previous) => !previous)}
+                  >
+                    {sfxSubcategoriesOpen ? <ChevronDown size={11} /> : <ChevronRight size={11} />} By category
+                  </button>
+                  {sfxSubcategoriesOpen
+                    ? tags
+                        .filter((tag) => tag.facet === "action")
+                        .map((tag) => (
+                          <button
+                            key={tag.id}
+                            className={
+                              typeof activeFilter === "object" && "tag" in activeFilter && activeFilter.tag === tag.id
+                                ? "nav-subitem active"
+                                : "nav-subitem"
+                            }
+                            onClick={() => setActiveFilter({ tag: tag.id })}
+                          >
+                            {tag.name}
+                          </button>
+                        ))
+                    : null}
+                </>
+              ) : null}
+            </div>
+          ))}
+          <div className="nav-heading">Projects</div>
+          {collections.map((project) => (
+            <button
+              className={
+                typeof activeFilter === "object" && "project" in activeFilter && activeFilter.project === project.id
+                  ? "nav-item active"
+                  : "nav-item"
+              }
+              key={project.id}
+              onClick={() => setActiveFilter({ project: project.id })}
+            >
+              {project.name}
+            </button>
+          ))}
+          <button type="button" className="text-button new-project-button" onClick={() => setNewProjectModalOpen(true)}>
+            + New Project
+          </button>
+        </div>
+      </aside>
+      <section className="workspace">
+        <header className="topbar">
           <label className="search">
             <Search size={16} />
             <input
@@ -1316,41 +1357,33 @@ export function App() {
             >
               <ListFilter size={17} />
             </button>
-            {filterMenuOpen ? (
-              <div className="modal-card" style={{ position: "absolute", top: 40, left: 0, width: 200, zIndex: 20 }}>
-                {smartFilters.map((filter) => (
-                  <button
-                    key={filter.label}
-                    className={activeFilter === filter.id ? "nav-item active" : "nav-item"}
-                    onClick={() => {
-                      setActiveFilter(filter.id);
-                      setFilterMenuOpen(false);
-                    }}
-                  >
-                    {filter.label}
-                  </button>
-                ))}
-              </div>
-            ) : null}
+            <AnimatePresence>
+              {filterMenuOpen ? (
+                <motion.div
+                  className="modal-card filter-menu"
+                  initial={{ opacity: 0, scale: 0.95, y: -6 }}
+                  animate={{ opacity: 1, scale: 1, y: 0 }}
+                  exit={{ opacity: 0, scale: 0.95, y: -6 }}
+                  transition={{ duration: 0.16, ease: [0.4, 0, 0.2, 1] }}
+                >
+                  {smartFilters.map((filter) => (
+                    <button
+                      key={filter.label}
+                      className={activeFilter === filter.id ? "nav-item active" : "nav-item"}
+                      onClick={() => {
+                        setActiveFilter(filter.id);
+                        setFilterMenuOpen(false);
+                      }}
+                    >
+                      {filter.label}
+                    </button>
+                  ))}
+                </motion.div>
+              ) : null}
+            </AnimatePresence>
           </div>
-          <div className="new-project-inline">
-            <input
-              placeholder="New project"
-              value={newProjectName}
-              onChange={(event) => setNewProjectName(event.target.value)}
-            />
-            <button type="button" className="icon-button" onClick={handleCreateProject} disabled={!newProjectName.trim()}>
-              +
-            </button>
-          </div>
-          <button
-            className="text-button"
-            type="button"
-            onClick={handleExportLicenseReport}
-            disabled={typeof activeFilter !== "object" || !("project" in activeFilter)}
-            title="Export a CSV license report for the active project"
-          >
-            License Report
+          <button type="button" className="icon-button" aria-label="Refresh library" onClick={() => handleRefreshLibrary()} title="Scan the media root for new files">
+            <RefreshCw size={16} />
           </button>
           <button className="primary-action" type="button" onClick={handleImportFolder}>
             <Import size={16} />
@@ -1359,29 +1392,19 @@ export function App() {
           <button className="icon-button" aria-label="Open settings" onClick={() => setSettingsOpen(true)}>
             <Settings size={17} />
           </button>
-          <button
-            className="icon-button panel-toggle"
-            aria-label={inspectorCollapsed ? "Show inspector panel" : "Hide inspector panel"}
-            onClick={() => setInspectorCollapsed((previous) => !previous)}
-          >
-            {inspectorCollapsed ? <PanelRightOpen size={17} /> : <PanelRightClose size={17} />}
-          </button>
         </header>
-        {queryFilters.length > 0 ? (
-          <div className="tag-grid" aria-label="Parsed search filters">
+        {queryFilters.length > 0 || refreshStatus || importStatus ? (
+          <div className="tag-grid status-strip" aria-label="Status">
             {queryFilters.map((filter, index) => (
               <span key={index} className="suggestion-chip">
                 {filter.field} {filter.operator} {filter.value}
               </span>
             ))}
+            {!queryFilters.length && (refreshStatus || importStatus) ? (
+              <span className="suggestion-chip">{refreshStatus ?? importStatus}</span>
+            ) : null}
           </div>
         ) : null}
-        <section className="onboarding-strip" aria-label="Library status">
-          <button type="button" className="icon-button" aria-label="Refresh library" onClick={() => handleRefreshLibrary()} title="Scan the media root for new files">
-            <RefreshCw size={15} />
-          </button>
-          <span>{refreshStatus ?? importStatus ?? "Referenced import — files stay where they are"}</span>
-        </section>
         <section className="command-strip" aria-label="Command palette preview">
           <Command size={15} />
           <button onClick={() => searchInputRef.current?.focus()}>Focus Search</button>
@@ -1391,7 +1414,6 @@ export function App() {
           <button onClick={handleExportSelected} disabled={!selectedAssetId}>
             Export Selected
           </button>
-          <button onClick={() => setSettingsOpen(true)}>Open Settings</button>
         </section>
         <section className="browser" aria-label="Sound browser" data-density={preferences?.browser_density ?? "Comfortable"}>
           <div className="selection-bar" aria-label="Selection actions">
@@ -1421,6 +1443,7 @@ export function App() {
               <article
                 className={isSelected ? "asset-row selected" : "asset-row"}
                 key={asset.id}
+                data-asset-id={asset.id}
                 onClick={(event) => handleRowClick(asset, index, event)}
               >
                 <button
@@ -1464,9 +1487,17 @@ export function App() {
         </section>
       </section>
       <aside className={inspectorCollapsed ? "inspector collapsed" : "inspector"} aria-label="Inspector">
-        <div className="inspector-head">
+        <div className="panel-head inspector-head">
           <h1>{selectedAsset?.display_name ?? "No sound selected"}</h1>
+          <button
+            className="icon-button panel-toggle"
+            aria-label={inspectorCollapsed ? "Show inspector panel" : "Hide inspector panel"}
+            onClick={() => setInspectorCollapsed((previous) => !previous)}
+          >
+            {inspectorCollapsed ? <PanelRightOpen size={15} /> : <PanelRightClose size={15} />}
+          </button>
         </div>
+        <div className="panel-body">
         {selectedCount > 1 ? (
           <CollapsibleSection
             id="bulk"
@@ -1621,24 +1652,6 @@ export function App() {
           )}
           {exportStatus ? <div className="status-line">{exportStatus}</div> : null}
         </CollapsibleSection>
-        <CollapsibleSection id="shortcuts" title="Shortcuts" collapsed={collapsedSections.has("shortcuts")} onToggle={toggleSection}>
-          <div className="shortcut-list">
-            {(preferences?.shortcuts.bindings ?? []).map((item) => (
-              <div className="shortcut-row" key={item.command}>
-                <span>{item.command}</span>
-                <kbd>{item.accelerator}</kbd>
-              </div>
-            ))}
-            <div className="shortcut-row">
-              <span>Undo</span>
-              <kbd>Mod+Z</kbd>
-            </div>
-            <div className="shortcut-row">
-              <span>Redo</span>
-              <kbd>Mod+Shift+Z</kbd>
-            </div>
-          </div>
-        </CollapsibleSection>
         <CollapsibleSection id="release" title="Release Readiness" collapsed={collapsedSections.has("release")} onToggle={toggleSection}>
           <div className="release-grid">
             {releaseItems.map((item) => (
@@ -1739,6 +1752,7 @@ export function App() {
           </button>
           <div className="status-line">{backupStatus ?? "Copies the catalog snapshot and manifest to a folder you choose"}</div>
         </CollapsibleSection>
+        </div>
       </aside>
       <footer className={sidebarCollapsed ? "transport sidebar-collapsed" : "transport"} aria-label="Transport">
         <button className="icon-button" aria-label="Previous" onClick={() => playRelative(-1)}>
@@ -1766,117 +1780,269 @@ export function App() {
             audio.currentTime = Math.max(0, Math.min(duration, fraction * duration));
           }}
         >
-          {(peaks ?? []).map((peak, i) => (
-            <span key={i} style={{ height: `${4 + peak * 96}%` }} />
-          ))}
+          <div className="waveform-track">
+            {(peaks ?? []).map((peak, i) => (
+              <span key={i} style={{ height: `${4 + peak * 96}%` }} />
+            ))}
+          </div>
+          <div className="waveform-progress" style={{ width: `${duration > 0 ? (currentTime / duration) * 100 : 0}%` }}>
+            {(peaks ?? []).map((peak, i) => (
+              <span key={i} style={{ height: `${4 + peak * 96}%` }} />
+            ))}
+          </div>
         </div>
         <span className="time">
           {formatTime(currentTime)} / {formatTime(duration)}
         </span>
       </footer>
+      <AnimatePresence>
       {settingsOpen ? (
-        <div className="modal-overlay" onClick={() => setSettingsOpen(false)}>
-          <div className="modal-card" onClick={(event) => event.stopPropagation()} aria-label="Settings">
+        <motion.div
+          className="modal-overlay"
+          onClick={() => setSettingsOpen(false)}
+          initial={{ opacity: 0 }}
+          animate={{ opacity: 1 }}
+          exit={{ opacity: 0 }}
+          transition={{ duration: 0.18 }}
+        >
+          <motion.div
+            className="modal-card settings-modal"
+            onClick={(event) => event.stopPropagation()}
+            aria-label="Settings"
+            initial={{ opacity: 0, scale: 0.96, y: 10 }}
+            animate={{ opacity: 1, scale: 1, y: 0 }}
+            exit={{ opacity: 0, scale: 0.96, y: 10 }}
+            transition={{ duration: 0.2, ease: [0.4, 0, 0.2, 1] }}
+          >
             <div className="modal-head">
-              <div>
-                <h1>Settings</h1>
-                <span className="empty-hint">Saved to preferences.json</span>
-              </div>
+              <h1>Settings</h1>
               <button type="button" className="icon-button" aria-label="Close settings" onClick={() => setSettingsOpen(false)}>
                 <X size={16} />
               </button>
             </div>
-            <h2>Library</h2>
-            <div className="settings-stack">
-              <div className="setting-row">
-                <SlidersHorizontal size={15} />
-                <span>Name</span>
-                <strong>{activeLibrary?.name ?? "—"}</strong>
-              </div>
-              <div className="setting-row">
-                <Volume2 size={15} />
-                <span>Media root</span>
-                <strong title={activeLibrary?.media_root}>{activeLibrary?.media_root ?? "—"}</strong>
-              </div>
-              <div className="setting-row">
-                <Gauge size={15} />
-                <span>Status</span>
-                <strong>{mediaRootStatus?.status ?? "unknown"}</strong>
-              </div>
-            </div>
-            <h2>Playback</h2>
-            <div className="settings-stack">
-              <label className="setting-row">
-                <SlidersHorizontal size={15} />
-                <span>Browser density</span>
-                <select
-                  value={preferences?.browser_density ?? "Comfortable"}
-                  onChange={(event) => {
-                    setPreferences((previous) => {
-                      if (!previous) return previous;
-                      const next = {
-                        ...previous,
-                        browser_density: event.target.value as AppPreferences["browser_density"]
-                      };
-                      invoke("save_app_preferences", { preferences: next }).catch(() => {});
-                      return next;
-                    });
-                  }}
-                >
-                  <option value="Compact">Compact</option>
-                  <option value="Comfortable">Comfortable</option>
-                  <option value="Expanded">Expanded</option>
-                </select>
-              </label>
-              <label className="setting-row">
-                <Gauge size={15} />
-                <span>Preview cache (MB)</span>
-                <input
-                  type="number"
-                  min={64}
-                  step={64}
-                  value={preferences?.preview_cache_limit_mb ?? 0}
-                  onChange={(event) => {
-                    const value = Number(event.target.value);
-                    setPreferences((previous) => {
-                      if (!previous || Number.isNaN(value)) return previous;
-                      const next = { ...previous, preview_cache_limit_mb: value };
-                      invoke("save_app_preferences", { preferences: next }).catch(() => {});
-                      return next;
-                    });
-                  }}
-                />
-              </label>
-              <div className="setting-row">
-                <Volume2 size={15} />
-                <span>Output route</span>
-                <strong>{preferences?.output_device === "SystemDefault" ? "System default" : "Custom device"}</strong>
+
+            <div className="settings-section">
+              <h2>Library</h2>
+              <div className="settings-grid">
+                <div className="settings-row">
+                  <SlidersHorizontal size={14} />
+                  <span>Name</span>
+                  <strong>{activeLibrary?.name ?? "—"}</strong>
+                </div>
+                <div className="settings-row">
+                  <Volume2 size={14} />
+                  <span>Media root</span>
+                  <strong className="settings-value-path" title={activeLibrary?.media_root}>
+                    {activeLibrary?.media_root ?? "—"}
+                  </strong>
+                </div>
+                <div className="settings-row">
+                  <Gauge size={14} />
+                  <span>Status</span>
+                  <strong>{mediaRootStatus?.status ?? "unknown"}</strong>
+                </div>
               </div>
             </div>
-            <h2>Accessibility</h2>
-            <div className="toggle-list">
-              <label>
-                <input
-                  type="checkbox"
-                  checked={preferences?.reduced_transparency ?? false}
-                  onChange={handleToggleReducedTransparency}
-                />
-                <Contrast size={15} />
-                Reduced transparency
-              </label>
-              <label>
-                <input
-                  type="checkbox"
-                  checked={preferences?.reduced_motion ?? false}
-                  onChange={handleToggleReducedMotion}
-                />
-                <Zap size={15} />
-                Reduced motion
-              </label>
+
+            <div className="settings-section">
+              <h2>Playback</h2>
+              <div className="settings-grid">
+                <label className="settings-row">
+                  <SlidersHorizontal size={14} />
+                  <span>Browser density</span>
+                  <select
+                    value={preferences?.browser_density ?? "Comfortable"}
+                    onChange={(event) => {
+                      setPreferences((previous) => {
+                        if (!previous) return previous;
+                        const next = {
+                          ...previous,
+                          browser_density: event.target.value as AppPreferences["browser_density"]
+                        };
+                        invoke("save_app_preferences", { preferences: next }).catch(() => {});
+                        return next;
+                      });
+                    }}
+                  >
+                    <option value="Compact">Compact</option>
+                    <option value="Comfortable">Comfortable</option>
+                    <option value="Expanded">Expanded</option>
+                  </select>
+                </label>
+                <div className="settings-row">
+                  <Volume2 size={14} />
+                  <span>Output route</span>
+                  <strong>{preferences?.output_device === "SystemDefault" ? "System default" : "Custom device"}</strong>
+                </div>
+              </div>
             </div>
-          </div>
-        </div>
+
+            <div className="settings-section">
+              <h2>Cache</h2>
+              <div className="settings-grid">
+                <label className="settings-row">
+                  <Gauge size={14} />
+                  <span>Local playback cache limit (MB)</span>
+                  <input
+                    type="number"
+                    min={64}
+                    step={64}
+                    value={preferences?.preview_cache_limit_mb ?? 0}
+                    onChange={(event) => {
+                      const value = Number(event.target.value);
+                      setPreferences((previous) => {
+                        if (!previous || Number.isNaN(value)) return previous;
+                        const next = { ...previous, preview_cache_limit_mb: value };
+                        invoke("save_app_preferences", { preferences: next }).catch(() => {});
+                        return next;
+                      });
+                    }}
+                  />
+                </label>
+                <div className="settings-row">
+                  <RefreshCw size={14} />
+                  <span>{cacheStatus ?? "Cache warms automatically while browsing"}</span>
+                  <button type="button" className="text-button" onClick={handlePurgeCache}>
+                    Purge Cache
+                  </button>
+                </div>
+              </div>
+            </div>
+
+            <div className="settings-section">
+              <h2>Accessibility</h2>
+              <div className="settings-grid">
+                <label className="settings-row">
+                  <Contrast size={14} />
+                  <span>Reduced transparency</span>
+                  <input
+                    type="checkbox"
+                    checked={preferences?.reduced_transparency ?? false}
+                    onChange={handleToggleReducedTransparency}
+                  />
+                </label>
+                <label className="settings-row">
+                  <Zap size={14} />
+                  <span>Reduced motion</span>
+                  <input
+                    type="checkbox"
+                    checked={preferences?.reduced_motion ?? false}
+                    onChange={handleToggleReducedMotion}
+                  />
+                </label>
+              </div>
+            </div>
+          </motion.div>
+        </motion.div>
       ) : null}
+      </AnimatePresence>
+      <AnimatePresence>
+      {newProjectModalOpen ? (
+        <motion.div
+          className="modal-overlay"
+          onClick={() => setNewProjectModalOpen(false)}
+          initial={{ opacity: 0 }}
+          animate={{ opacity: 1 }}
+          exit={{ opacity: 0 }}
+          transition={{ duration: 0.18 }}
+        >
+          <motion.div
+            className="modal-card"
+            onClick={(event) => event.stopPropagation()}
+            aria-label="New project"
+            initial={{ opacity: 0, scale: 0.96, y: 10 }}
+            animate={{ opacity: 1, scale: 1, y: 0 }}
+            exit={{ opacity: 0, scale: 0.96, y: 10 }}
+            transition={{ duration: 0.2, ease: [0.4, 0, 0.2, 1] }}
+          >
+            <div className="modal-head">
+              <h1>New Project</h1>
+              <button type="button" className="icon-button" aria-label="Close" onClick={() => setNewProjectModalOpen(false)}>
+                <X size={16} />
+              </button>
+            </div>
+            <div className="settings-stack">
+              <input
+                autoFocus
+                placeholder="Project name"
+                value={newProjectName}
+                onChange={(event) => setNewProjectName(event.target.value)}
+                onKeyDown={(event) => {
+                  if (event.key === "Enter" && newProjectName.trim()) {
+                    handleCreateProject();
+                    setNewProjectModalOpen(false);
+                  }
+                }}
+              />
+              <button
+                type="button"
+                className="primary-action"
+                disabled={!newProjectName.trim()}
+                onClick={() => {
+                  handleCreateProject();
+                  setNewProjectModalOpen(false);
+                }}
+              >
+                Create Project
+              </button>
+            </div>
+          </motion.div>
+        </motion.div>
+      ) : null}
+      </AnimatePresence>
+      <AnimatePresence>
+      {shortcutsOpen ? (
+        <motion.div
+          className="modal-overlay"
+          onClick={() => setShortcutsOpen(false)}
+          initial={{ opacity: 0 }}
+          animate={{ opacity: 1 }}
+          exit={{ opacity: 0 }}
+          transition={{ duration: 0.18 }}
+        >
+          <motion.div
+            className="modal-card"
+            onClick={(event) => event.stopPropagation()}
+            aria-label="Keyboard shortcuts"
+            initial={{ opacity: 0, scale: 0.96, y: 10 }}
+            animate={{ opacity: 1, scale: 1, y: 0 }}
+            exit={{ opacity: 0, scale: 0.96, y: 10 }}
+            transition={{ duration: 0.2, ease: [0.4, 0, 0.2, 1] }}
+          >
+            <div className="modal-head">
+              <h1>Keyboard Shortcuts</h1>
+              <button type="button" className="icon-button" aria-label="Close" onClick={() => setShortcutsOpen(false)}>
+                <X size={16} />
+              </button>
+            </div>
+            <div className="shortcut-list">
+              {(preferences?.shortcuts.bindings ?? []).map((item) => (
+                <div className="shortcut-row" key={item.command}>
+                  <span>{item.command}</span>
+                  <kbd>{item.accelerator}</kbd>
+                </div>
+              ))}
+              <div className="shortcut-row">
+                <span>Undo</span>
+                <kbd>Mod+Z</kbd>
+              </div>
+              <div className="shortcut-row">
+                <span>Redo</span>
+                <kbd>Mod+Shift+Z</kbd>
+              </div>
+              <div className="shortcut-row">
+                <span>Select All Visible</span>
+                <kbd>Mod+A</kbd>
+              </div>
+              <div className="shortcut-row">
+                <span>Keyboard Shortcuts</span>
+                <kbd>Mod+/</kbd>
+              </div>
+            </div>
+          </motion.div>
+        </motion.div>
+      ) : null}
+      </AnimatePresence>
     </main>
   );
 }
