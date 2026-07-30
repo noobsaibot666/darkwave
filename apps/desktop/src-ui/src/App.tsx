@@ -1,5 +1,5 @@
 import { convertFileSrc, invoke } from "@tauri-apps/api/core";
-import { open as openDialog } from "@tauri-apps/plugin-dialog";
+import { open as openDialog, confirm as confirmDialog } from "@tauri-apps/plugin-dialog";
 import {
   Bell,
   Command,
@@ -44,6 +44,9 @@ type AssetRecord = {
   availability_state: "Unknown" | "Local" | "Cached" | "Missing";
   review_state: "Unreviewed" | "Reviewed";
   favorite: boolean;
+  embedded_title: string | null;
+  embedded_genre: string | null;
+  embedded_comment: string | null;
 };
 
 type ImportFailure = {
@@ -432,6 +435,7 @@ export function App() {
     const requestId = ++peakRequestId.current;
     computePeaks(path).then((computed) => {
       if (peakRequestId.current === requestId) setPeaks(computed);
+      if (computed) invoke("mark_waveform_ready", { assetId: asset.id }).catch(() => {});
     });
   }, []);
 
@@ -493,6 +497,20 @@ export function App() {
       invoke<string>("apply_tag", { assetIds: [selectedAssetId], tagId: tag.id })
         .then((undoId) => {
           setUndoStack((previous) => [...previous, { id: undoId, label: `Apply "${tag.name}"` }]);
+          setRedoStack([]);
+          refreshAssetTags(selectedAssetId);
+        })
+        .catch(() => {});
+    },
+    [selectedAssetId, refreshAssetTags]
+  );
+
+  const handleRemoveTag = useCallback(
+    (tag: TagRecord) => {
+      if (!selectedAssetId) return;
+      invoke<string>("remove_tag", { assetId: selectedAssetId, tagId: tag.id })
+        .then((undoId) => {
+          setUndoStack((previous) => [...previous, { id: undoId, label: `Remove "${tag.name}"` }]);
           setRedoStack([]);
           refreshAssetTags(selectedAssetId);
         })
@@ -596,6 +614,20 @@ export function App() {
       .catch(() => {});
   }, [selectedAssetId, activeLibraryId, searchQuery, activeFilter, refreshAssets, refreshTrashItems, refreshMaintenance]);
 
+  const handleTrashDuplicateGroup = useCallback(
+    (assetIds: string[]) => {
+      if (!activeLibraryId) return;
+      invoke("trash_duplicate_group", { assetIds })
+        .then(() => {
+          refreshAssets(activeLibraryId, searchQuery, activeFilter);
+          refreshTrashItems(activeLibraryId);
+          refreshMaintenance(activeLibraryId);
+        })
+        .catch(() => {});
+    },
+    [activeLibraryId, searchQuery, activeFilter, refreshAssets, refreshTrashItems, refreshMaintenance]
+  );
+
   const handleRestoreFromTrash = useCallback(
     (item: TrashItem) => {
       if (!activeLibraryId) return;
@@ -648,6 +680,29 @@ export function App() {
     }
   }, [activeLibraryId]);
 
+  const handleRestoreLibrary = useCallback(async () => {
+    const source = await openDialog({ directory: true, multiple: false, title: "Choose a backup folder to restore" });
+    if (typeof source !== "string") return;
+
+    const confirmed = await confirmDialog(
+      "This replaces the current catalog with the selected backup. A safety copy of the current catalog is kept, but any changes made since the backup was taken will no longer be visible.",
+      { title: "Restore library from backup", kind: "warning" }
+    );
+    if (!confirmed) return;
+
+    setBackupStatus("Restoring…");
+    try {
+      const libraryCount = await invoke<number>("restore_library", { backupDir: source });
+      setBackupStatus(`Restored ${libraryCount} librar${libraryCount === 1 ? "y" : "ies"} from backup`);
+      setSelectedAssetId(null);
+      const loaded = await invoke<LibraryRecord[]>("list_libraries");
+      setLibraries(loaded);
+      setActiveLibraryId(loaded.length > 0 ? loaded[0].id : null);
+    } catch (error) {
+      setBackupStatus(`Restore failed: ${String(error)}`);
+    }
+  }, []);
+
   const handleChooseMediaRoot = async () => {
     const selected = await openDialog({ directory: true, multiple: false, title: "Choose media location" });
     if (typeof selected === "string") setLibraryRoot(selected);
@@ -686,6 +741,9 @@ export function App() {
       );
       refreshAssets(activeLibraryId, searchQuery, activeFilter);
       refreshMaintenance(activeLibraryId);
+      invoke<number>("process_pending_jobs")
+        .then(() => refreshAssets(activeLibraryId, searchQuery, activeFilter))
+        .catch(() => {});
     } catch (error) {
       setImportStatus(`Import failed: ${String(error)}`);
     }
@@ -1057,7 +1115,14 @@ export function App() {
             {appliedTags.length === 0 ? (
               <span className="empty-hint">No tags applied</span>
             ) : (
-              appliedTags.map((tag) => <span key={tag.id}>{tag.name}</span>)
+              appliedTags.map((tag) => (
+                <span key={tag.id} className="suggestion-chip">
+                  {tag.name}
+                  <button onClick={() => handleRemoveTag(tag)} aria-label={`Remove ${tag.name}`}>
+                    ✗
+                  </button>
+                </span>
+              ))
             )}
           </div>
           <h2>Add Tag</h2>
@@ -1095,6 +1160,16 @@ export function App() {
             ))}
           </div>
         </section>
+        {selectedAsset && (selectedAsset.embedded_title || selectedAsset.embedded_genre || selectedAsset.embedded_comment) ? (
+          <section>
+            <h2>Embedded Metadata</h2>
+            <div className="settings-stack">
+              {selectedAsset.embedded_title ? <div className="status-line">Title: {selectedAsset.embedded_title}</div> : null}
+              {selectedAsset.embedded_genre ? <div className="status-line">Genre: {selectedAsset.embedded_genre}</div> : null}
+              {selectedAsset.embedded_comment ? <div className="status-line">Comment: {selectedAsset.embedded_comment}</div> : null}
+            </div>
+          </section>
+        ) : null}
         <section>
           <h2>Source &amp; License</h2>
           {sourceDraft ? (
@@ -1224,6 +1299,9 @@ export function App() {
                 .map((finding, index) => (
                   <div className="status-line" key={index}>
                     {finding.asset_ids.length} duplicate files sharing content
+                    <button type="button" className="text-button" onClick={() => handleTrashDuplicateGroup(finding.asset_ids)}>
+                      Keep oldest, trash rest
+                    </button>
                   </div>
                 ))}
             </div>
@@ -1284,10 +1362,10 @@ export function App() {
           <button type="button" className="text-button" onClick={handleBackupLibrary} disabled={!activeLibraryId}>
             Back Up Library
           </button>
+          <button type="button" className="text-button" onClick={handleRestoreLibrary}>
+            Restore From Backup…
+          </button>
           <div className="status-line">{backupStatus ?? "Copies the catalog snapshot and manifest to a folder you choose"}</div>
-          <div className="status-line" title="Restoring would overwrite the live, currently-open catalog database">
-            Restore not wired up yet — data-safety risk, see ADR 0020
-          </div>
         </section>
       </aside>
       <footer className="transport" aria-label="Transport">

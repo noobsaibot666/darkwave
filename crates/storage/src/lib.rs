@@ -64,6 +64,9 @@ pub struct AssetRecord {
     pub availability_state: AvailabilityState,
     pub review_state: ReviewState,
     pub favorite: bool,
+    pub embedded_title: Option<String>,
+    pub embedded_genre: Option<String>,
+    pub embedded_comment: Option<String>,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
@@ -319,7 +322,8 @@ impl Catalog {
     pub fn list_assets(&self, library_id: Uuid) -> Result<Vec<AssetRecord>, StorageError> {
         let mut statement = self.connection.prepare(
             "SELECT id, library_id, original_filename, display_name, relative_path, referenced_path,
-                storage_mode, content_hash, media_type, file_size, availability_state, review_state, favorite
+                storage_mode, content_hash, media_type, file_size, availability_state, review_state, favorite,
+                    embedded_title, embedded_genre, embedded_comment
              FROM assets
              WHERE library_id = ?1
                AND NOT EXISTS (
@@ -385,6 +389,80 @@ impl Catalog {
             )
             .optional()
             .map_err(StorageError::from)
+    }
+
+    pub fn complete_job(&self, job_id: Uuid) -> Result<(), StorageError> {
+        self.connection.execute(
+            "UPDATE background_jobs SET state = 'completed', updated_at = ?1 WHERE id = ?2",
+            params![Utc::now().to_rfc3339(), job_id.to_string()],
+        )?;
+        Ok(())
+    }
+
+    pub fn fail_job(&self, job_id: Uuid) -> Result<(), StorageError> {
+        self.connection.execute(
+            "UPDATE background_jobs SET state = 'failed', attempts = attempts + 1, updated_at = ?1 WHERE id = ?2",
+            params![Utc::now().to_rfc3339(), job_id.to_string()],
+        )?;
+        Ok(())
+    }
+
+    pub fn complete_pending_jobs_for_asset(
+        &self,
+        asset_id: Uuid,
+        kind: JobKind,
+    ) -> Result<usize, StorageError> {
+        let updated = self.connection.execute(
+            "UPDATE background_jobs SET state = 'completed', updated_at = ?1
+             WHERE asset_id = ?2 AND kind = ?3 AND state = 'pending'",
+            params![
+                Utc::now().to_rfc3339(),
+                asset_id.to_string(),
+                job_kind_to_db(&kind),
+            ],
+        )?;
+        Ok(updated)
+    }
+
+    pub fn pending_jobs_of_kind(
+        &self,
+        kind: JobKind,
+        limit: usize,
+    ) -> Result<Vec<JobRecord>, StorageError> {
+        let mut statement = self.connection.prepare(
+            "SELECT id, asset_id, kind, priority
+             FROM background_jobs
+             WHERE state = 'pending' AND kind = ?1
+             ORDER BY priority ASC, created_at ASC
+             LIMIT ?2",
+        )?;
+
+        let jobs = statement
+            .query_map(params![job_kind_to_db(&kind), limit as i64], |row| {
+                Ok(JobRecord {
+                    id: parse_uuid(row.get::<_, String>(0)?),
+                    asset_id: parse_uuid(row.get::<_, String>(1)?),
+                    kind: job_kind_from_db(&row.get::<_, String>(2)?),
+                    priority: row.get(3)?,
+                })
+            })?
+            .collect::<Result<Vec<_>, _>>()?;
+
+        Ok(jobs)
+    }
+
+    pub fn set_embedded_metadata(
+        &self,
+        asset_id: Uuid,
+        title: Option<String>,
+        genre: Option<String>,
+        comment: Option<String>,
+    ) -> Result<(), StorageError> {
+        self.connection.execute(
+            "UPDATE assets SET embedded_title = ?1, embedded_genre = ?2, embedded_comment = ?3 WHERE id = ?4",
+            params![title, genre, comment, asset_id.to_string()],
+        )?;
+        Ok(())
     }
 
     pub fn seed_starter_taxonomy(&self) -> Result<(), StorageError> {
@@ -481,6 +559,28 @@ impl Catalog {
                 tag_origin_to_db(origin),
                 join_uuids(asset_ids)
             ),
+        )
+    }
+
+    pub fn remove_tag_from_asset(
+        &self,
+        asset_id: Uuid,
+        tag_id: Uuid,
+    ) -> Result<Uuid, StorageError> {
+        let origin: String = self.connection.query_row(
+            "SELECT origin FROM asset_tags WHERE asset_id = ?1 AND tag_id = ?2",
+            params![asset_id.to_string(), tag_id.to_string()],
+            |row| row.get(0),
+        )?;
+
+        self.connection.execute(
+            "DELETE FROM asset_tags WHERE asset_id = ?1 AND tag_id = ?2",
+            params![asset_id.to_string(), tag_id.to_string()],
+        )?;
+
+        self.record_undo(
+            "readd_asset_tags",
+            &format!("{}|{}|{}", tag_id, origin, join_uuids(&[asset_id])),
         )
     }
 
@@ -629,7 +729,8 @@ impl Catalog {
         let mut statement = self.connection.prepare(
             "SELECT assets.id, assets.library_id, assets.original_filename, assets.display_name,
                 assets.relative_path, assets.referenced_path, assets.storage_mode, assets.content_hash,
-                assets.media_type, assets.file_size, assets.availability_state, assets.review_state, assets.favorite
+                assets.media_type, assets.file_size, assets.availability_state, assets.review_state, assets.favorite,
+                assets.embedded_title, assets.embedded_genre, assets.embedded_comment
              FROM assets
              INNER JOIN collection_assets ON collection_assets.asset_id = assets.id
              WHERE collection_assets.collection_id = ?1
@@ -677,7 +778,8 @@ impl Catalog {
         let mut sql = String::from(
             "SELECT assets.id, assets.library_id, assets.original_filename, assets.display_name,
                 assets.relative_path, assets.referenced_path, assets.storage_mode, assets.content_hash,
-                assets.media_type, assets.file_size, assets.availability_state, assets.review_state, assets.favorite
+                assets.media_type, assets.file_size, assets.availability_state, assets.review_state, assets.favorite,
+                assets.embedded_title, assets.embedded_genre, assets.embedded_comment
              FROM assets",
         );
         let mut query_params = vec![library_id.to_string()];
@@ -1023,6 +1125,16 @@ impl Catalog {
                     )?;
                 }
             }
+            "readd_asset_tags" => {
+                let (tag_id, origin, asset_ids) = split_tag_owner_origin_and_assets(&payload);
+                for asset_id in asset_ids {
+                    self.connection.execute(
+                        "INSERT OR IGNORE INTO asset_tags (asset_id, tag_id, origin, confidence, approval_state, created_at)
+                         VALUES (?1, ?2, ?3, 1.0, 'accepted', ?4)",
+                        params![asset_id.to_string(), tag_id.to_string(), origin, Utc::now().to_rfc3339()],
+                    )?;
+                }
+            }
             _ => {}
         }
 
@@ -1067,6 +1179,15 @@ impl Catalog {
                         "INSERT OR IGNORE INTO collection_assets (collection_id, asset_id, created_at)
                          VALUES (?1, ?2, ?3)",
                         params![owner_id.to_string(), asset_id.to_string(), now],
+                    )?;
+                }
+            }
+            "readd_asset_tags" => {
+                let (tag_id, _origin, asset_ids) = split_tag_owner_origin_and_assets(&payload);
+                for asset_id in asset_ids {
+                    self.connection.execute(
+                        "DELETE FROM asset_tags WHERE tag_id = ?1 AND asset_id = ?2",
+                        params![tag_id.to_string(), asset_id.to_string()],
                     )?;
                 }
             }
@@ -1248,7 +1369,10 @@ impl Catalog {
               play_count INTEGER NOT NULL DEFAULT 0,
               export_count INTEGER NOT NULL DEFAULT 0,
               favorite INTEGER NOT NULL DEFAULT 0,
-              notes TEXT
+              notes TEXT,
+              embedded_title TEXT,
+              embedded_genre TEXT,
+              embedded_comment TEXT
             );
 
             CREATE TABLE IF NOT EXISTS background_jobs (
@@ -1391,7 +1515,8 @@ impl Catalog {
         self.connection
             .query_row(
                 "SELECT id, library_id, original_filename, display_name, relative_path, referenced_path,
-                    storage_mode, content_hash, media_type, file_size, availability_state, review_state, favorite
+                    storage_mode, content_hash, media_type, file_size, availability_state, review_state, favorite,
+                    embedded_title, embedded_genre, embedded_comment
                  FROM assets WHERE id = ?1",
                 params![id.to_string()],
                 asset_from_row,
@@ -1409,7 +1534,8 @@ impl Catalog {
         self.connection
             .query_row(
                 "SELECT id, library_id, original_filename, display_name, relative_path, referenced_path,
-                    storage_mode, content_hash, media_type, file_size, availability_state, review_state, favorite
+                    storage_mode, content_hash, media_type, file_size, availability_state, review_state, favorite,
+                    embedded_title, embedded_genre, embedded_comment
                  FROM assets
                  WHERE library_id = ?1 AND content_hash = ?2 AND file_size = ?3
                  LIMIT 1",
@@ -1452,6 +1578,9 @@ fn asset_from_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<AssetRecord> {
         availability_state: availability_from_db(&row.get::<_, String>(10)?),
         review_state: review_state_from_db(&row.get::<_, String>(11)?),
         favorite: row.get::<_, i64>(12)? != 0,
+        embedded_title: row.get(13)?,
+        embedded_genre: row.get(14)?,
+        embedded_comment: row.get(15)?,
     })
 }
 
@@ -1843,6 +1972,119 @@ mod tests {
     }
 
     #[test]
+    fn completing_a_job_removes_it_from_the_pending_queue() {
+        let catalog_path = unique_catalog_path("job-complete");
+        let catalog = Catalog::open(&catalog_path).expect("open catalog");
+        let library = catalog.create_library("Jobs", "/library").expect("library");
+        let asset = test_asset(&catalog, library.id, "tone.wav", "hash-job-complete");
+        let job = catalog
+            .enqueue_job(asset.id, JobKind::MetadataExtraction, 10)
+            .expect("enqueue");
+
+        assert_eq!(
+            catalog
+                .pending_jobs_of_kind(JobKind::MetadataExtraction, 10)
+                .expect("pending jobs")
+                .len(),
+            1
+        );
+
+        catalog.complete_job(job.id).expect("complete job");
+
+        assert!(catalog
+            .pending_jobs_of_kind(JobKind::MetadataExtraction, 10)
+            .expect("pending jobs")
+            .is_empty());
+    }
+
+    #[test]
+    fn failing_a_job_increments_attempts_and_clears_it_from_pending() {
+        let catalog_path = unique_catalog_path("job-fail");
+        let catalog = Catalog::open(&catalog_path).expect("open catalog");
+        let library = catalog.create_library("Jobs", "/library").expect("library");
+        let asset = test_asset(&catalog, library.id, "tone.wav", "hash-job-fail");
+        let job = catalog
+            .enqueue_job(asset.id, JobKind::MetadataExtraction, 10)
+            .expect("enqueue");
+
+        catalog.fail_job(job.id).expect("fail job");
+
+        assert!(catalog
+            .pending_jobs_of_kind(JobKind::MetadataExtraction, 10)
+            .expect("pending jobs")
+            .is_empty());
+    }
+
+    #[test]
+    fn completing_pending_jobs_for_asset_only_touches_matching_asset_and_kind() {
+        let catalog_path = unique_catalog_path("job-complete-for-asset");
+        let catalog = Catalog::open(&catalog_path).expect("open catalog");
+        let library = catalog.create_library("Jobs", "/library").expect("library");
+        let first = test_asset(&catalog, library.id, "one.wav", "hash-complete-1");
+        let second = test_asset(&catalog, library.id, "two.wav", "hash-complete-2");
+
+        catalog
+            .enqueue_job(first.id, JobKind::WaveformGeneration, 30)
+            .expect("enqueue waveform");
+        catalog
+            .enqueue_job(first.id, JobKind::MetadataExtraction, 10)
+            .expect("enqueue metadata");
+        catalog
+            .enqueue_job(second.id, JobKind::WaveformGeneration, 30)
+            .expect("enqueue waveform for other asset");
+
+        let completed = catalog
+            .complete_pending_jobs_for_asset(first.id, JobKind::WaveformGeneration)
+            .expect("complete");
+
+        assert_eq!(completed, 1);
+        assert_eq!(
+            catalog
+                .pending_job_count(JobKind::WaveformGeneration)
+                .expect("count"),
+            1
+        );
+        assert_eq!(
+            catalog
+                .pending_job_count(JobKind::MetadataExtraction)
+                .expect("count"),
+            1
+        );
+    }
+
+    #[test]
+    fn embedded_metadata_round_trips_through_get_asset() {
+        let catalog_path = unique_catalog_path("embedded-metadata");
+        let catalog = Catalog::open(&catalog_path).expect("open catalog");
+        let library = catalog.create_library("Org", "/library").expect("library");
+        let asset = test_asset(&catalog, library.id, "tone.wav", "hash-embedded");
+
+        assert_eq!(
+            catalog.get_asset(asset.id).expect("asset").expect("some"),
+            AssetRecord {
+                embedded_title: None,
+                embedded_genre: None,
+                embedded_comment: None,
+                ..asset.clone()
+            }
+        );
+
+        catalog
+            .set_embedded_metadata(
+                asset.id,
+                Some("Rain Loop".to_string()),
+                Some("Ambience".to_string()),
+                None,
+            )
+            .expect("set embedded metadata");
+
+        let reloaded = catalog.get_asset(asset.id).expect("asset").expect("some");
+        assert_eq!(reloaded.embedded_title, Some("Rain Loop".to_string()));
+        assert_eq!(reloaded.embedded_genre, Some("Ambience".to_string()));
+        assert_eq!(reloaded.embedded_comment, None);
+    }
+
+    #[test]
     fn starter_taxonomy_seeds_system_tags_once() {
         let catalog_path = unique_catalog_path("taxonomy");
         let catalog = Catalog::open(&catalog_path).expect("open catalog");
@@ -1920,6 +2162,33 @@ mod tests {
             catalog.tags_for_asset(second.id).expect("second tags"),
             vec![tag]
         );
+    }
+
+    #[test]
+    fn removing_a_tag_is_undoable_and_redoable() {
+        let catalog_path = unique_catalog_path("tag-remove");
+        let catalog = Catalog::open(&catalog_path).expect("open catalog");
+        let library = catalog.create_library("Org", "/library").expect("library");
+        let asset = test_asset(&catalog, library.id, "one.wav", "hash-one");
+        let tag = catalog.create_tag("Impact", "action", true).expect("tag");
+        catalog
+            .apply_tag_to_assets(&[asset.id], tag.id, TagOrigin::Manual)
+            .expect("apply tag");
+
+        let undo_id = catalog
+            .remove_tag_from_asset(asset.id, tag.id)
+            .expect("remove tag");
+
+        assert!(catalog.tags_for_asset(asset.id).expect("tags").is_empty());
+
+        catalog.undo(undo_id).expect("undo");
+        assert_eq!(
+            catalog.tags_for_asset(asset.id).expect("tags"),
+            vec![tag.clone()]
+        );
+
+        catalog.redo(undo_id).expect("redo");
+        assert!(catalog.tags_for_asset(asset.id).expect("tags").is_empty());
     }
 
     #[test]

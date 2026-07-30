@@ -15,6 +15,7 @@ crate-type = ["staticlib", "cdylib", "rlib"]
 tauri-build = { version = "2", features = [] }
 
 [dependencies]
+audio-metadata = { path = "../../../crates/audio-metadata" }
 backup = { path = "../../../crates/backup" }
 command-palette = { path = "../../../crates/command-palette" }
 export-pipeline = { path = "../../../crates/export-pipeline" }

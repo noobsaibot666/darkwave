@@ -34,7 +34,7 @@ A second follow-up added backup creation: `backup_library` builds a `PortableMan
 
 ## Consequences
 
-- Every interactive element in the desktop shell either does something real or is explicitly disabled with a tooltip saying it isn't wired yet (restore, duplicate-group actions beyond listing, and native drag-and-drop remain in that state after this pass).
+- Every interactive element in the desktop shell either does something real or is explicitly disabled with a tooltip saying it isn't wired yet (restore, duplicate-group actions beyond listing, and native drag-and-drop remain in that state after this pass). Restore and exact-duplicate trashing were subsequently wired in ADR 0021; native drag-and-drop remains deferred.
 - Per-row waveform bars in the asset browser were replaced with a neutral icon rather than fake random data; only the transport bar, for whatever is currently loaded, renders real computed peaks. Decoding every visible row's audio for a cosmetic mini-waveform was judged not worth the performance cost for an MVP with no background waveform cache yet.
 - Tag removal (as opposed to applying a tag or undoing the last apply) has no dedicated command yet — applied tags are shown but not individually removable outside of undo.
 - The maintenance report's duplicate detection is exact-hash-only; likely-duplicate detection needs real audio fingerprint extraction, which doesn't exist anywhere in the codebase yet.

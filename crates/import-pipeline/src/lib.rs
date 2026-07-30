@@ -274,7 +274,8 @@ fn import_file_internal(
     })?;
 
     catalog.enqueue_job(asset.id, JobKind::MetadataExtraction, 10)?;
-    catalog.enqueue_job(asset.id, JobKind::Hashing, 20)?;
+    // No Hashing job: content_hash above is already a full-file SHA-256, not a partial
+    // sample, so there is no further hashing work for a background job to do.
     catalog.enqueue_job(asset.id, JobKind::WaveformGeneration, 30)?;
     suggest_import_tags(catalog, &asset, &tag_suggestions)?;
     if let Some(source_context) = source_context {

@@ -200,6 +200,70 @@ fn backup_library(
     .map_err(|error| format!("{error:?}"))
 }
 
+/// Restores a catalog from a backup folder produced by `backup_library`. The live
+/// SQLite connection is closed (by swapping it out for an in-memory placeholder under
+/// the same mutex the rest of the app uses) before the file on disk is touched, and the
+/// snapshot is staged next to the live catalog and only `rename`d into place once fully
+/// copied, so a failed or partial copy never corrupts the live database.
+#[tauri::command]
+fn restore_library(app: tauri::AppHandle, state: tauri::State<CatalogState>, backup_dir: String) -> Result<usize, String> {
+    let backup_dir = backup_dir.trim_end_matches('/');
+    let catalog_snapshot_path = format!("{backup_dir}/catalog.sqlite");
+    let manifest_snapshot_path = format!("{backup_dir}/library.darkwave-manifest.json");
+
+    if !std::path::Path::new(&catalog_snapshot_path).exists() {
+        return Err("no catalog.sqlite found in the selected backup folder".to_string());
+    }
+    if !std::path::Path::new(&manifest_snapshot_path).exists() {
+        return Err("no manifest found in the selected backup folder".to_string());
+    }
+
+    let app_data_dir = app
+        .path()
+        .app_data_dir()
+        .map_err(|error| format!("resolve app data directory: {error}"))?;
+    let catalog_path = app_data_dir.join("catalog.sqlite");
+    let manifest_path = app_data_dir.join("library.darkwave-manifest.json");
+    let staged_catalog_path = app_data_dir.join("catalog.sqlite.restoring");
+
+    std::fs::copy(&catalog_snapshot_path, &staged_catalog_path)
+        .map_err(|error| format!("stage catalog snapshot: {error}"))?;
+
+    let mut guard = state.0.lock().expect("catalog mutex poisoned");
+    let _ = std::fs::copy(&catalog_path, app_data_dir.join("catalog.sqlite.before-restore"));
+    drop(std::mem::replace(
+        &mut *guard,
+        Catalog::open(":memory:").map_err(storage_error_message)?,
+    ));
+
+    let swap_result = std::fs::rename(&staged_catalog_path, &catalog_path)
+        .map_err(|error| format!("replace live catalog: {error}"))
+        .and_then(|_| {
+            std::fs::copy(&manifest_snapshot_path, &manifest_path)
+                .map(|_| ())
+                .map_err(|error| format!("copy manifest snapshot: {error}"))
+        });
+
+    let reopened = Catalog::open(&catalog_path).map_err(storage_error_message);
+
+    match (swap_result, reopened) {
+        (Ok(()), Ok(catalog)) => {
+            let library_count = catalog.list_libraries().map_err(storage_error_message)?.len();
+            *guard = catalog;
+            Ok(library_count)
+        }
+        (Err(error), Ok(catalog)) => {
+            *guard = catalog;
+            Err(error)
+        }
+        (_, Err(open_error)) => {
+            let _ = std::fs::remove_file(&staged_catalog_path);
+            *guard = Catalog::open(":memory:").map_err(storage_error_message)?;
+            Err(format!("catalog unreadable after restore attempt: {open_error}"))
+        }
+    }
+}
+
 #[tauri::command]
 fn supported_drag_targets() -> Vec<&'static str> {
     vec![
@@ -354,6 +418,28 @@ fn purge_from_trash(state: tauri::State<CatalogState>, asset_id: String) -> Resu
 }
 
 #[tauri::command]
+fn trash_duplicate_group(
+    state: tauri::State<CatalogState>,
+    asset_ids: Vec<String>,
+) -> Result<usize, String> {
+    let asset_ids = asset_ids
+        .iter()
+        .map(|id| parse_uuid_field(id, "asset id"))
+        .collect::<Result<Vec<_>, _>>()?;
+
+    let catalog = state.0.lock().expect("catalog mutex poisoned");
+    let mut trashed = 0usize;
+    for asset_id in asset_ids.iter().skip(1) {
+        catalog
+            .move_asset_to_trash(*asset_id, "duplicate content", current_time_ms())
+            .map_err(storage_error_message)?;
+        trashed += 1;
+    }
+
+    Ok(trashed)
+}
+
+#[tauri::command]
 fn backup_restore_requirements() -> Vec<&'static str> {
     vec!["catalog_snapshot", "portable_manifest", "media_root"]
 }
@@ -504,8 +590,12 @@ fn asset_playback_path(
         .map_err(storage_error_message)?
         .ok_or_else(|| "asset not found".to_string())?;
 
-    match asset.path {
-        AssetPath::Referenced(path) => Ok(path),
+    resolve_asset_path(&catalog, &asset)
+}
+
+fn resolve_asset_path(catalog: &Catalog, asset: &AssetRecord) -> Result<String, String> {
+    match &asset.path {
+        AssetPath::Referenced(path) => Ok(path.clone()),
         AssetPath::Managed(relative_path) => {
             let library = catalog
                 .get_library(asset.library_id)
@@ -518,6 +608,51 @@ fn asset_playback_path(
             ))
         }
     }
+}
+
+#[tauri::command]
+fn mark_waveform_ready(state: tauri::State<CatalogState>, asset_id: String) -> Result<usize, String> {
+    let asset_id = parse_uuid_field(&asset_id, "asset id")?;
+    let catalog = state.0.lock().expect("catalog mutex poisoned");
+    catalog
+        .complete_pending_jobs_for_asset(asset_id, JobKind::WaveformGeneration)
+        .map_err(storage_error_message)
+}
+
+#[tauri::command]
+fn process_pending_jobs(state: tauri::State<CatalogState>) -> Result<usize, String> {
+    let catalog = state.0.lock().expect("catalog mutex poisoned");
+    let jobs = catalog
+        .pending_jobs_of_kind(JobKind::MetadataExtraction, 50)
+        .map_err(storage_error_message)?;
+
+    let mut processed = 0usize;
+    for job in jobs {
+        let outcome = catalog
+            .get_asset(job.asset_id)
+            .map_err(storage_error_message)
+            .and_then(|asset| asset.ok_or_else(|| "asset not found".to_string()))
+            .and_then(|asset| resolve_asset_path(&catalog, &asset))
+            .and_then(|path| {
+                audio_metadata::extract_embedded_metadata(&path)
+                    .map_err(|error| format!("{error:?}"))
+            });
+
+        match outcome {
+            Ok(embedded) => {
+                catalog
+                    .set_embedded_metadata(job.asset_id, embedded.title, embedded.genre, embedded.comment)
+                    .map_err(storage_error_message)?;
+                catalog.complete_job(job.id).map_err(storage_error_message)?;
+            }
+            Err(_) => {
+                catalog.fail_job(job.id).map_err(storage_error_message)?;
+            }
+        }
+        processed += 1;
+    }
+
+    Ok(processed)
 }
 
 #[tauri::command]
@@ -577,6 +712,23 @@ fn apply_tag(
     let catalog = state.0.lock().expect("catalog mutex poisoned");
     let undo_id = catalog
         .apply_tag_to_assets(&asset_ids, tag_id, TagOrigin::Manual)
+        .map_err(storage_error_message)?;
+
+    Ok(undo_id.to_string())
+}
+
+#[tauri::command]
+fn remove_tag(
+    state: tauri::State<CatalogState>,
+    asset_id: String,
+    tag_id: String,
+) -> Result<String, String> {
+    let asset_id = parse_uuid_field(&asset_id, "asset id")?;
+    let tag_id = parse_uuid_field(&tag_id, "tag id")?;
+
+    let catalog = state.0.lock().expect("catalog mutex poisoned");
+    let undo_id = catalog
+        .remove_tag_from_asset(asset_id, tag_id)
         .map_err(storage_error_message)?;
 
     Ok(undo_id.to_string())
@@ -848,6 +1000,7 @@ pub fn run() {
             tags_for_asset,
             suggested_tags_for_asset,
             apply_tag,
+            remove_tag,
             accept_suggested_tag,
             reject_suggested_tag,
             set_favorite,
@@ -868,7 +1021,11 @@ pub fn run() {
             restore_from_trash,
             purge_from_trash,
             apply_offline_control,
-            backup_library
+            backup_library,
+            restore_library,
+            process_pending_jobs,
+            mark_waveform_ready,
+            trash_duplicate_group
         ])
         .run(tauri::generate_context!())
         .expect("failed to run Darkwave desktop shell");
