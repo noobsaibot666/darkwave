@@ -544,7 +544,7 @@ button:disabled,
   top: 0;
   z-index: 2;
   margin: 0 -18px;
-  padding: 8px 28px 8px 174px;
+  padding: 14px 28px 14px 174px;
   border-bottom: 1px solid rgba(243, 240, 231, 0.08);
   background: rgba(29, 26, 21, 0.82);
   backdrop-filter: blur(20px) saturate(1.4);
