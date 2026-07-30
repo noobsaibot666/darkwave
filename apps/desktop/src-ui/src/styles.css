@@ -148,6 +148,7 @@ button.panel-handle-right:active:not(:disabled) {
 }
 
 .panel-body > section {
+  flex-shrink: 0;
   margin-top: 12px;
   border-radius: 20px;
   border: 1px solid rgba(243, 240, 231, 0.08);
@@ -952,11 +953,14 @@ kbd {
 
 .status-line {
   display: flex;
-  gap: 8px;
+  flex-wrap: wrap;
+  gap: 4px 8px;
   align-items: center;
   min-height: 28px;
+  min-width: 0;
   color: #b3a291;
   font-size: 12px;
+  overflow-wrap: break-word;
 }
 
 .warning-line {
