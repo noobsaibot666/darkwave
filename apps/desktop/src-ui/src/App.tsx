@@ -372,7 +372,9 @@ export function App() {
   const [settingsOpen, setSettingsOpen] = useState(false);
   const [filterMenuOpen, setFilterMenuOpen] = useState(false);
   const [sfxSubcategoriesOpen, setSfxSubcategoriesOpen] = useState(false);
-  const [collapsedSections, setCollapsedSections] = useState<Set<string>>(() => new Set(["release"]));
+  const [collapsedSections, setCollapsedSections] = useState<Set<string>>(
+    () => new Set(["projects", "embedded", "detected", "source", "release", "maintenance", "nas", "trash", "backup"])
+  );
   const [refreshStatus, setRefreshStatus] = useState<string | null>(null);
   const [newProjectModalOpen, setNewProjectModalOpen] = useState(false);
   const [shortcutsOpen, setShortcutsOpen] = useState(false);
@@ -1832,9 +1834,6 @@ export function App() {
         </section>
       </section>
       <aside className={inspectorCollapsed ? "inspector collapsed" : "inspector"} aria-label="Inspector">
-        <div className="panel-head inspector-head">
-          <h1>{selectedAsset?.display_name ?? "No sound selected"}</h1>
-        </div>
         <div className="panel-body">
         {selectedCount > 1 ? (
           <CollapsibleSection
