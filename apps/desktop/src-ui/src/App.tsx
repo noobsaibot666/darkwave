@@ -5,6 +5,7 @@ import { open as openDialog, save as saveDialog, confirm as confirmDialog } from
 import {
   Bell,
   ChevronDown,
+  ChevronLeft,
   ChevronRight,
   Command,
   Contrast,
@@ -12,10 +13,6 @@ import {
   Import,
   ListFilter,
   Music,
-  PanelLeftClose,
-  PanelLeftOpen,
-  PanelRightClose,
-  PanelRightOpen,
   Pause,
   Play,
   RefreshCw,
@@ -1248,7 +1245,15 @@ export function App() {
   }
 
   return (
-    <main className="shell">
+    <main
+      className={[
+        "shell",
+        sidebarCollapsed ? "sidebar-collapsed" : "",
+        inspectorCollapsed ? "inspector-collapsed" : "",
+      ]
+        .filter(Boolean)
+        .join(" ")}
+    >
       <audio
         ref={audioRef}
         onPlay={() => setIsPlaying(true)}
@@ -1257,17 +1262,25 @@ export function App() {
         onLoadedMetadata={(event) => setDuration(event.currentTarget.duration)}
         onEnded={() => playRelative(1)}
       />
+      <button
+        type="button"
+        className="panel-handle panel-handle-left"
+        style={{ left: sidebarCollapsed ? "8px" : "232px" }}
+        aria-label={sidebarCollapsed ? "Show library panel" : "Hide library panel"}
+        onClick={() => setSidebarCollapsed((previous) => !previous)}
+      >
+        {sidebarCollapsed ? <ChevronRight size={13} /> : <ChevronLeft size={13} />}
+      </button>
+      <button
+        type="button"
+        className="panel-handle panel-handle-right"
+        style={{ right: inspectorCollapsed ? "8px" : "312px" }}
+        aria-label={inspectorCollapsed ? "Show inspector panel" : "Hide inspector panel"}
+        onClick={() => setInspectorCollapsed((previous) => !previous)}
+      >
+        {inspectorCollapsed ? <ChevronLeft size={13} /> : <ChevronRight size={13} />}
+      </button>
       <aside className={sidebarCollapsed ? "sidebar collapsed" : "sidebar"} aria-label="Library">
-        <div className="panel-head">
-          <img src="/logo.png" alt="Darkwave" className="brand-mark" />
-          <button
-            className="icon-button panel-toggle"
-            aria-label={sidebarCollapsed ? "Show library panel" : "Hide library panel"}
-            onClick={() => setSidebarCollapsed((previous) => !previous)}
-          >
-            {sidebarCollapsed ? <PanelLeftOpen size={15} /> : <PanelLeftClose size={15} />}
-          </button>
-        </div>
         <div className="panel-body">
           {libraries.length > 1 ? (
             <select
@@ -1489,13 +1502,6 @@ export function App() {
       <aside className={inspectorCollapsed ? "inspector collapsed" : "inspector"} aria-label="Inspector">
         <div className="panel-head inspector-head">
           <h1>{selectedAsset?.display_name ?? "No sound selected"}</h1>
-          <button
-            className="icon-button panel-toggle"
-            aria-label={inspectorCollapsed ? "Show inspector panel" : "Hide inspector panel"}
-            onClick={() => setInspectorCollapsed((previous) => !previous)}
-          >
-            {inspectorCollapsed ? <PanelRightOpen size={15} /> : <PanelRightClose size={15} />}
-          </button>
         </div>
         <div className="panel-body">
         {selectedCount > 1 ? (
