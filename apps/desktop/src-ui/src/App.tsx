@@ -1,5 +1,5 @@
 import { convertFileSrc, invoke } from "@tauri-apps/api/core";
-import { open as openDialog, confirm as confirmDialog } from "@tauri-apps/plugin-dialog";
+import { open as openDialog, save as saveDialog, confirm as confirmDialog } from "@tauri-apps/plugin-dialog";
 import {
   Bell,
   Command,
@@ -21,7 +21,7 @@ import {
   Volume2,
   Zap
 } from "lucide-react";
-import { useCallback, useEffect, useMemo, useRef, useState } from "react";
+import { useCallback, useEffect, useMemo, useRef, useState, type MouseEvent } from "react";
 
 type LibraryRecord = {
   id: string;
@@ -65,6 +65,34 @@ type TagRecord = {
   normalized_name: string;
   facet: string | null;
   is_system: boolean;
+};
+
+type ReconnectValidationReport = {
+  library_id: string;
+  manifest_revision: number;
+  checked_paths: number;
+  missing_paths: string[];
+};
+
+type VisibleFilter = {
+  field: string;
+  operator: string;
+  value: string;
+};
+
+type SelectionMode = "Replace" | "Toggle" | "Range";
+
+type BrowserCommand =
+  | { MoveSelection: { delta: number } }
+  | { FocusRow: { index: number } }
+  | { SelectFocused: { mode: SelectionMode } }
+  | "SelectAllVisible";
+
+type BrowserState = {
+  visible_asset_ids: string[];
+  focused_index: number;
+  anchor_index: number;
+  selected_indices: number[];
 };
 
 type CollectionRecord = {
@@ -235,7 +263,9 @@ export function App() {
   const [activeLibraryId, setActiveLibraryId] = useState<string | null>(null);
   const [assets, setAssets] = useState<AssetRecord[]>([]);
   const [selectedAssetId, setSelectedAssetId] = useState<string | null>(null);
+  const [browserState, setBrowserState] = useState<BrowserState | null>(null);
   const [searchQuery, setSearchQuery] = useState("");
+  const [queryFilters, setQueryFilters] = useState<VisibleFilter[]>([]);
   const [libraryName, setLibraryName] = useState("");
   const [libraryRoot, setLibraryRoot] = useState("");
   const [importStatus, setImportStatus] = useState<string | null>(null);
@@ -259,6 +289,7 @@ export function App() {
   const [mediaRootStatus, setMediaRootStatus] = useState<{ status: string; reconnectRequired: boolean } | null>(null);
   const [exportStatus, setExportStatus] = useState<string | null>(null);
   const [offlineControl, setOfflineControl] = useState<OfflineControlState | null>(null);
+  const [reconnectStatus, setReconnectStatus] = useState<string | null>(null);
   const [trashItems, setTrashItems] = useState<TrashItem[]>([]);
   const [backupStatus, setBackupStatus] = useState<string | null>(null);
 
@@ -274,6 +305,14 @@ export function App() {
   const peakRequestId = useRef(0);
 
   const selectedAsset = assets.find((asset) => asset.id === selectedAssetId) ?? null;
+  const selectedAssetIds = useMemo(() => {
+    if (!browserState) return [];
+    return browserState.selected_indices
+      .map((index) => browserState.visible_asset_ids[index])
+      .filter((id): id is string => Boolean(id));
+  }, [browserState]);
+  const selectedCount = selectedAssetIds.length;
+  const bulkAssetIds = selectedCount > 1 ? selectedAssetIds : selectedAssetId ? [selectedAssetId] : [];
   const activeLibrary = libraries.find((library) => library.id === activeLibraryId) ?? null;
 
   const visibleAssets = useMemo(() => {
@@ -285,6 +324,37 @@ export function App() {
     }
     return assets;
   }, [assets, activeFilter]);
+
+  useEffect(() => {
+    let cancelled = false;
+    const ids = visibleAssets.map((asset) => asset.id);
+
+    (async () => {
+      let next = await invoke<BrowserState>("create_browser_state", { visibleAssetIds: ids }).catch(() => null);
+      if (!next) return;
+
+      if (selectedAssetId) {
+        const index = ids.indexOf(selectedAssetId);
+        if (index >= 0) {
+          next = await invoke<BrowserState>("apply_browser_command", {
+            browserState: next,
+            command: { FocusRow: { index } }
+          }).catch(() => next);
+          next = await invoke<BrowserState>("apply_browser_command", {
+            browserState: next,
+            command: { SelectFocused: { mode: "Replace" } }
+          }).catch(() => next);
+        }
+      }
+
+      if (!cancelled) setBrowserState(next);
+    })();
+
+    return () => {
+      cancelled = true;
+    };
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [visibleAssets]);
 
   const refreshAssets = useCallback((libraryId: string, query: string, filter: ActiveFilter) => {
     if (typeof filter === "object") {
@@ -405,6 +475,19 @@ export function App() {
   }, [activeLibraryId, searchQuery, activeFilter, refreshAssets]);
 
   useEffect(() => {
+    if (!searchQuery.trim()) {
+      setQueryFilters([]);
+      return;
+    }
+    const timeout = setTimeout(() => {
+      invoke<VisibleFilter[]>("explain_search_query", { query: searchQuery })
+        .then(setQueryFilters)
+        .catch(() => setQueryFilters([]));
+    }, 200);
+    return () => clearTimeout(timeout);
+  }, [searchQuery]);
+
+  useEffect(() => {
     if (selectedAssetId && !assets.some((asset) => asset.id === selectedAssetId)) {
       setSelectedAssetId(null);
     }
@@ -493,16 +576,16 @@ export function App() {
 
   const handleApplyTag = useCallback(
     (tag: TagRecord) => {
-      if (!selectedAssetId) return;
-      invoke<string>("apply_tag", { assetIds: [selectedAssetId], tagId: tag.id })
+      if (bulkAssetIds.length === 0) return;
+      invoke<string>("apply_tag", { assetIds: bulkAssetIds, tagId: tag.id })
         .then((undoId) => {
           setUndoStack((previous) => [...previous, { id: undoId, label: `Apply "${tag.name}"` }]);
           setRedoStack([]);
-          refreshAssetTags(selectedAssetId);
+          if (selectedAssetId) refreshAssetTags(selectedAssetId);
         })
         .catch(() => {});
     },
-    [selectedAssetId, refreshAssetTags]
+    [bulkAssetIds, selectedAssetId, refreshAssetTags]
   );
 
   const handleRemoveTag = useCallback(
@@ -582,17 +665,39 @@ export function App() {
       .catch(() => {});
   }, [activeLibraryId, newProjectName]);
 
+  const handleRowClick = useCallback(
+    (asset: AssetRecord, index: number, event: MouseEvent) => {
+      setSelectedAssetId(asset.id);
+      if (!browserState) return;
+
+      const mode: SelectionMode = event.shiftKey ? "Range" : event.metaKey || event.ctrlKey ? "Toggle" : "Replace";
+      invoke<BrowserState>("apply_browser_command", {
+        browserState,
+        command: { FocusRow: { index } }
+      })
+        .then((focused) =>
+          invoke<BrowserState>("apply_browser_command", {
+            browserState: focused,
+            command: { SelectFocused: { mode } }
+          })
+        )
+        .then(setBrowserState)
+        .catch(() => {});
+    },
+    [browserState]
+  );
+
   const handleAddSelectedToProject = useCallback(
     (project: CollectionRecord) => {
-      if (!selectedAssetId) return;
-      invoke<string>("add_to_collection", { collectionId: project.id, assetIds: [selectedAssetId] })
+      if (bulkAssetIds.length === 0) return;
+      invoke<string>("add_to_collection", { collectionId: project.id, assetIds: bulkAssetIds })
         .then((undoId) => {
           setUndoStack((previous) => [...previous, { id: undoId, label: `Add to "${project.name}"` }]);
           setRedoStack([]);
         })
         .catch(() => {});
     },
-    [selectedAssetId]
+    [bulkAssetIds]
   );
 
   const handleSaveSource = useCallback(() => {
@@ -662,6 +767,32 @@ export function App() {
     },
     [offlineControl]
   );
+
+  const handleRetryReconnect = useCallback(() => {
+    if (!offlineControl || !activeLibraryId) return;
+    invoke<OfflineControlState>("apply_offline_control", { offlineState: offlineControl, command: "RetryReconnect" })
+      .then(setOfflineControl)
+      .catch(() => {});
+
+    setReconnectStatus("Validating…");
+    invoke<[number, ReconnectValidationReport | null]>("validate_reconnect", { libraryId: activeLibraryId })
+      .then(([changed, report]) => {
+        refreshAssets(activeLibraryId, searchQuery, activeFilter);
+        refreshMaintenance(activeLibraryId);
+        invoke<[string, boolean]>("media_root_status", { libraryId: activeLibraryId })
+          .then(([status, reconnectRequired]) => setMediaRootStatus({ status, reconnectRequired }))
+          .catch(() => {});
+
+        if (report) {
+          setReconnectStatus(
+            `${changed} asset${changed === 1 ? "" : "s"} updated — ${report.missing_paths.length} of ${report.checked_paths} managed paths still missing`
+          );
+        } else {
+          setReconnectStatus(`${changed} asset${changed === 1 ? "" : "s"} updated`);
+        }
+      })
+      .catch((error) => setReconnectStatus(`Reconnect validation failed: ${String(error)}`));
+  }, [offlineControl, activeLibraryId, searchQuery, activeFilter, refreshAssets, refreshMaintenance]);
 
   const handleBackupLibrary = useCallback(async () => {
     if (!activeLibraryId) return;
@@ -765,6 +896,61 @@ export function App() {
     }
   }, [selectedAssetId]);
 
+  const handleBulkFavorite = useCallback(() => {
+    if (bulkAssetIds.length === 0 || !activeLibraryId) return;
+    Promise.all(bulkAssetIds.map((assetId) => invoke("set_favorite", { assetId, favorite: true })))
+      .then(() => refreshAssets(activeLibraryId, searchQuery, activeFilter))
+      .catch(() => {});
+  }, [bulkAssetIds, activeLibraryId, searchQuery, activeFilter, refreshAssets]);
+
+  const handleBulkTrash = useCallback(() => {
+    if (bulkAssetIds.length === 0 || !activeLibraryId) return;
+    Promise.all(bulkAssetIds.map((assetId) => invoke("move_to_trash", { assetId, reason: "manual" })))
+      .then(() => {
+        setSelectedAssetId(null);
+        refreshAssets(activeLibraryId, searchQuery, activeFilter);
+        refreshTrashItems(activeLibraryId);
+        refreshMaintenance(activeLibraryId);
+      })
+      .catch(() => {});
+  }, [bulkAssetIds, activeLibraryId, searchQuery, activeFilter, refreshAssets, refreshTrashItems, refreshMaintenance]);
+
+  const handleBulkExport = useCallback(async () => {
+    if (bulkAssetIds.length === 0) return;
+    const destination = await openDialog({ directory: true, multiple: false, title: "Choose export destination" });
+    if (typeof destination !== "string") return;
+
+    try {
+      await Promise.all(
+        bulkAssetIds.map((assetId) =>
+          invoke<string>("export_selected_asset", { assetId, destinationFolder: destination })
+        )
+      );
+      setExportStatus(`Exported ${bulkAssetIds.length} sound${bulkAssetIds.length === 1 ? "" : "s"}`);
+    } catch (error) {
+      setExportStatus(`Export failed: ${String(error)}`);
+    }
+  }, [bulkAssetIds]);
+
+  const handleExportLicenseReport = useCallback(async () => {
+    if (typeof activeFilter !== "object") return;
+    const destination = await saveDialog({
+      defaultPath: "license-report.csv",
+      filters: [{ name: "CSV", extensions: ["csv"] }]
+    });
+    if (typeof destination !== "string") return;
+
+    try {
+      await invoke("export_project_license_report", {
+        projectId: activeFilter.project,
+        destinationPath: destination
+      });
+      setExportStatus(`License report exported to ${destination}`);
+    } catch (error) {
+      setExportStatus(`License report export failed: ${String(error)}`);
+    }
+  }, [activeFilter]);
+
   const handleToggleReducedMotion = useCallback(() => {
     setPreferences((previous) => {
       if (!previous) return previous;
@@ -802,6 +988,20 @@ export function App() {
 
     function handleKeyDown(event: KeyboardEvent) {
       if (isTypingTarget(event.target)) return;
+
+      if ((event.metaKey || event.ctrlKey) && event.key.toLowerCase() === "a") {
+        event.preventDefault();
+        if (browserState) {
+          invoke<BrowserState>("apply_browser_command", {
+            browserState,
+            command: "SelectAllVisible"
+          })
+            .then(setBrowserState)
+            .catch(() => {});
+        }
+        return;
+      }
+
       const binding = preferences?.shortcuts.bindings.find(
         (candidate) => candidate.accelerator === acceleratorFor(event)
       );
@@ -853,7 +1053,8 @@ export function App() {
     playRelative,
     handleToggleFavorite,
     handleImportFolder,
-    handleExportSelected
+    handleExportSelected,
+    browserState
   ]);
 
   if (librariesLoaded && libraries.length === 0) {
@@ -974,11 +1175,29 @@ export function App() {
           <button className="text-button" aria-label="Redo" onClick={handleRedo} disabled={redoStack.length === 0}>
             Redo
           </button>
+          <button
+            className="text-button"
+            type="button"
+            onClick={handleExportLicenseReport}
+            disabled={typeof activeFilter !== "object"}
+            title="Export a CSV license report for the active project"
+          >
+            License Report
+          </button>
           <button className="primary-action" type="button" onClick={handleImportFolder}>
             <Import size={16} />
             Import
           </button>
         </header>
+        {queryFilters.length > 0 ? (
+          <div className="tag-grid" aria-label="Parsed search filters">
+            {queryFilters.map((filter, index) => (
+              <span key={index} className="suggestion-chip">
+                {filter.field} {filter.operator} {filter.value}
+              </span>
+            ))}
+          </div>
+        ) : null}
         <section className="onboarding-strip" aria-label="Library setup">
           <button type="button" onClick={handleImportFolder}>
             <Import size={16} />
@@ -1024,11 +1243,15 @@ export function App() {
           {visibleAssets.length === 0 ? (
             <p className="empty-browser">No sounds here yet.</p>
           ) : (
-            visibleAssets.map((asset) => (
+            visibleAssets.map((asset, index) => {
+              const isSelected = browserState
+                ? browserState.selected_indices.includes(index)
+                : asset.id === selectedAssetId;
+              return (
               <article
-                className={asset.id === selectedAssetId ? "asset-row selected" : "asset-row"}
+                className={isSelected ? "asset-row selected" : "asset-row"}
                 key={asset.id}
-                onClick={() => setSelectedAssetId(asset.id)}
+                onClick={(event) => handleRowClick(asset, index, event)}
               >
                 <button
                   className="play-cell"
@@ -1065,7 +1288,8 @@ export function App() {
                   <Star size={15} fill={asset.favorite ? "currentColor" : "none"} />
                 </button>
               </article>
-            ))
+              );
+            })
           )}
         </section>
       </section>
@@ -1076,6 +1300,22 @@ export function App() {
             <Settings size={17} />
           </button>
         </div>
+        {selectedCount > 1 ? (
+          <section aria-label="Bulk actions">
+            <h2>{selectedCount} Selected</h2>
+            <div className="drop-target-grid">
+              <button type="button" onClick={handleBulkFavorite}>
+                Favorite All
+              </button>
+              <button type="button" onClick={handleBulkExport}>
+                Export All
+              </button>
+              <button type="button" className="text-button" onClick={handleBulkTrash}>
+                Move All to Trash
+              </button>
+            </div>
+          </section>
+        ) : null}
         {selectedAsset ? (
           <section>
             <label className="setting-row">
@@ -1128,7 +1368,7 @@ export function App() {
           <h2>Add Tag</h2>
           <div className="tag-grid">
             {tags.map((tag) => (
-              <button key={tag.id} onClick={() => handleApplyTag(tag)} disabled={!selectedAssetId}>
+              <button key={tag.id} onClick={() => handleApplyTag(tag)} disabled={bulkAssetIds.length === 0}>
                 {tag.name}
               </button>
             ))}
@@ -1154,7 +1394,7 @@ export function App() {
           <h2>Projects</h2>
           <div className="drop-target-grid">
             {collections.map((project) => (
-              <button key={project.id} onClick={() => handleAddSelectedToProject(project)} disabled={!selectedAssetId}>
+              <button key={project.id} onClick={() => handleAddSelectedToProject(project)} disabled={bulkAssetIds.length === 0}>
                 + {project.name}
               </button>
             ))}
@@ -1319,7 +1559,7 @@ export function App() {
                 <button type="button" onClick={() => handleOfflineCommand("UseCatalogOnly")}>
                   Use Catalog Only
                 </button>
-                <button type="button" onClick={() => handleOfflineCommand("RetryReconnect")}>
+                <button type="button" onClick={handleRetryReconnect}>
                   Retry Reconnect
                 </button>
                 <button
@@ -1331,6 +1571,7 @@ export function App() {
                   {offlineControl.validation_paused ? "Resume Validation" : "Pause Validation"}
                 </button>
               </div>
+              {reconnectStatus ? <div className="status-line">{reconnectStatus}</div> : null}
             </>
           ) : (
             <span className="empty-hint">No library selected</span>

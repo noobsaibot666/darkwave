@@ -1,14 +1,15 @@
+use serde::{Deserialize, Serialize};
 use std::collections::BTreeSet;
 use uuid::Uuid;
 
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
 pub enum SelectionMode {
     Replace,
     Toggle,
     Range,
 }
 
-#[derive(Clone, Debug, Eq, PartialEq)]
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 pub enum BrowserCommand {
     MoveSelection { delta: isize },
     FocusRow { index: usize },
@@ -16,7 +17,7 @@ pub enum BrowserCommand {
     SelectAllVisible,
 }
 
-#[derive(Clone, Debug, Eq, PartialEq)]
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 pub enum DragTarget {
     Tag(String),
     Collection(Uuid),
@@ -26,13 +27,13 @@ pub enum DragTarget {
     ExternalExport,
 }
 
-#[derive(Clone, Debug, Eq, PartialEq)]
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 pub struct DragPayload {
     pub asset_ids: Vec<Uuid>,
     pub target: DragTarget,
 }
 
-#[derive(Clone, Debug, Eq, PartialEq)]
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 pub struct BrowserState {
     visible_asset_ids: Vec<Uuid>,
     focused_index: usize,

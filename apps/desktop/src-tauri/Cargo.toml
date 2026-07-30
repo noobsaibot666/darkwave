@@ -26,6 +26,7 @@ library-sync = { path = "../../../crates/library-sync" }
 maintenance = { path = "../../../crates/maintenance" }
 preferences = { path = "../../../crates/preferences" }
 release-readiness = { path = "../../../crates/release-readiness" }
+search = { path = "../../../crates/search" }
 shared-types = { path = "../../../crates/shared-types" }
 storage = { path = "../../../crates/storage" }
 uuid.workspace = true

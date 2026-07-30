@@ -19,3 +19,5 @@ Implemented behavior:
 - A rejected suggestion from the same origin is preserved and not recreated as pending without new evidence.
 
 This keeps search explainable and local-first. Natural-language parsing is intentionally conservative before any later ranking or semantic expansion.
+
+The desktop shell's `search_assets` command runs the query through `parse_natural_language_query` before hitting the catalog: an inferred media type becomes a real `AssetSearchQuery` filter, and the cleaned term list becomes the FTS text. A separate `explain_search_query` command exposes the same parse for a live filter-chip row under the search bar, so what got inferred from a query like "sound effects rain forest" is visible, not silent.

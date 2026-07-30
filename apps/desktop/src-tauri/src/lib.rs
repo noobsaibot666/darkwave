@@ -468,6 +468,66 @@ fn media_root_status(
     Ok((status, probe.reconnect_validation_required))
 }
 
+/// Re-checks every asset's real on-disk availability against the library's media root
+/// (updating `availability_state` accordingly) and, when the root is back online, also
+/// runs the manifest-based reconnect validation to report exactly which managed paths
+/// are still missing after reconnect.
+#[tauri::command]
+fn validate_reconnect(
+    state: tauri::State<CatalogState>,
+    library_id: String,
+) -> Result<(usize, Option<library_sync::ReconnectValidationReport>), String> {
+    let library_id = parse_uuid_field(&library_id, "library id")?;
+    let catalog = state.0.lock().expect("catalog mutex poisoned");
+    let library = catalog
+        .get_library(library_id)
+        .map_err(storage_error_message)?
+        .ok_or_else(|| "library not found".to_string())?;
+    let assets = catalog
+        .list_assets(library_id)
+        .map_err(storage_error_message)?;
+
+    let media_root = library.media_root.clone();
+    let changed = catalog
+        .validate_media_availability(library_id, |path| {
+            let candidate = std::path::Path::new(path);
+            if candidate.is_absolute() {
+                candidate.exists()
+            } else {
+                std::path::Path::new(&media_root).join(path).exists()
+            }
+        })
+        .map_err(storage_error_message)?;
+
+    let probe = library_sync::probe_media_root(&library.media_root, |path| {
+        std::path::Path::new(path).exists()
+    });
+
+    let manifest = assets
+        .iter()
+        .filter_map(|asset| match &asset.path {
+            AssetPath::Managed(relative_path) => asset
+                .content_hash
+                .clone()
+                .map(|content_hash| library_sync::ManifestAsset {
+                    id: asset.id,
+                    relative_path: relative_path.clone(),
+                    content_hash,
+                }),
+            AssetPath::Referenced(_) => None,
+        })
+        .fold(
+            library_sync::PortableManifest::new(library_id, 1),
+            |manifest, asset| manifest.with_asset(asset),
+        );
+
+    let report = library_sync::plan_reconnect_validation(&manifest, &probe).map(|job| {
+        library_sync::validate_reconnect_paths(&job, |path| std::path::Path::new(path).exists())
+    });
+
+    Ok((changed, report))
+}
+
 #[tauri::command]
 fn apply_offline_control(
     mut offline_state: library_sync::OfflineControlState,
@@ -525,10 +585,72 @@ fn search_assets(
     query: String,
 ) -> Result<Vec<AssetRecord>, String> {
     let library_id = parse_uuid_field(&library_id, "library id")?;
+    let parsed = search::parse_natural_language_query(&query);
+    let mut search_query = storage::AssetSearchQuery::text(parsed.text);
+    if let Some(media_type) = parsed.media_type {
+        search_query = search_query.with_media_type(media_type);
+    }
+
     let catalog = state.0.lock().expect("catalog mutex poisoned");
     catalog
-        .search_assets(library_id, storage::AssetSearchQuery::text(query))
+        .search_assets(library_id, search_query)
         .map_err(storage_error_message)
+}
+
+#[tauri::command]
+fn explain_search_query(query: String) -> Vec<search::VisibleFilter> {
+    search::parse_natural_language_query(&query).visible_filters
+}
+
+#[tauri::command]
+fn export_project_license_report(
+    state: tauri::State<CatalogState>,
+    project_id: String,
+    destination_path: String,
+) -> Result<(), String> {
+    let project_id = parse_uuid_field(&project_id, "project id")?;
+    let catalog = state.0.lock().expect("catalog mutex poisoned");
+    let rows = catalog
+        .project_source_report(project_id)
+        .map_err(storage_error_message)?
+        .into_iter()
+        .map(|row| export_pipeline::LicenseReportRow {
+            asset_title: row.asset_title,
+            original_filename: row.original_filename,
+            provider: row.provider,
+            source_url: row.source_url,
+            license_type: row.license_type,
+            license_status: row.license_status,
+            attribution: row.attribution,
+            restrictions: row.restrictions,
+            receipt_path: row.receipt_path,
+            usage_status: row.usage_status,
+            destination: row.destination,
+        })
+        .collect::<Vec<_>>();
+
+    let csv = export_pipeline::render_license_report_csv(&rows);
+    std::fs::write(&destination_path, csv)
+        .map_err(|error| format!("write license report to {destination_path}: {error}"))
+}
+
+#[tauri::command]
+fn create_browser_state(visible_asset_ids: Vec<String>) -> Result<workspace_state::BrowserState, String> {
+    let ids = visible_asset_ids
+        .iter()
+        .map(|id| parse_uuid_field(id, "asset id"))
+        .collect::<Result<Vec<_>, _>>()?;
+
+    Ok(workspace_state::BrowserState::new(ids))
+}
+
+#[tauri::command]
+fn apply_browser_command(
+    mut browser_state: workspace_state::BrowserState,
+    command: workspace_state::BrowserCommand,
+) -> workspace_state::BrowserState {
+    browser_state.apply(command);
+    browser_state
 }
 
 #[tauri::command]
@@ -1025,7 +1147,12 @@ pub fn run() {
             restore_library,
             process_pending_jobs,
             mark_waveform_ready,
-            trash_duplicate_group
+            trash_duplicate_group,
+            explain_search_query,
+            create_browser_state,
+            apply_browser_command,
+            export_project_license_report,
+            validate_reconnect
         ])
         .run(tauri::generate_context!())
         .expect("failed to run Darkwave desktop shell");

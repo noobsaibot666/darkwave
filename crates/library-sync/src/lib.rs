@@ -68,7 +68,7 @@ pub struct ReconnectValidationJob {
     pub paths_to_validate: Vec<String>,
 }
 
-#[derive(Clone, Debug, Eq, PartialEq)]
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 pub struct ReconnectValidationReport {
     pub library_id: Uuid,
     pub manifest_revision: u64,
