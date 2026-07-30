@@ -751,10 +751,27 @@ fn refresh_library(
         .map_err(|error| format!("could not read {}: {error}", library.media_root))?;
     paths.sort();
 
+    // Re-hashing every file on every rescan would mean reading a NAS-backed library's
+    // entire contents over the network each time. Skip paths already cataloged as a
+    // referenced asset so only genuinely new files pay the read-and-hash cost.
+    let known_paths: HashSet<String> = catalog
+        .list_assets(library_id)
+        .map_err(storage_error_message)?
+        .into_iter()
+        .filter_map(|asset| match asset.path {
+            AssetPath::Referenced(path) => Some(path),
+            AssetPath::Managed(_) => None,
+        })
+        .collect();
+
     let mut imported = Vec::new();
     let mut failed = Vec::new();
 
     for path in paths {
+        if known_paths.contains(&path.to_string_lossy().to_string()) {
+            continue;
+        }
+
         let filename = path
             .file_name()
             .map(|name| name.to_string_lossy().to_string())

@@ -976,37 +976,24 @@ export function App() {
     }
   }, [activeLibraryId, searchQuery, activeFilter, refreshAssets, refreshMaintenance]);
 
-  const handleRefreshLibrary = useCallback(
-    (silent = false) => {
-      if (!activeLibraryId) return;
-      if (!silent) setRefreshStatus("Scanning for new files…");
-      invoke<ImportFolderResult>("refresh_library", { libraryId: activeLibraryId })
-        .then((result) => {
-          if (result.imported.length > 0) {
-            invoke<number>("process_pending_jobs").catch(() => {});
-          }
-          setRefreshStatus(
-            result.imported.length > 0
-              ? `Found ${result.imported.length} new sound${result.imported.length === 1 ? "" : "s"}`
-              : silent
-                ? null
-                : "No new files found"
-          );
-          refreshAssets(activeLibraryId, searchQuery, activeFilter);
-          refreshMaintenance(activeLibraryId);
-        })
-        .catch((error) => {
-          if (!silent) setRefreshStatus(`Refresh failed: ${String(error)}`);
-        });
-    },
-    [activeLibraryId, searchQuery, activeFilter, refreshAssets, refreshMaintenance]
-  );
-
-  useEffect(() => {
+  const handleRefreshLibrary = useCallback(() => {
     if (!activeLibraryId) return;
-    handleRefreshLibrary(true);
-    // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [activeLibraryId]);
+    setRefreshStatus("Scanning for new files…");
+    invoke<ImportFolderResult>("refresh_library", { libraryId: activeLibraryId })
+      .then((result) => {
+        if (result.imported.length > 0) {
+          invoke<number>("process_pending_jobs").catch(() => {});
+        }
+        setRefreshStatus(
+          result.imported.length > 0
+            ? `Found ${result.imported.length} new sound${result.imported.length === 1 ? "" : "s"}`
+            : "No new files found"
+        );
+        refreshAssets(activeLibraryId, searchQuery, activeFilter);
+        refreshMaintenance(activeLibraryId);
+      })
+      .catch((error) => setRefreshStatus(`Refresh failed: ${String(error)}`));
+  }, [activeLibraryId, searchQuery, activeFilter, refreshAssets, refreshMaintenance]);
 
   const handleExportSelected = useCallback(async () => {
     if (!selectedAssetId) return;
