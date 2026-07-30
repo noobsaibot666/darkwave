@@ -775,6 +775,25 @@ impl Catalog {
         Ok(count as usize)
     }
 
+    /// Like `pending_job_count`, but scoped to one library — for a per-library
+    /// job-status display where multiple libraries may have pending work of
+    /// the same kind.
+    pub fn pending_job_count_for_library(
+        &self,
+        library_id: Uuid,
+        kind: JobKind,
+    ) -> Result<usize, StorageError> {
+        let count: i64 = self.connection.query_row(
+            "SELECT COUNT(*) FROM background_jobs
+             INNER JOIN assets ON assets.id = background_jobs.asset_id
+             WHERE assets.library_id = ?1 AND background_jobs.kind = ?2 AND background_jobs.state = 'pending'",
+            params![library_id.to_string(), job_kind_to_db(&kind)],
+            |row| row.get(0),
+        )?;
+
+        Ok(count as usize)
+    }
+
     pub fn list_collections(
         &self,
         library_id: Uuid,
@@ -2095,6 +2114,42 @@ mod tests {
         assert_eq!(
             catalog
                 .pending_job_count(JobKind::MetadataExtraction)
+                .expect("count"),
+            0
+        );
+    }
+
+    #[test]
+    fn pending_job_count_for_library_only_counts_that_librarys_assets() {
+        let catalog_path = unique_catalog_path("job-counts-per-library");
+        let catalog = Catalog::open(&catalog_path).expect("open catalog");
+        let first_library = catalog.create_library("First", "/first").expect("library");
+        let second_library = catalog.create_library("Second", "/second").expect("library");
+        let first_asset = test_asset(&catalog, first_library.id, "one.wav", "hash-first-lib");
+        let second_asset = test_asset(&catalog, second_library.id, "two.wav", "hash-second-lib");
+
+        catalog
+            .enqueue_job(first_asset.id, JobKind::AudioAnalysis, 40)
+            .expect("enqueue first");
+        catalog
+            .enqueue_job(second_asset.id, JobKind::AudioAnalysis, 40)
+            .expect("enqueue second");
+
+        assert_eq!(
+            catalog
+                .pending_job_count_for_library(first_library.id, JobKind::AudioAnalysis)
+                .expect("count"),
+            1
+        );
+        assert_eq!(
+            catalog
+                .pending_job_count_for_library(second_library.id, JobKind::AudioAnalysis)
+                .expect("count"),
+            1
+        );
+        assert_eq!(
+            catalog
+                .pending_job_count_for_library(first_library.id, JobKind::MetadataExtraction)
                 .expect("count"),
             0
         );

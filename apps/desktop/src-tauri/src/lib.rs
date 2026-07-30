@@ -1014,6 +1014,42 @@ fn process_pending_jobs(state: tauri::State<CatalogState>) -> Result<usize, Stri
     Ok(processed)
 }
 
+#[derive(Debug, serde::Serialize)]
+struct JobStatusEntry {
+    kind: String,
+    pending: usize,
+}
+
+/// Library-scoped pending counts for the two job kinds the frontend can
+/// actually drive to completion (`process_pending_jobs`,
+/// `process_audio_analysis_jobs`). WaveformGeneration is deliberately
+/// excluded — it completes per-asset when the frontend previews a sound,
+/// not via any batch command, so there's no queue to report progress on.
+#[tauri::command]
+fn job_status(
+    state: tauri::State<CatalogState>,
+    library_id: String,
+) -> Result<Vec<JobStatusEntry>, String> {
+    let library_id = parse_uuid_field(&library_id, "library id")?;
+    let catalog = state.0.lock().expect("catalog mutex poisoned");
+
+    [
+        (JobKind::MetadataExtraction, "metadata_extraction"),
+        (JobKind::AudioAnalysis, "audio_analysis"),
+    ]
+    .into_iter()
+    .map(|(kind, label)| {
+        catalog
+            .pending_job_count_for_library(library_id, kind)
+            .map(|pending| JobStatusEntry {
+                kind: label.to_string(),
+                pending,
+            })
+            .map_err(storage_error_message)
+    })
+    .collect()
+}
+
 /// Real, content-based needs-review detection, best-effort action-tag
 /// suggestions, tempo/pitch estimates, and (via the isolated GPL subprocess)
 /// a similarity feature vector — see docs/adr/0025-real-audio-analysis.md.
@@ -1684,6 +1720,7 @@ pub fn run() {
             restore_library,
             process_pending_jobs,
             process_audio_analysis_jobs,
+            job_status,
             similar_assets,
             mark_waveform_ready,
             trash_duplicate_group,

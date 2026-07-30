@@ -267,6 +267,50 @@ button.panel-handle-right:active:not(:disabled) {
   padding: 4px 18px 0;
 }
 
+.job-progress-panel {
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+  padding: 8px 18px 0;
+}
+
+.job-progress-row {
+  display: grid;
+  grid-template-columns: 120px 1fr auto;
+  align-items: center;
+  gap: 10px;
+  font-size: 11px;
+  color: #aeb6c2;
+}
+
+.job-progress-label {
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+
+.job-progress-track {
+  height: 4px;
+  border-radius: 999px;
+  background: #20242b;
+  overflow: hidden;
+}
+
+.job-progress-fill {
+  height: 100%;
+  border-radius: 999px;
+  background: #52c7b8;
+  width: 0%;
+  transition: width 220ms var(--ease-soft);
+}
+
+.job-progress-count {
+  min-width: 44px;
+  text-align: right;
+  color: #717987;
+  font-variant-numeric: tabular-nums;
+}
+
 .search {
   display: flex;
   flex: 1;

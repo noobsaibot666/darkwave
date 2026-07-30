@@ -268,6 +268,13 @@ const smartFilters: { id: ActiveFilter; label: string }[] = [
   { id: "ambience", label: "Ambience" }
 ];
 
+type JobProgress = { kind: string; label: string; pending: number; total: number };
+
+const JOB_KINDS: { command: "process_pending_jobs" | "process_audio_analysis_jobs"; kind: string; label: string }[] = [
+  { command: "process_pending_jobs", kind: "metadata_extraction", label: "Reading metadata" },
+  { command: "process_audio_analysis_jobs", kind: "audio_analysis", label: "Analyzing audio" }
+];
+
 const maintenanceLabels: Record<string, string> = {
   MissingMedia: "Missing media",
   LicenseReviewRequired: "License review",
@@ -362,6 +369,7 @@ export function App() {
   const [mediaRootStatus, setMediaRootStatus] = useState<{ status: string; reconnectRequired: boolean } | null>(null);
   const [exportStatus, setExportStatus] = useState<string | null>(null);
   const [similarStatus, setSimilarStatus] = useState<string | null>(null);
+  const [jobProgress, setJobProgress] = useState<JobProgress[]>([]);
   const [offlineControl, setOfflineControl] = useState<OfflineControlState | null>(null);
   const [reconnectStatus, setReconnectStatus] = useState<string | null>(null);
   const [trashItems, setTrashItems] = useState<TrashItem[]>([]);
@@ -456,6 +464,48 @@ export function App() {
     request.then(setAssets).catch(() => setAssets([]));
   }, []);
 
+  // Repeatedly drives process_pending_jobs/process_audio_analysis_jobs to
+  // completion (each call only processes a capped batch) and tracks live
+  // progress per job kind for the status bars. `only` restricts which kinds
+  // to drain — used by the cache-warm effect, which should only retry
+  // audio analysis, not metadata extraction.
+  const runJobDrain = useCallback(
+    (libraryId: string, only?: string[]) => {
+      const configs = only ? JOB_KINDS.filter((config) => only.includes(config.kind)) : JOB_KINDS;
+
+      invoke<{ kind: string; pending: number }[]>("job_status", { libraryId })
+        .then((statuses) => {
+          const pendingByKind = new Map(statuses.map((entry) => [entry.kind, entry.pending]));
+
+          configs.forEach((config) => {
+            const startPending = pendingByKind.get(config.kind) ?? 0;
+            if (startPending === 0) return;
+
+            setJobProgress((previous) => [
+              ...previous.filter((entry) => entry.kind !== config.kind),
+              { kind: config.kind, label: config.label, pending: startPending, total: startPending }
+            ]);
+
+            (async () => {
+              let remaining = startPending;
+              for (let iterations = 0; iterations < 200 && remaining > 0; iterations += 1) {
+                const processed = await invoke<number>(config.command).catch(() => 0);
+                if (processed === 0) break;
+                remaining = Math.max(0, remaining - processed);
+                setJobProgress((previous) =>
+                  previous.map((entry) => (entry.kind === config.kind ? { ...entry, pending: remaining } : entry))
+                );
+              }
+              setJobProgress((previous) => previous.filter((entry) => entry.kind !== config.kind));
+              refreshAssets(libraryId, searchQuery, activeFilter);
+            })();
+          });
+        })
+        .catch(() => {});
+    },
+    [refreshAssets, searchQuery, activeFilter]
+  );
+
   const refreshMaintenance = useCallback((libraryId: string) => {
     invoke<MaintenanceReport>("maintenance_report", { libraryId })
       .then(setMaintenanceReport)
@@ -540,8 +590,14 @@ export function App() {
     // browsing feels fast. Bounded by preview_cache_limit_mb (unlike the mutex-holding
     // full-library rescan mistake this app shipped once already — see ADR 0023's
     // follow-up fix — this only ever copies as much as the user's cache budget allows).
-    invoke<number>("warm_library_cache", { libraryId: activeLibraryId }).catch(() => {});
-  }, [activeLibraryId, refreshCollections, refreshMaintenance, refreshTrashItems]);
+    // Once warmed, retry audio analysis: a referenced/NAS asset's job is left
+    // pending (not failed) if its file wasn't locally cached yet when analysis
+    // first ran, so this is what actually gets it processed instead of it
+    // staying stuck pending forever.
+    invoke<number>("warm_library_cache", { libraryId: activeLibraryId })
+      .then(() => runJobDrain(activeLibraryId, ["audio_analysis"]))
+      .catch(() => {});
+  }, [activeLibraryId, refreshCollections, refreshMaintenance, refreshTrashItems, runJobDrain]);
 
   useEffect(() => {
     if (activeLibrary) {
@@ -1020,16 +1076,11 @@ export function App() {
       );
       refreshAssets(activeLibraryId, searchQuery, activeFilter);
       refreshMaintenance(activeLibraryId);
-      invoke<number>("process_pending_jobs")
-        .then(() => refreshAssets(activeLibraryId, searchQuery, activeFilter))
-        .catch(() => {});
-      invoke<number>("process_audio_analysis_jobs")
-        .then(() => refreshAssets(activeLibraryId, searchQuery, activeFilter))
-        .catch(() => {});
+      runJobDrain(activeLibraryId);
     } catch (error) {
       setImportStatus(`Import failed: ${String(error)}`);
     }
-  }, [activeLibraryId, searchQuery, activeFilter, refreshAssets, refreshMaintenance]);
+  }, [activeLibraryId, searchQuery, activeFilter, refreshAssets, refreshMaintenance, runJobDrain]);
 
   const handleRefreshLibrary = useCallback(() => {
     if (!activeLibraryId) return;
@@ -1037,10 +1088,7 @@ export function App() {
     invoke<ImportFolderResult>("refresh_library", { libraryId: activeLibraryId })
       .then((result) => {
         if (result.imported.length > 0) {
-          invoke<number>("process_pending_jobs").catch(() => {});
-          invoke<number>("process_audio_analysis_jobs")
-            .then(() => refreshAssets(activeLibraryId, searchQuery, activeFilter))
-            .catch(() => {});
+          runJobDrain(activeLibraryId);
         }
         setRefreshStatus(
           result.imported.length > 0
@@ -1051,7 +1099,7 @@ export function App() {
         refreshMaintenance(activeLibraryId);
       })
       .catch((error) => setRefreshStatus(`Refresh failed: ${String(error)}`));
-  }, [activeLibraryId, searchQuery, activeFilter, refreshAssets, refreshMaintenance]);
+  }, [activeLibraryId, searchQuery, activeFilter, refreshAssets, refreshMaintenance, runJobDrain]);
 
   const handleExportSelected = useCallback(async () => {
     if (!selectedAssetId) return;
@@ -1455,6 +1503,24 @@ export function App() {
             {!queryFilters.length && (refreshStatus || importStatus) ? (
               <span className="suggestion-chip">{refreshStatus ?? importStatus}</span>
             ) : null}
+          </div>
+        ) : null}
+        {jobProgress.length > 0 ? (
+          <div className="job-progress-panel" aria-label="Background work">
+            {jobProgress.map((job) => {
+              const percent = job.total > 0 ? Math.round(((job.total - job.pending) / job.total) * 100) : 0;
+              return (
+                <div className="job-progress-row" key={job.kind}>
+                  <span className="job-progress-label">{job.label}</span>
+                  <div className="job-progress-track">
+                    <div className="job-progress-fill" style={{ width: `${percent}%` }} />
+                  </div>
+                  <span className="job-progress-count">
+                    {job.total - job.pending}/{job.total}
+                  </span>
+                </div>
+              );
+            })}
           </div>
         ) : null}
         <section className="command-strip" aria-label="Command palette preview">
