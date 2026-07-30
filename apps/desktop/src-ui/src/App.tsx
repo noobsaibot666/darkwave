@@ -7,7 +7,6 @@ import {
   ChevronDown,
   ChevronLeft,
   ChevronRight,
-  Command,
   Contrast,
   Gauge,
   Import,
@@ -30,7 +29,7 @@ import {
   X,
   Zap
 } from "lucide-react";
-import { useCallback, useEffect, useMemo, useRef, useState, type MouseEvent, type ReactNode } from "react";
+import { useCallback, useEffect, useMemo, useRef, useState, type CSSProperties, type MouseEvent, type ReactNode } from "react";
 
 type LibraryRecord = {
   id: string;
@@ -235,7 +234,9 @@ function formatTime(seconds: number): string {
   return `${minutes}:${remaining.toString().padStart(2, "0")}`;
 }
 
-async function computePeaks(path: string, bucketCount = 96): Promise<number[] | null> {
+const activeBarTrailLength = 10;
+
+async function computePeaks(path: string, bucketCount = 200): Promise<number[] | null> {
   try {
     const response = await fetch(convertFileSrc(path));
     const arrayBuffer = await response.arrayBuffer();
@@ -359,6 +360,13 @@ export function App() {
   const [importStatus, setImportStatus] = useState<string | null>(null);
   const [activeFilter, setActiveFilter] = useState<ActiveFilter>("all");
   const searchInputRef = useRef<HTMLInputElement | null>(null);
+  const focusSearch = useCallback(() => {
+    const input = searchInputRef.current;
+    if (!input) return;
+    input.scrollIntoView({ behavior: "smooth", inline: "nearest", block: "nearest" });
+    input.focus();
+    input.select();
+  }, []);
   const [sidebarCollapsed, setSidebarCollapsed] = useState(false);
   const [inspectorCollapsed, setInspectorCollapsed] = useState(false);
   const [settingsOpen, setSettingsOpen] = useState(false);
@@ -947,9 +955,12 @@ export function App() {
   const handleRowClick = useCallback(
     (asset: AssetRecord, index: number, event: MouseEvent) => {
       setSelectedAssetId(asset.id);
+      const mode: SelectionMode = event.shiftKey ? "Range" : event.metaKey || event.ctrlKey ? "Toggle" : "Replace";
+      if (mode === "Replace" && playingAssetId !== asset.id) {
+        loadAssetForPlayback(asset, true);
+      }
       if (!browserState) return;
 
-      const mode: SelectionMode = event.shiftKey ? "Range" : event.metaKey || event.ctrlKey ? "Toggle" : "Replace";
       invoke<BrowserState>("apply_browser_command", {
         browserState,
         command: { FocusRow: { index } }
@@ -963,7 +974,7 @@ export function App() {
         .then(setBrowserState)
         .catch(() => {});
     },
-    [browserState]
+    [browserState, playingAssetId, loadAssetForPlayback]
   );
 
   const handleAddSelectedToProject = useCallback(
@@ -1381,7 +1392,7 @@ export function App() {
           break;
         case "FocusSearch":
           event.preventDefault();
-          searchInputRef.current?.focus();
+          focusSearch();
           break;
         case "Import":
           event.preventDefault();
@@ -1405,6 +1416,7 @@ export function App() {
     loadAssetForPlayback,
     playRelative,
     handleToggleFavorite,
+    focusSearch,
     handleImportFolder,
     handleExportSelected,
     browserState
@@ -1450,6 +1462,8 @@ export function App() {
       </main>
     );
   }
+
+  const waveformActiveIndex = peaks && duration > 0 ? Math.floor((currentTime / duration) * peaks.length) : -1;
 
   return (
     <main
@@ -1562,6 +1576,27 @@ export function App() {
       </aside>
       <section className="workspace">
         <header className="topbar">
+          <button className="text-button" onClick={focusSearch}>
+            Focus Search
+          </button>
+          <button className="text-button" onClick={() => document.getElementById("tags-section")?.scrollIntoView({ behavior: "smooth" })}>
+            Apply Tag
+          </button>
+          <select
+            aria-label="Export format"
+            value={exportFormat}
+            onChange={(event) => setExportFormat(event.target.value === "wav24" ? "wav24" : "original")}
+          >
+            <option value="original">Original</option>
+            <option value="wav24">WAV (24-bit)</option>
+          </select>
+          <button className="primary-action" onClick={handleExportSelected} disabled={!selectedAssetId}>
+            Export Selected
+          </button>
+          <button className="primary-action" type="button" onClick={handleImportFolder}>
+            <Import size={16} />
+            Import
+          </button>
           <label className="search">
             <Search size={16} />
             <input
@@ -1607,10 +1642,6 @@ export function App() {
           <button type="button" className="icon-button" aria-label="Refresh library" onClick={() => handleRefreshLibrary()} title="Scan the media root for new files">
             <RefreshCw size={16} />
           </button>
-          <button className="primary-action" type="button" onClick={handleImportFolder}>
-            <Import size={16} />
-            Import
-          </button>
           <button className="icon-button" aria-label="Open settings" onClick={() => setSettingsOpen(true)}>
             <Settings size={17} />
           </button>
@@ -1645,25 +1676,12 @@ export function App() {
             })}
           </div>
         ) : null}
-        <section className="command-strip" aria-label="Command palette preview">
-          <Command size={15} />
-          <button onClick={() => searchInputRef.current?.focus()}>Focus Search</button>
-          <button onClick={() => document.getElementById("tags-section")?.scrollIntoView({ behavior: "smooth" })}>
-            Apply Tag
-          </button>
-          <select
-            aria-label="Export format"
-            value={exportFormat}
-            onChange={(event) => setExportFormat(event.target.value === "wav24" ? "wav24" : "original")}
-          >
-            <option value="original">Original</option>
-            <option value="wav24">WAV (24-bit)</option>
-          </select>
-          <button onClick={handleExportSelected} disabled={!selectedAssetId}>
-            Export Selected
-          </button>
-        </section>
         <section className="filter-panel" aria-label="Range filters">
+          <div className="selection-bar" aria-label="Selection actions">
+            <strong>{selectedAsset ? "1 selected" : "0 selected"}</strong>
+            <span>Click a row to select</span>
+            <span>Click a tag or project to apply it</span>
+          </div>
           <ListFilter size={13} />
           <label>
             Duration
@@ -1734,11 +1752,6 @@ export function App() {
           ) : null}
         </section>
         <section className="browser" aria-label="Sound browser" data-density={preferences?.browser_density ?? "Comfortable"}>
-          <div className="selection-bar" aria-label="Selection actions">
-            <strong>{selectedAsset ? "1 selected" : "0 selected"}</strong>
-            <span>Click a row to select</span>
-            <span>Click a tag or project to apply it</span>
-          </div>
           <div className="virtualization-bar" aria-label="Browser performance">
             <span>{visibleAssets.length} row{visibleAssets.length === 1 ? "" : "s"}</span>
             <span>Not yet virtualized</span>
@@ -2165,10 +2178,25 @@ export function App() {
               <span key={i} style={{ height: `${4 + peak * 96}%` }} />
             ))}
           </div>
-          <div className="waveform-progress" style={{ width: `${duration > 0 ? (currentTime / duration) * 100 : 0}%` }}>
-            {(peaks ?? []).map((peak, i) => (
-              <span key={i} style={{ height: `${4 + peak * 96}%` }} />
-            ))}
+          <div
+            className="waveform-progress"
+            style={{ clipPath: `inset(0 ${100 - (duration > 0 ? (currentTime / duration) * 100 : 0)}% 0 0)` }}
+          >
+            {(peaks ?? []).map((peak, i) => {
+              const trailDistance = waveformActiveIndex - i;
+              const isActive = isPlaying && trailDistance >= 0 && trailDistance < activeBarTrailLength;
+              return (
+                <span
+                  key={i}
+                  className={isActive ? "is-active" : undefined}
+                  style={
+                    isActive
+                      ? ({ height: `${4 + peak * 96}%`, "--trail": trailDistance } as CSSProperties)
+                      : { height: `${4 + peak * 96}%` }
+                  }
+                />
+              );
+            })}
           </div>
         </div>
         <span className="time">
