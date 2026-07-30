@@ -85,7 +85,7 @@ pub struct JobRecord {
     pub priority: i64,
 }
 
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
 pub enum TagOrigin {
     Filename,
     Metadata,
@@ -95,14 +95,14 @@ pub enum TagOrigin {
     Manual,
 }
 
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
 pub enum TagApprovalState {
     Suggested,
     Accepted,
     Rejected,
 }
 
-#[derive(Clone, Debug, Eq, PartialEq)]
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 pub struct TagRecord {
     pub id: Uuid,
     pub name: String,
@@ -111,14 +111,14 @@ pub struct TagRecord {
     pub is_system: bool,
 }
 
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
 pub enum CollectionType {
     Manual,
     Smart,
     Project,
 }
 
-#[derive(Clone, Debug, Eq, PartialEq)]
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 pub struct CollectionRecord {
     pub id: Uuid,
     pub library_id: Uuid,
@@ -127,7 +127,7 @@ pub struct CollectionRecord {
     pub query_definition: Option<String>,
 }
 
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
 pub enum UsageEventType {
     Played,
     Exported,
@@ -136,7 +136,7 @@ pub enum UsageEventType {
     Used,
 }
 
-#[derive(Clone, Debug, Eq, PartialEq)]
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 pub struct UsageEventRecord {
     pub id: Uuid,
     pub asset_id: Uuid,
@@ -145,7 +145,7 @@ pub struct UsageEventRecord {
     pub destination: Option<String>,
 }
 
-#[derive(Clone, Debug, Eq, PartialEq)]
+#[derive(Clone, Debug, Default, Eq, PartialEq, Serialize, Deserialize)]
 pub struct SourceRecordDraft {
     pub asset_id: Uuid,
     pub provider: Option<String>,
@@ -157,7 +157,7 @@ pub struct SourceRecordDraft {
     pub receipt_path: Option<String>,
 }
 
-#[derive(Clone, Debug, Eq, PartialEq)]
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 pub struct ProjectSourceReportRow {
     pub asset_id: Uuid,
     pub asset_title: String,
@@ -567,6 +567,33 @@ impl Catalog {
             )
             .optional()
             .map_err(StorageError::from)
+    }
+
+    pub fn pending_job_count(&self, kind: JobKind) -> Result<usize, StorageError> {
+        let count: i64 = self.connection.query_row(
+            "SELECT COUNT(*) FROM background_jobs WHERE kind = ?1 AND state = 'pending'",
+            params![job_kind_to_db(&kind)],
+            |row| row.get(0),
+        )?;
+
+        Ok(count as usize)
+    }
+
+    pub fn list_collections(
+        &self,
+        library_id: Uuid,
+    ) -> Result<Vec<CollectionRecord>, StorageError> {
+        let mut statement = self.connection.prepare(
+            "SELECT id, library_id, name, type, query_definition FROM collections
+             WHERE library_id = ?1 ORDER BY created_at ASC",
+        )?;
+
+        let collections = statement
+            .query_map(params![library_id.to_string()], collection_from_row)?
+            .collect::<Result<Vec<_>, _>>()
+            .map_err(StorageError::from)?;
+
+        Ok(collections)
     }
 
     pub fn add_assets_to_collection(
@@ -1040,6 +1067,33 @@ impl Catalog {
         )?;
 
         Ok(())
+    }
+
+    pub fn get_source_record(
+        &self,
+        asset_id: Uuid,
+    ) -> Result<Option<SourceRecordDraft>, StorageError> {
+        self.connection
+            .query_row(
+                "SELECT asset_id, provider, source_url, license_type, license_status,
+                    attribution, restrictions, receipt_path
+                 FROM source_records WHERE asset_id = ?1",
+                params![asset_id.to_string()],
+                |row| {
+                    Ok(SourceRecordDraft {
+                        asset_id: parse_uuid(row.get::<_, String>(0)?),
+                        provider: row.get(1)?,
+                        source_url: row.get(2)?,
+                        license_type: row.get(3)?,
+                        license_status: row.get(4)?,
+                        attribution: row.get(5)?,
+                        restrictions: row.get(6)?,
+                        receipt_path: row.get(7)?,
+                    })
+                },
+            )
+            .optional()
+            .map_err(StorageError::from)
     }
 
     fn migrate(&self) -> Result<(), StorageError> {
@@ -1618,6 +1672,38 @@ mod tests {
     }
 
     #[test]
+    fn pending_job_count_reports_only_matching_kind() {
+        let catalog_path = unique_catalog_path("job-counts");
+        let catalog = Catalog::open(&catalog_path).expect("open catalog");
+        let library = catalog.create_library("Jobs", "/library").expect("library");
+        let asset = test_asset(&catalog, library.id, "tone.wav", "hash-job-count");
+
+        catalog
+            .enqueue_job(asset.id, JobKind::WaveformGeneration, 30)
+            .expect("enqueue waveform");
+        catalog
+            .enqueue_job(asset.id, JobKind::Hashing, 20)
+            .expect("enqueue hashing");
+
+        assert_eq!(
+            catalog
+                .pending_job_count(JobKind::WaveformGeneration)
+                .expect("count"),
+            1
+        );
+        assert_eq!(
+            catalog.pending_job_count(JobKind::Hashing).expect("count"),
+            1
+        );
+        assert_eq!(
+            catalog
+                .pending_job_count(JobKind::MetadataExtraction)
+                .expect("count"),
+            0
+        );
+    }
+
+    #[test]
     fn starter_taxonomy_seeds_system_tags_once() {
         let catalog_path = unique_catalog_path("taxonomy");
         let catalog = Catalog::open(&catalog_path).expect("open catalog");
@@ -2051,6 +2137,27 @@ mod tests {
     }
 
     #[test]
+    fn list_collections_returns_only_collections_for_the_given_library() {
+        let catalog_path = unique_catalog_path("list-collections");
+        let catalog = Catalog::open(&catalog_path).expect("open catalog");
+        let library = catalog.create_library("One", "/library").expect("library");
+        let other_library = catalog.create_library("Two", "/other").expect("library");
+        let project = catalog
+            .create_collection(library.id, "Trailer", CollectionType::Project)
+            .expect("project");
+        catalog
+            .create_collection(other_library.id, "Unrelated", CollectionType::Manual)
+            .expect("unrelated collection");
+
+        let collections = catalog.list_collections(library.id).expect("list");
+
+        assert_eq!(
+            collections.iter().map(|c| c.id).collect::<Vec<_>>(),
+            vec![project.id]
+        );
+    }
+
+    #[test]
     fn unavailable_media_root_marks_originals_missing_but_keeps_catalog_searchable() {
         let catalog_path = unique_catalog_path("offline");
         let catalog = Catalog::open(&catalog_path).expect("open catalog");
@@ -2231,6 +2338,25 @@ mod tests {
         assert_eq!(report.len(), 1);
         assert_eq!(report[0].provider.as_deref(), Some("New Provider"));
         assert_eq!(report[0].license_status.as_deref(), Some("active"));
+
+        let source = catalog
+            .get_source_record(asset.id)
+            .expect("get source")
+            .expect("source exists");
+        assert_eq!(source.provider.as_deref(), Some("New Provider"));
+        assert_eq!(source.license_status.as_deref(), Some("active"));
+    }
+
+    #[test]
+    fn get_source_record_returns_none_when_unset() {
+        let catalog_path = unique_catalog_path("source-unset");
+        let catalog = Catalog::open(&catalog_path).expect("open catalog");
+        let library = catalog
+            .create_library("Report", "/library")
+            .expect("library");
+        let asset = test_asset(&catalog, library.id, "no-source.wav", "hash-no-source");
+
+        assert_eq!(catalog.get_source_record(asset.id).expect("query"), None);
     }
 
     fn unique_catalog_path(name: &str) -> PathBuf {

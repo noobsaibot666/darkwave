@@ -82,6 +82,10 @@ pub struct AppPreferences {
     pub preview_cache_limit_mb: u32,
     pub output_device: OutputDevicePreference,
     pub shortcuts: ShortcutMap,
+    #[serde(default)]
+    pub reduced_motion: bool,
+    #[serde(default)]
+    pub reduced_transparency: bool,
 }
 
 impl ShortcutMap {
@@ -165,6 +169,8 @@ impl AppPreferences {
             preview_cache_limit_mb: 16_384,
             output_device: OutputDevicePreference::SystemDefault,
             shortcuts: ShortcutMap::default_audio_workspace(),
+            reduced_motion: false,
+            reduced_transparency: false,
         }
     }
 }
@@ -289,6 +295,37 @@ mod tests {
 
         assert_eq!(preferences.browser_density, BrowserDensity::Compact);
         assert_eq!(preferences.preview_cache_limit_mb, 16_384);
+        assert!(!preferences.reduced_motion);
+        assert!(!preferences.reduced_transparency);
+    }
+
+    #[test]
+    fn accessibility_toggles_round_trip_through_saved_preferences() {
+        let path = unique_preferences_path("accessibility");
+        let mut preferences = AppPreferences::default_for_editorial_audio();
+        preferences.reduced_motion = true;
+        preferences.reduced_transparency = true;
+
+        save_preferences(&path, &preferences).expect("save");
+        let loaded = load_preferences(&path).expect("load");
+
+        assert!(loaded.reduced_motion);
+        assert!(loaded.reduced_transparency);
+    }
+
+    #[test]
+    fn preferences_without_accessibility_fields_default_to_false() {
+        let path = unique_preferences_path("legacy-file");
+        std::fs::write(
+            &path,
+            r#"{"browser_density":"Compact","preview_cache_limit_mb":16384,"output_device":"SystemDefault","shortcuts":{"bindings":[]}}"#,
+        )
+        .expect("write legacy preferences file");
+
+        let loaded = load_preferences(&path).expect("load legacy file");
+
+        assert!(!loaded.reduced_motion);
+        assert!(!loaded.reduced_transparency);
     }
 
     #[test]

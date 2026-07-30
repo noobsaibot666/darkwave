@@ -4,9 +4,21 @@ use std::sync::Mutex;
 
 use import_pipeline::{ImportError, ImportMode};
 use release_readiness::{ReleaseBlocker, ReleaseReadinessConfig};
-use storage::{AssetRecord, Catalog, LibraryRecord, StorageError};
+use storage::{
+    AssetPath, AssetRecord, Catalog, CollectionRecord, CollectionType, JobKind, LibraryRecord,
+    SourceRecordDraft, StorageError, TagApprovalState, TagOrigin, TagRecord,
+};
 use tauri::Manager;
 use uuid::Uuid;
+
+const ALL_TAG_ORIGINS: [TagOrigin; 6] = [
+    TagOrigin::Filename,
+    TagOrigin::Metadata,
+    TagOrigin::AcousticModel,
+    TagOrigin::UserRule,
+    TagOrigin::UserCorrection,
+    TagOrigin::Manual,
+];
 
 struct CatalogState(Mutex<Catalog>);
 
@@ -99,6 +111,29 @@ fn default_preferences() -> preferences::AppPreferences {
 }
 
 #[tauri::command]
+fn load_app_preferences(app: tauri::AppHandle) -> Result<preferences::AppPreferences, String> {
+    let path = preferences_path(&app)?;
+    preferences::load_preferences(path).map_err(|error| format!("{error:?}"))
+}
+
+#[tauri::command]
+fn save_app_preferences(
+    app: tauri::AppHandle,
+    preferences: preferences::AppPreferences,
+) -> Result<(), String> {
+    let path = preferences_path(&app)?;
+    preferences::save_preferences(path, &preferences).map_err(|error| format!("{error:?}"))
+}
+
+fn preferences_path(app: &tauri::AppHandle) -> Result<PathBuf, String> {
+    let dir = app
+        .path()
+        .app_data_dir()
+        .map_err(|error| format!("resolve app data directory: {error}"))?;
+    Ok(dir.join("preferences.json"))
+}
+
+#[tauri::command]
 fn supported_drag_targets() -> Vec<&'static str> {
     vec![
         "tag",
@@ -134,14 +169,65 @@ fn default_command_titles() -> Vec<String> {
 }
 
 #[tauri::command]
-fn sample_maintenance_summary() -> (usize, &'static str) {
-    let report = maintenance::MaintenanceReport::from_findings(Vec::new());
-    let severity = match report.severity {
-        maintenance::MaintenanceSeverity::Ok => "ok",
-        maintenance::MaintenanceSeverity::Warning => "warning",
-    };
+fn maintenance_report(
+    state: tauri::State<CatalogState>,
+    library_id: String,
+) -> Result<maintenance::MaintenanceReport, String> {
+    let library_id = parse_uuid_field(&library_id, "library id")?;
+    let catalog = state.0.lock().expect("catalog mutex poisoned");
+    let assets = catalog
+        .list_assets(library_id)
+        .map_err(storage_error_message)?;
 
-    (report.total_findings, severity)
+    let mut findings = Vec::new();
+
+    for asset in &assets {
+        if asset.availability_state == shared_types::AvailabilityState::Missing {
+            findings.push(maintenance::MaintenanceFinding::missing_media(asset.id));
+        }
+
+        let has_license_context = catalog
+            .get_source_record(asset.id)
+            .map_err(storage_error_message)?
+            .is_some();
+        if !has_license_context {
+            findings.push(maintenance::MaintenanceFinding::license_review_required(
+                asset.id,
+            ));
+        }
+    }
+
+    let mut duplicate_groups: std::collections::BTreeMap<String, Vec<Uuid>> =
+        std::collections::BTreeMap::new();
+    for asset in &assets {
+        if let Some(hash) = &asset.content_hash {
+            duplicate_groups
+                .entry(fingerprint::exact_duplicate_key(hash, asset.file_size))
+                .or_default()
+                .push(asset.id);
+        }
+    }
+    for (hash, asset_ids) in duplicate_groups {
+        if asset_ids.len() > 1 {
+            findings.push(maintenance::MaintenanceFinding::duplicate_content(
+                hash, asset_ids,
+            ));
+        }
+    }
+
+    let pending_waveforms = catalog
+        .pending_job_count(JobKind::WaveformGeneration)
+        .map_err(storage_error_message)?;
+    for _ in 0..pending_waveforms {
+        findings.push(maintenance::MaintenanceFinding {
+            kind: maintenance::MaintenanceFindingKind::StaleWaveformCache,
+            asset_ids: Vec::new(),
+            detail: "Waveform cache should be regenerated".to_string(),
+            recommended_action: maintenance::MaintenanceAction::Regenerate,
+        });
+    }
+
+    Ok(maintenance::MaintenanceReport::from_findings(findings))
 }
 
 #[tauri::command]
@@ -155,14 +241,27 @@ fn backup_restore_requirements() -> Vec<&'static str> {
 }
 
 #[tauri::command]
-fn sample_media_root_status() -> (&'static str, bool) {
-    let probe = library_sync::probe_media_root("/Volumes/TrueNAS/SFX", |_| false);
+fn media_root_status(
+    state: tauri::State<CatalogState>,
+    library_id: String,
+) -> Result<(String, bool), String> {
+    let library_id = parse_uuid_field(&library_id, "library id")?;
+    let catalog = state.0.lock().expect("catalog mutex poisoned");
+    let library = catalog
+        .get_library(library_id)
+        .map_err(storage_error_message)?
+        .ok_or_else(|| "library not found".to_string())?;
+
+    let probe = library_sync::probe_media_root(&library.media_root, |path| {
+        std::path::Path::new(path).exists()
+    });
     let status = match probe.status {
         library_sync::MediaRootStatus::Online => "online",
         library_sync::MediaRootStatus::Offline => "offline",
-    };
+    }
+    .to_string();
 
-    (status, probe.reconnect_validation_required)
+    Ok((status, probe.reconnect_validation_required))
 }
 
 #[tauri::command]
@@ -199,7 +298,7 @@ fn list_assets(
     state: tauri::State<CatalogState>,
     library_id: String,
 ) -> Result<Vec<AssetRecord>, String> {
-    let library_id = parse_library_id(&library_id)?;
+    let library_id = parse_uuid_field(&library_id, "library id")?;
     let catalog = state.0.lock().expect("catalog mutex poisoned");
     catalog
         .list_assets(library_id)
@@ -212,7 +311,7 @@ fn search_assets(
     library_id: String,
     query: String,
 ) -> Result<Vec<AssetRecord>, String> {
-    let library_id = parse_library_id(&library_id)?;
+    let library_id = parse_uuid_field(&library_id, "library id")?;
     let catalog = state.0.lock().expect("catalog mutex poisoned");
     catalog
         .search_assets(library_id, storage::AssetSearchQuery::text(query))
@@ -226,7 +325,7 @@ fn import_folder(
     folder_path: String,
     mode: String,
 ) -> Result<ImportFolderResult, String> {
-    let library_id = parse_library_id(&library_id)?;
+    let library_id = parse_uuid_field(&library_id, "library id")?;
     let import_mode = match mode.as_str() {
         "managed" => ImportMode::Managed,
         "referenced" => ImportMode::Referenced,
@@ -266,8 +365,314 @@ fn import_folder(
     Ok(ImportFolderResult { imported, failed })
 }
 
-fn parse_library_id(value: &str) -> Result<Uuid, String> {
-    Uuid::parse_str(value).map_err(|_| format!("invalid library id: {value}"))
+#[tauri::command]
+fn asset_playback_path(
+    state: tauri::State<CatalogState>,
+    asset_id: String,
+) -> Result<String, String> {
+    let asset_id = parse_uuid_field(&asset_id, "asset id")?;
+    let catalog = state.0.lock().expect("catalog mutex poisoned");
+    let asset = catalog
+        .get_asset(asset_id)
+        .map_err(storage_error_message)?
+        .ok_or_else(|| "asset not found".to_string())?;
+
+    match asset.path {
+        AssetPath::Referenced(path) => Ok(path),
+        AssetPath::Managed(relative_path) => {
+            let library = catalog
+                .get_library(asset.library_id)
+                .map_err(storage_error_message)?
+                .ok_or_else(|| "library not found".to_string())?;
+            Ok(format!(
+                "{}/{}",
+                library.media_root.trim_end_matches('/'),
+                relative_path
+            ))
+        }
+    }
+}
+
+#[tauri::command]
+fn list_tags(state: tauri::State<CatalogState>) -> Result<Vec<TagRecord>, String> {
+    let catalog = state.0.lock().expect("catalog mutex poisoned");
+    catalog.list_tags().map_err(storage_error_message)
+}
+
+#[tauri::command]
+fn create_tag(
+    state: tauri::State<CatalogState>,
+    name: String,
+    facet: String,
+) -> Result<TagRecord, String> {
+    let catalog = state.0.lock().expect("catalog mutex poisoned");
+    catalog
+        .create_tag(name, facet, false)
+        .map_err(storage_error_message)
+}
+
+#[tauri::command]
+fn tags_for_asset(
+    state: tauri::State<CatalogState>,
+    asset_id: String,
+) -> Result<Vec<TagRecord>, String> {
+    let asset_id = parse_uuid_field(&asset_id, "asset id")?;
+    let catalog = state.0.lock().expect("catalog mutex poisoned");
+    catalog
+        .tags_for_asset(asset_id)
+        .map_err(storage_error_message)
+}
+
+#[tauri::command]
+fn suggested_tags_for_asset(
+    state: tauri::State<CatalogState>,
+    asset_id: String,
+) -> Result<Vec<TagRecord>, String> {
+    let asset_id = parse_uuid_field(&asset_id, "asset id")?;
+    let catalog = state.0.lock().expect("catalog mutex poisoned");
+    catalog
+        .pending_suggested_tags(asset_id)
+        .map_err(storage_error_message)
+}
+
+#[tauri::command]
+fn apply_tag(
+    state: tauri::State<CatalogState>,
+    asset_ids: Vec<String>,
+    tag_id: String,
+) -> Result<String, String> {
+    let tag_id = parse_uuid_field(&tag_id, "tag id")?;
+    let asset_ids = asset_ids
+        .iter()
+        .map(|id| parse_uuid_field(id, "asset id"))
+        .collect::<Result<Vec<_>, _>>()?;
+
+    let catalog = state.0.lock().expect("catalog mutex poisoned");
+    let undo_id = catalog
+        .apply_tag_to_assets(&asset_ids, tag_id, TagOrigin::Manual)
+        .map_err(storage_error_message)?;
+
+    Ok(undo_id.to_string())
+}
+
+#[tauri::command]
+fn accept_suggested_tag(
+    state: tauri::State<CatalogState>,
+    asset_id: String,
+    tag_id: String,
+) -> Result<(), String> {
+    let asset_id = parse_uuid_field(&asset_id, "asset id")?;
+    let tag_id = parse_uuid_field(&tag_id, "tag id")?;
+    let catalog = state.0.lock().expect("catalog mutex poisoned");
+
+    for origin in ALL_TAG_ORIGINS {
+        catalog
+            .set_tag_approval(asset_id, tag_id, origin, TagApprovalState::Accepted)
+            .map_err(storage_error_message)?;
+    }
+
+    Ok(())
+}
+
+#[tauri::command]
+fn reject_suggested_tag(
+    state: tauri::State<CatalogState>,
+    asset_id: String,
+    tag_id: String,
+) -> Result<(), String> {
+    let asset_id = parse_uuid_field(&asset_id, "asset id")?;
+    let tag_id = parse_uuid_field(&tag_id, "tag id")?;
+    let catalog = state.0.lock().expect("catalog mutex poisoned");
+
+    for origin in ALL_TAG_ORIGINS {
+        catalog
+            .set_tag_approval(asset_id, tag_id, origin, TagApprovalState::Rejected)
+            .map_err(storage_error_message)?;
+    }
+
+    Ok(())
+}
+
+#[tauri::command]
+fn set_favorite(
+    state: tauri::State<CatalogState>,
+    asset_id: String,
+    favorite: bool,
+) -> Result<(), String> {
+    let asset_id = parse_uuid_field(&asset_id, "asset id")?;
+    let catalog = state.0.lock().expect("catalog mutex poisoned");
+    catalog
+        .set_asset_flags(asset_id, Some(favorite), None)
+        .map_err(storage_error_message)
+}
+
+#[tauri::command]
+fn set_reviewed(
+    state: tauri::State<CatalogState>,
+    asset_id: String,
+    reviewed: bool,
+) -> Result<(), String> {
+    let asset_id = parse_uuid_field(&asset_id, "asset id")?;
+    let review_state = if reviewed {
+        storage::ReviewState::Reviewed
+    } else {
+        storage::ReviewState::Unreviewed
+    };
+    let catalog = state.0.lock().expect("catalog mutex poisoned");
+    catalog
+        .set_asset_flags(asset_id, None, Some(review_state))
+        .map_err(storage_error_message)
+}
+
+#[tauri::command]
+fn undo_action(state: tauri::State<CatalogState>, undo_id: String) -> Result<(), String> {
+    let undo_id = parse_uuid_field(&undo_id, "undo id")?;
+    let catalog = state.0.lock().expect("catalog mutex poisoned");
+    catalog.undo(undo_id).map_err(storage_error_message)
+}
+
+#[tauri::command]
+fn redo_action(state: tauri::State<CatalogState>, undo_id: String) -> Result<(), String> {
+    let undo_id = parse_uuid_field(&undo_id, "undo id")?;
+    let catalog = state.0.lock().expect("catalog mutex poisoned");
+    catalog.redo(undo_id).map_err(storage_error_message)
+}
+
+#[tauri::command]
+fn list_collections(
+    state: tauri::State<CatalogState>,
+    library_id: String,
+) -> Result<Vec<CollectionRecord>, String> {
+    let library_id = parse_uuid_field(&library_id, "library id")?;
+    let catalog = state.0.lock().expect("catalog mutex poisoned");
+    catalog
+        .list_collections(library_id)
+        .map_err(storage_error_message)
+}
+
+#[tauri::command]
+fn create_project(
+    state: tauri::State<CatalogState>,
+    library_id: String,
+    name: String,
+) -> Result<CollectionRecord, String> {
+    let library_id = parse_uuid_field(&library_id, "library id")?;
+    let catalog = state.0.lock().expect("catalog mutex poisoned");
+    catalog
+        .create_collection(library_id, name, CollectionType::Project)
+        .map_err(storage_error_message)
+}
+
+#[tauri::command]
+fn add_to_collection(
+    state: tauri::State<CatalogState>,
+    collection_id: String,
+    asset_ids: Vec<String>,
+) -> Result<String, String> {
+    let collection_id = parse_uuid_field(&collection_id, "collection id")?;
+    let asset_ids = asset_ids
+        .iter()
+        .map(|id| parse_uuid_field(id, "asset id"))
+        .collect::<Result<Vec<_>, _>>()?;
+
+    let catalog = state.0.lock().expect("catalog mutex poisoned");
+    let undo_id = catalog
+        .add_assets_to_collection(collection_id, &asset_ids)
+        .map_err(storage_error_message)?;
+
+    Ok(undo_id.to_string())
+}
+
+#[tauri::command]
+fn assets_in_collection(
+    state: tauri::State<CatalogState>,
+    collection_id: String,
+) -> Result<Vec<AssetRecord>, String> {
+    let collection_id = parse_uuid_field(&collection_id, "collection id")?;
+    let catalog = state.0.lock().expect("catalog mutex poisoned");
+    catalog
+        .assets_in_collection(collection_id)
+        .map_err(storage_error_message)
+}
+
+#[tauri::command]
+fn get_source_record(
+    state: tauri::State<CatalogState>,
+    asset_id: String,
+) -> Result<Option<SourceRecordDraft>, String> {
+    let asset_id = parse_uuid_field(&asset_id, "asset id")?;
+    let catalog = state.0.lock().expect("catalog mutex poisoned");
+    catalog
+        .get_source_record(asset_id)
+        .map_err(storage_error_message)
+}
+
+#[tauri::command]
+fn set_source_record(
+    state: tauri::State<CatalogState>,
+    draft: SourceRecordDraft,
+) -> Result<(), String> {
+    let catalog = state.0.lock().expect("catalog mutex poisoned");
+    catalog
+        .set_source_record(draft)
+        .map_err(storage_error_message)
+}
+
+#[tauri::command]
+fn export_selected_asset(
+    state: tauri::State<CatalogState>,
+    asset_id: String,
+    destination_folder: String,
+) -> Result<String, String> {
+    let asset_id = parse_uuid_field(&asset_id, "asset id")?;
+    let catalog = state.0.lock().expect("catalog mutex poisoned");
+    let asset = catalog
+        .get_asset(asset_id)
+        .map_err(storage_error_message)?
+        .ok_or_else(|| "asset not found".to_string())?;
+
+    let source_path = match &asset.path {
+        AssetPath::Referenced(path) => path.clone(),
+        AssetPath::Managed(relative_path) => {
+            let library = catalog
+                .get_library(asset.library_id)
+                .map_err(storage_error_message)?
+                .ok_or_else(|| "library not found".to_string())?;
+            format!(
+                "{}/{}",
+                library.media_root.trim_end_matches('/'),
+                relative_path
+            )
+        }
+    };
+
+    let plan = export_pipeline::plan_editorial_export(export_pipeline::ExportRequest {
+        source_path,
+        project_media_dir: destination_folder,
+        asset_display_name: asset.display_name,
+        preset: export_pipeline::ExportPreset::Original,
+        range: None,
+        intent: export_pipeline::default_editorial_export_intent(),
+    })
+    .map_err(|error| format!("{error:?}"))?;
+
+    let executed = export_pipeline::execute_original_copy_export(&plan)
+        .map_err(|error| format!("{error:?}"))?;
+
+    catalog
+        .record_usage_event(
+            asset_id,
+            None,
+            storage::UsageEventType::Exported,
+            &executed.destination_path,
+        )
+        .map_err(storage_error_message)?;
+
+    Ok(executed.destination_path)
+}
+
+fn parse_uuid_field(value: &str, label: &str) -> Result<Uuid, String> {
+    Uuid::parse_str(value).map_err(|_| format!("invalid {label}: {value}"))
 }
 
 fn storage_error_message(error: StorageError) -> String {
@@ -301,15 +706,36 @@ pub fn run() {
             supported_drag_targets,
             default_virtualized_range,
             default_command_titles,
-            sample_maintenance_summary,
+            maintenance_report,
             trash_retention_policy_days,
             backup_restore_requirements,
-            sample_media_root_status,
+            media_root_status,
             list_libraries,
             create_library,
             list_assets,
             search_assets,
-            import_folder
+            import_folder,
+            asset_playback_path,
+            list_tags,
+            create_tag,
+            tags_for_asset,
+            suggested_tags_for_asset,
+            apply_tag,
+            accept_suggested_tag,
+            reject_suggested_tag,
+            set_favorite,
+            set_reviewed,
+            undo_action,
+            redo_action,
+            list_collections,
+            create_project,
+            add_to_collection,
+            assets_in_collection,
+            get_source_record,
+            set_source_record,
+            export_selected_asset,
+            load_app_preferences,
+            save_app_preferences
         ])
         .run(tauri::generate_context!())
         .expect("failed to run Darkwave desktop shell");
@@ -323,14 +749,14 @@ mod tests {
     }
 
     #[test]
-    fn parse_library_id_rejects_non_uuid_input() {
-        assert!(super::parse_library_id("not-a-uuid").is_err());
+    fn parse_uuid_field_rejects_non_uuid_input() {
+        assert!(super::parse_uuid_field("not-a-uuid", "library id").is_err());
     }
 
     #[test]
-    fn parse_library_id_accepts_uuid_input() {
+    fn parse_uuid_field_accepts_uuid_input() {
         let id = uuid::Uuid::new_v4();
-        assert_eq!(super::parse_library_id(&id.to_string()), Ok(id));
+        assert_eq!(super::parse_uuid_field(&id.to_string(), "library id"), Ok(id));
     }
 
     #[test]
@@ -409,11 +835,6 @@ mod tests {
     }
 
     #[test]
-    fn sample_maintenance_summary_reports_clean_state() {
-        assert_eq!(super::sample_maintenance_summary(), (0, "ok"));
-    }
-
-    #[test]
     fn trash_retention_policy_defaults_to_30_days() {
         assert_eq!(super::trash_retention_policy_days(), 30);
     }
@@ -426,8 +847,4 @@ mod tests {
         );
     }
 
-    #[test]
-    fn sample_media_root_status_reports_offline_without_reconnect_validation() {
-        assert_eq!(super::sample_media_root_status(), ("offline", false));
-    }
 }

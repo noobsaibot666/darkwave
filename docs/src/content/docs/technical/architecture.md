@@ -9,7 +9,7 @@ The active catalog remains local to each computer. Shared media and portable man
 
 Core modules are split by responsibility so indexing, audio analysis, waveform generation, storage, search, synchronization, playback, and export can be tested independently.
 
-The desktop shell (`apps/desktop/src-tauri`) opens a real SQLite catalog in the OS app data directory on startup and exposes library creation, folder import, and asset listing/search through Tauri commands backed directly by `storage` and `import-pipeline`. Real playback, background job processing for the queued metadata/hash/waveform work, and the remaining inspector panels are not wired yet — most other crates below remain tested but not yet called from the shell.
+The desktop shell (`apps/desktop/src-tauri`) opens a real SQLite catalog in the OS app data directory on startup and calls directly into the crates below through Tauri commands: library creation, folder import, asset listing/search, tags (list/create/apply/suggested/approval), favorites and review state, undo/redo, collections and projects, source/license editing, original-copy export, a maintenance report computed from live catalog state, media root online/offline status, and settings persistence. Playback and waveform rendering use the platform webview's native `<audio>` element and Web Audio API rather than the `audio-engine`/`waveform` crates directly — see the playback engine page. Background processing of the queued metadata/hash/waveform jobs, Trash, backup/restore, and NAS reconnect/offline controls are not wired to the shell yet.
 
 Milestone 1 introduces the first catalog boundary:
 

@@ -17,17 +17,20 @@ tauri-build = { version = "2", features = [] }
 [dependencies]
 backup = { path = "../../../crates/backup" }
 command-palette = { path = "../../../crates/command-palette" }
+export-pipeline = { path = "../../../crates/export-pipeline" }
+fingerprint = { path = "../../../crates/fingerprint" }
 import-pipeline = { path = "../../../crates/import-pipeline" }
 library-core = { path = "../../../crates/library-core" }
 library-sync = { path = "../../../crates/library-sync" }
 maintenance = { path = "../../../crates/maintenance" }
 preferences = { path = "../../../crates/preferences" }
 release-readiness = { path = "../../../crates/release-readiness" }
+shared-types = { path = "../../../crates/shared-types" }
 storage = { path = "../../../crates/storage" }
 uuid.workspace = true
 viewport = { path = "../../../crates/viewport" }
 workspace-state = { path = "../../../crates/workspace-state" }
-tauri = { version = "2", features = [] }
+tauri = { version = "2", features = ["protocol-asset"] }
 tauri-plugin-dialog = "2"
 tauri-plugin-fs = "2"
 tauri-plugin-opener = "2"
