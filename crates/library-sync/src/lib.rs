@@ -24,24 +24,24 @@ pub struct PortableManifest {
 }
 
 #[derive(Debug)]
-pub enum ManifestFileError {
+pub enum SyncFileError {
     Io(std::io::Error),
     Json(serde_json::Error),
 }
 
-impl From<std::io::Error> for ManifestFileError {
+impl From<std::io::Error> for SyncFileError {
     fn from(error: std::io::Error) -> Self {
         Self::Io(error)
     }
 }
 
-impl From<serde_json::Error> for ManifestFileError {
+impl From<serde_json::Error> for SyncFileError {
     fn from(error: serde_json::Error) -> Self {
         Self::Json(error)
     }
 }
 
-#[derive(Clone, Debug, Eq, PartialEq)]
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 pub struct WriterLease {
     pub device_id: String,
     pub acquired_at_ms: u64,
@@ -138,7 +138,7 @@ impl PortableManifest {
 pub fn write_manifest_file(
     manifest: &PortableManifest,
     path: impl AsRef<Path>,
-) -> Result<(), ManifestFileError> {
+) -> Result<(), SyncFileError> {
     let path = path.as_ref();
     if let Some(parent) = path.parent() {
         std::fs::create_dir_all(parent)?;
@@ -148,9 +148,71 @@ pub fn write_manifest_file(
     Ok(())
 }
 
-pub fn read_manifest_file(path: impl AsRef<Path>) -> Result<PortableManifest, ManifestFileError> {
+pub fn read_manifest_file(path: impl AsRef<Path>) -> Result<PortableManifest, SyncFileError> {
     let contents = std::fs::read_to_string(path)?;
     Ok(PortableManifest::from_json(&contents)?)
+}
+
+pub fn write_lease_file(lease: &WriterLease, path: impl AsRef<Path>) -> Result<(), SyncFileError> {
+    let path = path.as_ref();
+    if let Some(parent) = path.parent() {
+        std::fs::create_dir_all(parent)?;
+    }
+    std::fs::write(path, serde_json::to_string_pretty(lease)?)?;
+
+    Ok(())
+}
+
+pub fn read_lease_file(path: impl AsRef<Path>) -> Result<WriterLease, SyncFileError> {
+    let contents = std::fs::read_to_string(path)?;
+    Ok(serde_json::from_str(&contents)?)
+}
+
+/// Attempts to claim the shared-media writer lease file for `device_id`.
+///
+/// Writes a fresh lease (and so renews it) whenever the caller is allowed to be the
+/// writer: no lease exists, the existing lease expired, or `device_id` already holds
+/// it. Leaves another device's live lease untouched and reports it as read-only.
+pub fn acquire_lease_file(
+    path: impl AsRef<Path>,
+    device_id: &str,
+    ttl_ms: u64,
+    now_ms: u64,
+) -> Result<WriterLeaseState, SyncFileError> {
+    let path = path.as_ref();
+    let existing = if path.exists() {
+        Some(read_lease_file(path)?)
+    } else {
+        None
+    };
+
+    let state = lease_state_at(existing.as_ref(), device_id, now_ms);
+    if state == WriterLeaseState::Writable {
+        write_lease_file(
+            &WriterLease {
+                device_id: device_id.to_string(),
+                acquired_at_ms: now_ms,
+                ttl_ms,
+            },
+            path,
+        )?;
+    }
+
+    Ok(state)
+}
+
+/// Removes the lease file, but only when it is still owned by `device_id`.
+pub fn release_lease_file(path: impl AsRef<Path>, device_id: &str) -> Result<(), SyncFileError> {
+    let path = path.as_ref();
+    if !path.exists() {
+        return Ok(());
+    }
+
+    if read_lease_file(path)?.device_id == device_id {
+        std::fs::remove_file(path)?;
+    }
+
+    Ok(())
 }
 
 pub fn probe_media_root(
@@ -395,6 +457,70 @@ mod tests {
         let loaded = read_manifest_file(&path).expect("read manifest");
 
         assert_eq!(loaded, manifest);
+    }
+
+    #[test]
+    fn acquire_lease_file_claims_lease_when_none_exists() {
+        let path = unique_manifest_path("lease-fresh");
+
+        let state = acquire_lease_file(&path, "laptop", 1_000, 1_000).expect("acquire");
+
+        assert_eq!(state, WriterLeaseState::Writable);
+        let lease = read_lease_file(&path).expect("read lease");
+        assert_eq!(lease.device_id, "laptop");
+        assert_eq!(lease.acquired_at_ms, 1_000);
+    }
+
+    #[test]
+    fn acquire_lease_file_denies_other_device_within_ttl() {
+        let path = unique_manifest_path("lease-conflict");
+        acquire_lease_file(&path, "edit-suite", 1_000, 1_000).expect("first acquire");
+
+        let state = acquire_lease_file(&path, "laptop", 1_000, 1_200).expect("second acquire");
+
+        assert_eq!(state, WriterLeaseState::ReadOnlyBecauseAnotherWriterExists);
+        assert_eq!(
+            read_lease_file(&path).expect("read lease").device_id,
+            "edit-suite"
+        );
+    }
+
+    #[test]
+    fn acquire_lease_file_allows_takeover_after_expiry() {
+        let path = unique_manifest_path("lease-expired");
+        acquire_lease_file(&path, "edit-suite", 500, 1_000).expect("first acquire");
+
+        let state = acquire_lease_file(&path, "laptop", 500, 2_000).expect("second acquire");
+
+        assert_eq!(state, WriterLeaseState::Writable);
+        assert_eq!(
+            read_lease_file(&path).expect("read lease").device_id,
+            "laptop"
+        );
+    }
+
+    #[test]
+    fn release_lease_file_removes_lease_owned_by_device() {
+        let path = unique_manifest_path("lease-release");
+        acquire_lease_file(&path, "laptop", 1_000, 1_000).expect("acquire");
+
+        release_lease_file(&path, "laptop").expect("release");
+
+        assert!(!path.exists());
+    }
+
+    #[test]
+    fn release_lease_file_ignores_non_owner() {
+        let path = unique_manifest_path("lease-release-denied");
+        acquire_lease_file(&path, "edit-suite", 1_000, 1_000).expect("acquire");
+
+        release_lease_file(&path, "laptop").expect("release attempt");
+
+        assert!(path.exists());
+        assert_eq!(
+            read_lease_file(&path).expect("read lease").device_id,
+            "edit-suite"
+        );
     }
 
     #[test]
