@@ -1,15 +1,23 @@
 import { convertFileSrc, invoke } from "@tauri-apps/api/core";
+import { listen } from "@tauri-apps/api/event";
 import { open as openDialog, save as saveDialog, confirm as confirmDialog } from "@tauri-apps/plugin-dialog";
 import {
   Bell,
+  ChevronDown,
+  ChevronRight,
   Command,
   Contrast,
   Gauge,
   Import,
   ListFilter,
   Music,
+  PanelLeftClose,
+  PanelLeftOpen,
+  PanelRightClose,
+  PanelRightOpen,
   Pause,
   Play,
+  RefreshCw,
   Save,
   Search,
   Settings,
@@ -19,9 +27,10 @@ import {
   SlidersHorizontal,
   Star,
   Volume2,
+  X,
   Zap
 } from "lucide-react";
-import { useCallback, useEffect, useMemo, useRef, useState, type MouseEvent } from "react";
+import { useCallback, useEffect, useMemo, useRef, useState, type MouseEvent, type ReactNode } from "react";
 
 type LibraryRecord = {
   id: string;
@@ -142,10 +151,12 @@ type ActiveFilter =
   | "favorites"
   | "unreviewed"
   | "missing"
+  | "needs_review"
   | "music"
   | "sound_effect"
   | "ambience"
-  | { project: string };
+  | { project: string }
+  | { tag: string };
 
 type TrashItem = {
   asset_id: string;
@@ -242,7 +253,8 @@ const smartFilters: { id: ActiveFilter; label: string }[] = [
   { id: "favorites", label: "Favorites" },
   { id: "unreviewed", label: "Unreviewed" },
   { id: "missing", label: "Missing Files" },
-  { id: "music", label: "Music" },
+  { id: "needs_review", label: "Needs Review" },
+  { id: "music", label: "Soundtracks" },
   { id: "sound_effect", label: "Sound Effects" },
   { id: "ambience", label: "Ambience" }
 ];
@@ -253,6 +265,41 @@ const maintenanceLabels: Record<string, string> = {
   StaleWaveformCache: "Waveform cache",
   DuplicateContent: "Duplicates"
 };
+
+function CollapsibleSection({
+  id,
+  title,
+  collapsed,
+  onToggle,
+  children,
+  ...rest
+}: {
+  id: string;
+  title: string;
+  collapsed: boolean;
+  onToggle: (id: string) => void;
+  children: ReactNode;
+} & Record<string, unknown>) {
+  return (
+    <section {...rest}>
+      <div className="section-header" onClick={() => onToggle(id)}>
+        <h2>{title}</h2>
+        <button
+          type="button"
+          className="section-toggle"
+          aria-label={collapsed ? `Expand ${title}` : `Collapse ${title}`}
+          onClick={(event) => {
+            event.stopPropagation();
+            onToggle(id);
+          }}
+        >
+          {collapsed ? <ChevronRight size={13} /> : <ChevronDown size={13} />}
+        </button>
+      </div>
+      {collapsed ? null : <div className="section-body">{children}</div>}
+    </section>
+  );
+}
 
 export function App() {
   const [releaseItems, setReleaseItems] = useState(fallbackReleaseItems);
@@ -271,6 +318,21 @@ export function App() {
   const [importStatus, setImportStatus] = useState<string | null>(null);
   const [activeFilter, setActiveFilter] = useState<ActiveFilter>("all");
   const searchInputRef = useRef<HTMLInputElement | null>(null);
+  const [sidebarCollapsed, setSidebarCollapsed] = useState(false);
+  const [inspectorCollapsed, setInspectorCollapsed] = useState(false);
+  const [settingsOpen, setSettingsOpen] = useState(false);
+  const [filterMenuOpen, setFilterMenuOpen] = useState(false);
+  const [sfxSubcategoriesOpen, setSfxSubcategoriesOpen] = useState(false);
+  const [collapsedSections, setCollapsedSections] = useState<Set<string>>(() => new Set(["shortcuts", "release"]));
+  const [refreshStatus, setRefreshStatus] = useState<string | null>(null);
+  const toggleSection = useCallback((id: string) => {
+    setCollapsedSections((previous) => {
+      const next = new Set(previous);
+      if (next.has(id)) next.delete(id);
+      else next.add(id);
+      return next;
+    });
+  }, []);
 
   const [tags, setTags] = useState<TagRecord[]>([]);
   const [appliedTags, setAppliedTags] = useState<TagRecord[]>([]);
@@ -319,7 +381,12 @@ export function App() {
     if (activeFilter === "favorites") return assets.filter((asset) => asset.favorite);
     if (activeFilter === "unreviewed") return assets.filter((asset) => asset.review_state === "Unreviewed");
     if (activeFilter === "missing") return assets.filter((asset) => asset.availability_state === "Missing");
-    if (activeFilter === "music" || activeFilter === "sound_effect" || activeFilter === "ambience") {
+    if (
+      activeFilter === "needs_review" ||
+      activeFilter === "music" ||
+      activeFilter === "sound_effect" ||
+      activeFilter === "ambience"
+    ) {
       return assets.filter((asset) => asset.media_type === activeFilter);
     }
     return assets;
@@ -357,8 +424,14 @@ export function App() {
   }, [visibleAssets]);
 
   const refreshAssets = useCallback((libraryId: string, query: string, filter: ActiveFilter) => {
-    if (typeof filter === "object") {
+    if (typeof filter === "object" && "project" in filter) {
       invoke<AssetRecord[]>("assets_in_collection", { collectionId: filter.project })
+        .then(setAssets)
+        .catch(() => setAssets([]));
+      return;
+    }
+    if (typeof filter === "object" && "tag" in filter) {
+      invoke<AssetRecord[]>("assets_for_tag", { libraryId, tagId: filter.tag })
         .then(setAssets)
         .catch(() => setAssets([]));
       return;
@@ -546,8 +619,22 @@ export function App() {
       const nextAsset = visibleAssets[nextIndex];
       setSelectedAssetId(nextAsset.id);
       loadAssetForPlayback(nextAsset, true);
+      if (browserState) {
+        invoke<BrowserState>("apply_browser_command", {
+          browserState,
+          command: { FocusRow: { index: nextIndex } }
+        })
+          .then((focused) =>
+            invoke<BrowserState>("apply_browser_command", {
+              browserState: focused,
+              command: { SelectFocused: { mode: "Replace" } }
+            })
+          )
+          .then(setBrowserState)
+          .catch(() => {});
+      }
     },
-    [visibleAssets, playingAssetId, selectedAssetId, loadAssetForPlayback]
+    [visibleAssets, playingAssetId, selectedAssetId, loadAssetForPlayback, browserState]
   );
 
   const handleToggleFavorite = useCallback((asset: AssetRecord) => {
@@ -654,6 +741,15 @@ export function App() {
       if (selectedAssetId) refreshAssetTags(selectedAssetId);
     });
   }, [redoStack, activeLibraryId, searchQuery, activeFilter, refreshAssets, selectedAssetId, refreshAssetTags]);
+
+  useEffect(() => {
+    const unlistenUndo = listen("menu-undo", () => handleUndo());
+    const unlistenRedo = listen("menu-redo", () => handleRedo());
+    return () => {
+      unlistenUndo.then((dispose) => dispose());
+      unlistenRedo.then((dispose) => dispose());
+    };
+  }, [handleUndo, handleRedo]);
 
   const handleCreateProject = useCallback(() => {
     if (!activeLibraryId || !newProjectName.trim()) return;
@@ -880,6 +976,38 @@ export function App() {
     }
   }, [activeLibraryId, searchQuery, activeFilter, refreshAssets, refreshMaintenance]);
 
+  const handleRefreshLibrary = useCallback(
+    (silent = false) => {
+      if (!activeLibraryId) return;
+      if (!silent) setRefreshStatus("Scanning for new files…");
+      invoke<ImportFolderResult>("refresh_library", { libraryId: activeLibraryId })
+        .then((result) => {
+          if (result.imported.length > 0) {
+            invoke<number>("process_pending_jobs").catch(() => {});
+          }
+          setRefreshStatus(
+            result.imported.length > 0
+              ? `Found ${result.imported.length} new sound${result.imported.length === 1 ? "" : "s"}`
+              : silent
+                ? null
+                : "No new files found"
+          );
+          refreshAssets(activeLibraryId, searchQuery, activeFilter);
+          refreshMaintenance(activeLibraryId);
+        })
+        .catch((error) => {
+          if (!silent) setRefreshStatus(`Refresh failed: ${String(error)}`);
+        });
+    },
+    [activeLibraryId, searchQuery, activeFilter, refreshAssets, refreshMaintenance]
+  );
+
+  useEffect(() => {
+    if (!activeLibraryId) return;
+    handleRefreshLibrary(true);
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [activeLibraryId]);
+
   const handleExportSelected = useCallback(async () => {
     if (!selectedAssetId) return;
     const destination = await openDialog({ directory: true, multiple: false, title: "Choose export destination" });
@@ -933,7 +1061,7 @@ export function App() {
   }, [bulkAssetIds]);
 
   const handleExportLicenseReport = useCallback(async () => {
-    if (typeof activeFilter !== "object") return;
+    if (typeof activeFilter !== "object" || !("project" in activeFilter)) return;
     const destination = await saveDialog({
       defaultPath: "license-report.csv",
       filters: [{ name: "CSV", extensions: ["csv"] }]
@@ -1108,7 +1236,7 @@ export function App() {
         onLoadedMetadata={(event) => setDuration(event.currentTarget.duration)}
         onEnded={() => playRelative(1)}
       />
-      <aside className="sidebar" aria-label="Library">
+      <aside className={sidebarCollapsed ? "sidebar collapsed" : "sidebar"} aria-label="Library">
         <div className="brand">Darkwave</div>
         {libraries.length > 1 ? (
           <select
@@ -1124,19 +1252,49 @@ export function App() {
           </select>
         ) : null}
         {smartFilters.map((filter) => (
-          <button
-            className={activeFilter === filter.id ? "nav-item active" : "nav-item"}
-            key={filter.label}
-            onClick={() => setActiveFilter(filter.id)}
-          >
-            {filter.label}
-          </button>
+          <div key={filter.label}>
+            <button
+              className={activeFilter === filter.id ? "nav-item active" : "nav-item"}
+              onClick={() => setActiveFilter(filter.id)}
+            >
+              {filter.label}
+            </button>
+            {filter.id === "sound_effect" ? (
+              <>
+                <button
+                  className="nav-subitem"
+                  onClick={() => setSfxSubcategoriesOpen((previous) => !previous)}
+                >
+                  {sfxSubcategoriesOpen ? <ChevronDown size={11} /> : <ChevronRight size={11} />} By category
+                </button>
+                {sfxSubcategoriesOpen
+                  ? tags
+                      .filter((tag) => tag.facet === "action")
+                      .map((tag) => (
+                        <button
+                          key={tag.id}
+                          className={
+                            typeof activeFilter === "object" && "tag" in activeFilter && activeFilter.tag === tag.id
+                              ? "nav-subitem active"
+                              : "nav-subitem"
+                          }
+                          onClick={() => setActiveFilter({ tag: tag.id })}
+                        >
+                          {tag.name}
+                        </button>
+                      ))
+                  : null}
+              </>
+            ) : null}
+          </div>
         ))}
         <div className="nav-heading">Projects</div>
         {collections.map((project) => (
           <button
             className={
-              typeof activeFilter === "object" && activeFilter.project === project.id ? "nav-item active" : "nav-item"
+              typeof activeFilter === "object" && "project" in activeFilter && activeFilter.project === project.id
+                ? "nav-item active"
+                : "nav-item"
             }
             key={project.id}
             onClick={() => setActiveFilter({ project: project.id })}
@@ -1144,19 +1302,16 @@ export function App() {
             {project.name}
           </button>
         ))}
-        <div className="new-project-row">
-          <input
-            placeholder="New project"
-            value={newProjectName}
-            onChange={(event) => setNewProjectName(event.target.value)}
-          />
-          <button type="button" onClick={handleCreateProject} disabled={!newProjectName.trim()}>
-            +
-          </button>
-        </div>
       </aside>
       <section className="workspace">
         <header className="topbar">
+          <button
+            className="icon-button panel-toggle"
+            aria-label={sidebarCollapsed ? "Show library panel" : "Hide library panel"}
+            onClick={() => setSidebarCollapsed((previous) => !previous)}
+          >
+            {sidebarCollapsed ? <PanelLeftOpen size={17} /> : <PanelLeftClose size={17} />}
+          </button>
           <label className="search">
             <Search size={16} />
             <input
@@ -1166,20 +1321,46 @@ export function App() {
               onChange={(event) => setSearchQuery(event.target.value)}
             />
           </label>
-          <button className="icon-button" aria-label="Filter" disabled title="Use the sidebar filters">
-            <ListFilter size={17} />
-          </button>
-          <button className="text-button" aria-label="Undo" onClick={handleUndo} disabled={undoStack.length === 0}>
-            Undo
-          </button>
-          <button className="text-button" aria-label="Redo" onClick={handleRedo} disabled={redoStack.length === 0}>
-            Redo
-          </button>
+          <div style={{ position: "relative" }}>
+            <button
+              className="icon-button"
+              aria-label="Filter"
+              onClick={() => setFilterMenuOpen((previous) => !previous)}
+            >
+              <ListFilter size={17} />
+            </button>
+            {filterMenuOpen ? (
+              <div className="modal-card" style={{ position: "absolute", top: 40, left: 0, width: 200, zIndex: 20 }}>
+                {smartFilters.map((filter) => (
+                  <button
+                    key={filter.label}
+                    className={activeFilter === filter.id ? "nav-item active" : "nav-item"}
+                    onClick={() => {
+                      setActiveFilter(filter.id);
+                      setFilterMenuOpen(false);
+                    }}
+                  >
+                    {filter.label}
+                  </button>
+                ))}
+              </div>
+            ) : null}
+          </div>
+          <div className="new-project-inline">
+            <input
+              placeholder="New project"
+              value={newProjectName}
+              onChange={(event) => setNewProjectName(event.target.value)}
+            />
+            <button type="button" className="icon-button" onClick={handleCreateProject} disabled={!newProjectName.trim()}>
+              +
+            </button>
+          </div>
           <button
             className="text-button"
             type="button"
             onClick={handleExportLicenseReport}
-            disabled={typeof activeFilter !== "object"}
+            disabled={typeof activeFilter !== "object" || !("project" in activeFilter)}
             title="Export a CSV license report for the active project"
           >
             License Report
@@ -1187,6 +1368,16 @@ export function App() {
           <button className="primary-action" type="button" onClick={handleImportFolder}>
             <Import size={16} />
             Import
+          </button>
+          <button className="icon-button" aria-label="Open settings" onClick={() => setSettingsOpen(true)}>
+            <Settings size={17} />
+          </button>
+          <button
+            className="icon-button panel-toggle"
+            aria-label={inspectorCollapsed ? "Show inspector panel" : "Hide inspector panel"}
+            onClick={() => setInspectorCollapsed((previous) => !previous)}
+          >
+            {inspectorCollapsed ? <PanelRightOpen size={17} /> : <PanelRightClose size={17} />}
           </button>
         </header>
         {queryFilters.length > 0 ? (
@@ -1198,20 +1389,14 @@ export function App() {
             ))}
           </div>
         ) : null}
-        <section className="onboarding-strip" aria-label="Library setup">
-          <button type="button" onClick={handleImportFolder}>
-            <Import size={16} />
-            Import Folder
+        <section className="onboarding-strip" aria-label="Library status">
+          <button type="button" className="icon-button" aria-label="Refresh library" onClick={() => handleRefreshLibrary()} title="Scan the media root for new files">
+            <RefreshCw size={15} />
           </button>
-          <span>{importStatus ?? "Referenced import — files stay where they are"}</span>
-          <span>
-            {activeLibrary ? activeLibrary.media_root : ""}{" "}
-            {mediaRootStatus ? `(${mediaRootStatus.status})` : ""}
-          </span>
+          <span>{refreshStatus ?? importStatus ?? "Referenced import — files stay where they are"}</span>
         </section>
         <section className="command-strip" aria-label="Command palette preview">
           <Command size={15} />
-          <button onClick={handleImportFolder}>Import Folder</button>
           <button onClick={() => searchInputRef.current?.focus()}>Focus Search</button>
           <button onClick={() => document.getElementById("tags-section")?.scrollIntoView({ behavior: "smooth" })}>
             Apply Tag
@@ -1219,11 +1404,9 @@ export function App() {
           <button onClick={handleExportSelected} disabled={!selectedAssetId}>
             Export Selected
           </button>
-          <button onClick={() => document.getElementById("settings-section")?.scrollIntoView({ behavior: "smooth" })}>
-            Open Settings
-          </button>
+          <button onClick={() => setSettingsOpen(true)}>Open Settings</button>
         </section>
-        <section className="browser" aria-label="Sound browser">
+        <section className="browser" aria-label="Sound browser" data-density={preferences?.browser_density ?? "Comfortable"}>
           <div className="selection-bar" aria-label="Selection actions">
             <strong>{selectedAsset ? "1 selected" : "0 selected"}</strong>
             <span>Click a row to select</span>
@@ -1293,16 +1476,18 @@ export function App() {
           )}
         </section>
       </section>
-      <aside className="inspector" aria-label="Inspector">
+      <aside className={inspectorCollapsed ? "inspector collapsed" : "inspector"} aria-label="Inspector">
         <div className="inspector-head">
           <h1>{selectedAsset?.display_name ?? "No sound selected"}</h1>
-          <button className="icon-button" aria-label="Settings" onClick={() => document.getElementById("settings-section")?.scrollIntoView({ behavior: "smooth" })}>
-            <Settings size={17} />
-          </button>
         </div>
         {selectedCount > 1 ? (
-          <section aria-label="Bulk actions">
-            <h2>{selectedCount} Selected</h2>
+          <CollapsibleSection
+            id="bulk"
+            title={`${selectedCount} Selected`}
+            collapsed={collapsedSections.has("bulk")}
+            onToggle={toggleSection}
+            aria-label="Bulk actions"
+          >
             <div className="drop-target-grid">
               <button type="button" onClick={handleBulkFavorite}>
                 Favorite All
@@ -1314,10 +1499,15 @@ export function App() {
                 Move All to Trash
               </button>
             </div>
-          </section>
+          </CollapsibleSection>
         ) : null}
         {selectedAsset ? (
-          <section>
+          <CollapsibleSection
+            id="quick"
+            title="Quick Actions"
+            collapsed={collapsedSections.has("quick")}
+            onToggle={toggleSection}
+          >
             <label className="setting-row">
               <input
                 type="checkbox"
@@ -1329,9 +1519,9 @@ export function App() {
             <button type="button" className="text-button" onClick={handleMoveToTrash}>
               Move to Trash
             </button>
-          </section>
+          </CollapsibleSection>
         ) : null}
-        <section id="tags-section">
+        <CollapsibleSection id="tags-section" title="Tags" collapsed={collapsedSections.has("tags-section")} onToggle={toggleSection}>
           <h2>Suggested Tags</h2>
           <div className="tag-grid">
             {suggestedTags.length === 0 ? (
@@ -1389,9 +1579,8 @@ export function App() {
               Add
             </button>
           </div>
-        </section>
-        <section>
-          <h2>Projects</h2>
+        </CollapsibleSection>
+        <CollapsibleSection id="projects" title="Projects" collapsed={collapsedSections.has("projects")} onToggle={toggleSection}>
           <div className="drop-target-grid">
             {collections.map((project) => (
               <button key={project.id} onClick={() => handleAddSelectedToProject(project)} disabled={bulkAssetIds.length === 0}>
@@ -1399,21 +1588,22 @@ export function App() {
               </button>
             ))}
           </div>
-        </section>
+        </CollapsibleSection>
         {selectedAsset && (selectedAsset.embedded_title || selectedAsset.embedded_genre || selectedAsset.embedded_comment) ? (
-          <section>
-            <h2>Embedded Metadata</h2>
-            <div className="settings-stack">
-              {selectedAsset.embedded_title ? <div className="status-line">Title: {selectedAsset.embedded_title}</div> : null}
-              {selectedAsset.embedded_genre ? <div className="status-line">Genre: {selectedAsset.embedded_genre}</div> : null}
-              {selectedAsset.embedded_comment ? <div className="status-line">Comment: {selectedAsset.embedded_comment}</div> : null}
-            </div>
-          </section>
+          <CollapsibleSection
+            id="embedded"
+            title="Embedded Metadata"
+            collapsed={collapsedSections.has("embedded")}
+            onToggle={toggleSection}
+          >
+            {selectedAsset.embedded_title ? <div className="status-line">Title: {selectedAsset.embedded_title}</div> : null}
+            {selectedAsset.embedded_genre ? <div className="status-line">Genre: {selectedAsset.embedded_genre}</div> : null}
+            {selectedAsset.embedded_comment ? <div className="status-line">Comment: {selectedAsset.embedded_comment}</div> : null}
+          </CollapsibleSection>
         ) : null}
-        <section>
-          <h2>Source &amp; License</h2>
+        <CollapsibleSection id="source" title="Source & License" collapsed={collapsedSections.has("source")} onToggle={toggleSection}>
           {sourceDraft ? (
-            <div className="settings-stack">
+            <>
               <input
                 placeholder="Provider"
                 value={sourceDraft.provider ?? ""}
@@ -1438,39 +1628,13 @@ export function App() {
                 <Save size={15} />
                 Save source
               </button>
-            </div>
+            </>
           ) : (
             <span className="empty-hint">Select a sound to edit source and license</span>
           )}
           {exportStatus ? <div className="status-line">{exportStatus}</div> : null}
-        </section>
-        <section id="settings-section">
-          <h2>Settings</h2>
-          <div className="settings-stack">
-            <div className="setting-row">
-              <SlidersHorizontal size={15} />
-              <span>Browser density</span>
-              <strong>{preferences?.browser_density ?? "…"}</strong>
-            </div>
-            <div className="setting-row">
-              <Volume2 size={15} />
-              <span>Output route</span>
-              <strong>{preferences?.output_device === "SystemDefault" ? "System default" : "Custom device"}</strong>
-            </div>
-            <div className="setting-row">
-              <Gauge size={15} />
-              <span>Preview cache</span>
-              <strong>{preferences ? `${(preferences.preview_cache_limit_mb / 1024).toFixed(0)} GB` : "…"}</strong>
-            </div>
-            <div className="setting-row">
-              <Save size={15} />
-              <span>Settings file</span>
-              <strong>Saved to preferences.json</strong>
-            </div>
-          </div>
-        </section>
-        <section>
-          <h2>Shortcuts</h2>
+        </CollapsibleSection>
+        <CollapsibleSection id="shortcuts" title="Shortcuts" collapsed={collapsedSections.has("shortcuts")} onToggle={toggleSection}>
           <div className="shortcut-list">
             {(preferences?.shortcuts.bindings ?? []).map((item) => (
               <div className="shortcut-row" key={item.command}>
@@ -1478,33 +1642,17 @@ export function App() {
                 <kbd>{item.accelerator}</kbd>
               </div>
             ))}
+            <div className="shortcut-row">
+              <span>Undo</span>
+              <kbd>Mod+Z</kbd>
+            </div>
+            <div className="shortcut-row">
+              <span>Redo</span>
+              <kbd>Mod+Shift+Z</kbd>
+            </div>
           </div>
-        </section>
-        <section>
-          <h2>Accessibility</h2>
-          <div className="toggle-list">
-            <label>
-              <input
-                type="checkbox"
-                checked={preferences?.reduced_transparency ?? false}
-                onChange={handleToggleReducedTransparency}
-              />
-              <Contrast size={15} />
-              Reduced transparency
-            </label>
-            <label>
-              <input
-                type="checkbox"
-                checked={preferences?.reduced_motion ?? false}
-                onChange={handleToggleReducedMotion}
-              />
-              <Zap size={15} />
-              Reduced motion
-            </label>
-          </div>
-        </section>
-        <section>
-          <h2>Release Readiness</h2>
+        </CollapsibleSection>
+        <CollapsibleSection id="release" title="Release Readiness" collapsed={collapsedSections.has("release")} onToggle={toggleSection}>
           <div className="release-grid">
             {releaseItems.map((item) => (
               <div className="release-item" key={item.label}>
@@ -1521,9 +1669,8 @@ export function App() {
             <Bell size={15} />
             {updateChannelState === "Passed" ? "Update channel ready" : "Update channel planned"}
           </div>
-        </section>
-        <section>
-          <h2>Maintenance</h2>
+        </CollapsibleSection>
+        <CollapsibleSection id="maintenance" title="Maintenance" collapsed={collapsedSections.has("maintenance")} onToggle={toggleSection}>
           <div className="maintenance-list">
             {Object.entries(maintenanceLabels).map(([kind, label]) => (
               <div className="maintenance-row" key={kind}>
@@ -1533,7 +1680,7 @@ export function App() {
             ))}
           </div>
           {maintenanceReport && maintenanceReport.findings.some((finding) => finding.kind === "DuplicateContent") ? (
-            <div className="settings-stack">
+            <>
               {maintenanceReport.findings
                 .filter((finding) => finding.kind === "DuplicateContent")
                 .map((finding, index) => (
@@ -1544,11 +1691,10 @@ export function App() {
                     </button>
                   </div>
                 ))}
-            </div>
+            </>
           ) : null}
-        </section>
-        <section>
-          <h2>NAS &amp; Offline</h2>
+        </CollapsibleSection>
+        <CollapsibleSection id="nas" title="NAS & Offline" collapsed={collapsedSections.has("nas")} onToggle={toggleSection}>
           {offlineControl ? (
             <>
               <div className="status-line">
@@ -1576,14 +1722,13 @@ export function App() {
           ) : (
             <span className="empty-hint">No library selected</span>
           )}
-        </section>
-        <section>
-          <h2>Trash</h2>
+        </CollapsibleSection>
+        <CollapsibleSection id="trash" title="Trash" collapsed={collapsedSections.has("trash")} onToggle={toggleSection}>
           <div className="status-line">{trashRetentionDays} day retention before explicit purge</div>
           {trashItems.length === 0 ? (
             <span className="empty-hint">Trash is empty</span>
           ) : (
-            <div className="settings-stack">
+            <>
               {trashItems.map((item) => (
                 <div className="maintenance-row" key={item.asset_id}>
                   <span>{item.original_path.split("/").pop()}</span>
@@ -1595,11 +1740,10 @@ export function App() {
                   </button>
                 </div>
               ))}
-            </div>
+            </>
           )}
-        </section>
-        <section>
-          <h2>Backup</h2>
+        </CollapsibleSection>
+        <CollapsibleSection id="backup" title="Backup" collapsed={collapsedSections.has("backup")} onToggle={toggleSection}>
           <button type="button" className="text-button" onClick={handleBackupLibrary} disabled={!activeLibraryId}>
             Back Up Library
           </button>
@@ -1607,9 +1751,9 @@ export function App() {
             Restore From Backup…
           </button>
           <div className="status-line">{backupStatus ?? "Copies the catalog snapshot and manifest to a folder you choose"}</div>
-        </section>
+        </CollapsibleSection>
       </aside>
-      <footer className="transport" aria-label="Transport">
+      <footer className={sidebarCollapsed ? "transport sidebar-collapsed" : "transport"} aria-label="Transport">
         <button className="icon-button" aria-label="Previous" onClick={() => playRelative(-1)}>
           <SkipBack size={17} />
         </button>
@@ -1619,7 +1763,22 @@ export function App() {
         <button className="icon-button" aria-label="Next" onClick={() => playRelative(1)}>
           <SkipForward size={17} />
         </button>
-        <div className="transport-waveform" aria-hidden="true">
+        <div
+          className="transport-waveform"
+          role="slider"
+          tabIndex={0}
+          aria-label="Seek"
+          aria-valuemin={0}
+          aria-valuemax={Math.round(duration) || 0}
+          aria-valuenow={Math.round(currentTime) || 0}
+          onClick={(event) => {
+            const audio = audioRef.current;
+            if (!audio || !duration) return;
+            const rect = event.currentTarget.getBoundingClientRect();
+            const fraction = (event.clientX - rect.left) / rect.width;
+            audio.currentTime = Math.max(0, Math.min(duration, fraction * duration));
+          }}
+        >
           {(peaks ?? []).map((peak, i) => (
             <span key={i} style={{ height: `${4 + peak * 96}%` }} />
           ))}
@@ -1628,6 +1787,109 @@ export function App() {
           {formatTime(currentTime)} / {formatTime(duration)}
         </span>
       </footer>
+      {settingsOpen ? (
+        <div className="modal-overlay" onClick={() => setSettingsOpen(false)}>
+          <div className="modal-card" onClick={(event) => event.stopPropagation()} aria-label="Settings">
+            <div className="modal-head">
+              <div>
+                <h1>Settings</h1>
+                <span className="empty-hint">Saved to preferences.json</span>
+              </div>
+              <button type="button" className="icon-button" aria-label="Close settings" onClick={() => setSettingsOpen(false)}>
+                <X size={16} />
+              </button>
+            </div>
+            <h2>Library</h2>
+            <div className="settings-stack">
+              <div className="setting-row">
+                <SlidersHorizontal size={15} />
+                <span>Name</span>
+                <strong>{activeLibrary?.name ?? "—"}</strong>
+              </div>
+              <div className="setting-row">
+                <Volume2 size={15} />
+                <span>Media root</span>
+                <strong title={activeLibrary?.media_root}>{activeLibrary?.media_root ?? "—"}</strong>
+              </div>
+              <div className="setting-row">
+                <Gauge size={15} />
+                <span>Status</span>
+                <strong>{mediaRootStatus?.status ?? "unknown"}</strong>
+              </div>
+            </div>
+            <h2>Playback</h2>
+            <div className="settings-stack">
+              <label className="setting-row">
+                <SlidersHorizontal size={15} />
+                <span>Browser density</span>
+                <select
+                  value={preferences?.browser_density ?? "Comfortable"}
+                  onChange={(event) => {
+                    setPreferences((previous) => {
+                      if (!previous) return previous;
+                      const next = {
+                        ...previous,
+                        browser_density: event.target.value as AppPreferences["browser_density"]
+                      };
+                      invoke("save_app_preferences", { preferences: next }).catch(() => {});
+                      return next;
+                    });
+                  }}
+                >
+                  <option value="Compact">Compact</option>
+                  <option value="Comfortable">Comfortable</option>
+                  <option value="Expanded">Expanded</option>
+                </select>
+              </label>
+              <label className="setting-row">
+                <Gauge size={15} />
+                <span>Preview cache (MB)</span>
+                <input
+                  type="number"
+                  min={64}
+                  step={64}
+                  value={preferences?.preview_cache_limit_mb ?? 0}
+                  onChange={(event) => {
+                    const value = Number(event.target.value);
+                    setPreferences((previous) => {
+                      if (!previous || Number.isNaN(value)) return previous;
+                      const next = { ...previous, preview_cache_limit_mb: value };
+                      invoke("save_app_preferences", { preferences: next }).catch(() => {});
+                      return next;
+                    });
+                  }}
+                />
+              </label>
+              <div className="setting-row">
+                <Volume2 size={15} />
+                <span>Output route</span>
+                <strong>{preferences?.output_device === "SystemDefault" ? "System default" : "Custom device"}</strong>
+              </div>
+            </div>
+            <h2>Accessibility</h2>
+            <div className="toggle-list">
+              <label>
+                <input
+                  type="checkbox"
+                  checked={preferences?.reduced_transparency ?? false}
+                  onChange={handleToggleReducedTransparency}
+                />
+                <Contrast size={15} />
+                Reduced transparency
+              </label>
+              <label>
+                <input
+                  type="checkbox"
+                  checked={preferences?.reduced_motion ?? false}
+                  onChange={handleToggleReducedMotion}
+                />
+                <Zap size={15} />
+                Reduced motion
+              </label>
+            </div>
+          </div>
+        </div>
+      ) : null}
     </main>
   );
 }

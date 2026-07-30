@@ -3,6 +3,7 @@
   font-family: system-ui, -apple-system, BlinkMacSystemFont, "Segoe UI Variable", "Segoe UI", sans-serif;
   background: #101114;
   color: #f2f4f8;
+  font-size: 13px;
 }
 
 * {
@@ -16,8 +17,10 @@ body {
 }
 
 button,
-input {
+input,
+select {
   font: inherit;
+  white-space: nowrap;
 }
 
 button:focus-visible,
@@ -51,20 +54,25 @@ input:focus-visible {
 
 .brand {
   margin-bottom: 18px;
-  font-size: 22px;
+  font-size: 19px;
   font-weight: 650;
 }
 
 .nav-item {
+  display: block;
   width: 100%;
-  min-height: 32px;
+  min-height: 30px;
   margin-bottom: 3px;
   padding: 0 10px;
+  overflow: hidden;
   border: 0;
   border-radius: 6px;
   background: transparent;
   color: #aeb6c2;
+  font-size: 12px;
   text-align: left;
+  text-overflow: ellipsis;
+  white-space: nowrap;
 }
 
 .nav-item.active,
@@ -77,7 +85,7 @@ input:focus-visible {
   margin: 14px 0 4px;
   padding: 0 10px;
   color: #717987;
-  font-size: 11px;
+  font-size: 10px;
   font-weight: 700;
   text-transform: uppercase;
 }
@@ -121,7 +129,7 @@ input:focus-visible {
 
 .empty-hint {
   color: #717987;
-  font-size: 12px;
+  font-size: 11px;
 }
 
 .suggestion-chip {
@@ -133,7 +141,8 @@ input:focus-visible {
   border-radius: 999px;
   background: #181a1f;
   color: #f2f4f8;
-  font-size: 12px;
+  font-size: 11px;
+  white-space: nowrap;
 }
 
 .suggestion-chip button {
@@ -185,17 +194,23 @@ input:focus-visible {
 }
 
 .command-strip button {
-  min-height: 28px;
+  min-height: 26px;
   padding: 0 9px;
   border: 1px solid rgba(255, 255, 255, 0.1);
   border-radius: 6px;
   background: #181a1f;
   color: #dce3ec;
-  font-size: 12px;
+  font-size: 11px;
+  white-space: nowrap;
+}
+
+.onboarding-strip {
+  justify-content: space-between;
 }
 
 .onboarding-strip button {
   display: inline-flex;
+  flex: 0 0 auto;
   align-items: center;
   gap: 7px;
   height: 30px;
@@ -204,6 +219,13 @@ input:focus-visible {
   border-radius: 6px;
   background: #20242b;
   color: #dce3ec;
+  white-space: nowrap;
+}
+
+.onboarding-strip span {
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
 }
 
 .search {
@@ -256,6 +278,7 @@ input:focus-visible {
   background: #52c7b8;
   color: #08110f;
   font-weight: 650;
+  white-space: nowrap;
 }
 
 .text-button {
@@ -265,7 +288,8 @@ input:focus-visible {
   border-radius: 6px;
   background: #20242b;
   color: #f2f4f8;
-  font-size: 13px;
+  font-size: 12px;
+  white-space: nowrap;
 }
 
 button:disabled,
@@ -357,6 +381,15 @@ button:disabled,
   cursor: pointer;
 }
 
+.browser[data-density="Compact"] .asset-row {
+  min-height: 38px;
+  margin-bottom: 3px;
+}
+
+.browser[data-density="Expanded"] .asset-row {
+  min-height: 66px;
+}
+
 .asset-row.selected {
   border-color: rgba(82, 199, 184, 0.55);
   background: #20242b;
@@ -372,14 +405,14 @@ button:disabled,
   min-width: 0;
   overflow: hidden;
   color: #f2f4f8;
-  font-size: 14px;
+  font-size: 13px;
   text-overflow: ellipsis;
   white-space: nowrap;
 }
 
 .asset-row span {
   overflow: hidden;
-  font-size: 12px;
+  font-size: 11px;
   text-overflow: ellipsis;
   white-space: nowrap;
 }
@@ -410,14 +443,14 @@ button:disabled,
 
 h1 {
   margin: 0 0 20px;
-  font-size: 22px;
+  font-size: 19px;
   line-height: 1.15;
 }
 
 h2 {
   margin: 20px 0 10px;
   color: #aeb6c2;
-  font-size: 13px;
+  font-size: 12px;
   line-height: 1.25;
 }
 
@@ -429,12 +462,17 @@ h2 {
 
 .tag-grid button,
 .drop-target-grid button {
+  max-width: 100%;
   min-height: 30px;
   padding: 0 10px;
+  overflow: hidden;
   border: 1px solid rgba(82, 199, 184, 0.28);
   border-radius: 6px;
   background: rgba(82, 199, 184, 0.1);
   color: #d9fffa;
+  font-size: 12px;
+  text-overflow: ellipsis;
+  white-space: nowrap;
 }
 
 .drop-target-grid {
@@ -484,7 +522,7 @@ h2 {
   align-items: center;
   min-height: 30px;
   color: #dce3ec;
-  font-size: 13px;
+  font-size: 12px;
 }
 
 .setting-row {
@@ -532,7 +570,7 @@ kbd {
   align-items: center;
   min-height: 30px;
   color: #dce3ec;
-  font-size: 13px;
+  font-size: 12px;
 }
 
 .toggle-list input {
@@ -547,7 +585,7 @@ kbd {
   align-items: center;
   min-height: 28px;
   color: #aeb6c2;
-  font-size: 13px;
+  font-size: 12px;
 }
 
 .warning-line {
@@ -678,11 +716,12 @@ dd {
 .transport-waveform {
   height: 36px;
   overflow: hidden;
+  cursor: pointer;
 }
 
 .time {
   color: #aeb6c2;
-  font-size: 12px;
+  font-size: 11px;
   text-align: right;
 }
 
@@ -758,4 +797,136 @@ dd {
 
 .setup-card .primary-action:disabled {
   opacity: 0.5;
+}
+
+.shell.sidebar-collapsed {
+  grid-template-columns: 0 minmax(460px, 1fr) 300px;
+}
+
+.shell.inspector-collapsed {
+  grid-template-columns: 220px minmax(460px, 1fr) 0;
+}
+
+.shell.sidebar-collapsed.inspector-collapsed {
+  grid-template-columns: 0 minmax(460px, 1fr) 0;
+}
+
+.sidebar.collapsed,
+.inspector.collapsed {
+  display: none;
+}
+
+.transport.sidebar-collapsed {
+  left: 18px;
+}
+
+.panel-toggle {
+  flex: 0 0 auto;
+}
+
+.new-project-inline {
+  display: flex;
+  width: 190px;
+  flex: 0 0 auto;
+  gap: 6px;
+}
+
+.new-project-inline input {
+  width: 100%;
+  min-width: 0;
+  height: 34px;
+  padding: 0 10px;
+  border: 1px solid rgba(255, 255, 255, 0.1);
+  border-radius: 6px;
+  background: #181a1f;
+  color: #f2f4f8;
+  font-size: 12px;
+}
+
+.section-header {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  cursor: pointer;
+  -webkit-user-select: none;
+  user-select: none;
+}
+
+.section-header h2 {
+  margin: 20px 0 10px;
+}
+
+.section-toggle {
+  width: 22px;
+  height: 22px;
+  flex: 0 0 auto;
+  border: 1px solid rgba(255, 255, 255, 0.1);
+  border-radius: 5px;
+  background: #20242b;
+  color: #aeb6c2;
+  font-size: 10px;
+  line-height: 1;
+}
+
+.section-body {
+  display: grid;
+  gap: 7px;
+}
+
+.nav-subitem {
+  display: block;
+  width: 100%;
+  min-height: 26px;
+  margin-bottom: 2px;
+  padding: 0 10px 0 22px;
+  overflow: hidden;
+  border: 0;
+  border-radius: 6px;
+  background: transparent;
+  color: #838b98;
+  font-size: 11px;
+  text-align: left;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.nav-subitem.active,
+.nav-subitem:hover {
+  background: #20242b;
+  color: #f2f4f8;
+}
+
+.modal-overlay {
+  position: fixed;
+  inset: 0;
+  z-index: 50;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  background: rgba(8, 9, 11, 0.6);
+}
+
+.modal-card {
+  width: 440px;
+  max-height: 80vh;
+  overflow: auto;
+  padding: 20px 22px;
+  border: 1px solid rgba(255, 255, 255, 0.12);
+  border-radius: 10px;
+  background: #181a1f;
+}
+
+.modal-card h1 {
+  margin: 0 0 4px;
+  font-size: 17px;
+}
+
+.modal-card h2:first-of-type {
+  margin-top: 8px;
+}
+
+.modal-head {
+  display: flex;
+  align-items: flex-start;
+  justify-content: space-between;
 }

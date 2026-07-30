@@ -14,6 +14,38 @@ use storage::{
 use thiserror::Error;
 use uuid::Uuid;
 
+/// Extensions eligible for import/cataloging. Deliberately broader than
+/// `audio_metadata::supported_mvp_format`, which gates native decode/playback support:
+/// a file can be cataloged, tagged, and organized before this app can play it natively.
+const RECOGNIZED_AUDIO_EXTENSIONS: &[&str] = &[
+    "wav", "wave", "aif", "aiff", "mp3", "flac", "aac", "m4a", "ogg", "oga", "opus", "wma", "caf",
+    "wv", "ape", "amr",
+];
+
+pub fn is_recognized_audio_extension(extension: &str) -> bool {
+    RECOGNIZED_AUDIO_EXTENSIONS.contains(&extension.to_ascii_lowercase().as_str())
+}
+
+/// Files at or below this size are treated as broken/incomplete rather than real audio
+/// (e.g. zero-byte placeholders, NAS sync stubs, truncated downloads) and are routed to
+/// the `needs_review` category instead of being classified normally.
+const POSSIBLY_CORRUPTED_MAX_BYTES: u64 = 8 * 1024;
+
+/// Files at or below this size that didn't already get a stronger media-type suggestion
+/// are assumed to be short sound effects rather than music, since full tracks are
+/// virtually always larger than this.
+const SOUND_EFFECT_MAX_BYTES: u64 = 5 * 1024 * 1024;
+
+fn refine_media_type_by_size(media_type: String, file_size: u64) -> String {
+    if file_size <= POSSIBLY_CORRUPTED_MAX_BYTES {
+        return "needs_review".to_string();
+    }
+    if media_type == "other" && file_size <= SOUND_EFFECT_MAX_BYTES {
+        return "sound_effect".to_string();
+    }
+    media_type
+}
+
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum ImportMode {
     Managed,
@@ -234,7 +266,7 @@ fn import_file_internal(
 ) -> Result<AssetRecord, ImportError> {
     let metadata = extract_immediate_metadata(path)?;
 
-    if !supported_mvp_format(&metadata.extension) {
+    if !is_recognized_audio_extension(&metadata.extension) {
         return Err(ImportError::UnsupportedFormat(metadata.extension));
     }
 
@@ -259,7 +291,10 @@ fn import_file_internal(
     };
     let mut tag_suggestions = search::suggest_tags_from_filename(&original_filename);
     tag_suggestions.extend(metadata_tag_suggestions(path));
-    let media_type = infer_media_type_from_suggestions(&tag_suggestions);
+    let media_type = refine_media_type_by_size(
+        infer_media_type_from_suggestions(&tag_suggestions),
+        metadata.file_size,
+    );
 
     let asset = catalog.register_asset(NewAssetRecord {
         library_id,
@@ -416,6 +451,41 @@ mod tests {
         assert!(!is_stable_watched_file("track.wav", 42, 84));
         assert!(is_stable_watched_file("track.wav", 84, 84));
         assert!(!is_stable_watched_file("track.wav.crdownload", 84, 84));
+    }
+
+    #[test]
+    fn recognized_audio_extensions_are_broader_than_mvp_playback_support() {
+        assert!(is_recognized_audio_extension("wav"));
+        assert!(is_recognized_audio_extension("WMA"));
+        assert!(is_recognized_audio_extension("caf"));
+        assert!(!is_recognized_audio_extension("txt"));
+        assert!(!is_recognized_audio_extension("jpg"));
+    }
+
+    #[test]
+    fn tiny_files_are_routed_to_needs_review_regardless_of_suggested_type() {
+        assert_eq!(refine_media_type_by_size("music".to_string(), 100), "needs_review");
+        assert_eq!(refine_media_type_by_size("other".to_string(), 8192), "needs_review");
+    }
+
+    #[test]
+    fn small_unclassified_files_default_to_sound_effect() {
+        assert_eq!(
+            refine_media_type_by_size("other".to_string(), 200_000),
+            "sound_effect"
+        );
+    }
+
+    #[test]
+    fn large_files_and_confident_suggestions_are_left_alone() {
+        assert_eq!(
+            refine_media_type_by_size("other".to_string(), 10_000_000),
+            "other"
+        );
+        assert_eq!(
+            refine_media_type_by_size("music".to_string(), 10_000_000),
+            "music"
+        );
     }
 
     #[test]
@@ -625,7 +695,7 @@ mod tests {
     fn import_derives_media_type_from_filename_suggestions() {
         let catalog_path = unique_catalog_path("media-type-import");
         let audio_path = unique_audio_path("dark-metal-impact.wav");
-        fs::write(&audio_path, b"classified audio").expect("fixture");
+        fs::write(&audio_path, vec![0u8; 200_000]).expect("fixture");
 
         let catalog = Catalog::open(&catalog_path).expect("catalog");
         let library = catalog
@@ -642,7 +712,9 @@ mod tests {
     fn import_uses_embedded_metadata_for_suggestions_and_media_type() {
         let catalog_path = unique_catalog_path("embedded-smart-import");
         let audio_path = unique_audio_path("unknown.wav");
-        fs::write(&audio_path, wav_info_fixture()).expect("fixture");
+        let mut fixture = wav_info_fixture();
+        fixture.resize(200_000, 0);
+        fs::write(&audio_path, fixture).expect("fixture");
 
         let catalog = Catalog::open(&catalog_path).expect("catalog");
         let library = catalog

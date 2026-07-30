@@ -667,19 +667,13 @@ fn import_folder(
         other => return Err(format!("unknown import mode: {other}")),
     };
 
-    let entries = std::fs::read_dir(&folder_path)
+    let mut paths = collect_audio_files(std::path::Path::new(&folder_path))
         .map_err(|error| format!("could not read folder {folder_path}: {error}"))?;
+    paths.sort();
 
     let catalog = state.0.lock().expect("catalog mutex poisoned");
     let mut imported = Vec::new();
     let mut failed = Vec::new();
-
-    let mut paths: Vec<PathBuf> = entries
-        .filter_map(|entry| entry.ok())
-        .map(|entry| entry.path())
-        .filter(|path| path.is_file())
-        .collect();
-    paths.sort();
 
     for path in paths {
         let filename = path
@@ -698,6 +692,102 @@ fn import_folder(
     }
 
     Ok(ImportFolderResult { imported, failed })
+}
+
+/// Recursively collects every recognized audio file under `root`, including nested
+/// subfolders. Hidden entries (dotfiles/dot-directories, e.g. `.DS_Store`, `.git`) are
+/// skipped since real libraries are frequently a mess of nested vendor/pack folders.
+fn collect_audio_files(root: &std::path::Path) -> std::io::Result<Vec<PathBuf>> {
+    let mut files = Vec::new();
+    let mut directories = vec![root.to_path_buf()];
+
+    while let Some(directory) = directories.pop() {
+        for entry in std::fs::read_dir(&directory)? {
+            let entry = entry?;
+            let path = entry.path();
+            let is_hidden = path
+                .file_name()
+                .and_then(|name| name.to_str())
+                .is_some_and(|name| name.starts_with('.'));
+            if is_hidden {
+                continue;
+            }
+
+            let file_type = entry.file_type()?;
+            if file_type.is_dir() {
+                directories.push(path);
+            } else if file_type.is_file() {
+                let extension = path
+                    .extension()
+                    .and_then(|extension| extension.to_str())
+                    .unwrap_or_default();
+                if import_pipeline::is_recognized_audio_extension(extension) {
+                    files.push(path);
+                }
+            }
+        }
+    }
+
+    Ok(files)
+}
+
+/// Re-scans a library's media root for audio files not yet in the catalog (e.g. dropped
+/// into a watched NAS folder outside the app) and imports them as referenced assets.
+/// Registration is naturally idempotent: `register_asset` matches on content hash and
+/// file size, so files already cataloged are returned unchanged rather than duplicated.
+#[tauri::command]
+fn refresh_library(
+    state: tauri::State<CatalogState>,
+    library_id: String,
+) -> Result<ImportFolderResult, String> {
+    let library_id = parse_uuid_field(&library_id, "library id")?;
+    let catalog = state.0.lock().expect("catalog mutex poisoned");
+    let library = catalog
+        .get_library(library_id)
+        .map_err(storage_error_message)?
+        .ok_or_else(|| "library not found".to_string())?;
+
+    let mut paths = collect_audio_files(std::path::Path::new(&library.media_root))
+        .map_err(|error| format!("could not read {}: {error}", library.media_root))?;
+    paths.sort();
+
+    let mut imported = Vec::new();
+    let mut failed = Vec::new();
+
+    for path in paths {
+        let filename = path
+            .file_name()
+            .map(|name| name.to_string_lossy().to_string())
+            .unwrap_or_default();
+
+        match import_pipeline::import_file(&catalog, library_id, &path, ImportMode::Referenced) {
+            Ok(asset) => imported.push(asset),
+            Err(ImportError::UnsupportedFormat(_)) => {}
+            Err(error) => failed.push(ImportFailure {
+                filename,
+                reason: error.to_string(),
+            }),
+        }
+    }
+
+    Ok(ImportFolderResult { imported, failed })
+}
+
+#[tauri::command]
+fn assets_for_tag(
+    state: tauri::State<CatalogState>,
+    library_id: String,
+    tag_id: String,
+) -> Result<Vec<AssetRecord>, String> {
+    let library_id = parse_uuid_field(&library_id, "library id")?;
+    let tag_id = parse_uuid_field(&tag_id, "tag id")?;
+    let catalog = state.0.lock().expect("catalog mutex poisoned");
+    catalog
+        .search_assets(
+            library_id,
+            storage::AssetSearchQuery::text("").with_tag(tag_id),
+        )
+        .map_err(storage_error_message)
 }
 
 #[tauri::command]
@@ -1097,7 +1187,53 @@ pub fn run() {
                 .expect("open local catalog database");
             app.manage(CatalogState(Mutex::new(catalog)));
 
+            let undo_item =
+                tauri::menu::MenuItem::with_id(app, "undo", "Undo", true, Some("CmdOrCtrl+Z"))?;
+            let redo_item = tauri::menu::MenuItem::with_id(
+                app,
+                "redo",
+                "Redo",
+                true,
+                Some("CmdOrCtrl+Shift+Z"),
+            )?;
+            let edit_menu = tauri::menu::SubmenuBuilder::new(app, "Edit")
+                .item(&undo_item)
+                .item(&redo_item)
+                .separator()
+                .cut()
+                .copy()
+                .paste()
+                .select_all()
+                .build()?;
+            let app_menu = tauri::menu::SubmenuBuilder::new(app, "Darkwave")
+                .about(None)
+                .separator()
+                .quit()
+                .build()?;
+            let window_menu = tauri::menu::SubmenuBuilder::new(app, "Window")
+                .minimize()
+                .close_window()
+                .build()?;
+            let menu = tauri::menu::MenuBuilder::new(app)
+                .item(&app_menu)
+                .item(&edit_menu)
+                .item(&window_menu)
+                .build()?;
+            app.set_menu(menu)?;
+
             Ok(())
+        })
+        .on_menu_event(|app, event| {
+            use tauri::Emitter;
+            match event.id().as_ref() {
+                "undo" => {
+                    let _ = app.emit("menu-undo", ());
+                }
+                "redo" => {
+                    let _ = app.emit("menu-redo", ());
+                }
+                _ => {}
+            }
         })
         .invoke_handler(tauri::generate_handler![
             healthcheck,
@@ -1116,6 +1252,8 @@ pub fn run() {
             list_assets,
             search_assets,
             import_folder,
+            refresh_library,
+            assets_for_tag,
             asset_playback_path,
             list_tags,
             create_tag,
