@@ -55,6 +55,13 @@ pub struct PreviewCacheEvictionPlan {
     pub candidates: Vec<PreviewCacheEntry>,
 }
 
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+pub struct PreviewCacheEvictionResult {
+    pub removed_paths: Vec<String>,
+    pub failed_paths: Vec<String>,
+    pub bytes_freed: u64,
+}
+
 impl MaintenanceFinding {
     pub fn missing_media(asset_id: Uuid) -> Self {
         Self {
@@ -130,6 +137,32 @@ pub fn plan_preview_cache_eviction(
         current_size_bytes,
         bytes_to_free,
         candidates,
+    }
+}
+
+/// Removes each planned eviction candidate via `remove`, continuing past failures so one
+/// locked or already-missing file cannot block reclaiming space from the rest.
+pub fn evict_preview_cache(
+    plan: &PreviewCacheEvictionPlan,
+    mut remove: impl FnMut(&str) -> bool,
+) -> PreviewCacheEvictionResult {
+    let mut removed_paths = Vec::new();
+    let mut failed_paths = Vec::new();
+    let mut bytes_freed = 0_u64;
+
+    for candidate in &plan.candidates {
+        if remove(&candidate.path) {
+            removed_paths.push(candidate.path.clone());
+            bytes_freed = bytes_freed.saturating_add(candidate.size_bytes);
+        } else {
+            failed_paths.push(candidate.path.clone());
+        }
+    }
+
+    PreviewCacheEvictionResult {
+        removed_paths,
+        failed_paths,
+        bytes_freed,
     }
 }
 
@@ -273,5 +306,69 @@ mod tests {
         assert_eq!(plan.current_size_bytes, 512);
         assert_eq!(plan.bytes_to_free, 0);
         assert!(plan.candidates.is_empty());
+    }
+
+    #[test]
+    fn evict_preview_cache_removes_candidates_and_sums_bytes_freed() {
+        let plan = PreviewCacheEvictionPlan {
+            limit_bytes: 700,
+            current_size_bytes: 1_200,
+            bytes_to_free: 500,
+            candidates: vec![
+                PreviewCacheEntry {
+                    asset_id: Uuid::new_v4(),
+                    path: "cache/oldest.wav".to_string(),
+                    size_bytes: 400,
+                    last_accessed_at_ms: 10,
+                },
+                PreviewCacheEntry {
+                    asset_id: Uuid::new_v4(),
+                    path: "cache/newer.wav".to_string(),
+                    size_bytes: 500,
+                    last_accessed_at_ms: 20,
+                },
+            ],
+        };
+
+        let result = evict_preview_cache(&plan, |_path| true);
+
+        assert_eq!(
+            result.removed_paths,
+            vec![
+                "cache/oldest.wav".to_string(),
+                "cache/newer.wav".to_string()
+            ]
+        );
+        assert!(result.failed_paths.is_empty());
+        assert_eq!(result.bytes_freed, 900);
+    }
+
+    #[test]
+    fn evict_preview_cache_tracks_failures_without_stopping() {
+        let plan = PreviewCacheEvictionPlan {
+            limit_bytes: 700,
+            current_size_bytes: 1_200,
+            bytes_to_free: 500,
+            candidates: vec![
+                PreviewCacheEntry {
+                    asset_id: Uuid::new_v4(),
+                    path: "cache/locked.wav".to_string(),
+                    size_bytes: 400,
+                    last_accessed_at_ms: 10,
+                },
+                PreviewCacheEntry {
+                    asset_id: Uuid::new_v4(),
+                    path: "cache/newer.wav".to_string(),
+                    size_bytes: 500,
+                    last_accessed_at_ms: 20,
+                },
+            ],
+        };
+
+        let result = evict_preview_cache(&plan, |path| path != "cache/locked.wav");
+
+        assert_eq!(result.removed_paths, vec!["cache/newer.wav".to_string()]);
+        assert_eq!(result.failed_paths, vec!["cache/locked.wav".to_string()]);
+        assert_eq!(result.bytes_freed, 500);
     }
 }

@@ -25,5 +25,5 @@ Implement the first resilience core across `library-sync` and `storage`:
 - The catalog remains searchable when shared media is offline.
 - Shared-library coordination has a tested lease primitive, now backed by file-based lease I/O for acquire, renew, and release.
 - Portable manifests can round-trip stable asset identifiers and relative media paths in memory and through manifest files.
-- Preview cache eviction is planned as least-recently-used candidates without automatic file removal.
+- Preview cache eviction plans least-recently-used candidates and can execute their removal, since previews are regenerable derived data rather than original media.
 - Shipped arbitrary-format decoder artifacts remain future Milestone 5 work.
