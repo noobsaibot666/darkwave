@@ -236,6 +236,21 @@ function matchesSoundCategory(asset: AssetRecord, category: SoundCategory): bool
   }
 }
 
+/** Every format the real Symphonia-backed decoder accepts (see Exporting
+ * docs) — a format filter that only covered WAV/MP3 would silently miss
+ * whatever fraction of the library came in as FLAC, AAC, M4A, OGG, or AIFF. */
+const AUDIO_FORMATS = ["wav", "mp3", "flac", "aac", "m4a", "ogg", "aiff"] as const;
+type AudioFormat = (typeof AUDIO_FORMATS)[number];
+
+function detectAudioFormat(asset: AssetRecord): AudioFormat | null {
+  const name = asset.original_filename.toLowerCase();
+  const dot = name.lastIndexOf(".");
+  if (dot === -1) return null;
+  const ext = name.slice(dot + 1);
+  if (ext === "aif") return "aiff";
+  return (AUDIO_FORMATS as readonly string[]).includes(ext) ? (ext as AudioFormat) : null;
+}
+
 /** Duration in seconds (converted to ms at the API boundary) since that's
  * what a person actually types; BPM stays as-is. */
 type RangeFilters = {
@@ -499,6 +514,9 @@ function rowIconMeta(asset: AssetRecord): { Icon: typeof Music; color: string } 
 function CollapsibleSection({
   id,
   title,
+  icon,
+  accent,
+  headerExtra,
   collapsed,
   onToggle,
   children,
@@ -506,25 +524,34 @@ function CollapsibleSection({
 }: {
   id: string;
   title: string;
+  icon?: ReactNode;
+  accent?: boolean;
+  headerExtra?: ReactNode;
   collapsed: boolean;
   onToggle: (id: string) => void;
   children: ReactNode;
 } & Record<string, unknown>) {
   return (
     <section {...rest}>
-      <div className="section-header" onClick={() => onToggle(id)}>
-        <h2>{title}</h2>
-        <button
-          type="button"
-          className="section-toggle"
-          aria-label={collapsed ? `Expand ${title}` : `Collapse ${title}`}
-          onClick={(event) => {
-            event.stopPropagation();
-            onToggle(id);
-          }}
-        >
-          {collapsed ? <ChevronRight size={13} /> : <ChevronDown size={13} />}
-        </button>
+      <div className={accent ? "section-header accent" : "section-header"} onClick={() => onToggle(id)}>
+        <h2>
+          {icon}
+          {title}
+        </h2>
+        <div className="section-header-actions">
+          {headerExtra}
+          <button
+            type="button"
+            className="section-toggle"
+            aria-label={collapsed ? `Expand ${title}` : `Collapse ${title}`}
+            onClick={(event) => {
+              event.stopPropagation();
+              onToggle(id);
+            }}
+          >
+            {collapsed ? <ChevronRight size={13} /> : <ChevronDown size={13} />}
+          </button>
+        </div>
       </div>
       {collapsed ? null : <div className="section-body">{children}</div>}
     </section>
@@ -599,7 +626,7 @@ export function App() {
   const [maintenanceReport, setMaintenanceReport] = useState<MaintenanceReport | null>(null);
   const [mediaRootStatus, setMediaRootStatus] = useState<{ status: string; reconnectRequired: boolean } | null>(null);
   const [exportStatus, setExportStatus] = useState<string | null>(null);
-  const [exportFormat, setExportFormat] = useState<"original" | "wav24">("original");
+  const [formatFilter, setFormatFilter] = useState<AudioFormat | null>(null);
   const [similarStatus, setSimilarStatus] = useState<string | null>(null);
   const [jobProgress, setJobProgress] = useState<JobProgress[]>([]);
   const [backgroundActivityOpen, setBackgroundActivityOpen] = useState(false);
@@ -635,39 +662,39 @@ export function App() {
   const activeLibrary = libraries.find((library) => library.id === activeLibraryId) ?? null;
 
   const visibleAssets = useMemo(() => {
-    if (activeFilter === "favorites") return assets.filter((asset) => asset.favorite);
-    if (activeFilter === "unreviewed") return assets.filter((asset) => asset.review_state === "Unreviewed");
-    if (activeFilter === "missing") return assets.filter((asset) => asset.availability_state === "Missing");
-    if (
+    let base: AssetRecord[];
+    if (activeFilter === "favorites") {
+      base = assets.filter((asset) => asset.favorite);
+    } else if (activeFilter === "unreviewed") {
+      base = assets.filter((asset) => asset.review_state === "Unreviewed");
+    } else if (activeFilter === "missing") {
+      base = assets.filter((asset) => asset.availability_state === "Missing");
+    } else if (
       activeFilter === "needs_review" ||
       activeFilter === "music" ||
       activeFilter === "sound_effect" ||
       activeFilter === "ambience"
     ) {
-      return assets.filter((asset) => asset.media_type === activeFilter);
-    }
-    if (activeFilter === "has_vocals") {
-      return assets.filter((asset) => (asset.vocal_ratio ?? 0) >= VOCAL_RATIO_THRESHOLD);
-    }
-    if (activeFilter === "instrumental") {
-      return assets.filter((asset) => asset.vocal_ratio != null && asset.vocal_ratio < VOCAL_RATIO_THRESHOLD);
-    }
-    if (activeFilter === "has_tempo") {
-      return assets.filter((asset) => asset.bpm != null);
-    }
-    if (activeFilter === "has_pitch") {
-      return assets.filter((asset) => asset.musical_key != null);
-    }
-    if (typeof activeFilter === "object" && "favoritesCategory" in activeFilter) {
-      return assets.filter((asset) => asset.favorite && matchesSoundCategory(asset, activeFilter.favoritesCategory));
-    }
-    if (typeof activeFilter === "object" && "unreviewedCategory" in activeFilter) {
-      return assets.filter(
+      base = assets.filter((asset) => asset.media_type === activeFilter);
+    } else if (activeFilter === "has_vocals") {
+      base = assets.filter((asset) => (asset.vocal_ratio ?? 0) >= VOCAL_RATIO_THRESHOLD);
+    } else if (activeFilter === "instrumental") {
+      base = assets.filter((asset) => asset.vocal_ratio != null && asset.vocal_ratio < VOCAL_RATIO_THRESHOLD);
+    } else if (activeFilter === "has_tempo") {
+      base = assets.filter((asset) => asset.bpm != null);
+    } else if (activeFilter === "has_pitch") {
+      base = assets.filter((asset) => asset.musical_key != null);
+    } else if (typeof activeFilter === "object" && "favoritesCategory" in activeFilter) {
+      base = assets.filter((asset) => asset.favorite && matchesSoundCategory(asset, activeFilter.favoritesCategory));
+    } else if (typeof activeFilter === "object" && "unreviewedCategory" in activeFilter) {
+      base = assets.filter(
         (asset) => asset.review_state === "Unreviewed" && matchesSoundCategory(asset, activeFilter.unreviewedCategory)
       );
+    } else {
+      base = assets;
     }
-    return assets;
-  }, [assets, activeFilter]);
+    return formatFilter ? base.filter((asset) => detectAudioFormat(asset) === formatFilter) : base;
+  }, [assets, activeFilter, formatFilter]);
 
   const browserScrollRef = useRef<HTMLElement | null>(null);
   const [browserScrollTop, setBrowserScrollTop] = useState(0);
@@ -1562,22 +1589,25 @@ export function App() {
       .catch((error) => setRefreshStatus(`Refresh failed: ${String(error)}`));
   }, [activeLibraryId, searchQuery, activeFilter, refreshAssets, refreshMaintenance, runJobDrain]);
 
-  const handleExportSelected = useCallback(async () => {
-    if (!selectedAssetId) return;
-    const destination = await openDialog({ directory: true, multiple: false, title: "Choose export destination" });
-    if (typeof destination !== "string") return;
+  const handleExportSelected = useCallback(
+    async (format?: "wav24") => {
+      if (!selectedAssetId) return;
+      const destination = await openDialog({ directory: true, multiple: false, title: "Choose export destination" });
+      if (typeof destination !== "string") return;
 
-    try {
-      const destinationPath = await invoke<string>("export_selected_asset", {
-        assetId: selectedAssetId,
-        destinationFolder: destination,
-        format: exportFormat === "wav24" ? "wav24" : null
-      });
-      setExportStatus(`Exported to ${destinationPath}`);
-    } catch (error) {
-      setExportStatus(`Export failed: ${String(error)}`);
-    }
-  }, [selectedAssetId, exportFormat]);
+      try {
+        const destinationPath = await invoke<string>("export_selected_asset", {
+          assetId: selectedAssetId,
+          destinationFolder: destination,
+          format: format ?? null
+        });
+        setExportStatus(`Exported to ${destinationPath}`);
+      } catch (error) {
+        setExportStatus(`Export failed: ${String(error)}`);
+      }
+    },
+    [selectedAssetId]
+  );
 
   useEffect(() => {
     if (commandPaletteOpen) {
@@ -1618,8 +1648,7 @@ export function App() {
           else setEditorWorkflowOpen(true);
           break;
         case "Convert":
-          setExportFormat("wav24");
-          handleExportSelected();
+          handleExportSelected("wav24");
           break;
         case "Rescan":
           handleRefreshLibrary();
@@ -1667,7 +1696,7 @@ export function App() {
           invoke<string>("export_selected_asset", {
             assetId,
             destinationFolder: destination,
-            format: exportFormat === "wav24" ? "wav24" : null
+            format: null
           })
         )
       );
@@ -1675,7 +1704,7 @@ export function App() {
     } catch (error) {
       setExportStatus(`Export failed: ${String(error)}`);
     }
-  }, [bulkAssetIds, exportFormat]);
+  }, [bulkAssetIds]);
 
   const handleExportLicenseReport = useCallback(async () => {
     if (typeof activeFilter !== "object" || !("project" in activeFilter)) {
@@ -2016,16 +2045,23 @@ export function App() {
             All Sounds
           </button>
 
-          <button
-            className={activeFilter === "favorites" ? "nav-item sidebar-styled-item active" : "nav-item sidebar-styled-item"}
-            onClick={() => setActiveFilter("favorites")}
-          >
-            <Star size={13} />
-            Favorites
-          </button>
-          <button className="nav-subitem" onClick={() => setFavoritesCategoriesOpen((previous) => !previous)}>
-            {favoritesCategoriesOpen ? <ChevronDown size={11} /> : <ChevronRight size={11} />} By category
-          </button>
+          <div className="nav-item-row">
+            <button
+              className={activeFilter === "favorites" ? "nav-item sidebar-styled-item active" : "nav-item sidebar-styled-item"}
+              onClick={() => setActiveFilter("favorites")}
+            >
+              <Star size={13} />
+              Favorites
+            </button>
+            <button
+              type="button"
+              className="nav-heading-add"
+              aria-label={favoritesCategoriesOpen ? "Collapse Favorites categories" : "Expand Favorites categories"}
+              onClick={() => setFavoritesCategoriesOpen((previous) => !previous)}
+            >
+              {favoritesCategoriesOpen ? <ChevronDown size={14} /> : <ChevronRight size={14} />}
+            </button>
+          </div>
           {favoritesCategoriesOpen ? (
             <>
               <button
@@ -2079,16 +2115,23 @@ export function App() {
             </>
           ) : null}
 
-          <button
-            className={activeFilter === "unreviewed" ? "nav-item sidebar-styled-item active" : "nav-item sidebar-styled-item"}
-            onClick={() => setActiveFilter("unreviewed")}
-          >
-            <Eye size={13} />
-            Unreviewed
-          </button>
-          <button className="nav-subitem" onClick={() => setUnreviewedCategoriesOpen((previous) => !previous)}>
-            {unreviewedCategoriesOpen ? <ChevronDown size={11} /> : <ChevronRight size={11} />} By category
-          </button>
+          <div className="nav-item-row">
+            <button
+              className={activeFilter === "unreviewed" ? "nav-item sidebar-styled-item active" : "nav-item sidebar-styled-item"}
+              onClick={() => setActiveFilter("unreviewed")}
+            >
+              <Eye size={13} />
+              Unreviewed
+            </button>
+            <button
+              type="button"
+              className="nav-heading-add"
+              aria-label={unreviewedCategoriesOpen ? "Collapse Unreviewed categories" : "Expand Unreviewed categories"}
+              onClick={() => setUnreviewedCategoriesOpen((previous) => !previous)}
+            >
+              {unreviewedCategoriesOpen ? <ChevronDown size={14} /> : <ChevronRight size={14} />}
+            </button>
+          </div>
           {unreviewedCategoriesOpen ? (
             <>
               <button
@@ -2151,138 +2194,187 @@ export function App() {
           </button>
 
           <div className="nav-heading-row">
-            <span className="nav-heading">Categories</span>
+            <span className="nav-heading-lg" onClick={() => toggleSection("sidebar-categories")}>
+              <FolderOpen size={14} />
+              Categories
+            </span>
+            <button
+              type="button"
+              className="nav-heading-add"
+              aria-label={collapsedSections.has("sidebar-categories") ? "Expand Categories" : "Collapse Categories"}
+              onClick={() => toggleSection("sidebar-categories")}
+            >
+              {collapsedSections.has("sidebar-categories") ? <ChevronRight size={14} /> : <ChevronDown size={14} />}
+            </button>
           </div>
-          <button
-            className={activeFilter === "music" ? "nav-item sidebar-styled-item active" : "nav-item sidebar-styled-item"}
-            onClick={() => setActiveFilter("music")}
-          >
-            <Music2 size={13} />
-            Soundtracks
-          </button>
-          <button
-            className={activeFilter === "sound_effect" ? "nav-item sidebar-styled-item active" : "nav-item sidebar-styled-item"}
-            onClick={() => setActiveFilter("sound_effect")}
-          >
-            <Waves size={13} />
-            Sound Effects
-          </button>
-          <button
-            className="nav-subitem"
-            onClick={() => setSfxSubcategoriesOpen((previous) => !previous)}
-          >
-            {sfxSubcategoriesOpen ? <ChevronDown size={11} /> : <ChevronRight size={11} />} By category
-          </button>
-          {sfxSubcategoriesOpen
-            ? tags
-                .filter((tag) => tag.facet === "action")
-                .map((tag) => (
-                  <button
-                    key={tag.id}
-                    className={
-                      typeof activeFilter === "object" && "tag" in activeFilter && activeFilter.tag === tag.id
-                        ? "nav-subitem active"
-                        : "nav-subitem"
-                    }
-                    onClick={() => setActiveFilter({ tag: tag.id })}
-                  >
-                    {tag.name}
-                  </button>
-                ))
-            : null}
-          <button
-            className={activeFilter === "ambience" ? "nav-item sidebar-styled-item active" : "nav-item sidebar-styled-item"}
-            onClick={() => setActiveFilter("ambience")}
-          >
-            <Wind size={13} />
-            Ambience
-          </button>
+          {collapsedSections.has("sidebar-categories") ? null : (
+            <>
+              <button
+                className={activeFilter === "music" ? "nav-item sidebar-styled-item active" : "nav-item sidebar-styled-item"}
+                onClick={() => setActiveFilter("music")}
+              >
+                <Music2 size={13} />
+                Soundtracks
+              </button>
+              <button
+                className={activeFilter === "sound_effect" ? "nav-item sidebar-styled-item active" : "nav-item sidebar-styled-item"}
+                onClick={() => setActiveFilter("sound_effect")}
+              >
+                <Waves size={13} />
+                Sound Effects
+              </button>
+              <button
+                className="nav-subitem"
+                onClick={() => setSfxSubcategoriesOpen((previous) => !previous)}
+              >
+                {sfxSubcategoriesOpen ? <ChevronDown size={11} /> : <ChevronRight size={11} />} By category
+              </button>
+              {sfxSubcategoriesOpen
+                ? tags
+                    .filter((tag) => tag.facet === "action")
+                    .map((tag) => (
+                      <button
+                        key={tag.id}
+                        className={
+                          typeof activeFilter === "object" && "tag" in activeFilter && activeFilter.tag === tag.id
+                            ? "nav-subitem active"
+                            : "nav-subitem"
+                        }
+                        onClick={() => setActiveFilter({ tag: tag.id })}
+                      >
+                        {tag.name}
+                      </button>
+                    ))
+                : null}
+              <button
+                className={activeFilter === "ambience" ? "nav-item sidebar-styled-item active" : "nav-item sidebar-styled-item"}
+                onClick={() => setActiveFilter("ambience")}
+              >
+                <Wind size={13} />
+                Ambience
+              </button>
+            </>
+          )}
 
           <div className="nav-heading-row">
-            <span className="nav-heading sonic-radar-heading sonic-radar-root">
+            <span className="nav-heading sonic-radar-heading sonic-radar-root" onClick={() => toggleSection("sidebar-sonic-radar")}>
               <Activity size={13} />
               Sonic Radar
             </span>
+            <button
+              type="button"
+              className="nav-heading-add"
+              aria-label={collapsedSections.has("sidebar-sonic-radar") ? "Expand Sonic Radar" : "Collapse Sonic Radar"}
+              onClick={() => toggleSection("sidebar-sonic-radar")}
+            >
+              {collapsedSections.has("sidebar-sonic-radar") ? <ChevronRight size={14} /> : <ChevronDown size={14} />}
+            </button>
           </div>
-          <button
-            className={activeFilter === "has_vocals" ? "nav-item sonic-radar-item active" : "nav-item sonic-radar-item"}
-            onClick={() => setActiveFilter("has_vocals")}
-          >
-            <Mic size={13} />
-            Has Vocals
-          </button>
-          <button
-            className={activeFilter === "instrumental" ? "nav-item sonic-radar-item active" : "nav-item sonic-radar-item"}
-            onClick={() => setActiveFilter("instrumental")}
-          >
-            <MicOff size={13} />
-            Instrumental Only
-          </button>
-          <button
-            className={activeFilter === "has_tempo" ? "nav-item sonic-radar-item active" : "nav-item sonic-radar-item"}
-            onClick={() => setActiveFilter("has_tempo")}
-          >
-            <Gauge size={13} />
-            Detected Tempo
-          </button>
-          <button
-            className={activeFilter === "has_pitch" ? "nav-item sonic-radar-item active" : "nav-item sonic-radar-item"}
-            onClick={() => setActiveFilter("has_pitch")}
-          >
-            <Music size={13} />
-            Detected Pitch
-          </button>
+          {collapsedSections.has("sidebar-sonic-radar") ? null : (
+            <>
+              <button
+                className={activeFilter === "has_vocals" ? "nav-item sonic-radar-item active" : "nav-item sonic-radar-item"}
+                onClick={() => setActiveFilter("has_vocals")}
+              >
+                <Mic size={13} />
+                Has Vocals
+              </button>
+              <button
+                className={activeFilter === "instrumental" ? "nav-item sonic-radar-item active" : "nav-item sonic-radar-item"}
+                onClick={() => setActiveFilter("instrumental")}
+              >
+                <MicOff size={13} />
+                Instrumental Only
+              </button>
+              <button
+                className={activeFilter === "has_tempo" ? "nav-item sonic-radar-item active" : "nav-item sonic-radar-item"}
+                onClick={() => setActiveFilter("has_tempo")}
+              >
+                <Gauge size={13} />
+                Detected Tempo
+              </button>
+              <button
+                className={activeFilter === "has_pitch" ? "nav-item sonic-radar-item active" : "nav-item sonic-radar-item"}
+                onClick={() => setActiveFilter("has_pitch")}
+              >
+                <Music size={13} />
+                Detected Pitch
+              </button>
+            </>
+          )}
           <div className="nav-heading-row">
-            <span className="nav-heading">Projects</span>
+            <span className="nav-heading-lg" onClick={() => toggleSection("sidebar-projects")}>
+              <Clapperboard size={14} />
+              Projects
+            </span>
             <button
               type="button"
               className="nav-heading-add"
               aria-label="New project"
               title="New project"
-              onClick={() => setNewProjectModalOpen(true)}
+              onClick={(event) => {
+                event.stopPropagation();
+                setNewProjectModalOpen(true);
+              }}
             >
               <Plus size={16} />
             </button>
+            <button
+              type="button"
+              className="nav-heading-add"
+              aria-label={collapsedSections.has("sidebar-projects") ? "Expand Projects" : "Collapse Projects"}
+              onClick={() => toggleSection("sidebar-projects")}
+            >
+              {collapsedSections.has("sidebar-projects") ? <ChevronRight size={14} /> : <ChevronDown size={14} />}
+            </button>
           </div>
-          {collections.map((project) => (
-            <div className="nav-item-row" key={project.id}>
-              <button
-                className={
-                  typeof activeFilter === "object" && "project" in activeFilter && activeFilter.project === project.id
-                    ? "nav-item active"
-                    : "nav-item"
-                }
-                onClick={() => setActiveFilter({ project: project.id, smart: project.collection_type === "Smart" })}
-              >
-                {project.collection_type === "Smart" ? <Zap size={14} /> : null}
-                {project.name}
-              </button>
-              {project.collection_type === "Project" ? (
-                <button
-                  type="button"
-                  className={project.export_path ? "dr-button" : "dr-button disabled"}
-                  aria-label={
-                    project.export_path
-                      ? `Send selected to ${project.name}'s DaVinci Resolve folder`
-                      : `${project.name} has no DaVinci Resolve folder configured yet`
-                  }
-                  title={
-                    project.export_path
-                      ? `Send selected to ${project.name} (${project.export_path})`
-                      : "Set a DaVinci Resolve sounds folder for this project to enable quick export"
-                  }
-                  disabled={!project.export_path || bulkAssetIds.length === 0}
-                  onClick={(event) => {
-                    event.stopPropagation();
-                    handleExportToProject(project, bulkAssetIds);
-                  }}
-                >
-                  <Clapperboard size={16} />
-                </button>
-              ) : null}
-            </div>
-          ))}
-          <CollapsibleSection id="release" title="Release Readiness" collapsed={collapsedSections.has("release")} onToggle={toggleSection}>
+          {collapsedSections.has("sidebar-projects")
+            ? null
+            : collections.map((project) => (
+                <div className="nav-item-row" key={project.id}>
+                  <button
+                    className={
+                      typeof activeFilter === "object" && "project" in activeFilter && activeFilter.project === project.id
+                        ? "nav-item active"
+                        : "nav-item"
+                    }
+                    onClick={() => setActiveFilter({ project: project.id, smart: project.collection_type === "Smart" })}
+                  >
+                    {project.collection_type === "Smart" ? <Zap size={14} /> : null}
+                    {project.name}
+                  </button>
+                  {project.collection_type === "Project" ? (
+                    <button
+                      type="button"
+                      className={project.export_path ? "dr-button" : "dr-button disabled"}
+                      aria-label={
+                        project.export_path
+                          ? `Send selected to ${project.name}'s DaVinci Resolve folder`
+                          : `${project.name} has no DaVinci Resolve folder configured yet`
+                      }
+                      title={
+                        project.export_path
+                          ? `Send selected to ${project.name} (${project.export_path})`
+                          : "Set a DaVinci Resolve sounds folder for this project to enable quick export"
+                      }
+                      disabled={!project.export_path || bulkAssetIds.length === 0}
+                      onClick={(event) => {
+                        event.stopPropagation();
+                        handleExportToProject(project, bulkAssetIds);
+                      }}
+                    >
+                      <Clapperboard size={16} />
+                    </button>
+                  ) : null}
+                </div>
+              ))}
+          <CollapsibleSection
+            id="release"
+            title="Release Readiness"
+            icon={<ShieldCheck size={14} />}
+            collapsed={collapsedSections.has("release")}
+            onToggle={toggleSection}
+          >
             <div className="release-grid">
               {releaseItems.map((item) => (
                 <div className="release-item" key={item.label}>
@@ -2301,15 +2393,28 @@ export function App() {
             </div>
           </CollapsibleSection>
           <div className="nav-heading-row">
-            <span className="nav-heading">Maintenance</span>
+            <span className="nav-heading-lg" onClick={() => toggleSection("sidebar-maintenance")}>
+              <HardDrive size={14} />
+              Maintenance
+            </span>
+            <button
+              type="button"
+              className="nav-heading-add"
+              aria-label={collapsedSections.has("sidebar-maintenance") ? "Expand Maintenance" : "Collapse Maintenance"}
+              onClick={() => toggleSection("sidebar-maintenance")}
+            >
+              {collapsedSections.has("sidebar-maintenance") ? <ChevronRight size={14} /> : <ChevronDown size={14} />}
+            </button>
           </div>
-          <button
-            className={activeFilter === "missing" ? "nav-item sidebar-styled-item active" : "nav-item sidebar-styled-item"}
-            onClick={() => setActiveFilter("missing")}
-          >
-            <FileWarning size={13} />
-            Missing Files
-          </button>
+          {collapsedSections.has("sidebar-maintenance") ? null : (
+            <button
+              className={activeFilter === "missing" ? "nav-item sidebar-styled-item active" : "nav-item sidebar-styled-item"}
+              onClick={() => setActiveFilter("missing")}
+            >
+              <FileWarning size={13} />
+              Missing Files
+            </button>
+          )}
           <div className="virtualization-bar" aria-label="Browser performance">
             <span>{visibleAssets.length} row{visibleAssets.length === 1 ? "" : "s"}</span>
             <span>{browserVisibleRange.endExclusive - browserVisibleRange.start} rendered</span>
@@ -2318,15 +2423,7 @@ export function App() {
       </aside>
       <section className="workspace">
         <header className="topbar">
-          <select
-            aria-label="Export format"
-            value={exportFormat}
-            onChange={(event) => setExportFormat(event.target.value === "wav24" ? "wav24" : "original")}
-          >
-            <option value="original">Original</option>
-            <option value="wav24">WAV (24-bit)</option>
-          </select>
-          <button className="primary-action" onClick={handleExportSelected} disabled={!selectedAssetId}>
+          <button className="primary-action" onClick={() => handleExportSelected()} disabled={!selectedAssetId}>
             Export Selected
           </button>
           <button className="primary-action" type="button" onClick={handleImportFolder}>
@@ -2392,7 +2489,7 @@ export function App() {
           </button>
         </header>
         {queryFilters.length > 0 || refreshStatus || importStatus ? (
-          <div className="tag-grid status-strip" aria-label="Status">
+          <div className="chip-row status-strip" aria-label="Status">
             {queryFilters.map((filter, index) => (
               <span key={index} className="suggestion-chip">
                 {filter.field} {filter.operator} {filter.value}
@@ -2466,9 +2563,31 @@ export function App() {
               }
             />
           </label>
-          {hasActiveRangeFilters(rangeFilters) ? (
+          <label>
+            Format
+            <select
+              aria-label="Filter by audio format"
+              value={formatFilter ?? ""}
+              onChange={(event) => setFormatFilter(event.target.value === "" ? null : (event.target.value as AudioFormat))}
+            >
+              <option value="">All</option>
+              {AUDIO_FORMATS.map((format) => (
+                <option key={format} value={format}>
+                  {format.toUpperCase()}
+                </option>
+              ))}
+            </select>
+          </label>
+          {hasActiveRangeFilters(rangeFilters) || formatFilter ? (
             <>
-              <button type="button" className="text-button" onClick={() => setRangeFilters({})}>
+              <button
+                type="button"
+                className="text-button"
+                onClick={() => {
+                  setRangeFilters({});
+                  setFormatFilter(null);
+                }}
+              >
                 Clear
               </button>
               <button type="button" className="text-button" onClick={() => setSmartCollectionModalOpen(true)}>
@@ -2751,13 +2870,13 @@ export function App() {
         ) : null}
         <CollapsibleSection id="tags-section" title="Tags" collapsed={collapsedSections.has("tags-section")} onToggle={toggleSection}>
           <h2>Suggested Tags</h2>
-          <div className="tag-grid">
+          <div className="chip-row">
             {suggestedTags.length === 0 ? (
               <span className="empty-hint">No pending suggestions</span>
             ) : (
               suggestedTags.map((tag) => (
                 <span className="suggestion-chip" key={tag.id}>
-                  {tag.name}
+                  <span className="chip-label">{tag.name}</span>
                   <button onClick={() => handleAcceptSuggestion(tag)} aria-label={`Accept ${tag.name}`}>
                     ✓
                   </button>
@@ -2769,13 +2888,13 @@ export function App() {
             )}
           </div>
           <h2>Applied Tags</h2>
-          <div className="tag-grid">
+          <div className="chip-row">
             {appliedTags.length === 0 ? (
               <span className="empty-hint">No tags applied</span>
             ) : (
               appliedTags.map((tag) => (
                 <span key={tag.id} className="suggestion-chip">
-                  {tag.name}
+                  <span className="chip-label">{tag.name}</span>
                   <button onClick={() => handleRemoveTag(tag)} aria-label={`Remove ${tag.name}`}>
                     ✗
                   </button>

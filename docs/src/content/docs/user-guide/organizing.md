@@ -28,7 +28,7 @@ The sidebar is organized top to bottom as:
 - **Sonic Radar** — see Searching for what these filters mean.
 - **Maintenance** — **Missing Files**, at the bottom since it's the one you reach for least often, not day-to-day browsing.
 
-Every row in this list gets a leading icon and lights up in the app's accent color when active or hovered, so the sidebar reads as one consistent system rather than a plain text list.
+Every row in this list gets a leading icon and lights up in the app's accent color when active or hovered, so the sidebar reads as one consistent system rather than a plain text list. Favorites, Unreviewed, Categories, Sonic Radar, Projects, Release Readiness, and Maintenance are each a real header — icon, bigger label text, and a fold/unfold chevron — with their categories or options nested underneath, collapsible independently of one another.
 
 The main browser rows also color- and icon-code by what a sound actually is — a green music note for instrumental music, a purple mic for music with vocals, an amber waveform mark for sound effects, and a teal wind glyph for ambience — so you can tell tracks apart at a glance while scanning a long list, without opening each one.
 
