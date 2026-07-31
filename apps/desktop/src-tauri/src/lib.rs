@@ -843,7 +843,12 @@ fn apply_browser_command(
     browser_state
 }
 
-#[tauri::command]
+// (async): walks the whole folder tree and hashes every file — a plain
+// sync command runs on Tauri's main thread by default, so without this the
+// window is completely unresponsive (no spinner, no progress, just a
+// beachball) for however long the import takes, same class of bug already
+// fixed for list_assets/warm_library_cache/etc. above.
+#[tauri::command(async)]
 fn import_folder(
     state: tauri::State<CatalogState>,
     library_id: String,
