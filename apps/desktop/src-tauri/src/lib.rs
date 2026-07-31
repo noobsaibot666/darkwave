@@ -1289,11 +1289,21 @@ fn job_status(
 /// around this — never across decode, DSP, or the subprocess await, which
 /// together can take real time per asset. Holding the mutex across slow
 /// work is the exact bug this project hit twice before (ADR 0023/0024).
+// Claims and fully analyzes up to 20 jobs per call — real decode+DSP+VAD
+// work per file, so a batch can easily take minutes. The frontend's
+// progress bar only updates once this whole call resolves, which without
+// the per-job emit below means it sits frozen at 0% for that entire
+// batch despite real work happening (CPU-visible, but invisible in the
+// UI) — exactly the "stuck a long time at 0%" symptom this event fixes.
+// Each emit lets the frontend decrement its local pending count in near
+// real time instead of waiting on the batch as a single unit.
 #[tauri::command]
 async fn process_audio_analysis_jobs(
     app: tauri::AppHandle,
     state: tauri::State<'_, CatalogState>,
 ) -> Result<usize, String> {
+    use tauri::Emitter;
+
     let jobs = {
         let catalog = state.0.lock().expect("catalog mutex poisoned");
         catalog
@@ -1311,6 +1321,7 @@ async fn process_audio_analysis_jobs(
             let catalog = state.0.lock().expect("catalog mutex poisoned");
             catalog.fail_job(job.id).map_err(storage_error_message)?;
             processed += 1;
+            let _ = app.emit("audio-analysis-progress", ());
             continue;
         };
 
@@ -1323,10 +1334,12 @@ async fn process_audio_analysis_jobs(
         // pick it up (mirrors how playback already treats an uncached path).
         let Ok(local_path) = local_path else {
             processed += 1;
+            let _ = app.emit("audio-analysis-progress", ());
             continue;
         };
         if !std::path::Path::new(&local_path).exists() {
             processed += 1;
+            let _ = app.emit("audio-analysis-progress", ());
             continue;
         }
 
@@ -1364,6 +1377,7 @@ async fn process_audio_analysis_jobs(
             }
         }
         processed += 1;
+        let _ = app.emit("audio-analysis-progress", ());
     }
 
     Ok(processed)

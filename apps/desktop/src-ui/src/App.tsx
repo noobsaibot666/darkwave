@@ -1798,6 +1798,25 @@ export function App() {
     };
   }, [activeLibraryId, runJobDrain]);
 
+  // process_audio_analysis_jobs claims and fully decodes/analyzes up to 20
+  // files per invoke — real per-file work, easily minutes for a batch — so
+  // without this, the progress bar only updates once the whole batch's
+  // invoke resolves and sits frozen at 0% the entire time despite real
+  // work happening. This event (emitted per job, not per batch) is what
+  // lets it move continuously instead.
+  useEffect(() => {
+    const unlistenAnalysisProgress = listen("audio-analysis-progress", () => {
+      setJobProgress((previous) =>
+        previous.map((entry) =>
+          entry.kind === "audio_analysis" ? { ...entry, pending: Math.max(0, entry.pending - 1) } : entry
+        )
+      );
+    });
+    return () => {
+      unlistenAnalysisProgress.then((dispose) => dispose());
+    };
+  }, []);
+
   const handleToggleReducedMotion = useCallback(() => {
     setPreferences((previous) => {
       if (!previous) return previous;
