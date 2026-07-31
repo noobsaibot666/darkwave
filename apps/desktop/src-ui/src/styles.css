@@ -249,8 +249,8 @@ button.panel-handle-right:active:not(:disabled) {
 }
 
 .nav-item-row .dr-button {
-  width: 28px;
-  height: 28px;
+  width: 30px;
+  height: 30px;
   padding: 0;
   flex: 0 0 auto;
   justify-content: center;

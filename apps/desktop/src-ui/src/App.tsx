@@ -1667,7 +1667,7 @@ export function App() {
                 }
                 onClick={() => setActiveFilter({ project: project.id, smart: project.collection_type === "Smart" })}
               >
-                {project.collection_type === "Smart" ? <Zap size={11} /> : null}
+                {project.collection_type === "Smart" ? <Zap size={14} /> : null}
                 {project.name}
               </button>
               {project.collection_type === "Project" ? (
@@ -1690,7 +1690,7 @@ export function App() {
                     handleExportToProject(project, bulkAssetIds);
                   }}
                 >
-                  <Clapperboard size={13} />
+                  <Clapperboard size={16} />
                 </button>
               ) : null}
             </div>
@@ -1705,11 +1705,11 @@ export function App() {
               ))}
             </div>
             <div className="status-line">
-              <ShieldCheck size={15} />
+              <ShieldCheck size={18} />
               Distribution gates tracked
             </div>
             <div className="status-line">
-              <Bell size={15} />
+              <Bell size={18} />
               {updateChannelState === "Passed" ? "Update channel ready" : "Update channel planned"}
             </div>
           </CollapsibleSection>
