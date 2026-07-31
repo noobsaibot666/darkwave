@@ -258,9 +258,9 @@ This document fills the `product/roadmap.md` slot the plan's own documentation s
 
 ## Windows Trial Pre-Flight Checklist
 
-Specific to "try the application on a Windows machine" being next:
+**Update:** `windows-latest` CI is now green end-to-end (`cargo test --workspace`, `ort`/`voice_activity_detector` included), after fixing a real bug this check surfaced: CI had never built the `similarity-worker` sidecar before running tests, so `darkwave-desktop` failed to even compile on a clean checkout, on *both* platforms — not a Windows-only issue, and not something this pass introduced (latent since `crates/similarity-worker` was added). `ci.yml` now runs `scripts/build-similarity-worker-sidecar.sh` before `cargo test --workspace`. A full sequential PowerShell walkthrough for the Windows machine itself now lives at `docs/src/content/docs/development/windows-setup.md`.
 
-1. **Push to `origin/main`** (done as part of this review) and watch the `windows-latest` job in `ci.yml` — it runs `cargo test --workspace`, which is the first time the new `ort`/`voice_activity_detector` dependency will be built on Windows at all.
-2. **On the Windows machine, before the first `tauri dev`/`tauri build`:** install Rust + run `scripts/build-similarity-worker-sidecar.sh` to produce the Windows-triple `similarity-worker` binary Tauri's `externalBin` config requires — without this, the desktop shell won't build/launch, independent of anything else in this report.
-3. Expect **no crash** if the ONNX runtime fails to load on Windows — `detect_vocal_ratio` degrades to `None` and the player falls back to tag-only mood coloring (verified by code reading, see §0). If vocal-based coloring silently never appears on Windows, that confirms the ONNX runtime didn't load — check the CI run from step 1 first.
-4. Everything else audited in this review (e.g. deliberately-descoped OS-level drag-out) is platform-agnostic — expect the same gaps on Windows as on macOS, not new ones, apart from the two build-time items above.
+1. ~~Push to `origin/main` and watch the `windows-latest` job~~ — **done, and green.**
+2. **On the Windows machine, before the first `tauri dev`/`tauri build`:** run the sidecar build (PowerShell commands in `windows-setup.md`) — CI passing does not put that gitignored binary on the Windows machine; it still has to be built there once, same as any machine.
+3. Expect **no crash** if the ONNX runtime fails to load on Windows — `detect_vocal_ratio` degrades to `None` and the player falls back to tag-only mood coloring (verified by code reading, see §0; also now empirically consistent with CI actually building `ort` successfully on `windows-latest`).
+4. Everything else audited in this review (e.g. deliberately-descoped OS-level drag-out) is platform-agnostic — expect the same gaps on Windows as on macOS, not new ones.
