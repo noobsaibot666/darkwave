@@ -16,3 +16,5 @@ Default settings use compact browser rows, the system audio output device, and a
 The main window has three regions: a library sidebar on the left (smart filters, projects), the sound browser in the center, and a details inspector on the right. Both side panels can be hidden with the toggle in their own header — a thin collapsed strip stays in place as a handle to bring the panel back, and the center browser and transport bar resize to use the freed space.
 
 Undo/Redo, importing a project's license report, and the keyboard shortcut reference all live in the native menu bar (Edit, Library, and Help respectively) rather than as buttons in the workspace, so the canvas stays focused on the sounds themselves.
+
+Settings is organized like a native system-settings panel: a category list on the left (General, Playback, Storage, Appearance, Accessibility) rather than one long scroll. Appearance is where the theme lives — Dark is the standard, default look, with Light and "Match system" as real, persisted alternatives, not just a dark-mode-only app with an unused toggle.

@@ -21,3 +21,11 @@ Darkwave can:
 - Generate project source/license report rows from usage and source records, including attribution, restrictions, and receipt paths.
 - Render project source/license reports as CSV.
 - Warn, rather than block, when source or license context is missing, uncertain, or expired.
+
+## Quick-export to DaVinci Resolve
+
+Each project can be given an export folder (set at creation, or later in Settings). Once configured, a single "DR" button — in the transport, in the project's row in the sidebar, and in the Editor Workflow panel (see Organizing) — copies the selected sound(s) straight into that folder, so they're one drag away from the timeline in Resolve. This is a one-click copy to a watched folder, not live Resolve scripting automation; it uses the same original-copy export path as the rest of this page, just with the destination pre-configured per project.
+
+## Reveal and copy path
+
+The Editor Workflow panel also has **Reveal in Finder/Explorer** and **Copy File Path** (`Cmd/Ctrl+Shift+C`) for the current selection — the two simplest ways to hand a sound to another application by hand when a project export folder isn't set up.

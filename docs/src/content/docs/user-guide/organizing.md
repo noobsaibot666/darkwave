@@ -19,9 +19,32 @@ Current behavior supports:
 
 Catalog mutations and desktop event wiring remain separate from the interaction-state reducer.
 
-The sidebar groups media types as **Soundtracks**, **Sound Effects**, and **Ambience** (Soundtracks is a display label over the same underlying music category — no data changes if you're scripting against it). Sound Effects has an expandable **By category** list of the starter taxonomy's action tags (Impact, Whoosh, Rise, and so on); selecting one filters to just that tag. A **Needs Review** filter also appears for anything import's size-based check flagged as a likely broken or placeholder file.
+The sidebar is organized top to bottom as:
 
-Creating a project is a single "+ New Project" button in the sidebar, which opens a small dialog for the name rather than an inline field — keeps the sidebar from being cluttered by a text input that's only used occasionally.
+- **All Sounds** — the whole library.
+- **Favorites** and **Unreviewed**, each with an expandable **By category** breakdown (Soundtracks, Voice, No Voice, Sound FX) — so "my favorite dialogue" or "unreviewed sound effects" is one click, not a manual scan of a flat list.
+- **Needs Review** — anything import's size-based check flagged as a likely broken or placeholder file.
+- **Categories** — **Soundtracks**, **Sound Effects**, and **Ambience** (Soundtracks is a display label over the same underlying music category — no data changes if you're scripting against it). Sound Effects has its own expandable **By category** list of the starter taxonomy's action tags (Impact, Whoosh, Rise, and so on).
+- **Sonic Radar** — see Searching for what these filters mean.
+- **Maintenance** — **Missing Files**, at the bottom since it's the one you reach for least often, not day-to-day browsing.
+
+Every row in this list gets a leading icon and lights up in the app's accent color when active or hovered, so the sidebar reads as one consistent system rather than a plain text list.
+
+The main browser rows also color- and icon-code by what a sound actually is — a green music note for instrumental music, a purple mic for music with vocals, an amber waveform mark for sound effects, and a teal wind glyph for ambience — so you can tell tracks apart at a glance while scanning a long list, without opening each one.
+
+Creating a project is a small "+" icon next to the Projects heading in the sidebar, which opens a dialog for the name rather than an inline field — keeps the sidebar from being cluttered by a text input that's only used occasionally.
+
+## Editor Workflow
+
+A dedicated panel, opened from its own button near the top of the sidebar, consolidates the actions you reach for when a sound is ready to leave the library: **Reveal in Finder/Explorer**, **Copy File Path** (also `Cmd/Ctrl+Shift+C`), and **Send to Project** (the same DaVinci Resolve quick-export described in Exporting, plus every other project with an export folder configured). It opens as an animated panel over the main canvas rather than a modal, so the sidebar and inspector stay visible and usable while it's open.
+
+## Managing libraries
+
+Settings → General → Manage Libraries lists every library with **Clean Cache**, **Empty Trash**, and **Delete** actions. All three only ever touch Darkwave's own catalog records (cached preview copies, trash entries, or the whole catalog row) — the audio files at a library's media root are never read, moved, or deleted by any of them.
+
+## Background Activity
+
+A small activity icon next to Refresh Library lights up (a pulsing LED) whenever metadata extraction, audio analysis, or a library sync is actually running, and stays dim otherwise. Clicking it opens a panel with each running task's own progress bar and a plain-language note on why the app stays responsive while it works — background analysis runs off the main thread by design, so it never has to freeze the window to make progress.
 
 ## Find Similar Sounds
 
