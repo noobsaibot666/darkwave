@@ -17,6 +17,9 @@ jobs:
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable
+      - name: Build similarity-worker sidecar
+        shell: bash
+        run: ./scripts/build-similarity-worker-sidecar.sh
       - run: cargo test --workspace
 
   node:
