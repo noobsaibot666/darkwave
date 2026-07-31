@@ -549,6 +549,91 @@ fn create_library(
     Ok(library)
 }
 
+/// Removes this library's cached preview files (the local, disposable
+/// speed-up copies referenced/NAS assets get, keyed by asset id — see
+/// `cached_file_path`), scoped to only this library's assets rather than
+/// the whole shared preview-cache directory. Never touches anything under
+/// the library's own `media_root`.
+#[tauri::command]
+fn purge_library_cache(
+    app: tauri::AppHandle,
+    state: tauri::State<CatalogState>,
+    library_id: String,
+) -> Result<usize, String> {
+    let library_id = parse_uuid_field(&library_id, "library id")?;
+    let assets = {
+        let catalog = state.0.lock().expect("catalog mutex poisoned");
+        catalog.list_assets(library_id).map_err(storage_error_message)?
+    };
+
+    let cache_dir = preview_cache_dir(&app)?;
+    let mut removed = 0usize;
+    for asset in assets {
+        let cache_path = cached_file_path(&cache_dir, &asset);
+        if cache_path.exists() && std::fs::remove_file(&cache_path).is_ok() {
+            removed += 1;
+        }
+    }
+
+    Ok(removed)
+}
+
+/// Permanently removes every currently-trashed asset in this library from
+/// the catalog, bypassing the normal retention wait. Same guarantee as the
+/// rest of the trash system: only ever deletes catalog rows, never a real
+/// file (see `storage::Catalog::empty_trash_for_library`).
+#[tauri::command]
+fn empty_library_trash(state: tauri::State<CatalogState>, library_id: String) -> Result<usize, String> {
+    let library_id = parse_uuid_field(&library_id, "library id")?;
+    let catalog = state.0.lock().expect("catalog mutex poisoned");
+    catalog
+        .empty_trash_for_library(library_id)
+        .map_err(storage_error_message)
+}
+
+/// Deletes a library and everything the catalog knows about it (assets,
+/// tags applied to them, collections, jobs, trash records — see
+/// `storage::Catalog::delete_library` for the cascade). Deliberately never
+/// touches the filesystem under the library's `media_root`: the source
+/// audio a user pointed the library at is never at risk from this action,
+/// only Darkwave's own record of it. Also cleans up this library's own
+/// cache files (now orphaned) and clears the watched-folder preference if
+/// it pointed at the library being removed.
+#[tauri::command]
+fn delete_library(
+    app: tauri::AppHandle,
+    state: tauri::State<CatalogState>,
+    library_id: String,
+) -> Result<(), String> {
+    let library_id = parse_uuid_field(&library_id, "library id")?;
+
+    let assets = {
+        let catalog = state.0.lock().expect("catalog mutex poisoned");
+        catalog.list_assets(library_id).map_err(storage_error_message)?
+    };
+    if let Ok(cache_dir) = preview_cache_dir(&app) {
+        for asset in &assets {
+            let _ = std::fs::remove_file(cached_file_path(&cache_dir, asset));
+        }
+    }
+
+    {
+        let catalog = state.0.lock().expect("catalog mutex poisoned");
+        catalog.delete_library(library_id).map_err(storage_error_message)?;
+    }
+
+    let preferences_path = preferences_path(&app)?;
+    if let Ok(mut preferences) = preferences::load_preferences(&preferences_path) {
+        if preferences.watched_folder_library_id.as_deref() == Some(&library_id.to_string()) {
+            preferences.watched_folder_path = None;
+            preferences.watched_folder_library_id = None;
+            let _ = preferences::save_preferences(&preferences_path, &preferences);
+        }
+    }
+
+    Ok(())
+}
+
 #[tauri::command]
 fn list_assets(
     state: tauri::State<CatalogState>,
@@ -1206,41 +1291,58 @@ struct AudioAnalysisOutcome {
 }
 
 async fn analyze_asset_audio(app: &tauri::AppHandle, path: &str) -> Result<AudioAnalysisOutcome, String> {
-    let buffer =
-        audio_metadata::decode_any_supported_audio(path).map_err(|error| format!("{error:?}"))?;
+    // Decode + DSP + VAD inference are all synchronous, CPU-bound Rust —
+    // running them inline in this async fn would occupy one of Tauri's
+    // async-runtime worker threads for the whole duration. Those same
+    // worker threads service every other Tauri command (every UI click,
+    // every list/search query), so that previously stalled the entire app
+    // for as long as this took, which is what made import look and feel
+    // like a freeze rather than "some background work is happening."
+    // spawn_blocking moves it onto Tokio's separate blocking-thread pool,
+    // where it can run at full CPU cost without starving the UI thread.
+    let path_owned = path.to_string();
+    let (needs_review, suggested_tags, vocal_ratio, mut update) =
+        tauri::async_runtime::spawn_blocking(move || -> Result<_, String> {
+            let buffer = audio_metadata::decode_any_supported_audio(&path_owned)
+                .map_err(|error| format!("{error:?}"))?;
 
-    let needs_review = audio_analysis::is_likely_silent_or_corrupt(&buffer);
-    let measurements = audio_analysis::measure(&buffer);
-    let suggested_tags = audio_analysis::suggest_action_tags(&buffer, measurements)
-        .into_iter()
-        .map(|tag| tag.as_str())
-        .collect::<Vec<_>>();
-    let tempo = audio_analysis::estimate_tempo(&buffer);
-    let pitch = audio_analysis::estimate_pitch(&buffer);
-    let vocal_ratio = audio_analysis::detect_vocal_ratio(&buffer);
+            let needs_review = audio_analysis::is_likely_silent_or_corrupt(&buffer);
+            let measurements = audio_analysis::measure(&buffer);
+            let suggested_tags = audio_analysis::suggest_action_tags(&buffer, measurements)
+                .into_iter()
+                .map(|tag| tag.as_str())
+                .collect::<Vec<_>>();
+            let tempo = audio_analysis::estimate_tempo(&buffer);
+            let pitch = audio_analysis::estimate_pitch(&buffer);
+            let vocal_ratio = audio_analysis::detect_vocal_ratio(&buffer);
 
-    let channels = buffer.channels.max(1) as u64;
-    let duration_ms = if buffer.sample_rate > 0 {
-        Some((buffer.samples.len() as f64 / channels as f64 / buffer.sample_rate as f64 * 1000.0) as i64)
-    } else {
-        None
-    };
+            let channels = buffer.channels.max(1) as u64;
+            let duration_ms = if buffer.sample_rate > 0 {
+                Some((buffer.samples.len() as f64 / channels as f64 / buffer.sample_rate as f64 * 1000.0) as i64)
+            } else {
+                None
+            };
 
-    let perceptual_fingerprint = run_similarity_worker(app, path).await;
+            let update = storage::AudioAnalysisUpdate {
+                duration_ms,
+                sample_rate: Some(buffer.sample_rate as i64),
+                bit_depth: None,
+                channels: Some(buffer.channels as i64),
+                loudness_lufs: None,
+                peak_db: Some(measurements.peak_db as f64),
+                bpm: tempo.map(|estimate| estimate.bpm as f64),
+                bpm_confidence: tempo.map(|estimate| estimate.confidence as f64),
+                musical_key: pitch.as_ref().map(|estimate| estimate.note_name.clone()),
+                key_confidence: pitch.as_ref().map(|estimate| estimate.clarity as f64),
+                perceptual_fingerprint: None,
+            };
 
-    let update = storage::AudioAnalysisUpdate {
-        duration_ms,
-        sample_rate: Some(buffer.sample_rate as i64),
-        bit_depth: None,
-        channels: Some(buffer.channels as i64),
-        loudness_lufs: None,
-        peak_db: Some(measurements.peak_db as f64),
-        bpm: tempo.map(|estimate| estimate.bpm as f64),
-        bpm_confidence: tempo.map(|estimate| estimate.confidence as f64),
-        musical_key: pitch.as_ref().map(|estimate| estimate.note_name.clone()),
-        key_confidence: pitch.as_ref().map(|estimate| estimate.clarity as f64),
-        perceptual_fingerprint,
-    };
+            Ok((needs_review, suggested_tags, vocal_ratio, update))
+        })
+        .await
+        .map_err(|error| format!("audio analysis task panicked: {error}"))??;
+
+    update.perceptual_fingerprint = run_similarity_worker(app, path).await;
 
     Ok(AudioAnalysisOutcome {
         needs_review,
@@ -1269,16 +1371,6 @@ async fn run_similarity_worker(app: &tauri::AppHandle, path: &str) -> Option<Str
         .get("analysis")
         .filter(|value| value.is_array())
         .map(|value| value.to_string())
-}
-
-/// Fetched on demand for the selected/playing asset (the player-color
-/// feature), not joined into asset list queries — `None` until the
-/// background audio-analysis job has run its Silero VAD pass on this asset.
-#[tauri::command]
-fn asset_vocal_ratio(state: tauri::State<CatalogState>, asset_id: String) -> Result<Option<f64>, String> {
-    let asset_id = parse_uuid_field(&asset_id, "asset id")?;
-    let catalog = state.0.lock().expect("catalog mutex poisoned");
-    catalog.get_vocal_ratio(asset_id).map_err(storage_error_message)
 }
 
 /// Loads every non-trashed asset in the library with a stored similarity
@@ -1972,6 +2064,9 @@ pub fn run() {
             media_root_status,
             list_libraries,
             create_library,
+            purge_library_cache,
+            empty_library_trash,
+            delete_library,
             list_assets,
             search_assets,
             import_folder,
@@ -2017,7 +2112,6 @@ pub fn run() {
             process_pending_jobs,
             process_audio_analysis_jobs,
             job_status,
-            asset_vocal_ratio,
             similar_assets,
             mark_waveform_ready,
             trash_duplicate_group,

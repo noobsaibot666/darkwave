@@ -5,6 +5,7 @@ import { open as openDialog, save as saveDialog, confirm as confirmDialog } from
 import { revealItemInDir } from "@tauri-apps/plugin-opener";
 import { writeText as writeClipboardText } from "@tauri-apps/plugin-clipboard-manager";
 import {
+  Activity,
   Bell,
   ChevronDown,
   ChevronLeft,
@@ -12,11 +13,14 @@ import {
   Clapperboard,
   Contrast,
   Copy,
+  Database,
   FolderOpen,
   Gauge,
   Import,
   Link2,
   ListFilter,
+  Mic,
+  MicOff,
   Music,
   Palette,
   Pause,
@@ -32,6 +36,7 @@ import {
   SkipForward,
   SlidersHorizontal,
   Star,
+  Trash2,
   Volume2,
   Workflow,
   X,
@@ -74,6 +79,8 @@ type AssetRecord = {
   /** Best-effort detected pitch note name (e.g. "A4"), not a musical key. */
   musical_key: string | null;
   key_confidence: number | null;
+  /** Fraction of the clip classified as speech (Silero VAD). */
+  vocal_ratio: number | null;
 };
 
 type ImportFailure = {
@@ -196,6 +203,10 @@ type ActiveFilter =
   | "music"
   | "sound_effect"
   | "ambience"
+  | "has_vocals"
+  | "instrumental"
+  | "has_tempo"
+  | "has_pitch"
   | { project: string; smart?: boolean }
   | { tag: string };
 
@@ -336,11 +347,17 @@ const maintenanceLabels: Record<string, string> = {
 
 type PlayerMood = "soundtrack" | "soundtrack-voice" | "voice-over" | "sfx";
 
+// sfx used to be a coral (#ff8a73 -> #f2543a) that read as nearly the same
+// hue as the app's own default orange accent (the fallback player color
+// when no mood is classified, and every primary button) — the two oranges
+// were only distinguishable side-by-side. Moved to amber/gold so all four
+// moods are genuinely distinct hues (green / purple / blue / amber), with
+// none of them competing with the brand accent.
 const playerMoodTheme: Record<PlayerMood, { from: string; to: string; glow: string }> = {
   soundtrack: { from: "#4ade9c", to: "#0ea968", glow: "rgba(14, 169, 104, 0.45)" },
   "soundtrack-voice": { from: "#c4a6fa", to: "#8b5cf6", glow: "rgba(139, 92, 246, 0.45)" },
   "voice-over": { from: "#7c90f5", to: "#4c5fe0", glow: "rgba(76, 95, 224, 0.45)" },
-  sfx: { from: "#ff8a73", to: "#f2543a", glow: "rgba(242, 84, 58, 0.45)" }
+  sfx: { from: "#fbd34d", to: "#d69e0a", glow: "rgba(214, 158, 10, 0.45)" }
 };
 
 // Derives a playback "mood" from the sound's applied tags (falling back to
@@ -504,7 +521,6 @@ export function App() {
   const [tags, setTags] = useState<TagRecord[]>([]);
   const [appliedTags, setAppliedTags] = useState<TagRecord[]>([]);
   const [suggestedTags, setSuggestedTags] = useState<TagRecord[]>([]);
-  const [vocalRatio, setVocalRatio] = useState<number | null>(null);
   const [newTagName, setNewTagName] = useState("");
   const [newTagFacet, setNewTagFacet] = useState("action");
 
@@ -531,11 +547,14 @@ export function App() {
   const [exportFormat, setExportFormat] = useState<"original" | "wav24">("original");
   const [similarStatus, setSimilarStatus] = useState<string | null>(null);
   const [jobProgress, setJobProgress] = useState<JobProgress[]>([]);
+  const [backgroundActivityOpen, setBackgroundActivityOpen] = useState(false);
+  const drainingJobKinds = useRef<Set<string>>(new Set());
   const [offlineControl, setOfflineControl] = useState<OfflineControlState | null>(null);
   const [reconnectStatus, setReconnectStatus] = useState<string | null>(null);
   const [trashItems, setTrashItems] = useState<TrashItem[]>([]);
   const [backupStatus, setBackupStatus] = useState<string | null>(null);
   const [cacheStatus, setCacheStatus] = useState<string | null>(null);
+  const [libraryAdminStatus, setLibraryAdminStatus] = useState<string | null>(null);
 
   const [preferences, setPreferences] = useState<AppPreferences | null>(null);
   const [trashRetentionDays, setTrashRetentionDays] = useState(30);
@@ -548,7 +567,6 @@ export function App() {
   const [looping, setLooping] = useState(false);
   const [peaks, setPeaks] = useState<number[] | null>(null);
   const peakRequestId = useRef(0);
-  const vocalRatioRequestId = useRef(0);
 
   const selectedAsset = assets.find((asset) => asset.id === selectedAssetId) ?? null;
   const selectedAssetIds = useMemo(() => {
@@ -572,6 +590,18 @@ export function App() {
       activeFilter === "ambience"
     ) {
       return assets.filter((asset) => asset.media_type === activeFilter);
+    }
+    if (activeFilter === "has_vocals") {
+      return assets.filter((asset) => (asset.vocal_ratio ?? 0) >= VOCAL_RATIO_THRESHOLD);
+    }
+    if (activeFilter === "instrumental") {
+      return assets.filter((asset) => asset.vocal_ratio != null && asset.vocal_ratio < VOCAL_RATIO_THRESHOLD);
+    }
+    if (activeFilter === "has_tempo") {
+      return assets.filter((asset) => asset.bpm != null);
+    }
+    if (activeFilter === "has_pitch") {
+      return assets.filter((asset) => asset.musical_key != null);
     }
     return assets;
   }, [assets, activeFilter]);
@@ -687,7 +717,15 @@ export function App() {
 
           configs.forEach((config) => {
             const startPending = pendingByKind.get(config.kind) ?? 0;
-            if (startPending === 0) return;
+            // A prior drain for this same kind (e.g. from the last
+            // background-tick) may still be mid-flight — importing a large
+            // batch of files can easily take longer than the ~20s tick
+            // interval. Starting a second overlapping loop on top of it was
+            // stacking concurrent analysis work with nothing bounding it,
+            // which is exactly what was driving CPU/memory usage far past
+            // what a single drain needs.
+            if (startPending === 0 || drainingJobKinds.current.has(config.kind)) return;
+            drainingJobKinds.current.add(config.kind);
 
             setJobProgress((previous) => [
               ...previous.filter((entry) => entry.kind !== config.kind),
@@ -705,6 +743,7 @@ export function App() {
                 );
               }
               setJobProgress((previous) => previous.filter((entry) => entry.kind !== config.kind));
+              drainingJobKinds.current.delete(config.kind);
               refreshAssets(libraryId, searchQuery, activeFilter);
             })();
           });
@@ -874,18 +913,9 @@ export function App() {
       setAppliedTags([]);
       setSuggestedTags([]);
       setSourceDraft(null);
-      setVocalRatio(null);
       return;
     }
     refreshAssetTags(selectedAssetId);
-    const requestId = ++vocalRatioRequestId.current;
-    invoke<number | null>("asset_vocal_ratio", { assetId: selectedAssetId })
-      .then((ratio) => {
-        if (vocalRatioRequestId.current === requestId) setVocalRatio(ratio);
-      })
-      .catch(() => {
-        if (vocalRatioRequestId.current === requestId) setVocalRatio(null);
-      });
   }, [selectedAssetId, refreshAssetTags]);
 
   const loadAssetForPlayback = useCallback(async (asset: AssetRecord, autoplay: boolean) => {
@@ -1361,6 +1391,51 @@ export function App() {
       .catch((error) => setCacheStatus(`Purge failed: ${String(error)}`));
   }, []);
 
+  const handleCleanLibraryCache = useCallback((library: LibraryRecord) => {
+    setLibraryAdminStatus(`Cleaning ${library.name}'s cache…`);
+    invoke<number>("purge_library_cache", { libraryId: library.id })
+      .then((removed) => setLibraryAdminStatus(`Cleared ${removed} cached file${removed === 1 ? "" : "s"} for ${library.name}`))
+      .catch((error) => setLibraryAdminStatus(`Cache clean failed: ${String(error)}`));
+  }, []);
+
+  const handleEmptyLibraryTrash = useCallback(
+    (library: LibraryRecord) => {
+      setLibraryAdminStatus(`Emptying ${library.name}'s trash…`);
+      invoke<number>("empty_library_trash", { libraryId: library.id })
+        .then((purged) => {
+          setLibraryAdminStatus(`Permanently removed ${purged} item${purged === 1 ? "" : "s"} from ${library.name}'s trash`);
+          if (library.id === activeLibraryId) refreshTrashItems(library.id);
+        })
+        .catch((error) => setLibraryAdminStatus(`Empty trash failed: ${String(error)}`));
+    },
+    [activeLibraryId, refreshTrashItems]
+  );
+
+  const handleDeleteLibrary = useCallback(
+    async (library: LibraryRecord) => {
+      const confirmed = await confirmDialog(
+        `This permanently deletes "${library.name}" from Darkwave — its catalog, tags applied to its sounds, collections, and trash records. The audio files themselves, at ${library.media_root}, are never touched or deleted.`,
+        { title: `Delete "${library.name}"?`, kind: "warning" }
+      );
+      if (!confirmed) return;
+
+      setLibraryAdminStatus(`Deleting ${library.name}…`);
+      try {
+        await invoke("delete_library", { libraryId: library.id });
+        setLibraryAdminStatus(`Deleted ${library.name}`);
+        if (library.id === activeLibraryId) setSelectedAssetId(null);
+        const loaded = await invoke<LibraryRecord[]>("list_libraries");
+        setLibraries(loaded);
+        if (library.id === activeLibraryId) {
+          setActiveLibraryId(loaded.length > 0 ? loaded[0].id : null);
+        }
+      } catch (error) {
+        setLibraryAdminStatus(`Delete failed: ${String(error)}`);
+      }
+    },
+    [activeLibraryId]
+  );
+
   const handleChooseMediaRoot = async () => {
     const selected = await openDialog({ directory: true, multiple: false, title: "Choose media location" });
     if (typeof selected === "string") setLibraryRoot(selected);
@@ -1801,7 +1876,7 @@ export function App() {
   const waveformActiveIndex = peaks && duration > 0 ? Math.floor((currentTime / duration) * peaks.length) : -1;
   const drTargetAssetId = playingAssetId ?? selectedAssetId;
   const drTargetProject = collections.find((project) => project.id === lastExportProjectId) ?? null;
-  const playerMood = classifyPlayerMood(selectedAsset, appliedTags, vocalRatio);
+  const playerMood = classifyPlayerMood(selectedAsset, appliedTags, selectedAsset?.vocal_ratio ?? null);
   const playerMoodStyle = playerMood
     ? ({
         "--player-accent-from": playerMoodTheme[playerMood].from,
@@ -1913,6 +1988,40 @@ export function App() {
               ) : null}
             </div>
           ))}
+          <div className="nav-heading-row">
+            <span className="nav-heading sonic-radar-heading">
+              <Activity size={11} />
+              Sonic Radar
+            </span>
+          </div>
+          <button
+            className={activeFilter === "has_vocals" ? "nav-item sonic-radar-item active" : "nav-item sonic-radar-item"}
+            onClick={() => setActiveFilter("has_vocals")}
+          >
+            <Mic size={13} />
+            Has Vocals
+          </button>
+          <button
+            className={activeFilter === "instrumental" ? "nav-item sonic-radar-item active" : "nav-item sonic-radar-item"}
+            onClick={() => setActiveFilter("instrumental")}
+          >
+            <MicOff size={13} />
+            Instrumental Only
+          </button>
+          <button
+            className={activeFilter === "has_tempo" ? "nav-item sonic-radar-item active" : "nav-item sonic-radar-item"}
+            onClick={() => setActiveFilter("has_tempo")}
+          >
+            <Gauge size={13} />
+            Detected Tempo
+          </button>
+          <button
+            className={activeFilter === "has_pitch" ? "nav-item sonic-radar-item active" : "nav-item sonic-radar-item"}
+            onClick={() => setActiveFilter("has_pitch")}
+          >
+            <Music size={13} />
+            Detected Pitch
+          </button>
           <div className="nav-heading-row">
             <span className="nav-heading">Projects</span>
             <button
@@ -2055,6 +2164,16 @@ export function App() {
           <button type="button" className="icon-button" aria-label="Refresh library" onClick={() => handleRefreshLibrary()} title="Scan the media root for new files">
             <RefreshCw size={16} />
           </button>
+          <button
+            type="button"
+            className={jobProgress.length > 0 ? "icon-button activity-button busy" : "icon-button activity-button"}
+            aria-label="Background activity"
+            title={jobProgress.length > 0 ? "Background work is running — click for details" : "Background activity: all caught up"}
+            onClick={() => setBackgroundActivityOpen(true)}
+          >
+            <Activity size={16} />
+            <span className="activity-led" aria-hidden="true" />
+          </button>
           <button className="icon-button" aria-label="Open settings" onClick={() => setSettingsOpen(true)}>
             <Settings size={17} />
           </button>
@@ -2069,24 +2188,6 @@ export function App() {
             {!queryFilters.length && (refreshStatus || importStatus) ? (
               <span className="suggestion-chip">{refreshStatus ?? importStatus}</span>
             ) : null}
-          </div>
-        ) : null}
-        {jobProgress.length > 0 ? (
-          <div className="job-progress-panel" aria-label="Background work">
-            {jobProgress.map((job) => {
-              const percent = job.total > 0 ? Math.round(((job.total - job.pending) / job.total) * 100) : 0;
-              return (
-                <div className="job-progress-row" key={job.kind}>
-                  <span className="job-progress-label">{job.label}</span>
-                  <div className="job-progress-track">
-                    <div className="job-progress-fill" style={{ width: `${percent}%` }} />
-                  </div>
-                  <span className="job-progress-count">
-                    {job.total - job.pending}/{job.total}
-                  </span>
-                </div>
-              );
-            })}
           </div>
         ) : null}
         <section className="filter-panel" aria-label="Range filters">
@@ -2822,6 +2923,45 @@ export function App() {
             </div>
 
             <div className="settings-section">
+              <h2>Manage Libraries</h2>
+              <p className="settings-hint">
+                Deleting a library or emptying its trash only removes Darkwave's own catalog records — tags,
+                collections, source/license notes, trash entries. The audio files at each library's media root are
+                never touched.
+              </p>
+              <div className="library-admin-list">
+                {libraries.map((library) => (
+                  <div className="library-admin-row" key={library.id}>
+                    <span className="library-admin-icon">
+                      <Database size={14} />
+                    </span>
+                    <div className="library-admin-meta">
+                      <strong>{library.name}</strong>
+                      <small title={library.media_root}>{library.media_root}</small>
+                    </div>
+                    <div className="library-admin-actions">
+                      <button type="button" className="text-button" onClick={() => handleCleanLibraryCache(library)}>
+                        Clean Cache
+                      </button>
+                      <button type="button" className="text-button" onClick={() => handleEmptyLibraryTrash(library)}>
+                        Empty Trash
+                      </button>
+                      <button
+                        type="button"
+                        className="text-button danger"
+                        onClick={() => handleDeleteLibrary(library)}
+                      >
+                        <Trash2 size={13} />
+                        Delete
+                      </button>
+                    </div>
+                  </div>
+                ))}
+              </div>
+              {libraryAdminStatus ? <div className="status-line">{libraryAdminStatus}</div> : null}
+            </div>
+
+            <div className="settings-section">
               <h2>Watched Folder</h2>
               <div className="settings-grid">
                 <div className="settings-row">
@@ -3049,6 +3189,66 @@ export function App() {
                 ))
               )}
             </div>
+          </motion.div>
+        </motion.div>
+      ) : null}
+      </AnimatePresence>
+      <AnimatePresence>
+      {backgroundActivityOpen ? (
+        <motion.div
+          className="modal-overlay"
+          onClick={() => setBackgroundActivityOpen(false)}
+          initial={{ opacity: 0 }}
+          animate={{ opacity: 1 }}
+          exit={{ opacity: 0 }}
+          transition={{ duration: 0.15 }}
+        >
+          <motion.div
+            className="modal-card"
+            onClick={(event) => event.stopPropagation()}
+            aria-label="Background activity"
+            initial={{ opacity: 0, scale: 0.96, y: 10 }}
+            animate={{ opacity: 1, scale: 1, y: 0 }}
+            exit={{ opacity: 0, scale: 0.96, y: 10 }}
+            transition={{ duration: 0.2, ease: [0.4, 0, 0.2, 1] }}
+          >
+            <div className="modal-head">
+              <h1>Background Activity</h1>
+              <button
+                type="button"
+                className="icon-button"
+                aria-label="Close background activity"
+                onClick={() => setBackgroundActivityOpen(false)}
+              >
+                <X size={16} />
+              </button>
+            </div>
+            {jobProgress.length === 0 ? (
+              <p className="empty-hint">
+                All caught up — nothing analyzing, importing, or scanning right now.
+              </p>
+            ) : (
+              <div className="job-progress-panel" aria-label="Background work">
+                {jobProgress.map((job) => {
+                  const percent = job.total > 0 ? Math.round(((job.total - job.pending) / job.total) * 100) : 0;
+                  return (
+                    <div className="job-progress-row" key={job.kind}>
+                      <span className="job-progress-label">{job.label}</span>
+                      <div className="job-progress-track">
+                        <div className="job-progress-fill" style={{ width: `${percent}%` }} />
+                      </div>
+                      <span className="job-progress-count">
+                        {job.total - job.pending}/{job.total}
+                      </span>
+                    </div>
+                  );
+                })}
+              </div>
+            )}
+            <p className="settings-hint">
+              Analysis (metadata, waveform, tempo, key, vocal detection) always runs in the background, one file at a
+              time, so browsing and playback stay responsive while it works.
+            </p>
           </motion.div>
         </motion.div>
       ) : null}
