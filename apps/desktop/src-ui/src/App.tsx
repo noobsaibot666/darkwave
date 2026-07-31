@@ -357,6 +357,49 @@ const VOCAL_RATIO_THRESHOLD = 0.15;
 const isMacPlatform = typeof navigator !== "undefined" && /Mac|iPhone|iPad/.test(navigator.userAgent);
 const modKeyLabel = isMacPlatform ? "⌘" : "Ctrl";
 
+// Matches the min-height + margin-bottom each density actually renders at
+// in styles.css (.asset-row / .browser[data-density="..."] .asset-row).
+// Virtualization assumes a uniform row height, so this has to stay in
+// sync with those rules by hand.
+const ROW_HEIGHT_PX_BY_DENSITY: Record<string, number> = {
+  Compact: 41,
+  Comfortable: 60,
+  Expanded: 72
+};
+
+const BROWSER_OVERSCAN_ROWS = 6;
+
+type VisibleRowRange = {
+  start: number;
+  endExclusive: number;
+  offsetTopPx: number;
+  spacerBottomPx: number;
+};
+
+// Direct port of crates/viewport::VirtualViewport::visible_range (kept
+// client-side, not round-tripped through Tauri, since it has to recompute
+// on every scroll frame). Keep the two in sync if the algorithm changes.
+function computeVisibleRowRange(
+  totalRows: number,
+  rowHeightPx: number,
+  viewportHeightPx: number,
+  scrollTopPx: number,
+  overscanRows: number
+): VisibleRowRange {
+  if (totalRows === 0 || rowHeightPx === 0 || viewportHeightPx === 0) {
+    return { start: 0, endExclusive: 0, offsetTopPx: 0, spacerBottomPx: 0 };
+  }
+
+  const firstVisibleRow = Math.floor(scrollTopPx / rowHeightPx);
+  const visibleRowCount = Math.ceil(viewportHeightPx / rowHeightPx);
+  const start = Math.max(0, firstVisibleRow - overscanRows);
+  const endExclusive = Math.min(totalRows, firstVisibleRow + visibleRowCount + overscanRows);
+  const offsetTopPx = start * rowHeightPx;
+  const spacerBottomPx = Math.max(0, totalRows - endExclusive) * rowHeightPx;
+
+  return { start, endExclusive, offsetTopPx, spacerBottomPx };
+}
+
 function classifyPlayerMood(asset: AssetRecord | null, tags: TagRecord[], vocalRatio: number | null): PlayerMood | null {
   if (!asset) return null;
   const names = tags.map((tag) => tag.name.toLowerCase());
@@ -532,6 +575,35 @@ export function App() {
     }
     return assets;
   }, [assets, activeFilter]);
+
+  const browserScrollRef = useRef<HTMLElement | null>(null);
+  const [browserScrollTop, setBrowserScrollTop] = useState(0);
+  const [browserViewportHeight, setBrowserViewportHeight] = useState(600);
+
+  useEffect(() => {
+    const node = browserScrollRef.current;
+    if (!node || typeof ResizeObserver === "undefined") return;
+    const observer = new ResizeObserver((entries) => {
+      const entry = entries[0];
+      if (entry) setBrowserViewportHeight(entry.contentRect.height);
+    });
+    observer.observe(node);
+    return () => observer.disconnect();
+  }, []);
+
+  const browserRowHeightPx = ROW_HEIGHT_PX_BY_DENSITY[preferences?.browser_density ?? "Comfortable"] ?? 60;
+
+  const browserVisibleRange = useMemo(
+    () =>
+      computeVisibleRowRange(
+        visibleAssets.length,
+        browserRowHeightPx,
+        browserViewportHeight,
+        browserScrollTop,
+        BROWSER_OVERSCAN_ROWS
+      ),
+    [visibleAssets.length, browserRowHeightPx, browserViewportHeight, browserScrollTop]
+  );
 
   useEffect(() => {
     let cancelled = false;
@@ -779,9 +851,23 @@ export function App() {
 
   useEffect(() => {
     if (!selectedAssetId) return;
-    const row = document.querySelector(`[data-asset-id="${selectedAssetId}"]`);
-    row?.scrollIntoView({ block: "nearest", behavior: "smooth" });
-  }, [selectedAssetId]);
+    const container = browserScrollRef.current;
+    if (!container) return;
+    const index = visibleAssets.findIndex((asset) => asset.id === selectedAssetId);
+    if (index === -1) return;
+
+    // Computed directly from the row's index rather than found-and-scrolled
+    // via the DOM, since a virtualized row outside the current window
+    // doesn't exist as an element yet to scroll to — this is what actually
+    // brings it into the rendered range in the first place.
+    const rowTop = index * browserRowHeightPx;
+    const rowBottom = rowTop + browserRowHeightPx;
+    if (rowTop < container.scrollTop) {
+      container.scrollTop = rowTop;
+    } else if (rowBottom > container.scrollTop + container.clientHeight) {
+      container.scrollTop = rowBottom - container.clientHeight;
+    }
+  }, [selectedAssetId, visibleAssets, browserRowHeightPx]);
 
   useEffect(() => {
     if (!selectedAssetId) {
@@ -1897,7 +1983,7 @@ export function App() {
           </CollapsibleSection>
           <div className="virtualization-bar" aria-label="Browser performance">
             <span>{visibleAssets.length} row{visibleAssets.length === 1 ? "" : "s"}</span>
-            <span>Not yet virtualized</span>
+            <span>{browserVisibleRange.endExclusive - browserVisibleRange.start} rendered</span>
           </div>
         </div>
       </aside>
@@ -2078,7 +2164,13 @@ export function App() {
             </>
           ) : null}
         </section>
-        <section className="browser" aria-label="Sound browser" data-density={preferences?.browser_density ?? "Comfortable"}>
+        <section
+          className="browser"
+          aria-label="Sound browser"
+          data-density={preferences?.browser_density ?? "Comfortable"}
+          ref={browserScrollRef}
+          onScroll={(event) => setBrowserScrollTop(event.currentTarget.scrollTop)}
+        >
           <div className="browser-header">
             <span aria-hidden="true" />
             <span aria-hidden="true" />
@@ -2091,7 +2183,12 @@ export function App() {
           {visibleAssets.length === 0 ? (
             <p className="empty-browser">No sounds here yet.</p>
           ) : (
-            visibleAssets.map((asset, index) => {
+            <>
+              {browserVisibleRange.offsetTopPx > 0 ? (
+                <div style={{ height: browserVisibleRange.offsetTopPx }} aria-hidden="true" />
+              ) : null}
+              {visibleAssets.slice(browserVisibleRange.start, browserVisibleRange.endExclusive).map((asset, sliceIndex) => {
+              const index = browserVisibleRange.start + sliceIndex;
               const isSelected = browserState
                 ? browserState.selected_indices.includes(index)
                 : asset.id === selectedAssetId;
@@ -2152,7 +2249,11 @@ export function App() {
                 )}
               </article>
               );
-            })
+              })}
+              {browserVisibleRange.spacerBottomPx > 0 ? (
+                <div style={{ height: browserVisibleRange.spacerBottomPx }} aria-hidden="true" />
+              ) : null}
+            </>
           )}
         </section>
         <AnimatePresence>

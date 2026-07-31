@@ -814,7 +814,6 @@ dependencies = [
  "tauri-plugin-shell",
  "trash",
  "uuid",
- "viewport",
  "workspace-state",
 ]
 

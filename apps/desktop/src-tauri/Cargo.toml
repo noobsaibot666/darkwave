@@ -31,7 +31,6 @@ search = { path = "../../../crates/search" }
 shared-types = { path = "../../../crates/shared-types" }
 storage = { path = "../../../crates/storage" }
 uuid.workspace = true
-viewport = { path = "../../../crates/viewport" }
 workspace-state = { path = "../../../crates/workspace-state" }
 tauri = { version = "2", features = ["protocol-asset"] }
 tauri-plugin-clipboard-manager = "2"
