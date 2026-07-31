@@ -599,6 +599,7 @@ export function App() {
   );
   const [refreshStatus, setRefreshStatus] = useState<string | null>(null);
   const [newProjectModalOpen, setNewProjectModalOpen] = useState(false);
+  const [createLibraryModalOpen, setCreateLibraryModalOpen] = useState(false);
   const [shortcutsOpen, setShortcutsOpen] = useState(false);
   const toggleSection = useCallback((id: string) => {
     setCollapsedSections((previous) => {
@@ -957,6 +958,21 @@ export function App() {
       setOfflineControl(null);
     }
   }, [activeLibrary]);
+
+  // Deleting a library only reloads whichever library becomes active next
+  // (or nothing) — without this, a deleted library's assets, trash, and
+  // maintenance findings would keep showing until something else happened
+  // to trigger a refetch. This is what actually makes "Delete" clean the
+  // app's own view of things, not just the backend catalog.
+  useEffect(() => {
+    if (activeLibraryId) return;
+    setAssets([]);
+    setSelectedAssetId(null);
+    setBrowserState(null);
+    setCollections([]);
+    setTrashItems([]);
+    setMaintenanceReport(null);
+  }, [activeLibraryId]);
 
   useEffect(() => {
     if (!activeLibraryId) return;
@@ -1551,6 +1567,7 @@ export function App() {
     setActiveLibraryId(library.id);
     setLibraryName("");
     setLibraryRoot("");
+    setCreateLibraryModalOpen(false);
   };
 
   const handleImportFolder = useCallback(async () => {
@@ -2017,19 +2034,34 @@ export function App() {
       </button>
       <aside className={sidebarCollapsed ? "sidebar collapsed" : "sidebar"} aria-label="Library">
         <div className="panel-body">
-          {libraries.length > 1 ? (
-            <select
-              className="library-select"
-              value={activeLibraryId ?? ""}
-              onChange={(event) => setActiveLibraryId(event.target.value)}
+          <div className="library-select-row">
+            {libraries.length > 1 ? (
+              <select
+                className="library-select"
+                value={activeLibraryId ?? ""}
+                onChange={(event) => setActiveLibraryId(event.target.value)}
+              >
+                {libraries.map((library) => (
+                  <option key={library.id} value={library.id}>
+                    {library.name}
+                  </option>
+                ))}
+              </select>
+            ) : (
+              <div className="library-select-static" title={activeLibrary?.media_root}>
+                {activeLibrary?.name ?? "Library"}
+              </div>
+            )}
+            <button
+              type="button"
+              className="icon-button"
+              aria-label="Create a new library"
+              title="Create a new library"
+              onClick={() => setCreateLibraryModalOpen(true)}
             >
-              {libraries.map((library) => (
-                <option key={library.id} value={library.id}>
-                  {library.name}
-                </option>
-              ))}
-            </select>
-          ) : null}
+              <Plus size={16} />
+            </button>
+          </div>
           <button
             className={activeFilter === "all" ? "nav-item sidebar-styled-item active" : "nav-item sidebar-styled-item"}
             onClick={() => setActiveFilter("all")}
@@ -3231,7 +3263,13 @@ export function App() {
                     </div>
 
                     <div className="settings-section">
-                      <h2>Manage Libraries</h2>
+                      <div className="settings-section-head">
+                        <h2>Manage Libraries</h2>
+                        <button type="button" className="text-button" onClick={() => setCreateLibraryModalOpen(true)}>
+                          <Plus size={13} />
+                          New Library
+                        </button>
+                      </div>
                       <p className="settings-hint">
                         Deleting a library or emptying its trash only removes Darkwave's own catalog records — tags,
                         collections, source/license notes, trash entries. The audio files at each library's media
@@ -3718,6 +3756,67 @@ export function App() {
                 }}
               >
                 Create Project
+              </button>
+            </div>
+          </motion.div>
+        </motion.div>
+      ) : null}
+      </AnimatePresence>
+      <AnimatePresence>
+      {createLibraryModalOpen ? (
+        <motion.div
+          className="modal-overlay"
+          onClick={() => setCreateLibraryModalOpen(false)}
+          initial={{ opacity: 0 }}
+          animate={{ opacity: 1 }}
+          exit={{ opacity: 0 }}
+          transition={{ duration: 0.18 }}
+        >
+          <motion.div
+            className="modal-card"
+            onClick={(event) => event.stopPropagation()}
+            aria-label="Create library"
+            initial={{ opacity: 0, scale: 0.96, y: 10 }}
+            animate={{ opacity: 1, scale: 1, y: 0 }}
+            exit={{ opacity: 0, scale: 0.96, y: 10 }}
+            transition={{ duration: 0.2, ease: [0.4, 0, 0.2, 1] }}
+          >
+            <div className="modal-head">
+              <h1>New Library</h1>
+              <button type="button" className="icon-button" aria-label="Close" onClick={() => setCreateLibraryModalOpen(false)}>
+                <X size={16} />
+              </button>
+            </div>
+            <div className="settings-stack">
+              <label className="setup-field">
+                <span>Library name</span>
+                <input
+                  autoFocus
+                  value={libraryName}
+                  onChange={(event) => setLibraryName(event.target.value)}
+                  placeholder="Home Studio"
+                />
+              </label>
+              <label className="setup-field">
+                <span>Media location</span>
+                <div className="setup-field-row">
+                  <input
+                    value={libraryRoot}
+                    onChange={(event) => setLibraryRoot(event.target.value)}
+                    placeholder="/Volumes/TrueNAS/SFX"
+                  />
+                  <button type="button" onClick={handleChooseMediaRoot}>
+                    Browse
+                  </button>
+                </div>
+              </label>
+              <button
+                className="primary-action"
+                type="button"
+                onClick={handleCreateLibrary}
+                disabled={!libraryName.trim() || !libraryRoot.trim()}
+              >
+                Create Library
               </button>
             </div>
           </motion.div>

@@ -41,7 +41,7 @@ A dedicated panel, opened from its own button in the topbar (before Export Selec
 
 ## Managing libraries
 
-Settings → General → Manage Libraries lists every library with **Clean Cache**, **Empty Trash**, and **Delete** actions. All three only ever touch Darkwave's own catalog records (cached preview copies, trash entries, or the whole catalog row) — the audio files at a library's media root are never read, moved, or deleted by any of them.
+A "+" button next to the library switcher at the top of the sidebar opens the same New Library dialog used on first run, so adding a second (or third) library doesn't require deleting the first one. Settings → General → Manage Libraries has its own **New Library** shortcut too, alongside every existing library's **Clean Cache**, **Empty Trash**, and **Delete** actions. All three only ever touch Darkwave's own catalog records (cached preview copies, trash entries, or the whole catalog row) — the audio files at a library's media root are never read, moved, or deleted by any of them. Deleting the active library also clears its assets, trash, and maintenance findings from the current view immediately, rather than leaving stale data on screen until something else happens to trigger a refresh.
 
 ## Background Activity
 

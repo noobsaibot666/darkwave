@@ -450,15 +450,46 @@ button.panel-handle-right:active:not(:disabled) {
   color: var(--text-primary);
 }
 
+.library-select-row {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  margin-bottom: 12px;
+}
+
 .library-select {
+  flex: 1;
+  min-width: 0;
   width: 100%;
   height: 30px;
-  margin-bottom: 12px;
   padding: 0 8px;
   border: 1px solid rgba(var(--ink-rgb), 0.1);
   border-radius: 6px;
   background: var(--surface-input);
   color: var(--text-primary);
+}
+
+.library-select-row .icon-button {
+  width: 30px;
+  height: 30px;
+  flex: 0 0 auto;
+}
+
+.library-select-static {
+  display: flex;
+  flex: 1;
+  min-width: 0;
+  align-items: center;
+  height: 30px;
+  padding: 0 8px;
+  overflow: hidden;
+  border: 1px solid rgba(var(--ink-rgb), 0.1);
+  border-radius: 6px;
+  background: var(--surface-input);
+  color: var(--text-primary);
+  font-size: 12px;
+  text-overflow: ellipsis;
+  white-space: nowrap;
 }
 
 .empty-hint {
@@ -1758,6 +1789,27 @@ dd {
   margin: 0 0 10px;
   font-size: 13px;
   font-weight: 700;
+}
+
+.settings-section-head {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 10px;
+  margin-bottom: 10px;
+}
+
+.settings-section-head h2 {
+  margin: 0;
+}
+
+.settings-section-head .text-button {
+  display: inline-flex;
+  align-items: center;
+  gap: 5px;
+  height: 28px;
+  padding: 0 10px;
+  font-size: 11px;
 }
 
 .settings-grid {
