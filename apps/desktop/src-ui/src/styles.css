@@ -2346,20 +2346,24 @@ dd {
   display: flex;
   align-items: center;
   justify-content: center;
-  color: #60a5fa;
+  color: #1e9bff;
   pointer-events: none;
 }
 
 .activity-pulse-icon path {
-  stroke-dasharray: 0.22 1;
+  stroke-width: 2.75px;
+  stroke-dasharray: 0.26 1;
   stroke-dashoffset: 0;
-  filter: drop-shadow(0 0 2px rgba(96, 165, 250, 0.85));
+  filter: drop-shadow(0 0 3px #1e9bff) drop-shadow(0 0 6px rgba(30, 155, 255, 0.75));
   animation: activity-pulse-travel 1.3s linear infinite;
 }
 
 @keyframes activity-pulse-travel {
   to {
-    stroke-dashoffset: -1.22;
+    /* Path data runs right-to-left (starts at x=22, ends at x=2), so a
+       positive-going offset draws the visible segment start-to-end —
+       left-to-right on screen, not backwards along the path. */
+    stroke-dashoffset: 1.26;
   }
 }
 
