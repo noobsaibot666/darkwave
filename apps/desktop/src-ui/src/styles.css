@@ -316,11 +316,11 @@ button.panel-handle-right:active:not(:disabled) {
   display: inline-flex;
   align-items: center;
   justify-content: center;
-  width: 18px;
-  height: 18px;
+  width: 24px;
+  height: 24px;
   flex: 0 0 auto;
   border: none;
-  border-radius: 5px;
+  border-radius: 6px;
   background: transparent;
   color: #8a7d6d;
   transition: background-color 140ms var(--ease-soft), color 140ms var(--ease-soft);

@@ -1654,7 +1654,7 @@ export function App() {
               title="New project"
               onClick={() => setNewProjectModalOpen(true)}
             >
-              <Plus size={12} />
+              <Plus size={16} />
             </button>
           </div>
           {collections.map((project) => (
