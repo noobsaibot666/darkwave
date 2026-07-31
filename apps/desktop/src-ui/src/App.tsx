@@ -1898,6 +1898,8 @@ export function App() {
         </section>
         <section className="browser" aria-label="Sound browser" data-density={preferences?.browser_density ?? "Comfortable"}>
           <div className="browser-header">
+            <span aria-hidden="true" />
+            <span aria-hidden="true" />
             <span>Name</span>
             <span>Type</span>
             <span>Storage</span>

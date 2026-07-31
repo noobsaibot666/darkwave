@@ -665,7 +665,7 @@ button:disabled,
 .browser-header,
 .asset-row {
   display: grid;
-  grid-template-columns: 34px 112px minmax(170px, 1fr) 110px 74px 78px 88px 34px 34px;
+  grid-template-columns: 34px 36px minmax(170px, 1fr) 110px 74px 78px 88px 34px 34px;
   gap: 10px;
   align-items: center;
 }
@@ -675,7 +675,11 @@ button:disabled,
   top: 0;
   z-index: 2;
   margin: 0 -18px;
-  padding: 14px 28px 14px 174px;
+  /* Same horizontal inset as .asset-row's content (.browser's own 18px
+     padding + the row's 12px padding), so the shared grid template above
+     lands in the exact same columns as the data instead of an approximated
+     offset that drifts every time a column width changes. */
+  padding: 14px 30px 14px 30px;
   border-bottom: 1px solid rgba(243, 240, 231, 0.08);
   background: rgba(26, 26, 26, 0.82);
   backdrop-filter: blur(20px) saturate(1);
@@ -740,8 +744,10 @@ button:disabled,
 .waveform {
   display: flex;
   align-items: center;
+  justify-content: center;
   gap: 2px;
   height: 28px;
+  color: #8a7d6d;
 }
 
 .waveform span {
