@@ -2349,7 +2349,6 @@ export function App() {
           }}
         >
           <Clapperboard size={16} />
-          DR
         </button>
         {drExportStatus ? <span className="dr-status">{drExportStatus}</span> : null}
       </footer>

@@ -251,16 +251,15 @@ button.panel-handle-right:active:not(:disabled) {
 .dr-button {
   display: inline-flex;
   align-items: center;
-  gap: 6px;
+  justify-content: center;
+  width: 34px;
   height: 34px;
-  padding: 0 12px;
+  flex: 0 0 auto;
+  padding: 0;
   border: 1px solid rgba(255, 92, 0, 0.35);
   border-radius: var(--radius-sm);
   background: rgba(255, 92, 0, 0.12);
   color: #ffa366;
-  font-size: 12px;
-  font-weight: 700;
-  white-space: nowrap;
   transition: background-color 140ms var(--ease-soft);
 }
 
