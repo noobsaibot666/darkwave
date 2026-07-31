@@ -320,6 +320,22 @@ function formatTime(seconds: number): string {
   return `${minutes}:${remaining.toString().padStart(2, "0")}`;
 }
 
+// "not_set" (no media root yet — a library created without a folder, before
+// its first import) is distinct from "offline" (a root that was reachable
+// before and isn't right now) at the API boundary; this is just the label.
+function formatMediaRootStatus(status: string | undefined): string {
+  switch (status) {
+    case "not_set":
+      return "Not set yet";
+    case "online":
+      return "Online";
+    case "offline":
+      return "Offline";
+    default:
+      return "Unknown";
+  }
+}
+
 const activeBarTrailLength = 10;
 
 async function computePeaks(path: string, bucketCount = 200): Promise<number[] | null> {
@@ -588,7 +604,6 @@ export function App() {
   const [smartCollectionName, setSmartCollectionName] = useState("");
   const [queryFilters, setQueryFilters] = useState<VisibleFilter[]>([]);
   const [libraryName, setLibraryName] = useState("");
-  const [libraryRoot, setLibraryRoot] = useState("");
   const [importStatus, setImportStatus] = useState<string | null>(null);
   const [activeFilter, setActiveFilter] = useState<ActiveFilter>("all");
   const [sidebarCollapsed, setSidebarCollapsed] = useState(false);
@@ -1558,22 +1573,16 @@ export function App() {
     [activeLibraryId]
   );
 
-  const handleChooseMediaRoot = async () => {
-    const selected = await openDialog({ directory: true, multiple: false, title: "Choose media location" });
-    if (typeof selected === "string") setLibraryRoot(selected);
-  };
-
   const handleCreateLibrary = async () => {
-    if (!libraryName.trim() || !libraryRoot.trim()) return;
+    if (!libraryName.trim()) return;
 
     const library = await invoke<LibraryRecord>("create_library", {
       name: libraryName.trim(),
-      mediaRoot: libraryRoot.trim()
+      mediaRoot: ""
     });
     setLibraries((previous) => [...previous, library]);
     setActiveLibraryId(library.id);
     setLibraryName("");
-    setLibraryRoot("");
     setCreateLibraryModalOpen(false);
   };
 
@@ -1595,13 +1604,20 @@ export function App() {
           ? `Imported ${result.imported.length}, ${result.failed.length} failed`
           : `Imported ${result.imported.length} sound${result.imported.length === 1 ? "" : "s"}`
       );
+      // The very first import into a library sets its media root
+      // automatically (see import_folder) — re-fetching here is what
+      // picks that up so Settings/NAS status reflect it immediately
+      // instead of only after the next library switch.
+      if (!activeLibrary?.media_root) {
+        invoke<LibraryRecord[]>("list_libraries").then(setLibraries).catch(() => {});
+      }
       refreshAssets(activeLibraryId, searchQuery, activeFilter);
       refreshMaintenance(activeLibraryId);
       runJobDrain(activeLibraryId);
     } catch (error) {
       setImportStatus(`Import failed: ${String(error)}`);
     }
-  }, [activeLibraryId, searchQuery, activeFilter, refreshAssets, refreshMaintenance, runJobDrain]);
+  }, [activeLibraryId, activeLibrary, searchQuery, activeFilter, refreshAssets, refreshMaintenance, runJobDrain]);
 
   const handleRefreshLibrary = useCallback(() => {
     if (!activeLibraryId) return;
@@ -1955,33 +1971,24 @@ export function App() {
         <section className="setup-card" aria-label="Create library">
           <div className="brand">Darkwave</div>
           <h1>Create your library</h1>
-          <p>Choose a name and a media location. This can be a local disk, external drive, or NAS folder.</p>
+          <p>Choose a name. The first folder you import becomes this library's media location automatically.</p>
           <label className="setup-field">
             <span>Library name</span>
             <input
+              autoFocus
               value={libraryName}
               onChange={(event) => setLibraryName(event.target.value)}
               placeholder="Home Studio"
+              onKeyDown={(event) => {
+                if (event.key === "Enter" && libraryName.trim()) handleCreateLibrary();
+              }}
             />
-          </label>
-          <label className="setup-field">
-            <span>Media location</span>
-            <div className="setup-field-row">
-              <input
-                value={libraryRoot}
-                onChange={(event) => setLibraryRoot(event.target.value)}
-                placeholder="/Volumes/TrueNAS/SFX"
-              />
-              <button type="button" onClick={handleChooseMediaRoot}>
-                Browse
-              </button>
-            </div>
           </label>
           <button
             className="primary-action"
             type="button"
             onClick={handleCreateLibrary}
-            disabled={!libraryName.trim() || !libraryRoot.trim()}
+            disabled={!libraryName.trim()}
           >
             Create Library
           </button>
@@ -2467,7 +2474,14 @@ export function App() {
               ) : null}
             </AnimatePresence>
           </div>
-          <button type="button" className="icon-button" aria-label="Refresh library" onClick={() => handleRefreshLibrary()} title="Scan the media root for new files">
+          <button
+            type="button"
+            className="icon-button"
+            aria-label="Refresh library"
+            onClick={() => handleRefreshLibrary()}
+            disabled={!activeLibrary?.media_root}
+            title={activeLibrary?.media_root ? "Scan the media root for new files" : "Import a folder first to set this library's media root"}
+          >
             <RefreshCw size={16} />
           </button>
           <button
@@ -3061,10 +3075,10 @@ export function App() {
           ) : null}
         </CollapsibleSection>
         <CollapsibleSection id="nas" title="NAS & Offline" collapsed={collapsedSections.has("nas")} onToggle={toggleSection}>
-          {offlineControl ? (
+          {offlineControl && activeLibrary?.media_root ? (
             <>
               <div className="status-line">
-                {offlineControl.media_root} — {mediaRootStatus?.status ?? "unknown"}
+                {offlineControl.media_root} — {formatMediaRootStatus(mediaRootStatus?.status)}
                 {offlineControl.catalog_only ? " (catalog only)" : ""}
               </div>
               <div className="action-list">
@@ -3085,6 +3099,8 @@ export function App() {
               </div>
               {reconnectStatus ? <div className="status-line">{reconnectStatus}</div> : null}
             </>
+          ) : activeLibrary ? (
+            <span className="empty-hint">No media root yet — import a folder to enable NAS/offline detection</span>
           ) : (
             <span className="empty-hint">No library selected</span>
           )}
@@ -3257,14 +3273,14 @@ export function App() {
                         <div className="settings-row">
                           <Volume2 size={14} />
                           <span>Media root</span>
-                          <strong className="settings-value-path" title={activeLibrary?.media_root}>
-                            {activeLibrary?.media_root ?? "—"}
+                          <strong className="settings-value-path" title={activeLibrary?.media_root || undefined}>
+                            {activeLibrary?.media_root || "Not set yet — import a folder"}
                           </strong>
                         </div>
                         <div className="settings-row">
                           <Gauge size={14} />
                           <span>Status</span>
-                          <strong>{mediaRootStatus?.status ?? "unknown"}</strong>
+                          <strong>{formatMediaRootStatus(mediaRootStatus?.status)}</strong>
                         </div>
                       </div>
                     </div>
@@ -3290,7 +3306,9 @@ export function App() {
                             </span>
                             <div className="library-admin-meta">
                               <strong>{library.name}</strong>
-                              <small title={library.media_root}>{library.media_root}</small>
+                              <small title={library.media_root || undefined}>
+                                {library.media_root || "No media root yet — import a folder to set it"}
+                              </small>
                             </div>
                             <div className="library-admin-actions">
                               <button type="button" className="text-button" onClick={() => handleCleanLibraryCache(library)}>
@@ -3802,26 +3820,17 @@ export function App() {
                   value={libraryName}
                   onChange={(event) => setLibraryName(event.target.value)}
                   placeholder="Home Studio"
+                  onKeyDown={(event) => {
+                    if (event.key === "Enter" && libraryName.trim()) handleCreateLibrary();
+                  }}
                 />
               </label>
-              <label className="setup-field">
-                <span>Media location</span>
-                <div className="setup-field-row">
-                  <input
-                    value={libraryRoot}
-                    onChange={(event) => setLibraryRoot(event.target.value)}
-                    placeholder="/Volumes/TrueNAS/SFX"
-                  />
-                  <button type="button" onClick={handleChooseMediaRoot}>
-                    Browse
-                  </button>
-                </div>
-              </label>
+              <p className="settings-hint">The first folder you import becomes this library's media location automatically.</p>
               <button
                 className="primary-action"
                 type="button"
                 onClick={handleCreateLibrary}
-                disabled={!libraryName.trim() || !libraryRoot.trim()}
+                disabled={!libraryName.trim()}
               >
                 Create Library
               </button>

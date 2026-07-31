@@ -82,6 +82,6 @@ than being abandoned after the first failure.
 
 ## Refresh and the local cache
 
-The Refresh action (top of the workspace) re-scans the active library's media root for files that aren't in the catalog yet — useful after dropping something into a NAS folder outside the app. It only reads and hashes files it doesn't already know about, so repeat scans are fast regardless of library size.
+The Refresh action (top of the workspace) re-scans the active library's media root for files that aren't in the catalog yet — useful after dropping something into a NAS folder outside the app. It only reads and hashes files it doesn't already know about, so repeat scans are fast regardless of library size. It stays disabled until the library has a media root — which a brand-new library doesn't until its first import — since there's nothing yet to rescan.
 
 Separately, opening a library warms a local playback cache (referenced/NAS-backed files only) up to the budget set in Settings, so recently-added sounds preview quickly. The cache is cleared automatically when the app closes, or on demand via the Purge Cache button in Settings.

@@ -447,6 +447,13 @@ fn media_root_status(
         .map_err(storage_error_message)?
         .ok_or_else(|| "library not found".to_string())?;
 
+    // "not_set" is distinct from "offline": offline implies a root that was
+    // reachable before and now isn't (reconnect UI applies), while a library
+    // with no root yet has never had anything to probe in the first place.
+    if library.media_root.trim().is_empty() {
+        return Ok(("not_set".to_string(), false));
+    }
+
     let probe = library_sync::probe_media_root(&library.media_root, |path| {
         std::path::Path::new(path).exists()
     });
@@ -850,6 +857,25 @@ fn import_folder(
         other => return Err(format!("unknown import mode: {other}")),
     };
 
+    // A library no longer needs a folder picked at creation time — the
+    // first folder someone imports into it becomes its media root, which
+    // is what turns on Refresh Library and NAS-offline detection from here
+    // on. Set unconditionally on the imported folder, not contingent on
+    // any file inside it actually matching, since choosing this folder to
+    // import from is itself what establishes it as the root.
+    {
+        let catalog = state.0.lock().expect("catalog mutex poisoned");
+        let library = catalog
+            .get_library(library_id)
+            .map_err(storage_error_message)?
+            .ok_or_else(|| "library not found".to_string())?;
+        if library.media_root.trim().is_empty() {
+            catalog
+                .set_library_media_root(library_id, &folder_path)
+                .map_err(storage_error_message)?;
+        }
+    }
+
     let mut paths = collect_audio_files(std::path::Path::new(&folder_path))
         .map_err(|error| format!("could not read folder {folder_path}: {error}"))?;
     paths.sort();
@@ -953,6 +979,10 @@ fn refresh_library(
             .collect();
         (library.media_root, known_paths)
     };
+
+    if media_root.trim().is_empty() {
+        return Err("This library has no media root yet — import a folder first.".to_string());
+    }
 
     let mut paths = collect_audio_files(std::path::Path::new(&media_root))
         .map_err(|error| format!("could not read {media_root}: {error}"))?;
@@ -2192,6 +2222,31 @@ mod tests {
     fn parse_uuid_field_accepts_uuid_input() {
         let id = uuid::Uuid::new_v4();
         assert_eq!(super::parse_uuid_field(&id.to_string(), "library id"), Ok(id));
+    }
+
+    #[test]
+    fn collect_audio_files_recurses_into_nested_subfolders() {
+        let root = std::env::temp_dir().join(format!(
+            "darkwave-collect-audio-test-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        let nested = root.join("Pack A").join("Impacts");
+        std::fs::create_dir_all(&nested).unwrap();
+        std::fs::write(root.join("top-level.wav"), b"x").unwrap();
+        std::fs::write(nested.join("buried.wav"), b"x").unwrap();
+        std::fs::write(nested.join("not-audio.txt"), b"x").unwrap();
+        std::fs::write(root.join(".DS_Store"), b"x").unwrap();
+
+        let files = super::collect_audio_files(&root).unwrap();
+        std::fs::remove_dir_all(&root).unwrap();
+
+        assert_eq!(files.len(), 2);
+        assert!(files.iter().any(|path| path.ends_with("top-level.wav")));
+        assert!(files.iter().any(|path| path.ends_with("buried.wav")));
     }
 
     #[test]

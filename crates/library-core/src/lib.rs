@@ -6,10 +6,14 @@ use uuid::Uuid;
 pub enum LibraryError {
     #[error("library name is required")]
     MissingName,
-    #[error("media root is required")]
-    MissingMediaRoot,
 }
 
+/// `media_root` is deliberately allowed to be empty here: a library no
+/// longer needs a folder picked at creation time, since there's nothing to
+/// import yet. It gets set automatically from the first folder someone
+/// imports into that library (see `set_library_media_root` in storage),
+/// which is also what turns on Refresh Library and NAS-offline detection
+/// for it.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct LibraryDraft {
     pub name: String,
@@ -23,10 +27,6 @@ pub fn product_codename() -> &'static str {
 pub fn validate_library_draft(draft: &LibraryDraft) -> Result<(), LibraryError> {
     if draft.name.trim().is_empty() {
         return Err(LibraryError::MissingName);
-    }
-
-    if draft.media_root.trim().is_empty() {
-        return Err(LibraryError::MissingMediaRoot);
     }
 
     Ok(())
@@ -62,6 +62,16 @@ mod tests {
             validate_library_draft(&draft),
             Err(LibraryError::MissingName)
         );
+    }
+
+    #[test]
+    fn library_draft_accepts_an_empty_media_root() {
+        let draft = LibraryDraft {
+            name: "Home Studio".to_string(),
+            media_root: String::new(),
+        };
+
+        assert_eq!(validate_library_draft(&draft), Ok(()));
     }
 
     #[test]

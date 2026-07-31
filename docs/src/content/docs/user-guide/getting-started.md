@@ -5,7 +5,7 @@ description: Install, create a library, and import audio.
 
 Darkwave is a local-first desktop audio library.
 
-Start by creating or opening a library. A library can manage copied media, reference files where they already live, or use a hybrid mode.
+Start by creating or opening a library. Creating one only asks for a name — there's no folder to pick upfront. The first folder you import into it becomes its media root automatically, which is what turns on the Refresh action and NAS-offline detection for that library; until then, both stay off since there's nothing yet to scan or watch. A library can manage copied media, reference files where they already live, or use a hybrid mode.
 
 Use folder import for existing sound libraries and watched Downloads for new files. NAS-backed libraries should keep media on the share while the active catalog and waveform cache stay local.
 

@@ -330,6 +330,23 @@ impl Catalog {
             .map_err(StorageError::from)
     }
 
+    /// Sets a library's media root after the fact — used to establish it
+    /// automatically from the first folder someone imports into a library
+    /// created without one (see ADR-worthy note in library-core::LibraryDraft).
+    /// Overwrites unconditionally rather than only-if-empty, since the only
+    /// caller already checks that first.
+    pub fn set_library_media_root(
+        &self,
+        library_id: Uuid,
+        media_root: impl AsRef<str>,
+    ) -> Result<(), StorageError> {
+        self.connection.execute(
+            "UPDATE libraries SET media_root = ?1 WHERE id = ?2",
+            params![media_root.as_ref(), library_id.to_string()],
+        )?;
+        Ok(())
+    }
+
     /// Deletes a library and every catalog row that belongs to it (assets,
     /// background jobs, asset_tags, trash_items, collections,
     /// collection_assets, source_records) via `ON DELETE CASCADE` — the
@@ -2277,6 +2294,26 @@ mod tests {
             .expect("library exists");
 
         assert_eq!(loaded.name, "Editor Library");
+        assert_eq!(loaded.media_root, "/Volumes/TrueNAS/SFX");
+    }
+
+    #[test]
+    fn set_library_media_root_updates_an_initially_empty_root() {
+        let catalog_path = unique_catalog_path("set-media-root");
+        let catalog = Catalog::open(&catalog_path).expect("open catalog");
+        let library = catalog
+            .create_library("Home Studio", "")
+            .expect("create library without a media root");
+        assert_eq!(library.media_root, "");
+
+        catalog
+            .set_library_media_root(library.id, "/Volumes/TrueNAS/SFX")
+            .expect("set media root");
+
+        let loaded = catalog
+            .get_library(library.id)
+            .expect("load library")
+            .expect("library exists");
         assert_eq!(loaded.media_root, "/Volumes/TrueNAS/SFX");
     }
 
