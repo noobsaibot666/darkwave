@@ -78,6 +78,17 @@ pub enum OutputDevicePreference {
     DeviceId(String),
 }
 
+/// Dark is the standard, default appearance for this app (a deliberate
+/// product choice, not an oversight — light mode is an option, not the
+/// baseline). `System` follows the OS light/dark setting.
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq, Serialize, Deserialize)]
+pub enum ThemePreference {
+    #[default]
+    Dark,
+    Light,
+    System,
+}
+
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 pub struct AppPreferences {
     pub browser_density: BrowserDensity,
@@ -88,6 +99,8 @@ pub struct AppPreferences {
     pub reduced_motion: bool,
     #[serde(default)]
     pub reduced_transparency: bool,
+    #[serde(default)]
+    pub theme: ThemePreference,
     /// A single folder (matching the plan's "Watched Downloads folder,"
     /// singular) the standing background worker polls for new, stable
     /// audio files and imports automatically. `None` disables watching.
@@ -191,6 +204,7 @@ impl AppPreferences {
             shortcuts: ShortcutMap::default_audio_workspace(),
             reduced_motion: false,
             reduced_transparency: false,
+            theme: ThemePreference::default(),
             watched_folder_path: None,
             watched_folder_library_id: None,
         }
@@ -350,6 +364,20 @@ mod tests {
         assert!(!loaded.reduced_transparency);
         assert_eq!(loaded.watched_folder_path, None);
         assert_eq!(loaded.watched_folder_library_id, None);
+        assert_eq!(loaded.theme, ThemePreference::Dark);
+    }
+
+    #[test]
+    fn theme_preference_round_trips_through_saved_preferences() {
+        let path = unique_preferences_path("theme");
+        let mut preferences = AppPreferences::default_for_editorial_audio();
+        assert_eq!(preferences.theme, ThemePreference::Dark);
+
+        preferences.theme = ThemePreference::Light;
+        save_preferences(&path, &preferences).expect("save");
+        let loaded = load_preferences(&path).expect("load");
+
+        assert_eq!(loaded.theme, ThemePreference::Light);
     }
 
     #[test]

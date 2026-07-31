@@ -18,6 +18,7 @@ import {
   Link2,
   ListFilter,
   Music,
+  Palette,
   Pause,
   Play,
   Plus,
@@ -181,6 +182,7 @@ type AppPreferences = {
   shortcuts: { bindings: ShortcutBinding[] };
   reduced_motion: boolean;
   reduced_transparency: boolean;
+  theme: "Dark" | "Light" | "System";
   watched_folder_path: string | null;
   watched_folder_library_id: string | null;
 };
@@ -1515,6 +1517,15 @@ export function App() {
     });
   }, []);
 
+  const handleSetTheme = useCallback((theme: AppPreferences["theme"]) => {
+    setPreferences((previous) => {
+      if (!previous) return previous;
+      const next = { ...previous, theme };
+      invoke("save_app_preferences", { preferences: next }).catch(() => {});
+      return next;
+    });
+  }, []);
+
   const handleChooseWatchedFolder = useCallback(async () => {
     if (!activeLibraryId) return;
     const folder = await openDialog({ directory: true, multiple: false, title: "Choose a folder to watch" });
@@ -1541,6 +1552,21 @@ export function App() {
     document.documentElement.classList.toggle("reduced-motion", preferences?.reduced_motion ?? false);
     document.documentElement.classList.toggle("reduced-transparency", preferences?.reduced_transparency ?? false);
   }, [preferences]);
+
+  useEffect(() => {
+    const theme = preferences?.theme ?? "Dark";
+    const media = window.matchMedia("(prefers-color-scheme: light)");
+
+    function applyResolvedTheme() {
+      const resolved = theme === "System" ? (media.matches ? "light" : "dark") : theme.toLowerCase();
+      document.documentElement.dataset.theme = resolved;
+    }
+
+    applyResolvedTheme();
+    if (theme !== "System") return;
+    media.addEventListener("change", applyResolvedTheme);
+    return () => media.removeEventListener("change", applyResolvedTheme);
+  }, [preferences?.theme]);
 
   useEffect(() => {
     function isTypingTarget(target: EventTarget | null) {
@@ -2788,6 +2814,24 @@ export function App() {
                     Purge Cache
                   </button>
                 </div>
+              </div>
+            </div>
+
+            <div className="settings-section">
+              <h2>Appearance</h2>
+              <div className="settings-grid">
+                <label className="settings-row">
+                  <Palette size={14} />
+                  <span>Theme</span>
+                  <select
+                    value={preferences?.theme ?? "Dark"}
+                    onChange={(event) => handleSetTheme(event.target.value as AppPreferences["theme"])}
+                  >
+                    <option value="Dark">Dark</option>
+                    <option value="Light">Light</option>
+                    <option value="System">Match system</option>
+                  </select>
+                </label>
               </div>
             </div>
 
