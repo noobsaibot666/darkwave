@@ -26,7 +26,6 @@ pub struct DecodedAudioBuffer {
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum CodecSupportStatus {
-    NativePcm,
     RequiresPackagedDecoder,
     Unsupported,
 }
@@ -95,17 +94,21 @@ pub fn supported_mvp_format(extension: &str) -> bool {
 pub fn codec_support_for_extension(extension: &str) -> CodecSupport {
     let extension = extension.to_ascii_lowercase();
     let status = match extension.as_str() {
-        "wav" => CodecSupportStatus::NativePcm,
-        "aiff" | "aif" | "mp3" | "flac" | "aac" | "m4a" | "ogg" => {
+        "wav" | "aiff" | "aif" | "mp3" | "flac" | "aac" | "m4a" | "ogg" => {
             CodecSupportStatus::RequiresPackagedDecoder
         }
         _ => CodecSupportStatus::Unsupported,
     };
 
     CodecSupport {
+        // A source already in WAV has nothing to gain from a WAV
+        // conversion — this is about whether converting *to* WAV is a
+        // meaningful action, not which decoder handles the source (kept
+        // true even for formats we can't decode ourselves, matching the
+        // pre-existing contract).
+        conversion_available: extension != "wav",
         extension,
         status,
-        conversion_available: status != CodecSupportStatus::NativePcm,
     }
 }
 
@@ -142,6 +145,12 @@ pub fn extract_embedded_metadata(
     parse_wav_info_metadata(&bytes)
 }
 
+/// A minimal hand-rolled 16-bit PCM WAV decoder. Only used directly by
+/// callers that control both ends of the format (e.g. the local preview
+/// cache, which always writes 16-bit) — NOT used for arbitrary user-supplied
+/// WAV files anymore (see `decode_supported_audio`), since real-world SFX
+/// libraries are commonly 24-bit and this parser errors on anything but
+/// 16-bit, which made every 24-bit WAV import fail analysis outright.
 pub fn decode_wav_pcm(path: impl AsRef<Path>) -> Result<DecodedAudioBuffer, MetadataError> {
     let path = path.as_ref();
     let extension = path
@@ -157,9 +166,10 @@ pub fn decode_wav_pcm(path: impl AsRef<Path>) -> Result<DecodedAudioBuffer, Meta
     parse_wav_pcm(&bytes)
 }
 
-/// Decodes any MVP-supported extension (WAV via the built-in parser, every
-/// other packaged format via Symphonia) without callers needing to wire up
-/// their own `PackagedAudioDecoder`.
+/// Decodes any MVP-supported extension via Symphonia (which — unlike
+/// `decode_wav_pcm` — handles every real-world WAV bit depth, not just
+/// 16-bit) without callers needing to wire up their own
+/// `PackagedAudioDecoder`.
 pub fn decode_any_supported_audio(path: impl AsRef<Path>) -> Result<DecodedAudioBuffer, MetadataError> {
     decode_supported_audio(path, Some(&SymphoniaDecoder))
 }
@@ -176,7 +186,6 @@ pub fn decode_supported_audio(
         .to_ascii_lowercase();
 
     match codec_support_for_extension(&extension).status {
-        CodecSupportStatus::NativePcm => decode_wav_pcm(path),
         CodecSupportStatus::RequiresPackagedDecoder => packaged_decoder
             .ok_or_else(|| MetadataError::PackagedDecoderUnavailable(extension.clone()))?
             .decode_packaged_audio(path, &extension),
@@ -404,15 +413,41 @@ mod tests {
     }
 
     #[test]
-    fn supported_audio_decoder_uses_native_wav_without_packaged_decoder() {
+    fn supported_audio_decoder_requires_a_packaged_decoder_for_wav_too() {
         let mut path = std::env::temp_dir();
         path.push(format!("darkwave-decoder-{}.wav", Uuid::new_v4()));
         fs::write(&path, wav_16_bit_fixture()).expect("fixture");
 
-        let decoded = decode_supported_audio(&path, None).expect("decode wav");
+        assert_eq!(
+            decode_supported_audio(&path, None),
+            Err(MetadataError::PackagedDecoderUnavailable("wav".to_string()))
+        );
+
+        let decoded =
+            decode_supported_audio(&path, Some(&SymphoniaDecoder)).expect("decode wav via symphonia");
+        assert_eq!(decoded.sample_rate, 48_000);
+        assert_eq!(decoded.channels, 1);
+    }
+
+    /// The actual bug this pass fixed: `decode_wav_pcm` only ever supported
+    /// 16-bit PCM and errored on everything else, and real-world SFX
+    /// libraries are commonly 24-bit — every 24-bit WAV import failed audio
+    /// analysis outright. Routing WAV through Symphonia (like every other
+    /// format) instead of the hand-rolled parser fixes it.
+    #[test]
+    fn decode_any_supported_audio_handles_24_bit_wav() {
+        let mut path = std::env::temp_dir();
+        path.push(format!("darkwave-24bit-{}.wav", Uuid::new_v4()));
+        fs::write(&path, wav_24_bit_fixture()).expect("fixture");
+
+        let decoded = decode_any_supported_audio(&path).expect("decode 24-bit wav");
 
         assert_eq!(decoded.sample_rate, 48_000);
         assert_eq!(decoded.channels, 1);
+        assert_eq!(decoded.samples.len(), 3);
+        assert!(decoded.samples[0] < -0.99);
+        assert_eq!(decoded.samples[1], 0.0);
+        assert!(decoded.samples[2] > 0.99);
     }
 
     #[test]
@@ -449,12 +484,15 @@ mod tests {
     }
 
     #[test]
-    fn codec_support_marks_wav_native_and_compressed_formats_packaged() {
+    fn codec_support_marks_wav_and_compressed_formats_as_requiring_a_packaged_decoder() {
         assert_eq!(
             codec_support_for_extension("wav"),
             CodecSupport {
                 extension: "wav".to_string(),
-                status: CodecSupportStatus::NativePcm,
+                status: CodecSupportStatus::RequiresPackagedDecoder,
+                // Converting WAV to WAV isn't a meaningful action, even
+                // though decoding it now goes through the same packaged
+                // (Symphonia) path as every other format.
                 conversion_available: false,
             }
         );
@@ -580,6 +618,36 @@ mod tests {
         wav.extend_from_slice(&data_size.to_le_bytes());
         for sample in samples {
             wav.extend_from_slice(&sample.to_le_bytes());
+        }
+
+        wav
+    }
+
+    /// Single-channel, 24-bit, 48kHz PCM WAV — `decode_wav_pcm` rejects this
+    /// (only 16-bit was ever supported), which is exactly the shape of the
+    /// real bug: 24-bit is a routine bit depth for professional SFX/music
+    /// libraries, not an edge case.
+    fn wav_24_bit_fixture() -> Vec<u8> {
+        let samples: [i32; 3] = [-8_388_608, 0, 8_388_607];
+        let block_align = 3u16;
+        let data_size = samples.len() as u32 * block_align as u32;
+        let mut wav = Vec::new();
+
+        wav.extend_from_slice(b"RIFF");
+        wav.extend_from_slice(&(36 + data_size).to_le_bytes());
+        wav.extend_from_slice(b"WAVE");
+        wav.extend_from_slice(b"fmt ");
+        wav.extend_from_slice(&16u32.to_le_bytes());
+        wav.extend_from_slice(&1u16.to_le_bytes()); // PCM
+        wav.extend_from_slice(&1u16.to_le_bytes()); // mono
+        wav.extend_from_slice(&48_000u32.to_le_bytes());
+        wav.extend_from_slice(&(48_000u32 * block_align as u32).to_le_bytes()); // byte rate
+        wav.extend_from_slice(&block_align.to_le_bytes());
+        wav.extend_from_slice(&24u16.to_le_bytes());
+        wav.extend_from_slice(b"data");
+        wav.extend_from_slice(&data_size.to_le_bytes());
+        for sample in samples {
+            wav.extend_from_slice(&sample.to_le_bytes()[0..3]);
         }
 
         wav

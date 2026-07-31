@@ -1295,6 +1295,30 @@ fn job_status(
     .collect()
 }
 
+/// Explicit, user-initiated "Retry Failed" action — see
+/// `Catalog::retry_failed_jobs_for_library` for why this needs to exist
+/// separately from the standing worker's attempt-capped auto-requeue: a fix
+/// that resolves the actual root cause (e.g. the 24-bit WAV decode bug)
+/// makes jobs that already exhausted their 3 automatic attempts worth
+/// trying again, and the cap has no way to know that on its own.
+#[tauri::command]
+fn retry_failed_jobs(
+    state: tauri::State<CatalogState>,
+    library_id: String,
+    kind: String,
+) -> Result<usize, String> {
+    let library_id = parse_uuid_field(&library_id, "library id")?;
+    let job_kind = match kind.as_str() {
+        "metadata_extraction" => JobKind::MetadataExtraction,
+        "audio_analysis" => JobKind::AudioAnalysis,
+        other => return Err(format!("unknown job kind: {other}")),
+    };
+    let catalog = state.0.lock().expect("catalog mutex poisoned");
+    catalog
+        .retry_failed_jobs_for_library(library_id, job_kind)
+        .map_err(storage_error_message)
+}
+
 #[derive(Clone, Copy, serde::Serialize)]
 struct AudioAnalysisProgressEvent {
     succeeded: bool,
@@ -2283,6 +2307,7 @@ pub fn run() {
             set_audio_analysis_paused,
             audio_analysis_paused,
             job_status,
+            retry_failed_jobs,
             similar_assets,
             mark_waveform_ready,
             trash_duplicate_group,

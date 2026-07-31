@@ -624,6 +624,27 @@ impl Catalog {
         Ok(changed)
     }
 
+    /// Explicit, user-initiated retry for one library + kind — unlike
+    /// `requeue_failed_jobs`, ignores the attempt cap entirely (a fix that
+    /// resolves the actual root cause, like the 24-bit WAV decode bug this
+    /// was built for, makes jobs that already exhausted their 3 automatic
+    /// attempts worth retrying again; also resets attempts back to 0 so
+    /// they get the same fair shot at automatic retries afterward).
+    pub fn retry_failed_jobs_for_library(
+        &self,
+        library_id: Uuid,
+        kind: JobKind,
+    ) -> Result<usize, StorageError> {
+        let changed = self.connection.execute(
+            "UPDATE background_jobs SET state = 'pending', attempts = 0, updated_at = ?1
+             WHERE state = 'failed' AND kind = ?2
+               AND asset_id IN (SELECT id FROM assets WHERE library_id = ?3)",
+            params![Utc::now().to_rfc3339(), job_kind_to_db(&kind), library_id.to_string()],
+        )?;
+
+        Ok(changed)
+    }
+
     pub fn set_embedded_metadata(
         &self,
         asset_id: Uuid,
@@ -2648,6 +2669,48 @@ mod tests {
             .pending_jobs_of_kind(JobKind::AudioAnalysis, 10)
             .expect("pending jobs")
             .is_empty());
+    }
+
+    #[test]
+    fn retry_failed_jobs_for_library_ignores_the_attempt_cap_and_resets_attempts() {
+        let catalog_path = unique_catalog_path("job-manual-retry");
+        let catalog = Catalog::open(&catalog_path).expect("open catalog");
+        let library = catalog.create_library("Jobs", "/library").expect("library");
+        let other_library = catalog.create_library("Other", "/other").expect("library");
+        let asset = test_asset(&catalog, library.id, "tone.wav", "hash-job-manual-retry");
+        let other_asset = test_asset(&catalog, other_library.id, "tone2.wav", "hash-job-manual-retry-2");
+        let job = catalog
+            .enqueue_job(asset.id, JobKind::AudioAnalysis, 40)
+            .expect("enqueue");
+        let other_job = catalog
+            .enqueue_job(other_asset.id, JobKind::AudioAnalysis, 40)
+            .expect("enqueue other library");
+
+        // Exhaust the normal 3-attempt cap for both jobs (the second library's
+        // job stays failed throughout — it's here to prove retry is scoped
+        // to the target library, not to exercise the cap itself).
+        catalog.fail_job(job.id).expect("fail once");
+        catalog.fail_job(job.id).expect("fail twice");
+        catalog.fail_job(job.id).expect("fail thrice");
+        catalog.fail_job(other_job.id).expect("fail once");
+        catalog.fail_job(other_job.id).expect("fail twice");
+        catalog.fail_job(other_job.id).expect("fail thrice");
+
+        let retried = catalog
+            .retry_failed_jobs_for_library(library.id, JobKind::AudioAnalysis)
+            .expect("manual retry");
+        assert_eq!(retried, 1, "only this library's failed job should be retried");
+
+        let pending = catalog
+            .pending_jobs_of_kind(JobKind::AudioAnalysis, 10)
+            .expect("pending jobs");
+        assert_eq!(pending.len(), 1);
+        assert_eq!(pending[0].id, job.id);
+
+        // Attempts reset, so it survives the normal cap again if it fails once
+        // more — other_job stays excluded since it's still at 3 attempts.
+        catalog.fail_job(job.id).expect("fail after manual retry");
+        assert_eq!(catalog.requeue_failed_jobs(3).expect("requeue after retry"), 1);
     }
 
     #[test]

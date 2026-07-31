@@ -341,10 +341,11 @@ function formatMediaRootStatus(status: string | undefined): string {
 // what the work even was or what to do about failures.
 function describeJobCompletion(summary: JobCompletionSummary): { headline: string; detail: string | null } {
   const noun = summary.kind === "audio_analysis" ? "sound" : "file";
+  const verb = summary.kind === "audio_analysis" ? "analyzing" : "reading";
   const headline =
     summary.completed > 0
-      ? `Finished ${summary.kind === "audio_analysis" ? "analyzing" : "reading"} ${summary.completed} ${noun}${summary.completed === 1 ? "" : "s"}`
-      : "Finished";
+      ? `Finished ${verb} ${summary.completed} ${noun}${summary.completed === 1 ? "" : "s"}`
+      : `Couldn't ${summary.kind === "audio_analysis" ? "analyze" : "read"} ${summary.failed} ${noun}${summary.failed === 1 ? "" : "s"}`;
   if (summary.failed === 0) {
     return {
       headline,
@@ -356,7 +357,7 @@ function describeJobCompletion(summary: JobCompletionSummary): { headline: strin
   }
   return {
     headline,
-    detail: `${summary.failed} couldn't be read — retried automatically, up to 3 attempts each.`
+    detail: `${summary.failed} ${summary.failed === 1 ? "was" : "were"} skipped, usually an unusual file encoding. They'll retry automatically for a while, or you can retry them now.`
   };
 }
 
@@ -984,6 +985,21 @@ export function App() {
     invoke("set_audio_analysis_paused", { paused: next }).catch(() => {});
     if (!next && activeLibraryId) runJobDrain(activeLibraryId, ["audio_analysis"]);
   }, [audioAnalysisPaused, activeLibraryId, runJobDrain]);
+
+  const handleRetryFailedJobs = useCallback(
+    (kind: string) => {
+      if (!activeLibraryId) return;
+      setJobCompletionSummaries((previous) => {
+        const next = { ...previous };
+        delete next[kind];
+        return next;
+      });
+      invoke("retry_failed_jobs", { libraryId: activeLibraryId, kind })
+        .then(() => runJobDrain(activeLibraryId, [kind]))
+        .catch(() => {});
+    },
+    [activeLibraryId, runJobDrain]
+  );
 
   useEffect(() => {
     invoke<AppPreferences>("load_app_preferences")
@@ -3848,6 +3864,11 @@ export function App() {
                         </div>
                         {detail ? <div className="status-line">{detail}</div> : null}
                       </div>
+                      {summary.failed > 0 ? (
+                        <button type="button" className="text-button" onClick={() => handleRetryFailedJobs(summary.kind)}>
+                          Retry Now
+                        </button>
+                      ) : null}
                     </div>
                   );
                 })}
