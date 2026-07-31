@@ -14,15 +14,20 @@ import {
   Contrast,
   Copy,
   Database,
+  Eye,
+  FileWarning,
+  Flag,
   FolderOpen,
   Gauge,
   HardDrive,
   Import,
+  Library,
   Link2,
   ListFilter,
   Mic,
   MicOff,
   Music,
+  Music2,
   Palette,
   Pause,
   Play,
@@ -39,6 +44,8 @@ import {
   Star,
   Trash2,
   Volume2,
+  Waves,
+  Wind,
   Workflow,
   X,
   Zap
@@ -195,6 +202,8 @@ type AppPreferences = {
   watched_folder_library_id: string | null;
 };
 
+type SoundCategory = "music" | "voice" | "instrumental" | "sound_effect";
+
 type ActiveFilter =
   | "all"
   | "favorites"
@@ -208,8 +217,25 @@ type ActiveFilter =
   | "instrumental"
   | "has_tempo"
   | "has_pitch"
+  | { favoritesCategory: SoundCategory }
+  | { unreviewedCategory: SoundCategory }
   | { project: string; smart?: boolean }
   | { tag: string };
+
+function matchesSoundCategory(asset: AssetRecord, category: SoundCategory): boolean {
+  switch (category) {
+    case "music":
+      return asset.media_type === "music";
+    case "sound_effect":
+      return asset.media_type === "sound_effect";
+    case "voice":
+      return (asset.vocal_ratio ?? 0) >= VOCAL_RATIO_THRESHOLD;
+    case "instrumental":
+      return asset.vocal_ratio != null && asset.vocal_ratio < VOCAL_RATIO_THRESHOLD;
+    default:
+      return true;
+  }
+}
 
 /** Duration in seconds (converted to ms at the API boundary) since that's
  * what a person actually types; BPM stays as-is. */
@@ -447,6 +473,30 @@ function classifyPlayerMood(asset: AssetRecord | null, tags: TagRecord[], vocalR
   return null;
 }
 
+// Same color language as playerMoodTheme (so a row's icon and the player's
+// accent agree once that row is loaded), extended with a color for
+// ambience, which has no player mood of its own. Picking the icon and
+// color from real per-asset data (media_type, vocal_ratio) rather than a
+// single flat "Music" glyph is what actually lets someone tell a
+// soundtrack apart from a sound effect at a glance while scanning a long
+// list, per row, without opening it.
+function rowIconMeta(asset: AssetRecord): { Icon: typeof Music; color: string } {
+  const hasVoice = (asset.vocal_ratio ?? 0) >= VOCAL_RATIO_THRESHOLD;
+  if (asset.media_type === "music") {
+    return hasVoice ? { Icon: Mic, color: "#c4a6fa" } : { Icon: Music2, color: "#4ade9c" };
+  }
+  if (asset.media_type === "sound_effect") {
+    return { Icon: Waves, color: "#fbd34d" };
+  }
+  if (asset.media_type === "ambience") {
+    return { Icon: Wind, color: "#5ec8d8" };
+  }
+  if (hasVoice) {
+    return { Icon: Mic, color: "#7c90f5" };
+  }
+  return { Icon: Music, color: "#8a7d6d" };
+}
+
 function CollapsibleSection({
   id,
   title,
@@ -515,6 +565,8 @@ export function App() {
   const [settingsCategory, setSettingsCategory] = useState<SettingsCategory>("general");
   const [filterMenuOpen, setFilterMenuOpen] = useState(false);
   const [sfxSubcategoriesOpen, setSfxSubcategoriesOpen] = useState(false);
+  const [favoritesCategoriesOpen, setFavoritesCategoriesOpen] = useState(false);
+  const [unreviewedCategoriesOpen, setUnreviewedCategoriesOpen] = useState(false);
   const [collapsedSections, setCollapsedSections] = useState<Set<string>>(
     () => new Set(["projects", "embedded", "detected", "source", "release", "maintenance", "nas", "backup"])
   );
@@ -614,6 +666,14 @@ export function App() {
     }
     if (activeFilter === "has_pitch") {
       return assets.filter((asset) => asset.musical_key != null);
+    }
+    if (typeof activeFilter === "object" && "favoritesCategory" in activeFilter) {
+      return assets.filter((asset) => asset.favorite && matchesSoundCategory(asset, activeFilter.favoritesCategory));
+    }
+    if (typeof activeFilter === "object" && "unreviewedCategory" in activeFilter) {
+      return assets.filter(
+        (asset) => asset.review_state === "Unreviewed" && matchesSoundCategory(asset, activeFilter.unreviewedCategory)
+      );
     }
     return assets;
   }, [assets, activeFilter]);
@@ -1963,46 +2023,201 @@ export function App() {
               <small>Send, reveal, copy</small>
             </span>
           </button>
-          {smartFilters.map((filter) => (
-            <div key={filter.label}>
+          <button
+            className={activeFilter === "all" ? "nav-item sidebar-styled-item active" : "nav-item sidebar-styled-item"}
+            onClick={() => setActiveFilter("all")}
+            title="All sounds in the library"
+            aria-label="All sounds in the library"
+          >
+            <Library size={13} />
+            All Sounds
+          </button>
+
+          <button
+            className={activeFilter === "favorites" ? "nav-item sidebar-styled-item active" : "nav-item sidebar-styled-item"}
+            onClick={() => setActiveFilter("favorites")}
+          >
+            <Star size={13} />
+            Favorites
+          </button>
+          <button className="nav-subitem" onClick={() => setFavoritesCategoriesOpen((previous) => !previous)}>
+            {favoritesCategoriesOpen ? <ChevronDown size={11} /> : <ChevronRight size={11} />} By category
+          </button>
+          {favoritesCategoriesOpen ? (
+            <>
               <button
-                className={activeFilter === filter.id ? "nav-item active" : "nav-item"}
-                onClick={() => setActiveFilter(filter.id)}
+                className={
+                  typeof activeFilter === "object" && "favoritesCategory" in activeFilter && activeFilter.favoritesCategory === "music"
+                    ? "nav-subitem sidebar-styled-item active"
+                    : "nav-subitem sidebar-styled-item"
+                }
+                onClick={() => setActiveFilter({ favoritesCategory: "music" })}
               >
-                {filter.label}
+                <Music2 size={12} />
+                Soundtracks
               </button>
-              {filter.id === "sound_effect" ? (
-                <>
-                  <button
-                    className="nav-subitem"
-                    onClick={() => setSfxSubcategoriesOpen((previous) => !previous)}
-                  >
-                    {sfxSubcategoriesOpen ? <ChevronDown size={11} /> : <ChevronRight size={11} />} By category
-                  </button>
-                  {sfxSubcategoriesOpen
-                    ? tags
-                        .filter((tag) => tag.facet === "action")
-                        .map((tag) => (
-                          <button
-                            key={tag.id}
-                            className={
-                              typeof activeFilter === "object" && "tag" in activeFilter && activeFilter.tag === tag.id
-                                ? "nav-subitem active"
-                                : "nav-subitem"
-                            }
-                            onClick={() => setActiveFilter({ tag: tag.id })}
-                          >
-                            {tag.name}
-                          </button>
-                        ))
-                    : null}
-                </>
-              ) : null}
-            </div>
-          ))}
+              <button
+                className={
+                  typeof activeFilter === "object" && "favoritesCategory" in activeFilter && activeFilter.favoritesCategory === "voice"
+                    ? "nav-subitem sidebar-styled-item active"
+                    : "nav-subitem sidebar-styled-item"
+                }
+                onClick={() => setActiveFilter({ favoritesCategory: "voice" })}
+              >
+                <Mic size={12} />
+                Voice
+              </button>
+              <button
+                className={
+                  typeof activeFilter === "object" &&
+                  "favoritesCategory" in activeFilter &&
+                  activeFilter.favoritesCategory === "instrumental"
+                    ? "nav-subitem sidebar-styled-item active"
+                    : "nav-subitem sidebar-styled-item"
+                }
+                onClick={() => setActiveFilter({ favoritesCategory: "instrumental" })}
+              >
+                <MicOff size={12} />
+                No Voice
+              </button>
+              <button
+                className={
+                  typeof activeFilter === "object" &&
+                  "favoritesCategory" in activeFilter &&
+                  activeFilter.favoritesCategory === "sound_effect"
+                    ? "nav-subitem sidebar-styled-item active"
+                    : "nav-subitem sidebar-styled-item"
+                }
+                onClick={() => setActiveFilter({ favoritesCategory: "sound_effect" })}
+              >
+                <Waves size={12} />
+                Sound FX
+              </button>
+            </>
+          ) : null}
+
+          <button
+            className={activeFilter === "unreviewed" ? "nav-item sidebar-styled-item active" : "nav-item sidebar-styled-item"}
+            onClick={() => setActiveFilter("unreviewed")}
+          >
+            <Eye size={13} />
+            Unreviewed
+          </button>
+          <button className="nav-subitem" onClick={() => setUnreviewedCategoriesOpen((previous) => !previous)}>
+            {unreviewedCategoriesOpen ? <ChevronDown size={11} /> : <ChevronRight size={11} />} By category
+          </button>
+          {unreviewedCategoriesOpen ? (
+            <>
+              <button
+                className={
+                  typeof activeFilter === "object" && "unreviewedCategory" in activeFilter && activeFilter.unreviewedCategory === "music"
+                    ? "nav-subitem sidebar-styled-item active"
+                    : "nav-subitem sidebar-styled-item"
+                }
+                onClick={() => setActiveFilter({ unreviewedCategory: "music" })}
+              >
+                <Music2 size={12} />
+                Soundtracks
+              </button>
+              <button
+                className={
+                  typeof activeFilter === "object" && "unreviewedCategory" in activeFilter && activeFilter.unreviewedCategory === "voice"
+                    ? "nav-subitem sidebar-styled-item active"
+                    : "nav-subitem sidebar-styled-item"
+                }
+                onClick={() => setActiveFilter({ unreviewedCategory: "voice" })}
+              >
+                <Mic size={12} />
+                Voice
+              </button>
+              <button
+                className={
+                  typeof activeFilter === "object" &&
+                  "unreviewedCategory" in activeFilter &&
+                  activeFilter.unreviewedCategory === "instrumental"
+                    ? "nav-subitem sidebar-styled-item active"
+                    : "nav-subitem sidebar-styled-item"
+                }
+                onClick={() => setActiveFilter({ unreviewedCategory: "instrumental" })}
+              >
+                <MicOff size={12} />
+                No Voice
+              </button>
+              <button
+                className={
+                  typeof activeFilter === "object" &&
+                  "unreviewedCategory" in activeFilter &&
+                  activeFilter.unreviewedCategory === "sound_effect"
+                    ? "nav-subitem sidebar-styled-item active"
+                    : "nav-subitem sidebar-styled-item"
+                }
+                onClick={() => setActiveFilter({ unreviewedCategory: "sound_effect" })}
+              >
+                <Waves size={12} />
+                Sound FX
+              </button>
+            </>
+          ) : null}
+
+          <button
+            className={activeFilter === "needs_review" ? "nav-item sidebar-styled-item active" : "nav-item sidebar-styled-item"}
+            onClick={() => setActiveFilter("needs_review")}
+          >
+            <Flag size={13} />
+            Needs Review
+          </button>
+
           <div className="nav-heading-row">
-            <span className="nav-heading sonic-radar-heading">
-              <Activity size={11} />
+            <span className="nav-heading">Categories</span>
+          </div>
+          <button
+            className={activeFilter === "music" ? "nav-item sidebar-styled-item active" : "nav-item sidebar-styled-item"}
+            onClick={() => setActiveFilter("music")}
+          >
+            <Music2 size={13} />
+            Soundtracks
+          </button>
+          <button
+            className={activeFilter === "sound_effect" ? "nav-item sidebar-styled-item active" : "nav-item sidebar-styled-item"}
+            onClick={() => setActiveFilter("sound_effect")}
+          >
+            <Waves size={13} />
+            Sound Effects
+          </button>
+          <button
+            className="nav-subitem"
+            onClick={() => setSfxSubcategoriesOpen((previous) => !previous)}
+          >
+            {sfxSubcategoriesOpen ? <ChevronDown size={11} /> : <ChevronRight size={11} />} By category
+          </button>
+          {sfxSubcategoriesOpen
+            ? tags
+                .filter((tag) => tag.facet === "action")
+                .map((tag) => (
+                  <button
+                    key={tag.id}
+                    className={
+                      typeof activeFilter === "object" && "tag" in activeFilter && activeFilter.tag === tag.id
+                        ? "nav-subitem active"
+                        : "nav-subitem"
+                    }
+                    onClick={() => setActiveFilter({ tag: tag.id })}
+                  >
+                    {tag.name}
+                  </button>
+                ))
+            : null}
+          <button
+            className={activeFilter === "ambience" ? "nav-item sidebar-styled-item active" : "nav-item sidebar-styled-item"}
+            onClick={() => setActiveFilter("ambience")}
+          >
+            <Wind size={13} />
+            Ambience
+          </button>
+
+          <div className="nav-heading-row">
+            <span className="nav-heading sonic-radar-heading sonic-radar-root">
+              <Activity size={13} />
               Sonic Radar
             </span>
           </div>
@@ -2102,6 +2317,16 @@ export function App() {
               {updateChannelState === "Passed" ? "Update channel ready" : "Update channel planned"}
             </div>
           </CollapsibleSection>
+          <div className="nav-heading-row">
+            <span className="nav-heading">Maintenance</span>
+          </div>
+          <button
+            className={activeFilter === "missing" ? "nav-item sidebar-styled-item active" : "nav-item sidebar-styled-item"}
+            onClick={() => setActiveFilter("missing")}
+          >
+            <FileWarning size={13} />
+            Missing Files
+          </button>
           <div className="virtualization-bar" aria-label="Browser performance">
             <span>{visibleAssets.length} row{visibleAssets.length === 1 ? "" : "s"}</span>
             <span>{browserVisibleRange.endExclusive - browserVisibleRange.start} rendered</span>
@@ -2302,6 +2527,7 @@ export function App() {
               const isSelected = browserState
                 ? browserState.selected_indices.includes(index)
                 : asset.id === selectedAssetId;
+              const { Icon: RowIcon, color: rowIconColor } = rowIconMeta(asset);
               return (
               <article
                 className={isSelected ? "asset-row selected" : "asset-row"}
@@ -2325,8 +2551,8 @@ export function App() {
                 >
                   {playingAssetId === asset.id && isPlaying ? <Pause size={15} /> : <Play size={15} />}
                 </button>
-                <div className="waveform" aria-hidden="true">
-                  <Music size={16} />
+                <div className="waveform" aria-hidden="true" style={{ color: rowIconColor }}>
+                  <RowIcon size={16} />
                 </div>
                 <strong>{asset.display_name}</strong>
                 <span>{asset.media_type}</span>
@@ -3264,23 +3490,43 @@ export function App() {
                 <X size={16} />
               </button>
             </div>
-            {jobProgress.length === 0 ? (
+            {jobProgress.length === 0 && !refreshStatus ? (
               <p className="empty-hint">
                 All caught up — nothing analyzing, importing, or scanning right now.
               </p>
             ) : (
               <div className="job-progress-panel" aria-label="Background work">
+                {refreshStatus ? (
+                  <div className="job-progress-row">
+                    <span className="job-progress-icon">
+                      <RefreshCw size={15} />
+                    </span>
+                    <div className="job-progress-body">
+                      <div className="job-progress-head">
+                        <span className="job-progress-label">Library Sync</span>
+                      </div>
+                      <div className="status-line">{refreshStatus}</div>
+                    </div>
+                  </div>
+                ) : null}
                 {jobProgress.map((job) => {
                   const percent = job.total > 0 ? Math.round(((job.total - job.pending) / job.total) * 100) : 0;
                   return (
                     <div className="job-progress-row" key={job.kind}>
-                      <span className="job-progress-label">{job.label}</span>
-                      <div className="job-progress-track">
-                        <div className="job-progress-fill" style={{ width: `${percent}%` }} />
-                      </div>
-                      <span className="job-progress-count">
-                        {job.total - job.pending}/{job.total}
+                      <span className="job-progress-icon">
+                        <Activity size={15} />
                       </span>
+                      <div className="job-progress-body">
+                        <div className="job-progress-head">
+                          <span className="job-progress-label">{job.label}</span>
+                          <span className="job-progress-count">
+                            {job.total - job.pending}/{job.total} · {percent}%
+                          </span>
+                        </div>
+                        <div className="job-progress-track">
+                          <div className="job-progress-fill" style={{ width: `${percent}%` }} />
+                        </div>
+                      </div>
                     </div>
                   );
                 })}

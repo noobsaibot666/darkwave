@@ -521,27 +521,54 @@ button.panel-handle-right:active:not(:disabled) {
 .job-progress-panel {
   display: flex;
   flex-direction: column;
-  gap: 6px;
-  padding: 8px 18px 0;
+  gap: 14px;
 }
 
 .job-progress-row {
-  display: grid;
-  grid-template-columns: 120px 1fr auto;
+  display: flex;
+  align-items: flex-start;
+  gap: 12px;
+  padding: 12px 14px;
+  border-radius: 14px;
+  background: rgba(var(--ink-rgb), 0.04);
+}
+
+.job-progress-icon {
+  display: flex;
+  flex: 0 0 auto;
   align-items: center;
+  justify-content: center;
+  width: 32px;
+  height: 32px;
+  border-radius: 10px;
+  background: rgba(255, 92, 0, 0.14);
+  color: var(--accent-ink);
+}
+
+.job-progress-body {
+  flex: 1;
+  min-width: 0;
+}
+
+.job-progress-head {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
   gap: 10px;
-  font-size: 11px;
-  color: var(--text-secondary);
+  margin-bottom: 6px;
 }
 
 .job-progress-label {
-  white-space: nowrap;
   overflow: hidden;
+  color: var(--text-primary);
+  font-size: 13px;
+  font-weight: 600;
   text-overflow: ellipsis;
+  white-space: nowrap;
 }
 
 .job-progress-track {
-  height: 4px;
+  height: 6px;
   border-radius: 999px;
   background: var(--surface-hover);
   overflow: hidden;
@@ -550,15 +577,15 @@ button.panel-handle-right:active:not(:disabled) {
 .job-progress-fill {
   height: 100%;
   border-radius: 999px;
-  background: #ff5c00;
+  background: linear-gradient(90deg, var(--player-accent-from, #ff7940), var(--player-accent-to, #f14800));
   width: 0%;
   transition: width 220ms var(--ease-soft);
 }
 
 .job-progress-count {
-  min-width: 44px;
-  text-align: right;
+  flex: 0 0 auto;
   color: var(--text-muted);
+  font-size: 12px;
   font-variant-numeric: tabular-nums;
 }
 
@@ -2169,7 +2196,11 @@ dd {
 /* Sonic Radar — sidebar quick filters over the app's own real analysis
    results (vocal detection, tempo, pitch). Same nav-item family as the
    rest of the sidebar list, with a small leading icon and an accent-lit
-   heading to read as the "smart" section without a heavier visual style. */
+   heading to read as the "smart" section without a heavier visual style.
+   .sidebar-styled-item extends the same icon-led, accent-on-active look
+   to every other sidebar row (All Sounds, Favorites, Categories, etc.)
+   so the whole list reads as one consistent system, not just this one
+   section. */
 .sonic-radar-heading {
   display: flex;
   align-items: center;
@@ -2177,19 +2208,28 @@ dd {
   color: var(--accent);
 }
 
-.sonic-radar-item {
+.sonic-radar-heading.sonic-radar-root {
+  gap: 6px;
+  font-size: 12px;
+}
+
+.sonic-radar-item,
+.sidebar-styled-item {
   display: flex;
   align-items: center;
   gap: 8px;
 }
 
-.sonic-radar-item svg {
+.sonic-radar-item svg,
+.sidebar-styled-item svg {
   flex: 0 0 auto;
   color: var(--text-muted);
 }
 
 .sonic-radar-item.active svg,
-.sonic-radar-item:hover svg {
+.sonic-radar-item:hover svg,
+.sidebar-styled-item.active svg,
+.sidebar-styled-item:hover svg {
   color: var(--accent-ink);
 }
 
