@@ -22,6 +22,14 @@ const ALL_TAG_ORIGINS: [TagOrigin; 6] = [
 
 struct CatalogState(Mutex<Catalog>);
 
+/// In-memory, not persisted — pausing is a "stop for this session" control,
+/// not a saved preference. Checked at the top of process_audio_analysis_jobs
+/// so a paused queue costs nothing (no claim, no work) rather than churning
+/// through claim/reset cycles every background tick.
+struct JobControlState {
+    audio_analysis_paused: std::sync::atomic::AtomicBool,
+}
+
 #[derive(Debug, serde::Serialize)]
 struct ImportFailure {
     filename: String,
@@ -1301,11 +1309,25 @@ fn job_status(
 async fn process_audio_analysis_jobs(
     app: tauri::AppHandle,
     state: tauri::State<'_, CatalogState>,
+    job_control: tauri::State<'_, JobControlState>,
 ) -> Result<usize, String> {
+    use std::sync::atomic::Ordering;
     use tauri::Emitter;
+
+    if job_control.audio_analysis_paused.load(Ordering::SeqCst) {
+        return Ok(0);
+    }
 
     let jobs = {
         let catalog = state.0.lock().expect("catalog mutex poisoned");
+        // Self-heals jobs left 'processing' by an abandoned claim (a paused
+        // batch, a dev-rebuild restart, a crash) before claiming more — see
+        // reset_stuck_processing_jobs. Without this they're stuck forever:
+        // claim only selects 'pending', and the failed-job requeue never
+        // touches 'processing' rows.
+        catalog
+            .reset_stuck_processing_jobs(JobKind::AudioAnalysis)
+            .map_err(storage_error_message)?;
         catalog
             .claim_pending_jobs(JobKind::AudioAnalysis, 20)
             .map_err(storage_error_message)?
@@ -1313,6 +1335,13 @@ async fn process_audio_analysis_jobs(
 
     let mut processed = 0usize;
     for job in jobs {
+        if job_control.audio_analysis_paused.load(Ordering::SeqCst) {
+            // Whatever's left of this claimed batch stays 'processing' —
+            // reset_stuck_processing_jobs picks it back up on the next
+            // (unpaused) call, so nothing here is lost, just deferred.
+            break;
+        }
+
         let asset = {
             let catalog = state.0.lock().expect("catalog mutex poisoned");
             catalog.get_asset(job.asset_id).map_err(storage_error_message)?
@@ -1381,6 +1410,22 @@ async fn process_audio_analysis_jobs(
     }
 
     Ok(processed)
+}
+
+/// Pausing is a session-only control (not a saved preference): stops new
+/// audio-analysis batches from being claimed, without discarding queued
+/// work — reset_stuck_processing_jobs picks any interrupted batch back up
+/// once unpaused. See JobControlState.
+#[tauri::command]
+fn set_audio_analysis_paused(job_control: tauri::State<JobControlState>, paused: bool) {
+    job_control
+        .audio_analysis_paused
+        .store(paused, std::sync::atomic::Ordering::SeqCst);
+}
+
+#[tauri::command]
+fn audio_analysis_paused(job_control: tauri::State<JobControlState>) -> bool {
+    job_control.audio_analysis_paused.load(std::sync::atomic::Ordering::SeqCst)
 }
 
 struct AudioAnalysisOutcome {
@@ -1454,13 +1499,20 @@ async fn analyze_asset_audio(app: &tauri::AppHandle, path: &str) -> Result<Audio
 
 /// Spawns the GPL-isolated similarity-worker subprocess and parses its
 /// stdout. Returns `None` on any failure (missing sidecar, decode error,
-/// malformed output) — similarity is a nice-to-have, never a reason to fail
-/// the whole analysis job.
+/// malformed output, or timeout) — similarity is a nice-to-have, never a
+/// reason to fail or indefinitely stall the whole analysis job. Bounded at
+/// 90s: a debug build of the sidecar (unoptimized) has been observed taking
+/// 20-40s for an ordinary file, so this is generous headroom for that, not
+/// a tight production budget — without any bound at all, one pathological
+/// file hangs that job's slot forever with nothing to recover it.
 async fn run_similarity_worker(app: &tauri::AppHandle, path: &str) -> Option<String> {
     use tauri_plugin_shell::ShellExt;
 
     let sidecar = app.shell().sidecar("similarity-worker").ok()?;
-    let output = sidecar.args([path]).output().await.ok()?;
+    let output = tokio::time::timeout(std::time::Duration::from_secs(90), sidecar.args([path]).output())
+        .await
+        .ok()?
+        .ok()?;
     if !output.status.success() {
         return None;
     }
@@ -1990,6 +2042,9 @@ pub fn run() {
             let catalog = Catalog::open(app_data_dir.join("catalog.sqlite"))
                 .expect("open local catalog database");
             app.manage(CatalogState(Mutex::new(catalog)));
+            app.manage(JobControlState {
+                audio_analysis_paused: std::sync::atomic::AtomicBool::new(false),
+            });
 
             // Standing background worker: requeues jobs that failed with
             // retries left, polls the configured watched folder (if any),
@@ -2211,6 +2266,8 @@ pub fn run() {
             restore_library,
             process_pending_jobs,
             process_audio_analysis_jobs,
+            set_audio_analysis_paused,
+            audio_analysis_paused,
             job_status,
             similar_assets,
             mark_waveform_ready,

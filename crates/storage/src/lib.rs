@@ -586,6 +586,23 @@ impl Catalog {
         Ok(jobs)
     }
 
+    /// Resets any job of `kind` left in `'processing'` back to `'pending'` —
+    /// `claim_pending_jobs` marks a job `'processing'` before doing the real
+    /// work, so a job whose claiming call never reaches `complete_job` or
+    /// `fail_job` (a cancelled batch, a dev-rebuild restart, a crash) is
+    /// permanently stuck: `claim_pending_jobs` only ever selects `'pending'`
+    /// rows, and `requeue_failed_jobs` only ever selects `'failed'` ones, so
+    /// nothing else would ever pick it back up. Meant to run at the start of
+    /// a claim cycle, before the next `claim_pending_jobs` for the same kind.
+    pub fn reset_stuck_processing_jobs(&self, kind: JobKind) -> Result<usize, StorageError> {
+        let changed = self.connection.execute(
+            "UPDATE background_jobs SET state = 'pending', updated_at = ?1
+             WHERE state = 'processing' AND kind = ?2",
+            params![Utc::now().to_rfc3339(), job_kind_to_db(&kind)],
+        )?;
+        Ok(changed)
+    }
+
     /// Requeues jobs abandoned after a failure, up to `max_attempts` tries
     /// total. Run periodically by the standing background worker rather than
     /// immediately on failure, so a transient error (e.g. a momentarily
@@ -2499,6 +2516,34 @@ mod tests {
             .pending_jobs_of_kind(JobKind::AudioAnalysis, 10)
             .expect("pending jobs")
             .is_empty());
+    }
+
+    #[test]
+    fn reset_stuck_processing_jobs_makes_an_abandoned_claim_claimable_again() {
+        let catalog_path = unique_catalog_path("job-reset-stuck");
+        let catalog = Catalog::open(&catalog_path).expect("open catalog");
+        let library = catalog.create_library("Jobs", "/library").expect("library");
+        let asset = test_asset(&catalog, library.id, "tone.wav", "hash-job-reset-stuck");
+        catalog
+            .enqueue_job(asset.id, JobKind::AudioAnalysis, 40)
+            .expect("enqueue");
+        catalog
+            .claim_pending_jobs(JobKind::AudioAnalysis, 10)
+            .expect("claim");
+
+        let reset = catalog
+            .reset_stuck_processing_jobs(JobKind::AudioAnalysis)
+            .expect("reset stuck jobs");
+        assert_eq!(reset, 1);
+
+        let reclaimed = catalog
+            .claim_pending_jobs(JobKind::AudioAnalysis, 10)
+            .expect("reclaim");
+        assert_eq!(
+            reclaimed.len(),
+            1,
+            "a job left 'processing' by an abandoned claim must become claimable again after reset"
+        );
     }
 
     #[test]

@@ -659,6 +659,7 @@ export function App() {
   const [formatFilter, setFormatFilter] = useState<AudioFormat | null>(null);
   const [similarStatus, setSimilarStatus] = useState<string | null>(null);
   const [jobProgress, setJobProgress] = useState<JobProgress[]>([]);
+  const [audioAnalysisPaused, setAudioAnalysisPaused] = useState(false);
   const [backgroundActivityOpen, setBackgroundActivityOpen] = useState(false);
   const drainingJobKinds = useRef<Set<string>>(new Set());
   const [offlineControl, setOfflineControl] = useState<OfflineControlState | null>(null);
@@ -844,6 +845,7 @@ export function App() {
             // stacking concurrent analysis work with nothing bounding it,
             // which is exactly what was driving CPU/memory usage far past
             // what a single drain needs.
+            if (config.kind === "audio_analysis" && audioAnalysisPaused) return;
             if (startPending === 0 || drainingJobKinds.current.has(config.kind)) return;
             drainingJobKinds.current.add(config.kind);
 
@@ -870,7 +872,7 @@ export function App() {
         })
         .catch(() => {});
     },
-    [refreshAssets, searchQuery, activeFilter]
+    [refreshAssets, searchQuery, activeFilter, audioAnalysisPaused]
   );
 
   const refreshMaintenance = useCallback((libraryId: string) => {
@@ -919,6 +921,17 @@ export function App() {
       .then(setReleaseItems)
       .catch(() => setReleaseItems(fallbackReleaseItems));
   }, []);
+
+  useEffect(() => {
+    invoke<boolean>("audio_analysis_paused").then(setAudioAnalysisPaused).catch(() => {});
+  }, []);
+
+  const handleToggleAudioAnalysisPaused = useCallback(() => {
+    const next = !audioAnalysisPaused;
+    setAudioAnalysisPaused(next);
+    invoke("set_audio_analysis_paused", { paused: next }).catch(() => {});
+    if (!next && activeLibraryId) runJobDrain(activeLibraryId, ["audio_analysis"]);
+  }, [audioAnalysisPaused, activeLibraryId, runJobDrain]);
 
   useEffect(() => {
     invoke<AppPreferences>("load_app_preferences")
@@ -3689,7 +3702,7 @@ export function App() {
                 <X size={16} />
               </button>
             </div>
-            {jobProgress.length === 0 && !refreshStatus ? (
+            {jobProgress.length === 0 && !refreshStatus && !audioAnalysisPaused ? (
               <p className="empty-hint">
                 All caught up — nothing analyzing, importing, or scanning right now.
               </p>
@@ -3726,9 +3739,42 @@ export function App() {
                           <div className="job-progress-fill" style={{ width: `${percent}%` }} />
                         </div>
                       </div>
+                      {job.kind === "audio_analysis" ? (
+                        <button
+                          type="button"
+                          className="icon-button"
+                          aria-label="Pause audio analysis"
+                          title="Pause audio analysis — queued work stays queued, nothing is lost"
+                          onClick={handleToggleAudioAnalysisPaused}
+                        >
+                          <Pause size={15} />
+                        </button>
+                      ) : null}
                     </div>
                   );
                 })}
+                {audioAnalysisPaused ? (
+                  <div className="job-progress-row">
+                    <span className="job-progress-icon">
+                      <Pause size={15} />
+                    </span>
+                    <div className="job-progress-body">
+                      <div className="job-progress-head">
+                        <span className="job-progress-label">Audio analysis paused</span>
+                      </div>
+                      <div className="status-line">Queued files stay queued — nothing is lost, just deferred.</div>
+                    </div>
+                    <button
+                      type="button"
+                      className="icon-button"
+                      aria-label="Resume audio analysis"
+                      title="Resume audio analysis"
+                      onClick={handleToggleAudioAnalysisPaused}
+                    >
+                      <Play size={15} />
+                    </button>
+                  </div>
+                ) : null}
               </div>
             )}
             <p className="settings-hint">
