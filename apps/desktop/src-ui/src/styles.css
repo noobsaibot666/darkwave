@@ -2329,42 +2329,37 @@ dd {
    Background Activity modal for details. */
 .activity-button {
   position: relative;
-  overflow: hidden;
-}
-
-/* Absolutely-positioned siblings paint above static content regardless of
-   DOM order, so the icon glyph needs its own stacking context to stay
-   visible on top of the sweep instead of getting covered by it. */
-.activity-button svg {
-  position: relative;
-  z-index: 1;
 }
 
 /* "Preparing" — indeterminate work with no live percentage yet (scanning a
-   folder, hashing files) — a blue light sweeping through the icon, distinct
-   from the steady green LED that means "a real job queue is draining". */
-.activity-scan {
+   folder, hashing files) — a blue pulse traveling along the Activity icon's
+   own heartbeat-monitor line, distinct from the steady green LED that means
+   "a real job queue is draining". Confined to the icon itself (not the
+   button box) via a second copy of the exact same path, stacked on top of
+   the normal muted-color icon and traced with a moving dash so only a short
+   segment of it is ever lit — an EKG-trace look, not a background wash.
+   pathLength="1" normalizes stroke-dasharray/-dashoffset to fractions of
+   the path regardless of its actual on-screen geometry. */
+.activity-pulse-icon {
   position: absolute;
   inset: 0;
-  z-index: 0;
-  background: linear-gradient(
-    90deg,
-    transparent 0%,
-    rgba(59, 130, 246, 0.5) 45%,
-    rgba(96, 165, 250, 0.95) 50%,
-    rgba(59, 130, 246, 0.5) 55%,
-    transparent 100%
-  );
-  background-size: 260% 100%;
-  animation: activity-scan-sweep 1.3s linear infinite;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  color: #60a5fa;
+  pointer-events: none;
 }
 
-@keyframes activity-scan-sweep {
-  0% {
-    background-position: 140% 0;
-  }
-  100% {
-    background-position: -140% 0;
+.activity-pulse-icon path {
+  stroke-dasharray: 0.22 1;
+  stroke-dashoffset: 0;
+  filter: drop-shadow(0 0 2px rgba(96, 165, 250, 0.85));
+  animation: activity-pulse-travel 1.3s linear infinite;
+}
+
+@keyframes activity-pulse-travel {
+  to {
+    stroke-dashoffset: -1.22;
   }
 }
 

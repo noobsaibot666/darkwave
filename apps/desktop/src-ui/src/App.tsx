@@ -2643,8 +2643,17 @@ export function App() {
             }
             onClick={() => setBackgroundActivityOpen(true)}
           >
-            {activityPreparing ? <span className="activity-scan" aria-hidden="true" /> : null}
             <Activity size={16} />
+            {activityPreparing ? (
+              <span className="activity-pulse-icon" aria-hidden="true">
+                <svg width={16} height={16} viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth={2} strokeLinecap="round" strokeLinejoin="round">
+                  <path
+                    pathLength={1}
+                    d="M22 12h-2.48a2 2 0 0 0-1.93 1.46l-2.35 8.36a.25.25 0 0 1-.48 0L9.24 2.18a.25.25 0 0 0-.48 0l-2.35 8.36A2 2 0 0 1 4.49 12H2"
+                  />
+                </svg>
+              </span>
+            ) : null}
             <span className="activity-led" aria-hidden="true" />
           </button>
           <button className="icon-button" aria-label="Open settings" onClick={() => setSettingsOpen(true)}>
