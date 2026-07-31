@@ -52,7 +52,7 @@ input:focus-visible {
   position: relative;
   display: grid;
   grid-template-columns: 232px minmax(460px, 1fr) 312px;
-  grid-template-rows: 1fr 78px;
+  grid-template-rows: 1fr;
   height: 100vh;
   background: #15130f;
   transition: grid-template-columns 320ms var(--ease-soft);
@@ -143,6 +143,7 @@ button.panel-handle-right:active:not(:disabled) {
   min-height: 0;
   flex-direction: column;
   overflow-y: auto;
+  padding-bottom: 96px;
   opacity: 1;
   transition: opacity 180ms var(--ease-soft);
 }
@@ -1204,7 +1205,7 @@ dd {
   padding: 10px 16px;
   border: 1px solid rgba(243, 240, 231, 0.1);
   border-radius: var(--radius-lg);
-  background: rgba(26, 26, 26, 0.78);
+  background: rgba(26, 26, 26, 0.52);
   backdrop-filter: blur(24px) saturate(1);
   transition: left 320ms var(--ease-soft), right 320ms var(--ease-soft), box-shadow 500ms var(--ease-soft);
   box-shadow: 0 12px 32px rgba(0, 0, 0, 0.28), 0 0 0 0 var(--player-glow-color, transparent);
