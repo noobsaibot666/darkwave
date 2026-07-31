@@ -291,12 +291,8 @@ fn default_virtualized_range() -> (usize, usize) {
 }
 
 #[tauri::command]
-fn default_command_titles() -> Vec<String> {
-    command_palette::CommandRegistry::default_audio_workspace()
-        .search("")
-        .into_iter()
-        .map(|command| command.title)
-        .collect()
+fn search_commands(query: String) -> Vec<command_palette::PaletteCommand> {
+    command_palette::CommandRegistry::default_audio_workspace().search(&query)
 }
 
 #[tauri::command]
@@ -1983,7 +1979,7 @@ pub fn run() {
             default_preferences,
             supported_drag_targets,
             default_virtualized_range,
-            default_command_titles,
+            search_commands,
             maintenance_report,
             trash_retention_policy_days,
             backup_restore_requirements,
@@ -2135,11 +2131,21 @@ mod tests {
     }
 
     #[test]
-    fn default_command_titles_include_import_and_search_first() {
+    fn search_commands_include_import_and_search_first_for_empty_query() {
+        let results = super::search_commands(String::new());
         assert_eq!(
-            &super::default_command_titles()[0..2],
+            results[0..2]
+                .iter()
+                .map(|command| command.title.clone())
+                .collect::<Vec<_>>(),
             ["Import Folder".to_string(), "Focus Search".to_string()]
         );
+    }
+
+    #[test]
+    fn search_commands_filters_by_query() {
+        let results = super::search_commands("tag".to_string());
+        assert_eq!(results[0].title, "Apply Tag");
     }
 
     #[test]

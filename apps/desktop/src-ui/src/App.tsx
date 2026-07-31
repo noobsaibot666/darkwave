@@ -130,6 +130,25 @@ type CollectionRecord = {
   export_path: string | null;
 };
 
+type PaletteCommandId =
+  | "Import"
+  | "Search"
+  | "ApplyTag"
+  | "AddToCollection"
+  | "Export"
+  | "Reveal"
+  | "Convert"
+  | "Rescan"
+  | "OpenSettings"
+  | "RunMaintenance";
+
+type PaletteCommand = {
+  id: PaletteCommandId;
+  title: string;
+  category: string;
+  keywords: string[];
+};
+
 type SourceRecordDraft = {
   asset_id: string;
   provider: string | null;
@@ -451,6 +470,11 @@ export function App() {
   const [drExportStatus, setDrExportStatus] = useState<string | null>(null);
   const [editorWorkflowOpen, setEditorWorkflowOpen] = useState(false);
   const [editorActionStatus, setEditorActionStatus] = useState<string | null>(null);
+  const [commandPaletteOpen, setCommandPaletteOpen] = useState(false);
+  const [commandPaletteQuery, setCommandPaletteQuery] = useState("");
+  const [commandPaletteResults, setCommandPaletteResults] = useState<PaletteCommand[]>([]);
+  const [commandPaletteActiveIndex, setCommandPaletteActiveIndex] = useState(0);
+  const commandPaletteInputRef = useRef<HTMLInputElement | null>(null);
 
   const [undoStack, setUndoStack] = useState<{ id: string; label: string }[]>([]);
   const [redoStack, setRedoStack] = useState<{ id: string; label: string }[]>([]);
@@ -1329,6 +1353,67 @@ export function App() {
     }
   }, [selectedAssetId, exportFormat]);
 
+  useEffect(() => {
+    if (commandPaletteOpen) {
+      commandPaletteInputRef.current?.focus();
+    } else {
+      setCommandPaletteQuery("");
+    }
+  }, [commandPaletteOpen]);
+
+  useEffect(() => {
+    if (!commandPaletteOpen) return;
+    invoke<PaletteCommand[]>("search_commands", { query: commandPaletteQuery })
+      .then((results) => {
+        setCommandPaletteResults(results);
+        setCommandPaletteActiveIndex(0);
+      })
+      .catch(() => setCommandPaletteResults([]));
+  }, [commandPaletteOpen, commandPaletteQuery]);
+
+  const executeCommand = useCallback(
+    (commandId: PaletteCommandId) => {
+      setCommandPaletteOpen(false);
+      switch (commandId) {
+        case "Import":
+          handleImportFolder();
+          break;
+        case "Search":
+          focusSearch();
+          break;
+        case "ApplyTag":
+          document.getElementById("tags-section")?.scrollIntoView({ behavior: "smooth" });
+          break;
+        case "AddToCollection":
+          setEditorWorkflowOpen(true);
+          break;
+        case "Export":
+          handleExportSelected();
+          break;
+        case "Reveal":
+          if (bulkAssetIds.length > 0) handleRevealAssets(bulkAssetIds);
+          else setEditorWorkflowOpen(true);
+          break;
+        case "Convert":
+          setExportFormat("wav24");
+          handleExportSelected();
+          break;
+        case "Rescan":
+          handleRefreshLibrary();
+          break;
+        case "OpenSettings":
+          setSettingsOpen(true);
+          break;
+        case "RunMaintenance":
+          document.getElementById("maintenance")?.scrollIntoView({ behavior: "smooth" });
+          break;
+        default:
+          break;
+      }
+    },
+    [handleImportFolder, focusSearch, handleExportSelected, bulkAssetIds, handleRevealAssets, handleRefreshLibrary]
+  );
+
   const handleBulkFavorite = useCallback(() => {
     if (bulkAssetIds.length === 0 || !activeLibraryId) return;
     Promise.all(bulkAssetIds.map((assetId) => invoke("set_favorite", { assetId, favorite: true })))
@@ -1463,10 +1548,15 @@ export function App() {
     }
 
     function acceleratorFor(event: KeyboardEvent): string {
+      // Every check here reads metaKey OR ctrlKey, never one alone, so the
+      // same accelerator string fires from Cmd on macOS and Ctrl on Windows.
       const mod = event.metaKey || event.ctrlKey;
-      if (event.key === " ") return mod ? "Mod+Space" : "Space";
-      const key = event.key.length === 1 ? event.key.toUpperCase() : event.key;
-      return mod ? `Mod+${key}` : key;
+      const key = event.key === " " ? "Space" : event.key.length === 1 ? event.key.toUpperCase() : event.key;
+      const parts: string[] = [];
+      if (mod) parts.push("Mod");
+      if (event.shiftKey) parts.push("Shift");
+      parts.push(key);
+      return parts.join("+");
     }
 
     function handleKeyDown(event: KeyboardEvent) {
@@ -1521,6 +1611,18 @@ export function App() {
           event.preventDefault();
           handleExportSelected();
           break;
+        case "CommandPalette":
+          event.preventDefault();
+          setCommandPaletteOpen((previous) => !previous);
+          break;
+        case "ToggleLoop":
+          event.preventDefault();
+          setLooping((previous) => !previous);
+          break;
+        case "CopyPath":
+          event.preventDefault();
+          if (bulkAssetIds.length > 0) handleCopyAssetPaths(bulkAssetIds);
+          break;
         default:
           break;
       }
@@ -1537,6 +1639,8 @@ export function App() {
     handleToggleFavorite,
     focusSearch,
     handleImportFolder,
+    bulkAssetIds,
+    handleCopyAssetPaths,
     handleExportSelected,
     browserState
   ]);
@@ -2457,6 +2561,7 @@ export function App() {
           className={looping ? "icon-button active" : "icon-button"}
           aria-label={looping ? "Disable loop" : "Enable loop"}
           aria-pressed={looping}
+          title="Loop (L)"
           onClick={() => setLooping((previous) => !previous)}
         >
           <Repeat size={15} />
@@ -2479,7 +2584,7 @@ export function App() {
           onKeyDown={(event) => {
             const audio = audioRef.current;
             if (!audio || !duration) return;
-            const seekStepSeconds = 5;
+            const seekStepSeconds = event.shiftKey ? 15 : 5;
             if (event.key === "ArrowLeft") {
               event.preventDefault();
               audio.currentTime = Math.max(0, audio.currentTime - seekStepSeconds);
@@ -2729,6 +2834,74 @@ export function App() {
                     </div>
                   ))}
                 </div>
+              )}
+            </div>
+          </motion.div>
+        </motion.div>
+      ) : null}
+      </AnimatePresence>
+      <AnimatePresence>
+      {commandPaletteOpen ? (
+        <motion.div
+          className="modal-overlay"
+          onClick={() => setCommandPaletteOpen(false)}
+          initial={{ opacity: 0 }}
+          animate={{ opacity: 1 }}
+          exit={{ opacity: 0 }}
+          transition={{ duration: 0.15 }}
+        >
+          <motion.div
+            className="modal-card command-palette"
+            onClick={(event) => event.stopPropagation()}
+            aria-label="Command palette"
+            initial={{ opacity: 0, scale: 0.97, y: -8 }}
+            animate={{ opacity: 1, scale: 1, y: 0 }}
+            exit={{ opacity: 0, scale: 0.97, y: -8 }}
+            transition={{ duration: 0.16, ease: [0.4, 0, 0.2, 1] }}
+          >
+            <div className="command-palette-input-row">
+              <Search size={15} />
+              <input
+                ref={commandPaletteInputRef}
+                value={commandPaletteQuery}
+                onChange={(event) => setCommandPaletteQuery(event.target.value)}
+                placeholder="Type a command…"
+                aria-label="Command palette search"
+                onKeyDown={(event) => {
+                  if (event.key === "Escape") {
+                    event.preventDefault();
+                    setCommandPaletteOpen(false);
+                  } else if (event.key === "ArrowDown") {
+                    event.preventDefault();
+                    setCommandPaletteActiveIndex((previous) => Math.min(previous + 1, commandPaletteResults.length - 1));
+                  } else if (event.key === "ArrowUp") {
+                    event.preventDefault();
+                    setCommandPaletteActiveIndex((previous) => Math.max(previous - 1, 0));
+                  } else if (event.key === "Enter") {
+                    event.preventDefault();
+                    const command = commandPaletteResults[commandPaletteActiveIndex];
+                    if (command) executeCommand(command.id);
+                  }
+                }}
+              />
+              <kbd>Esc</kbd>
+            </div>
+            <div className="command-palette-list">
+              {commandPaletteResults.length === 0 ? (
+                <p className="command-palette-empty">No matching commands</p>
+              ) : (
+                commandPaletteResults.map((command, index) => (
+                  <button
+                    type="button"
+                    key={command.id}
+                    className={index === commandPaletteActiveIndex ? "command-palette-row active" : "command-palette-row"}
+                    onMouseEnter={() => setCommandPaletteActiveIndex(index)}
+                    onClick={() => executeCommand(command.id)}
+                  >
+                    <span>{command.title}</span>
+                    <small>{command.category}</small>
+                  </button>
+                ))
               )}
             </div>
           </motion.div>

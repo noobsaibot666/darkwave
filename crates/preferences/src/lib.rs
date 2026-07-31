@@ -17,6 +17,8 @@ pub enum CommandId {
     Import,
     FocusSearch,
     ExportSelected,
+    ToggleLoop,
+    CopyPath,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
@@ -137,6 +139,14 @@ impl ShortcutMap {
                 ShortcutBinding {
                     command: CommandId::ExportSelected,
                     accelerator: "Mod+E".to_string(),
+                },
+                ShortcutBinding {
+                    command: CommandId::ToggleLoop,
+                    accelerator: "L".to_string(),
+                },
+                ShortcutBinding {
+                    command: CommandId::CopyPath,
+                    accelerator: "Mod+Shift+C".to_string(),
                 },
             ],
         }
