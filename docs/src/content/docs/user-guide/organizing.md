@@ -26,9 +26,10 @@ The sidebar is organized top to bottom as:
 - **Needs Review** — anything import's size-based check flagged as a likely broken or placeholder file.
 - **Sonic Radar** — see Searching for what these filters mean.
 - **Categories** — **Soundtracks**, **Sound Effects**, and **Ambience** (Soundtracks is a display label over the same underlying music category — no data changes if you're scripting against it). Sound Effects has its own expandable **By category** list of the starter taxonomy's action tags (Impact, Whoosh, Rise, and so on).
-- **Maintenance** — **Missing Files**, at the bottom since it's the one you reach for least often, not day-to-day browsing.
 
-Every row in this list gets a leading icon and lights up in the app's accent color when active or hovered, so the sidebar reads as one consistent system rather than a plain text list. Favorites, Unreviewed, Categories, Sonic Radar, Projects, Release Readiness, and Maintenance are each a real header — icon, bigger label text, and a fold/unfold chevron — with their categories or options nested underneath, collapsible independently of one another.
+Every row in this list gets a leading icon and lights up in the app's accent color when active or hovered, so the sidebar reads as one consistent system rather than a plain text list. Favorites, Unreviewed, Categories, Sonic Radar, and Projects are each a real header — icon, bigger label text, and a fold/unfold chevron — with their categories or options nested underneath, collapsible independently of one another.
+
+Release Readiness and Maintenance moved out of the sidebar into their own Settings categories — they're administrative/release concerns, not day-to-day browsing actions. Settings → Maintenance shows the same missing-media, license-review, stale-cache, and duplicate-content counts as before, plus a "View in Browser" action on Missing Media that jumps straight to that filtered view.
 
 The main browser rows also color- and icon-code by what a sound actually is — a green music note for instrumental music, a purple mic for music with vocals, an amber waveform mark for sound effects, and a teal wind glyph for ambience — so you can tell tracks apart at a glance while scanning a long list, without opening each one.
 

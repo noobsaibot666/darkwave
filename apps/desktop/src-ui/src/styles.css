@@ -1647,11 +1647,16 @@ dd {
   padding: 8px;
 }
 
+/* Fixed height (not max-height) so the modal stays the same size across
+   every category — a short category like Accessibility used to leave the
+   modal small, then Storage or Maintenance would make it jump taller.
+   settings-nav/settings-content scroll internally instead. */
 .settings-modal {
   display: flex;
   flex-direction: column;
   width: 640px;
-  max-height: 78vh;
+  height: 78vh;
+  max-height: 640px;
   padding: 0;
 }
 

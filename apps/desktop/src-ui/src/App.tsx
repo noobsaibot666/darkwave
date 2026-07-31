@@ -427,14 +427,23 @@ const ROW_HEIGHT_PX_BY_DENSITY: Record<string, number> = {
 
 const BROWSER_OVERSCAN_ROWS = 6;
 
-type SettingsCategory = "general" | "playback" | "storage" | "appearance" | "accessibility";
+type SettingsCategory =
+  | "general"
+  | "playback"
+  | "storage"
+  | "appearance"
+  | "accessibility"
+  | "release"
+  | "maintenance";
 
 const SETTINGS_CATEGORIES: { id: SettingsCategory; label: string; icon: typeof Database }[] = [
   { id: "general", label: "General", icon: Database },
   { id: "playback", label: "Playback", icon: Volume2 },
   { id: "storage", label: "Storage", icon: HardDrive },
   { id: "appearance", label: "Appearance", icon: Palette },
-  { id: "accessibility", label: "Accessibility", icon: Contrast }
+  { id: "accessibility", label: "Accessibility", icon: Contrast },
+  { id: "release", label: "Release Readiness", icon: ShieldCheck },
+  { id: "maintenance", label: "Maintenance", icon: FileWarning }
 ];
 
 type VisibleRowRange = {
@@ -586,7 +595,7 @@ export function App() {
   const [favoritesCategoriesOpen, setFavoritesCategoriesOpen] = useState(false);
   const [unreviewedCategoriesOpen, setUnreviewedCategoriesOpen] = useState(false);
   const [collapsedSections, setCollapsedSections] = useState<Set<string>>(
-    () => new Set(["projects", "embedded", "detected", "source", "release", "maintenance", "nas", "backup"])
+    () => new Set(["projects", "embedded", "detected", "source", "maintenance", "nas", "backup"])
   );
   const [refreshStatus, setRefreshStatus] = useState<string | null>(null);
   const [newProjectModalOpen, setNewProjectModalOpen] = useState(false);
@@ -2354,53 +2363,6 @@ export function App() {
                   ) : null}
                 </div>
               ))}
-          <CollapsibleSection
-            id="release"
-            title="Release Readiness"
-            icon={<ShieldCheck size={14} />}
-            collapsed={collapsedSections.has("release")}
-            onToggle={toggleSection}
-          >
-            <div className="release-grid">
-              {releaseItems.map((item) => (
-                <div className="release-item" key={item.label}>
-                  <span>{item.label}</span>
-                  <mark className={item.state === "Passed" ? "passed" : "planned"}>{item.state}</mark>
-                </div>
-              ))}
-            </div>
-            <div className="status-line">
-              <ShieldCheck size={18} />
-              Distribution gates tracked
-            </div>
-            <div className="status-line">
-              <Bell size={18} />
-              {updateChannelState === "Passed" ? "Update channel ready" : "Update channel planned"}
-            </div>
-          </CollapsibleSection>
-          <div className="nav-heading-row">
-            <span className="nav-heading-lg" onClick={() => toggleSection("sidebar-maintenance")}>
-              <HardDrive size={14} />
-              Maintenance
-            </span>
-            <button
-              type="button"
-              className="nav-heading-add"
-              aria-label={collapsedSections.has("sidebar-maintenance") ? "Expand Maintenance" : "Collapse Maintenance"}
-              onClick={() => toggleSection("sidebar-maintenance")}
-            >
-              {collapsedSections.has("sidebar-maintenance") ? <ChevronRight size={14} /> : <ChevronDown size={14} />}
-            </button>
-          </div>
-          {collapsedSections.has("sidebar-maintenance") ? null : (
-            <button
-              className={activeFilter === "missing" ? "nav-item sidebar-styled-item active" : "nav-item sidebar-styled-item"}
-              onClick={() => setActiveFilter("missing")}
-            >
-              <FileWarning size={13} />
-              Missing Files
-            </button>
-          )}
           <div className="virtualization-bar" aria-label="Browser performance">
             <span>{visibleAssets.length} row{visibleAssets.length === 1 ? "" : "s"}</span>
             <span>{browserVisibleRange.endExclusive - browserVisibleRange.start} rendered</span>
@@ -3477,6 +3439,68 @@ export function App() {
                         />
                       </label>
                     </div>
+                  </div>
+                ) : null}
+
+                {settingsCategory === "release" ? (
+                  <div className="settings-section">
+                    <h2>Release Readiness</h2>
+                    <div className="release-grid">
+                      {releaseItems.map((item) => (
+                        <div className="release-item" key={item.label}>
+                          <span>{item.label}</span>
+                          <mark className={item.state === "Passed" ? "passed" : "planned"}>{item.state}</mark>
+                        </div>
+                      ))}
+                    </div>
+                    <div className="status-line">
+                      <ShieldCheck size={18} />
+                      Distribution gates tracked
+                    </div>
+                    <div className="status-line">
+                      <Bell size={18} />
+                      {updateChannelState === "Passed" ? "Update channel ready" : "Update channel planned"}
+                    </div>
+                  </div>
+                ) : null}
+
+                {settingsCategory === "maintenance" ? (
+                  <div className="settings-section">
+                    <h2>Maintenance</h2>
+                    <div className="maintenance-list">
+                      {Object.entries(maintenanceLabels).map(([kind, label]) => (
+                        <div className="maintenance-row" key={kind}>
+                          <span>{label}</span>
+                          <strong>{maintenanceReport?.counts_by_kind[kind] ?? 0}</strong>
+                          {kind === "MissingMedia" ? (
+                            <button
+                              type="button"
+                              className="text-button"
+                              onClick={() => {
+                                setActiveFilter("missing");
+                                setSettingsOpen(false);
+                              }}
+                            >
+                              View in Browser
+                            </button>
+                          ) : null}
+                        </div>
+                      ))}
+                    </div>
+                    {maintenanceReport && maintenanceReport.findings.some((finding) => finding.kind === "DuplicateContent") ? (
+                      <div className="maintenance-list">
+                        {maintenanceReport.findings
+                          .filter((finding) => finding.kind === "DuplicateContent")
+                          .map((finding, index) => (
+                            <div className="maintenance-row" key={index}>
+                              <span>{finding.asset_ids.length} duplicate files sharing content</span>
+                              <button type="button" className="text-button" onClick={() => handleTrashDuplicateGroup(finding.asset_ids)}>
+                                Keep oldest, trash rest
+                              </button>
+                            </div>
+                          ))}
+                      </div>
+                    ) : null}
                   </div>
                 ) : null}
               </div>
