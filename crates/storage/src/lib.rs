@@ -85,6 +85,9 @@ pub struct AssetRecord {
     /// see docs/adr/0025-real-audio-analysis.md.
     pub musical_key: Option<String>,
     pub key_confidence: Option<f64>,
+    /// Fraction of the clip Silero VAD classifies as speech (ADR 0027).
+    /// `None` until the analysis job runs, or if it couldn't run at all.
+    pub vocal_ratio: Option<f64>,
 }
 
 /// Fields written by the `AudioAnalysis` background job. `None` leaves the
@@ -327,6 +330,23 @@ impl Catalog {
             .map_err(StorageError::from)
     }
 
+    /// Deletes a library and every catalog row that belongs to it (assets,
+    /// background jobs, asset_tags, trash_items, collections,
+    /// collection_assets, source_records) via `ON DELETE CASCADE` — the
+    /// schema already declares every one of those foreign keys with
+    /// cascade, and `foreign_keys` is turned on for this connection, so a
+    /// single delete on `libraries` is sufficient and atomic. Deliberately
+    /// never touches the filesystem: nothing under the library's
+    /// `media_root` is read, referenced, or removed. The global `tags`
+    /// table is untouched too — tags aren't library-scoped.
+    pub fn delete_library(&self, library_id: Uuid) -> Result<(), StorageError> {
+        self.connection.execute(
+            "DELETE FROM libraries WHERE id = ?1",
+            params![library_id.to_string()],
+        )?;
+        Ok(())
+    }
+
     pub fn register_asset(&self, asset: NewAssetRecord) -> Result<AssetRecord, StorageError> {
         if let Some(content_hash) = &asset.content_hash {
             if let Some(existing) =
@@ -375,7 +395,7 @@ impl Catalog {
                 storage_mode, content_hash, media_type, file_size, availability_state, review_state, favorite,
                     embedded_title, embedded_genre, embedded_comment,
                     duration_ms, sample_rate, bit_depth, channels, loudness_lufs, peak_db,
-                    bpm, bpm_confidence, musical_key, key_confidence
+                    bpm, bpm_confidence, musical_key, key_confidence, vocal_ratio
              FROM assets
              WHERE library_id = ?1
                AND NOT EXISTS (
@@ -928,7 +948,7 @@ impl Catalog {
                 assets.embedded_title, assets.embedded_genre, assets.embedded_comment,
                 assets.duration_ms, assets.sample_rate, assets.bit_depth, assets.channels,
                 assets.loudness_lufs, assets.peak_db, assets.bpm, assets.bpm_confidence,
-                assets.musical_key, assets.key_confidence
+                assets.musical_key, assets.key_confidence, assets.vocal_ratio
              FROM assets
              INNER JOIN collection_assets ON collection_assets.asset_id = assets.id
              WHERE collection_assets.collection_id = ?1
@@ -1048,7 +1068,7 @@ impl Catalog {
                 assets.embedded_title, assets.embedded_genre, assets.embedded_comment,
                 assets.duration_ms, assets.sample_rate, assets.bit_depth, assets.channels,
                 assets.loudness_lufs, assets.peak_db, assets.bpm, assets.bpm_confidence,
-                assets.musical_key, assets.key_confidence
+                assets.musical_key, assets.key_confidence, assets.vocal_ratio
              FROM assets",
         );
         let mut query_params: Vec<rusqlite::types::Value> = vec![library_id.to_string().into()];
@@ -1586,6 +1606,35 @@ impl Catalog {
         Ok(())
     }
 
+    /// Permanently removes every currently-trashed asset's catalog row for
+    /// one library, bypassing the normal retention wait — an explicit,
+    /// user-initiated "empty trash" action, not the automatic timed purge.
+    /// Same guarantee as `purge_trash_item`: only ever deletes SQLite rows,
+    /// never touches a real file.
+    pub fn empty_trash_for_library(&self, library_id: Uuid) -> Result<usize, StorageError> {
+        let mut statement = self.connection.prepare(
+            "SELECT trash_items.asset_id FROM trash_items
+             INNER JOIN assets ON assets.id = trash_items.asset_id
+             WHERE assets.library_id = ?1 AND trash_items.state = 'in_trash'",
+        )?;
+        let asset_ids: Vec<String> = statement
+            .query_map(params![library_id.to_string()], |row| row.get(0))?
+            .collect::<Result<Vec<_>, _>>()
+            .map_err(StorageError::from)?;
+        drop(statement);
+
+        for asset_id in &asset_ids {
+            self.connection.execute(
+                "UPDATE trash_items SET state = 'purged' WHERE asset_id = ?1",
+                params![asset_id],
+            )?;
+            self.connection
+                .execute("DELETE FROM assets WHERE id = ?1", params![asset_id])?;
+        }
+
+        Ok(asset_ids.len())
+    }
+
     pub fn purge_trash_item(
         &self,
         asset_id: Uuid,
@@ -1841,7 +1890,7 @@ impl Catalog {
                     storage_mode, content_hash, media_type, file_size, availability_state, review_state, favorite,
                     embedded_title, embedded_genre, embedded_comment,
                     duration_ms, sample_rate, bit_depth, channels, loudness_lufs, peak_db,
-                    bpm, bpm_confidence, musical_key, key_confidence
+                    bpm, bpm_confidence, musical_key, key_confidence, vocal_ratio
                  FROM assets WHERE id = ?1",
                 params![id.to_string()],
                 asset_from_row,
@@ -1862,7 +1911,7 @@ impl Catalog {
                     storage_mode, content_hash, media_type, file_size, availability_state, review_state, favorite,
                     embedded_title, embedded_genre, embedded_comment,
                     duration_ms, sample_rate, bit_depth, channels, loudness_lufs, peak_db,
-                    bpm, bpm_confidence, musical_key, key_confidence
+                    bpm, bpm_confidence, musical_key, key_confidence, vocal_ratio
                  FROM assets
                  WHERE library_id = ?1 AND content_hash = ?2 AND file_size = ?3
                  LIMIT 1",
@@ -1918,6 +1967,7 @@ fn asset_from_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<AssetRecord> {
         bpm_confidence: row.get(23)?,
         musical_key: row.get(24)?,
         key_confidence: row.get(25)?,
+        vocal_ratio: row.get(26)?,
     })
 }
 
@@ -3427,6 +3477,83 @@ mod tests {
             vec![trashed.id]
         );
         assert_eq!(items[0].reason, "duplicate");
+    }
+
+    #[test]
+    fn empty_trash_for_library_purges_only_in_trash_assets_for_that_library() {
+        let catalog_path = unique_catalog_path("empty-trash-library");
+        let catalog = Catalog::open(&catalog_path).expect("open catalog");
+        let library = catalog
+            .create_library("Empty Trash", "/library")
+            .expect("library");
+        let other_library = catalog
+            .create_library("Other", "/other")
+            .expect("other library");
+
+        let trashed = test_asset(&catalog, library.id, "trashed.wav", "hash-empty-trashed");
+        let kept = test_asset(&catalog, library.id, "kept.wav", "hash-empty-kept");
+        let other_trashed = test_asset(&catalog, other_library.id, "other.wav", "hash-empty-other");
+
+        catalog
+            .move_asset_to_trash(trashed.id, "duplicate", 1_000)
+            .expect("trash asset");
+        catalog
+            .move_asset_to_trash(other_trashed.id, "duplicate", 1_000)
+            .expect("trash other library asset");
+
+        let purged = catalog
+            .empty_trash_for_library(library.id)
+            .expect("empty trash");
+
+        assert_eq!(purged, 1);
+        assert!(catalog.get_asset(trashed.id).expect("get").is_none());
+        assert!(catalog.get_asset(kept.id).expect("get").is_some());
+        assert!(
+            catalog.get_asset(other_trashed.id).expect("get").is_some(),
+            "another library's trashed asset must not be purged"
+        );
+    }
+
+    #[test]
+    fn delete_library_cascades_to_assets_tags_and_collections_but_not_other_libraries() {
+        let catalog_path = unique_catalog_path("delete-library");
+        let catalog = Catalog::open(&catalog_path).expect("open catalog");
+        let library = catalog
+            .create_library("Deleted", "/library")
+            .expect("library");
+        let other_library = catalog
+            .create_library("Kept", "/other")
+            .expect("other library");
+
+        let asset = test_asset(&catalog, library.id, "gone.wav", "hash-delete-library");
+        let tag = catalog
+            .create_tag("impact", "action", true)
+            .expect("create tag");
+        catalog
+            .apply_tag_to_assets(&[asset.id], tag.id, TagOrigin::Manual)
+            .expect("apply tag");
+        let project = catalog
+            .create_collection(library.id, "Trailer", CollectionType::Project)
+            .expect("create collection");
+        catalog
+            .add_assets_to_collection(project.id, &[asset.id])
+            .expect("add to collection");
+        let other_asset = test_asset(&catalog, other_library.id, "stays.wav", "hash-delete-other");
+
+        catalog.delete_library(library.id).expect("delete library");
+
+        assert!(catalog.get_library(library.id).expect("get").is_none());
+        assert!(catalog.get_asset(asset.id).expect("get").is_none());
+        assert!(
+            catalog
+                .list_tags()
+                .expect("list tags")
+                .iter()
+                .any(|candidate| candidate.id == tag.id),
+            "tags are global, not library-scoped, and must survive"
+        );
+        assert!(catalog.get_library(other_library.id).expect("get").is_some());
+        assert!(catalog.get_asset(other_asset.id).expect("get").is_some());
     }
 
     #[test]
