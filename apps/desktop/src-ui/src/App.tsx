@@ -2022,20 +2022,6 @@ export function App() {
             </select>
           ) : null}
           <button
-            type="button"
-            className={editorWorkflowOpen ? "editor-workflow-trigger active" : "editor-workflow-trigger"}
-            onClick={() => setEditorWorkflowOpen((previous) => !previous)}
-            aria-pressed={editorWorkflowOpen}
-          >
-            <span className="editor-workflow-trigger-icon">
-              <Workflow size={15} />
-            </span>
-            <span className="editor-workflow-trigger-copy">
-              <strong>Editor Workflow</strong>
-              <small>Send, reveal, copy</small>
-            </span>
-          </button>
-          <button
             className={activeFilter === "all" ? "nav-item sidebar-styled-item active" : "nav-item sidebar-styled-item"}
             onClick={() => setActiveFilter("all")}
             title="All sounds in the library"
@@ -2194,6 +2180,53 @@ export function App() {
           </button>
 
           <div className="nav-heading-row">
+            <span className="nav-heading sonic-radar-heading sonic-radar-root" onClick={() => toggleSection("sidebar-sonic-radar")}>
+              <Activity size={13} />
+              Sonic Radar
+            </span>
+            <button
+              type="button"
+              className="nav-heading-add"
+              aria-label={collapsedSections.has("sidebar-sonic-radar") ? "Expand Sonic Radar" : "Collapse Sonic Radar"}
+              onClick={() => toggleSection("sidebar-sonic-radar")}
+            >
+              {collapsedSections.has("sidebar-sonic-radar") ? <ChevronRight size={14} /> : <ChevronDown size={14} />}
+            </button>
+          </div>
+          {collapsedSections.has("sidebar-sonic-radar") ? null : (
+            <>
+              <button
+                className={activeFilter === "has_vocals" ? "nav-item sonic-radar-item active" : "nav-item sonic-radar-item"}
+                onClick={() => setActiveFilter("has_vocals")}
+              >
+                <Mic size={13} />
+                Has Vocals
+              </button>
+              <button
+                className={activeFilter === "instrumental" ? "nav-item sonic-radar-item active" : "nav-item sonic-radar-item"}
+                onClick={() => setActiveFilter("instrumental")}
+              >
+                <MicOff size={13} />
+                Instrumental Only
+              </button>
+              <button
+                className={activeFilter === "has_tempo" ? "nav-item sonic-radar-item active" : "nav-item sonic-radar-item"}
+                onClick={() => setActiveFilter("has_tempo")}
+              >
+                <Gauge size={13} />
+                Detected Tempo
+              </button>
+              <button
+                className={activeFilter === "has_pitch" ? "nav-item sonic-radar-item active" : "nav-item sonic-radar-item"}
+                onClick={() => setActiveFilter("has_pitch")}
+              >
+                <Music size={13} />
+                Detected Pitch
+              </button>
+            </>
+          )}
+
+          <div className="nav-heading-row">
             <span className="nav-heading-lg" onClick={() => toggleSection("sidebar-categories")}>
               <FolderOpen size={14} />
               Categories
@@ -2252,53 +2285,6 @@ export function App() {
               >
                 <Wind size={13} />
                 Ambience
-              </button>
-            </>
-          )}
-
-          <div className="nav-heading-row">
-            <span className="nav-heading sonic-radar-heading sonic-radar-root" onClick={() => toggleSection("sidebar-sonic-radar")}>
-              <Activity size={13} />
-              Sonic Radar
-            </span>
-            <button
-              type="button"
-              className="nav-heading-add"
-              aria-label={collapsedSections.has("sidebar-sonic-radar") ? "Expand Sonic Radar" : "Collapse Sonic Radar"}
-              onClick={() => toggleSection("sidebar-sonic-radar")}
-            >
-              {collapsedSections.has("sidebar-sonic-radar") ? <ChevronRight size={14} /> : <ChevronDown size={14} />}
-            </button>
-          </div>
-          {collapsedSections.has("sidebar-sonic-radar") ? null : (
-            <>
-              <button
-                className={activeFilter === "has_vocals" ? "nav-item sonic-radar-item active" : "nav-item sonic-radar-item"}
-                onClick={() => setActiveFilter("has_vocals")}
-              >
-                <Mic size={13} />
-                Has Vocals
-              </button>
-              <button
-                className={activeFilter === "instrumental" ? "nav-item sonic-radar-item active" : "nav-item sonic-radar-item"}
-                onClick={() => setActiveFilter("instrumental")}
-              >
-                <MicOff size={13} />
-                Instrumental Only
-              </button>
-              <button
-                className={activeFilter === "has_tempo" ? "nav-item sonic-radar-item active" : "nav-item sonic-radar-item"}
-                onClick={() => setActiveFilter("has_tempo")}
-              >
-                <Gauge size={13} />
-                Detected Tempo
-              </button>
-              <button
-                className={activeFilter === "has_pitch" ? "nav-item sonic-radar-item active" : "nav-item sonic-radar-item"}
-                onClick={() => setActiveFilter("has_pitch")}
-              >
-                <Music size={13} />
-                Detected Pitch
               </button>
             </>
           )}
@@ -2423,6 +2409,15 @@ export function App() {
       </aside>
       <section className="workspace">
         <header className="topbar">
+          <button
+            type="button"
+            className={editorWorkflowOpen ? "primary-action active" : "primary-action"}
+            onClick={() => setEditorWorkflowOpen((previous) => !previous)}
+            aria-pressed={editorWorkflowOpen}
+          >
+            <Workflow size={16} />
+            Editor Workflow
+          </button>
           <button className="primary-action" onClick={() => handleExportSelected()} disabled={!selectedAssetId}>
             Export Selected
           </button>

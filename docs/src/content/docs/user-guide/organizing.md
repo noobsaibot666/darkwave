@@ -24,8 +24,8 @@ The sidebar is organized top to bottom as:
 - **All Sounds** — the whole library.
 - **Favorites** and **Unreviewed**, each with an expandable **By category** breakdown (Soundtracks, Voice, No Voice, Sound FX) — so "my favorite dialogue" or "unreviewed sound effects" is one click, not a manual scan of a flat list.
 - **Needs Review** — anything import's size-based check flagged as a likely broken or placeholder file.
-- **Categories** — **Soundtracks**, **Sound Effects**, and **Ambience** (Soundtracks is a display label over the same underlying music category — no data changes if you're scripting against it). Sound Effects has its own expandable **By category** list of the starter taxonomy's action tags (Impact, Whoosh, Rise, and so on).
 - **Sonic Radar** — see Searching for what these filters mean.
+- **Categories** — **Soundtracks**, **Sound Effects**, and **Ambience** (Soundtracks is a display label over the same underlying music category — no data changes if you're scripting against it). Sound Effects has its own expandable **By category** list of the starter taxonomy's action tags (Impact, Whoosh, Rise, and so on).
 - **Maintenance** — **Missing Files**, at the bottom since it's the one you reach for least often, not day-to-day browsing.
 
 Every row in this list gets a leading icon and lights up in the app's accent color when active or hovered, so the sidebar reads as one consistent system rather than a plain text list. Favorites, Unreviewed, Categories, Sonic Radar, Projects, Release Readiness, and Maintenance are each a real header — icon, bigger label text, and a fold/unfold chevron — with their categories or options nested underneath, collapsible independently of one another.
@@ -36,7 +36,7 @@ Creating a project is a small "+" icon next to the Projects heading in the sideb
 
 ## Editor Workflow
 
-A dedicated panel, opened from its own button near the top of the sidebar, consolidates the actions you reach for when a sound is ready to leave the library: **Reveal in Finder/Explorer**, **Copy File Path** (also `Cmd/Ctrl+Shift+C`), and **Send to Project** (the same DaVinci Resolve quick-export described in Exporting, plus every other project with an export folder configured). It opens as an animated panel over the main canvas rather than a modal, so the sidebar and inspector stay visible and usable while it's open.
+A dedicated panel, opened from its own button in the topbar (before Export Selected, styled the same as Import), consolidates the actions you reach for when a sound is ready to leave the library: **Reveal in Finder/Explorer**, **Copy File Path** (also `Cmd/Ctrl+Shift+C`), and **Send to Project** (the same DaVinci Resolve quick-export described in Exporting, plus every other project with an export folder configured). It opens as an animated panel over the main canvas rather than a modal, so the sidebar and inspector stay visible and usable while it's open.
 
 ## Managing libraries
 
