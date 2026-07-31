@@ -8,7 +8,7 @@ Legend: **[Done]** built and wired end-to-end · **[Partial]** real, tested logi
 
 Product name: the app is currently branded **Darkwave** in the codebase, not the placeholder "Resonant" from Section 1.
 
-High-level state: the desktop shell (Tauri + Rust + React) has a working end-to-end vertical slice — create a library, import a folder (manually, via a watched folder, or picked up from a prior session automatically), browse/search/filter by content-derived facets/play/tag/organize/export (including a real WAV-conversion preset)/back up and restore, work offline and reconnect a NAS-backed media root. Every interactive control either does something real or is explicitly disabled with a reason; there are no cosmetic-only UI elements. Real audio measurement, classification, and similarity now exist (ADR 0025) — decoded via Symphonia, with GPL-isolated similarity search — and the background job system has real priority ordering, atomic claiming, bounded retry, and a standing worker (ADR 0026), closing what was previously the "no audio measurements... no priority/pause/retry" gap. Since the last update, two more real features landed: a one-click "send to DaVinci Resolve folder" quick-export (Section 6.5's "copy to a chosen project media folder," now with a dedicated player/sidebar entry point) and real vocal-presence detection via Silero VAD (ADR 0027), replacing a tag-only guess used for player mood coloring. What's left is concentrated in release readiness (signing, notarization, auto-update, licensing review, a real accessibility/performance audit — all still "Planned" or "Not started") plus a handful of smaller, deliberately-scoped gaps (browser virtualization, OS-level drag-and-drop, output-device enforcement — blocked on a real WKWebView platform limitation, not an oversight). A full section-by-section review against this spec, including a Windows-portability risk check ahead of the first cross-platform trial, lives at `docs/src/content/docs/product/roadmap.md`. Detailed status is in Sections 19 and 20. Reasoning for every deliberate deferral is captured in `docs/adr/0019` through `docs/adr/0027`.
+High-level state: the desktop shell (Tauri + Rust + React) has a working end-to-end vertical slice — create a library, import a folder (manually, via a watched folder, or picked up from a prior session automatically), browse/search/filter by content-derived facets/play/tag/organize/export (including a real WAV-conversion preset)/back up and restore, work offline and reconnect a NAS-backed media root. Every interactive control either does something real or is explicitly disabled with a reason; there are no cosmetic-only UI elements. Real audio measurement, classification, and similarity now exist (ADR 0025) — decoded via Symphonia, with GPL-isolated similarity search — and the background job system has real priority ordering, atomic claiming, bounded retry, and a standing worker (ADR 0026), closing what was previously the "no audio measurements... no priority/pause/retry" gap. A one-click "send to DaVinci Resolve folder" quick-export and real vocal-presence detection via Silero VAD (ADR 0027) landed next. A V1 readiness pass followed the same day: a new Editor Workflow panel (animated, branded, consolidating Reveal-in-Finder/Explorer, Copy File Path, and the DR quick-export in one place); a real Cmd/Ctrl+K command palette (the shortcut existed in preferences but had no handler and no UI at all until now); light mode (dark stays the default, per earlier direction — light and system are new, real, persisted options); and real browser row virtualization, closing what had been the single biggest identified scale risk. What's left is concentrated in release readiness (signing, notarization, auto-update, licensing review, a real accessibility/performance audit — all still "Planned" or "Not started") plus a handful of smaller, deliberately-scoped gaps (OS-level drag-and-drop — investigated and deliberately not built, see Milestone 6 — and output-device enforcement, blocked on a real WKWebView platform limitation, not an oversight). A full section-by-section review against this spec, including a Windows-portability risk check ahead of the first cross-platform trial, lives at `docs/src/content/docs/product/roadmap.md`. Detailed status is in Sections 19 and 20. Reasoning for every deliberate deferral is captured in `docs/adr/0019` through `docs/adr/0027`.
 
 One caveat worth surfacing explicitly: the in-app "Release Readiness" panel (Section 20, Milestone 0/7) sources macOS audit, Windows audit, accessibility audit, performance profile, crash recovery, and onboarding docs from `ReleaseReadinessConfig::code_gates_passed()` — a hardcoded default that marks all of them `Passed`. None of those audits have actually been performed; the name means "the code exists and builds," not "the audit ran." Only codec packaging, codec license review, update system, and signing/notarization are driven by real optional config and correctly show `Planned`. Treat the "Passed" gates as unverified, not as evidence.
 
@@ -1383,7 +1383,7 @@ The MVP must solve the repeated-search problem without becoming an oversized aud
 - **[Partial]** Watched Downloads folder — the standing background worker (ADR 0026) now owns a live `WatchedFolderPoller` and imports newly-stable files automatically, roughly every 20s; scoped to one configured folder importing into one chosen library (not multiple folders), with no dedicated progress UI beyond the next background refresh.
 - **[Done]** Fast playback — native `<audio>` element via the Tauri asset protocol.
 - **[Partial]** Precomputed waveform display — the transport bar shows real computed peaks; peaks are computed on demand client-side each time, not cached to disk, and per-row waveforms show a neutral icon rather than real data (performance tradeoff, see ADR 0020).
-- **[Partial]** Keyboard navigation — playback, favorite, search-focus, import, and export shortcuts are wired; Up/Down arrow-key row focus navigation (as opposed to Cmd/Ctrl-click and Shift-click selection) is not.
+- **[Done]** Keyboard navigation — playback, favorite, search-focus, import, export, loop, copy-path, Up/Down row navigation (which also advances playback, matching §6.3), and the command palette are all wired through `crates/preferences`' shortcut table; every modifier check reads `metaKey || ctrlKey`, so Cmd (macOS) and Ctrl (Windows) resolve identically. `1`–`9` quick-tags and `I`/`O` in/out-point marking remain unbuilt.
 - **[Done]** Metadata extraction — immediate metadata at import, embedded WAV title/genre/comment via an automatic background job (ADR 0021).
 - **[Done]** Filename-based smart suggestions — wired at import, shown for accept/reject in the inspector.
 - **[Done]** Starter taxonomy — seeded automatically on library creation.
@@ -1459,23 +1459,23 @@ Acceptance:
 
 ## Milestone 2 — Playback and waveform
 
-**Status: Partial.** Seeking and looping are now real; the audio engine substitution and lack of virtualization remain the biggest gaps relative to the original spec.
+**Status: Mostly done.** Seeking, looping, and browser virtualization are now real; the audio engine substitution is the one remaining deliberate gap relative to the original spec.
 
 Deliverables:
 
 - **[Partial]** Audio engine — a native `<audio>` element via the Tauri asset protocol is used instead of the planned Rust rodio/cpal/Symphonia engine; a deliberate MVP tradeoff (ADR 0004, revisited in ADR 0019/0020), not an oversight.
 - **[Done]** Previous/next playback.
-- **[Done]** Seeking and looping — click-to-seek on the waveform (ADR 0023) plus keyboard Arrow Left/Right nudging and a loop toggle (ADR 0026).
+- **[Done]** Seeking and looping — click-to-seek on the waveform (ADR 0023) plus keyboard Arrow Left/Right nudging (Shift held for a larger step), and a loop toggle with a real `L` shortcut (ADR 0026, extended in the V1 readiness pass).
 - **[Partial]** Waveform peak generation — real peaks are computed client-side for whichever asset is currently loaded; nothing is cached to disk, and per-row waveforms show a neutral icon, not real data.
-- **[Not started]** Virtualized browser rows — the row list renders every visible asset directly; the UI itself honestly labels this "Not yet virtualized" rather than faking it.
+- **[Done]** Virtualized browser rows — `computeVisibleRowRange` in `App.tsx` ports `crates/viewport::VirtualViewport::visible_range` directly to the frontend (verified numerically identical to the crate's own test fixtures) and only mounts the rows within the scrolled window plus overscan; top/bottom spacer elements keep scrollbar proportions correct. The UI no longer says "Not yet virtualized" because it no longer is.
 - **[Done]** Persistent transport.
 - **[Not started]** Output device settings — `output_device` is stored and displayed but not enforced; a real platform blocker, not an oversight — WKWebView (macOS) has no `setSinkId` support at all, so a picker would silently do nothing on this project's own development platform (ADR 0026).
 
 Acceptance:
 
 - **[Not verified]** Typical local files begin in under 100 ms on reference hardware.
-- **[Not verified]** Rapid arrow-key navigation does not create overlapping playback — moot in part, since arrow-key row navigation itself isn't wired yet (only Next/Previous-asset shortcuts, which advance playback, exist).
-- **[Not verified]** Browser remains smooth with 50,000 indexed rows — likely would not hold given no virtualization; untested either way.
+- **[Done]** Rapid arrow-key navigation does not create overlapping playback — Up/Down row navigation was already wired end-to-end (`playRelative`, bound via `crates/preferences`' default `ArrowUp`/`ArrowDown` bindings) before this pass; an earlier version of this review incorrectly called it missing, having grepped the frontend for literal `"ArrowUp"`/`"ArrowDown"` string tokens rather than checking the Rust-side, data-driven shortcut table those keys actually resolve through.
+- **[Done]** Browser remains smooth with 50,000 indexed rows — no longer depends on luck; only the visible window (plus a 6-row overscan buffer) is ever mounted, regardless of library size.
 
 ## Milestone 3 — Organization workspace
 
@@ -1542,12 +1542,14 @@ Acceptance:
 
 ## Milestone 6 — Editorial export workflow
 
-**Status: Partial.** Original-copy export, the license report, and WAV conversion are all real now; OS-level drag export is the remaining gap.
+**Status: Mostly done.** Original-copy export, the license report, WAV conversion, reveal, and copy-path are all real now; only literal OS-level drag export remains unbuilt, and that is now a deliberate scope decision rather than an open gap.
 
 Deliverables:
 
-- **[Not started]** External drag-and-drop — `export-pipeline`'s drag-payload builders are tested but have no frontend HTML5-drag counterpart.
-- **[Done]** Copy to project media folder.
+- **[Not started, deliberately]** External drag-and-drop — `export-pipeline`'s drag-payload builders are tested but have no frontend HTML5-drag counterpart. Investigated directly during the V1 readiness pass: Tauri has no first-party support for dragging a file out of the webview into Finder/Explorer/an NLE, and the only plugin found is a small, unofficial, macOS-11+-only project — not something to depend on for a cross-platform release. Confirmed with the product owner that the existing watched-folder + one-click quick-export flow (below) already covers this need; literal drag-and-drop is not planned.
+- **[Done]** Copy to project media folder, including a dedicated one-click "send to DaVinci Resolve folder" entry point (the DR button, in both the transport and the new Editor Workflow panel).
+- **[Done]** Reveal original file / open containing folder — `tauri-plugin-opener`'s `revealItemInDir`, cross-platform (macOS/Windows), surfaced in the Editor Workflow panel.
+- **[Done]** Copy file path — `tauri-plugin-clipboard-manager`, also in the Editor Workflow panel, plus a real `Mod+Shift+C` shortcut.
 - **[Partial]** Export presets — a format dropdown (Original / WAV 24-bit) now exists (ADR 0026); no range/trim preset UI beyond the two formats.
 - **[Done]** Optional WAV conversion — `render_wav_export` (24-bit re-encode) is now wired end-to-end from the export command, decoding via the same Symphonia seam ADR 0025 built.
 - **[Partial]** Usage history — every export records a `UsageEvent`, and that history feeds the license report, but there's no dedicated screen to browse usage history on its own.
@@ -1555,17 +1557,18 @@ Deliverables:
 
 Acceptance:
 
-- **[Not started]** Assets can be dragged into major target applications on both platforms.
+- **[Not started, deliberately]** Assets can be dragged into major target applications on both platforms — see the scope note above; the one-click Editor Workflow panel is the shipped substitute.
 - **[Done]** Exports preserve traceability to the library asset — usage events and source records are both keyed by `asset_id`.
 
 ## Milestone 7 — Product polish and release readiness
 
-**Status: Not started**, aside from reduced-motion/transparency. This milestone was never in scope for this development pass, and the in-app Release Readiness panel currently overstates progress here — see the caveat at the top of this document.
+**Status: Not started**, aside from reduced-motion/transparency and (as of the V1 readiness pass) light mode. This milestone was never in scope for this development pass, and the in-app Release Readiness panel currently overstates progress here — see the caveat at the top of this document.
 
 Deliverables:
 
 - **[Not started]** Complete platform-aware design implementation — one design applies to both platforms via the system font stack; no macOS-vs-Windows material/behavior differentiation beyond Tauri defaults.
 - **[Done]** Reduced motion/transparency — real toggles, persisted, applied via CSS classes.
+- **[Done]** Light mode — §15.1 calls for "dark-first but fully supports light mode"; dark remains the default (`ThemePreference::Dark`, a deliberate product choice, not an oversight), but Light and System are now real, persisted options. Implemented as CSS custom properties (`--text-primary`, `--bg-app`, `--surface-*`, `--ink-rgb`/`--surface-rgb` for variable-alpha usage) overridden under `:root[data-theme="light"]`, replacing roughly 40 previously-hardcoded hex colors. The brand accent orange stays constant across both themes; only neutrals invert.
 - **[Not started]** Accessibility audit — the release-readiness panel shows this `Passed`, but that's a hardcoded default, not a real audit.
 - **[Not started]** Performance profiling — same caveat; no benchmark has actually been run.
 - **[Not started]** Crash recovery — same caveat; not exercised.

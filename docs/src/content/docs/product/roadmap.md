@@ -5,6 +5,8 @@ description: Full spec-vs-implementation audit ahead of the first Windows trial 
 
 _Reviewed 2026-07-31, against `docs/genesis/audio_library_application_plan.md` (updated the same day), ADRs 0001–0027, and direct inspection of the current codebase. This is a review, not new development — nothing described as "Missing" below was built as part of this pass, except two small hardening fixes called out explicitly in Section 0._
 
+**Update, same day:** the four highest-leverage items from this review were then built in a follow-up development pass — the Editor Workflow panel (§6), the command palette (§5/§9), light mode (§9), and row virtualization (§8). Sections below are marked accordingly; the original review text is otherwise left as written so the "before" state stays visible. One finding was corrected in the process: the original §5 claim that arrow-key row navigation was missing was wrong (it was already wired via `playRelative`) — see the note in §5.
+
 Legend: **Complete** · **Partial** (real, working, but not the full scope requested) · **Missing** (not built).
 
 ---
@@ -108,65 +110,71 @@ Is search instant? Functionally yes for the FTS5-backed query at small/medium sc
 
 | Item | Status |
 |---|---|
-| Arrow-key row navigation | **Missing** — confirmed by direct grep: only `ArrowLeft`/`ArrowRight` exist (`App.tsx:2297-2300`), and they seek within the current track, not move row focus |
-| Instant next-sound audition | Partial — real once a row is clicked; not reachable by arrow keys since row navigation itself doesn't exist |
-| Continue playback while browsing | Complete | Transport is a persistent, floating element |
-| Waveforms | Partial | See §2 |
-| Scrub | Complete | Click/drag-to-seek (ADR 0023/0026) |
-| Loop | Partial | Real toggle button; no `L` keyboard shortcut (spec §6.3) |
-| In/out points | **Missing** | No `I`/`O` marking, no preview-range UI |
-| Playback speed | **Missing** | Confirmed zero references anywhere in the frontend |
-| Normalize preview volume | **Missing** | No loudness-based playback gain |
+| Arrow-key row navigation | **Correction, not a fix — Complete already.** This review originally said "Missing," based on grepping the frontend for literal `"ArrowUp"`/`"ArrowDown"` strings. Wrong — those keys are wired through `crates/preferences`' data-driven shortcut table (`ArrowDown`→`NextAsset`, `ArrowUp`→`PreviousAsset`), resolved in `App.tsx`'s `handleKeyDown`, and drive `playRelative`, which moves selection and plays. Nothing needed building here. |
+| Instant next-sound audition | Complete — real via click and via Up/Down (see above) |
+| Continue playback while browsing | Complete — transport is a persistent, floating element |
+| Waveforms | Partial — see §2 |
+| Scrub | Complete — click/drag-to-seek (ADR 0023/0026); Shift+Arrow now gives a larger seek step, per spec §6.3 |
+| Loop | **Complete (built).** Real toggle button, now also a real `L` keyboard shortcut (`ToggleLoop` in `crates/preferences`) |
+| In/out points | **Missing** — no `I`/`O` marking, no preview-range UI |
+| Playback speed | **Missing** — confirmed zero references anywhere in the frontend |
+| Normalize preview volume | **Missing** — no loudness-based playback gain |
 
 ## 6. Editor Workflow
 
+**Update:** the three items below marked "Complete (built)" were built in the Editor Workflow panel — a new animated section, opened from a sidebar button, consolidating all of this app's editor-integration actions in one place (`App.tsx`'s `editor-workflow` section; `Reveal`/`Copy File Path`/`Send to Project` actions). True OS-level drag-and-drop was investigated and deliberately not built — see the note below.
+
 | Item | Status |
 |---|---|
-| Drag into Premiere/Resolve/Final Cut/AE/Finder | **Missing** | Zero `draggable`/`dragstart` usage anywhere in `App.tsx` |
-| Copy file path | **Missing** | Zero clipboard usage anywhere — not even a button |
-| Reveal original file / open containing folder | **Missing** | `tauri-plugin-opener` is installed and registered (`lib.rs:1805`) — the cross-platform-safe capability is one call away — but nothing in the frontend invokes it |
-| Copy to project folder | Complete | |
-| DaVinci Resolve quick-export | Complete | New this pass, see §0 |
+| Drag into Premiere/Resolve/Final Cut/AE/Finder | **Missing, deliberately.** Investigated directly: Tauri has no first-party support for dragging a file out of the webview, and the only plugin found is a small, unofficial, macOS-only project. Confirmed with the product owner that the watched-folder + quick-export flow below already covers this need |
+| Copy file path | **Complete (built).** `tauri-plugin-clipboard-manager`, wired to the Editor Workflow panel plus a real `Mod+Shift+C` shortcut |
+| Reveal original file / open containing folder | **Complete (built).** `tauri-plugin-opener`'s `revealItemInDir`, cross-platform, wired to the Editor Workflow panel |
+| Copy to project folder | Complete |
+| DaVinci Resolve quick-export | Complete — now also has a dedicated entry point in the Editor Workflow panel, alongside the existing player/sidebar buttons |
 
-This is the weakest section relative to spec intent. The "editor's dream" quick-export (DR button) is a real, good substitute for one specific NLE, but the universal drag-out/copy-path/reveal trio that the plan calls "first release priority" (§6.5) is entirely unbuilt, despite the enabling plugin already being a dependency.
+This was the weakest section relative to spec intent at review time. The universal copy-path/reveal pair is now real and cross-platform; literal drag-and-drop remains the one deliberately-unbuilt item, by explicit product decision rather than oversight.
 
 ## 7. Project Intelligence
 
 | Item | Status |
 |---|---|
-| Which project used each sound | Complete | `UsageEvent`, keyed by `asset_id` + `project_id` |
-| Last usage / number of uses | Partial | Data is captured and feeds the license report CSV; no dedicated usage-history view |
-| User notes | **Missing** | `notes` exists in the §17.1 data model on paper; zero references to a notes field anywhere in `App.tsx` — not exposed at all |
-| Custom collections per project | Complete | Projects are just Collections with `type: Project` |
+| Which project used each sound | Complete — `UsageEvent`, keyed by `asset_id` + `project_id` |
+| Last usage / number of uses | Partial — data is captured and feeds the license report CSV; no dedicated usage-history view |
+| User notes | **Missing** — `notes` exists in the §17.1 data model on paper; zero references to a notes field anywhere in `App.tsx` — not exposed at all |
+| Custom collections per project | Complete — projects are just Collections with `type: Project` |
 
 ## 8. Performance
 
+**Update:** row virtualization is now real (`computeVisibleRowRange` in `App.tsx`, a verified port of `crates/viewport::VirtualViewport::visible_range`) — this was the dominant risk factor behind most of this section's "Not verified" ratings, so several are upgraded below.
+
 | Item | Status |
 |---|---|
-| Instant scrolling | **Missing** | No row virtualization — the UI's own "Not yet virtualized" label is literal, not modesty |
-| Instant search | Partial | See §4 |
-| Immediate playback | Complete | Native `<audio>` via Tauri asset protocol |
-| Smooth waveform rendering | Partial | Works, but recomputed client-side each load, not cached |
-| Background indexing | Complete | Real priority queue, atomic claiming, bounded retry, standing worker (ADR 0026) |
-| Lazy loading | **Missing** | Tied to the virtualization gap |
-| Cache management | Partial | No waveform-peak disk cache, no offline preview cache; job/backup caching is otherwise solid |
-| Low RAM usage | Not verified | Memory scales with row count with no virtualization in place — real risk, untested |
-| 500k+ assets | Not verified, likely at risk | The project's own ignored profiling test targets 100k, not 500k; virtualization absence is the dominant risk factor here, repeatedly flagged by the plan's own status notes |
+| Instant scrolling | **Complete (built).** Only the scrolled window plus overscan is ever mounted, independent of library size; the old "Not yet virtualized" label is gone because it's no longer true |
+| Instant search | Partial — see §4 |
+| Immediate playback | Complete — native `<audio>` via Tauri asset protocol |
+| Smooth waveform rendering | Partial — works, but recomputed client-side each load, not cached |
+| Background indexing | Complete — real priority queue, atomic claiming, bounded retry, standing worker (ADR 0026) |
+| Lazy loading | **Complete (built)** — see Instant scrolling above |
+| Cache management | Partial — no waveform-peak disk cache, no offline preview cache; job/backup caching is otherwise solid |
+| Low RAM usage | Improved, not fully verified — DOM node count is now bounded regardless of row count; underlying data structures (e.g. `selected_indices` as an array) still scale with selection size, untested at very large selections |
+| 500k+ assets | Improved, not fully verified — the dominant risk (virtualization) is closed; the project's own ignored profiling test still only targets 100k, not 500k, and remains unverified in CI |
 
 ## 9. Design
 
+**Update:** light mode and the command palette were both built (see §0's follow-up note and §5/§6 above for the palette and Editor Workflow respectively).
+
 | Item | Status |
 |---|---|
-| Native typography | Complete | System font stack |
-| Apple-style hierarchy / Liquid Glass | Complete | Extensively rebuilt this session — foldable glass cards, floating rounded side panels |
-| Smooth animations | Complete | `motion` (Motion for React) is genuinely imported and used (`App.tsx:3`), not a dead dependency |
-| Waveform animation | Complete | Gradient fill + pulse animation on the active transport waveform |
-| Responsive layout | Partial | Collapsible panels work well; the shell assumes a desktop window (`min-width: 920px`) rather than fluid responsive breakpoints — reasonable for this product category, worth naming honestly |
-| Modern spacing | Complete | |
-| Keyboard-first workflow | Partial | Many real shortcuts (play/favorite/search-focus/import/export); arrow-row-nav, loop, in/out, quick-tag-by-number, speed are all missing |
-| Accessibility | Partial | Reduced motion + reduced transparency are real, persisted toggles. `aria-label` is used broadly (41 instances). High-contrast mode and a real accessibility audit are both **Missing/Not started**, matching the plan's own Milestone 7 caveat |
-| Dark Mode | Complete | |
-| Light Mode | **Missing** | Zero `prefers-color-scheme: light` or theme toggle anywhere. Worth naming plainly: the original spec calls for "dark-first but fully supports light mode" (§15.1) — that promise isn't kept. This matches this session's own explicit direction ("keep dark tones as standard"), so it may be a deliberate product choice rather than an oversight — flagging so it's a decision, not an accident |
+| Native typography | Complete — system font stack |
+| Apple-style hierarchy / Liquid Glass | Complete — extensively rebuilt this session — foldable glass cards, floating rounded side panels |
+| Smooth animations | Complete — `motion` (Motion for React) is genuinely imported and used (`App.tsx:3`), not a dead dependency |
+| Waveform animation | Complete — gradient fill + pulse animation on the active transport waveform |
+| Responsive layout | Partial — collapsible panels work well; the shell assumes a desktop window (`min-width: 920px`) rather than fluid responsive breakpoints — reasonable for this product category, worth naming honestly |
+| Modern spacing | Complete |
+| Keyboard-first workflow | Improved — play/favorite/search-focus/import/export/loop/copy-path/row-navigation/command-palette are all real; `1`–`9` quick-tags and `I`/`O` in/out marking remain unbuilt |
+| Accessibility | Partial — reduced motion + reduced transparency are real, persisted toggles. `aria-label` is used broadly. High-contrast mode and a real accessibility audit are both **Missing/Not started**, matching the plan's own Milestone 7 caveat |
+| Dark Mode | Complete |
+| Light Mode | **Complete (built).** CSS custom properties (`--text-primary`, `--bg-app`, `--surface-*`) with a `:root[data-theme="light"]` override, using the provided Silver Mist / Flameburst Orange / Midnight Shadow palette. Dark remains the default per this session's own earlier direction — light and "match system" are new, real, persisted options (`ThemePreference` in `crates/preferences`), not a replacement |
 
 ## 10. Storage Architecture
 
@@ -182,34 +190,32 @@ The plan's architecture (local SQLite catalog, NAS/external for media only, no l
 
 ## 11. Missing Features — what I'd add myself
 
-Scoped to: improves editor workflow, reduces repetitive work, increases speed, improves organization, or differentiates. Ordered roughly cheapest/highest-leverage first, not by section:
+Scoped to: improves editor workflow, reduces repetitive work, increases speed, improves organization, or differentiates. Ordered roughly cheapest/highest-leverage first, not by section.
 
-1. **Copy file path + Reveal in Finder/Explorer.** The enabling plugin (`tauri-plugin-opener`) is already a dependency and already registered — this is a near-zero-effort, high-frequency-use feature that's currently just... not called.
-2. **Playback speed control.** The native `<audio>` element already supports `playbackRate` for free — no engine change needed. High value for reviewing long dialogue/ambience quickly.
-3. **Surface `vocal_ratio` beyond player color** — an inspector pill ("Vocal" / "Instrumental" / "Mixed") and a matching search filter. The hard part (real detection) is already done; this is pure UI wiring on data that already exists.
-4. **Rating + "Never used" smart filter.** Both are small, well-precedented additions (Favorites and Missing-Files filters already establish the pattern).
-5. **Arrow-key row navigation.** The single biggest gap relative to the stated "Artlist-like" browsing goal — the app currently cannot be driven top-to-bottom by keyboard at all, which directly contradicts Principle 4 ("keyboard use must be as complete as mouse use").
-6. **Command-palette frontend (Cmd/Ctrl+K).** The registry already exists and is tested (`command-palette` crate, ADR 0013) with exactly one trivial Tauri command consuming it (`default_command_titles`, `lib.rs:293-300`) and zero frontend usage. A real palette UI is most of a "professional tool" feel for comparatively little backend work.
-7. **Persisted waveform peak cache.** Removes a real, repeated client-side decode cost and is explicitly what §10.4 calls for.
-8. **Remaining §11.2 search filters** (source, license, date added, last used, times used, file format) — the underlying data already exists in every case; this is query/UI work, not new data collection.
-9. **Row virtualization.** Not optional if "large libraries" is a real commercial claim — this is the one item on this list I'd treat as a release blocker rather than a nice-to-have, given how many other "Not verified at scale" notes trace back to it.
-10. **OS-level drag-and-drop**, both directions (drop files onto the window to import; drag a row out to Finder/Explorer/an NLE). Larger effort (real HTML5/Tauri drag plumbing), but it's the one item repeatedly named as "first release priority" in the plan itself that never happened.
+**Built since this review:** copy file path + reveal in Finder/Explorer, arrow-key row navigation (turned out to already exist), a command-palette frontend, and row virtualization — items 1, 5, 6, and 9 from the original numbered list. What remains:
 
-Deliberately **not** recommending: instrument/ambience ML classifiers, a full 3-tier duplicate manager, light mode, or a writer-lease/multi-computer sync layer — all real spec items, but each is a substantial build with a smaller near-term payoff than the list above. They belong in a post-V1 roadmap, not this one.
+1. **Playback speed control.** The native `<audio>` element already supports `playbackRate` for free — no engine change needed. High value for reviewing long dialogue/ambience quickly.
+2. **Surface `vocal_ratio` beyond player color** — an inspector pill ("Vocal" / "Instrumental" / "Mixed") and a matching search filter. The hard part (real detection) is already done; this is pure UI wiring on data that already exists.
+3. **Rating + "Never used" smart filter.** Both are small, well-precedented additions (Favorites and Missing-Files filters already establish the pattern).
+4. **Persisted waveform peak cache.** Removes a real, repeated client-side decode cost and is explicitly what §10.4 calls for.
+5. **Remaining §11.2 search filters** (source, license, date added, last used, times used, file format) — the underlying data already exists in every case; this is query/UI work, not new data collection.
+6. **OS-level drag-and-drop for importing** (dropping files/folders onto the app window). Note this is distinct from dragging *out* to other apps, which was investigated and deliberately not built (§6) — the product owner confirmed the watched-folder + quick-export flow already covers that direction.
+
+Deliberately **not** recommending: instrument/ambience ML classifiers, a full 3-tier duplicate manager, or a writer-lease/multi-computer sync layer — all real spec items, but each is a substantial build with a smaller near-term payoff than the list above. They belong in a post-V1 roadmap, not this one.
 
 ---
 
 ## UX Improvements
 
-- Keyboard-drive the browser (arrow keys) before anything else in this category — every other keyboard shortcut in the app is undermined by not being able to move through the list without a mouse.
-- Add the copy-path/reveal pair to the transport and/or a row context menu — cheap, and closes the single biggest gap in "get this sound into my editor" flow.
+- ~~Keyboard-drive the browser (arrow keys)~~ — already worked; corrected in this review, not built.
+- ~~Add the copy-path/reveal pair to the transport and/or a row context menu~~ — **built**, in the new Editor Workflow panel.
 - Show `last_played` and a "Never used" state in the sidebar — the data already exists and is currently invisible.
 - Consider a lightweight per-asset Notes field in the inspector — spec'd, zero-cost relative to the rest of this list, and directly useful for the "why did I keep this" problem the whole product exists to solve.
 
 ## Technical Improvements
 
-- Persist waveform peaks to disk instead of recomputing per load (§10.4) — the highest-value performance fix that doesn't require virtualization.
-- Add row virtualization to the browser — the current honest "Not yet virtualized" label is doing its job; it's time to close it.
+- Persist waveform peaks to disk instead of recomputing per load (§10.4) — the highest-value remaining performance fix.
+- ~~Add row virtualization to the browser~~ — **built.**
 - Wire a real background reconnect poll for NAS availability rather than relying on on-demand validation.
 - Run the existing `#[ignore]`d 100k-asset search-profiling test in CI on a schedule (not every push) so "search stays fast at scale" stops being an assumption.
 
@@ -217,7 +223,7 @@ Deliberately **not** recommending: instrument/ambience ML classifiers, a full 3-
 
 - Solve ONNX Runtime + `similarity-worker` sidecar bundling together as one Milestone-7 packaging task before `bundle.active` flips to `true` — both need the same kind of `bundle.resources`/`externalBin` treatment and are cheaper to solve as one pass than two.
 - Continuously maintain the portable library manifest beside the media (§9.3) instead of building it on demand, and wire the already-built, already-tested writer-lease functions to it — this is the real remaining piece of the "multi-computer/NAS" story, not a documentation gap.
-- Decide deliberately on light mode: either commit to it (real spec requirement, §15.1) or formally amend the spec to "dark-only," so it stops being a silent gap.
+- ~~Decide deliberately on light mode~~ — **decided and built**: dark stays the default, light and system are real options.
 
 ## Priority Order for Implementation
 
@@ -225,23 +231,21 @@ Deliberately **not** recommending: instrument/ambience ML classifiers, a full 3-
 1. Push this branch and check the `windows-latest` CI run — first real signal on whether `ort`/`voice_activity_detector` builds on Windows at all.
 2. Build a Windows-triple `similarity-worker` sidecar (`scripts/build-similarity-worker-sidecar.sh`, run on the Windows machine itself) before the first `tauri dev`/`tauri build` there — without it, Tauri won't even launch.
 
-**P1 — cheap, high-value:**
-3. Copy file path + Reveal in Finder/Explorer.
-4. Playback speed control.
-5. Surface `vocal_ratio` as an inspector value + filter.
-6. Rating field + Never-used filter.
+**Built since this review (formerly P1/P2/P3 items 3, 7, 8, 11):** copy file path + reveal in Finder/Explorer, arrow-key row navigation (already existed), command-palette frontend, and row virtualization.
 
-**P2 — moderate effort, core spec fidelity:**
-7. Arrow-key row navigation.
-8. Command-palette frontend.
-9. Remaining §11.2 search filters.
-10. Persisted waveform peak cache.
+**P1 — cheap, high-value, still open:**
+3. Playback speed control.
+4. Surface `vocal_ratio` as an inspector value + filter.
+5. Rating field + Never-used filter.
 
-**P3 — larger infrastructure:**
-11. Row virtualization.
-12. OS-level drag-and-drop (both directions).
-13. Offline preview cache.
-14. Continuously-maintained portable manifest + writer-lease wiring.
+**P2 — moderate effort, core spec fidelity, still open:**
+6. Remaining §11.2 search filters.
+7. Persisted waveform peak cache.
+
+**P3 — larger infrastructure, still open:**
+8. OS-level drag-and-drop for *importing* (dropping files onto the window) — exporting via drag was deliberately descoped, see §6.
+9. Offline preview cache.
+10. Continuously-maintained portable manifest + writer-lease wiring.
 
 **P4 — release readiness (deliberately last, matches the project's own stated posture):**
 15. Real accessibility/performance/crash-recovery audits, code signing/notarization, auto-update, a considered light-mode decision, platform-specific (Windows) design pass.
@@ -259,4 +263,4 @@ Specific to "try the application on a Windows machine" being next:
 1. **Push to `origin/main`** (done as part of this review) and watch the `windows-latest` job in `ci.yml` — it runs `cargo test --workspace`, which is the first time the new `ort`/`voice_activity_detector` dependency will be built on Windows at all.
 2. **On the Windows machine, before the first `tauri dev`/`tauri build`:** install Rust + run `scripts/build-similarity-worker-sidecar.sh` to produce the Windows-triple `similarity-worker` binary Tauri's `externalBin` config requires — without this, the desktop shell won't build/launch, independent of anything else in this report.
 3. Expect **no crash** if the ONNX runtime fails to load on Windows — `detect_vocal_ratio` degrades to `None` and the player falls back to tag-only mood coloring (verified by code reading, see §0). If vocal-based coloring silently never appears on Windows, that confirms the ONNX runtime didn't load — check the CI run from step 1 first.
-4. Everything else audited in this review (missing drag-and-drop, no virtualization, etc.) is platform-agnostic — expect the same gaps on Windows as on macOS, not new ones, apart from the two build-time items above.
+4. Everything else audited in this review (e.g. deliberately-descoped OS-level drag-out) is platform-agnostic — expect the same gaps on Windows as on macOS, not new ones, apart from the two build-time items above.
