@@ -466,6 +466,7 @@ export function App() {
   const [looping, setLooping] = useState(false);
   const [peaks, setPeaks] = useState<number[] | null>(null);
   const peakRequestId = useRef(0);
+  const vocalRatioRequestId = useRef(0);
 
   const selectedAsset = assets.find((asset) => asset.id === selectedAssetId) ?? null;
   const selectedAssetIds = useMemo(() => {
@@ -752,9 +753,14 @@ export function App() {
       return;
     }
     refreshAssetTags(selectedAssetId);
+    const requestId = ++vocalRatioRequestId.current;
     invoke<number | null>("asset_vocal_ratio", { assetId: selectedAssetId })
-      .then(setVocalRatio)
-      .catch(() => setVocalRatio(null));
+      .then((ratio) => {
+        if (vocalRatioRequestId.current === requestId) setVocalRatio(ratio);
+      })
+      .catch(() => {
+        if (vocalRatioRequestId.current === requestId) setVocalRatio(null);
+      });
   }, [selectedAssetId, refreshAssetTags]);
 
   const loadAssetForPlayback = useCallback(async (asset: AssetRecord, autoplay: boolean) => {
