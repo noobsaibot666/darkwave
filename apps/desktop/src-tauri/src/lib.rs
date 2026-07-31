@@ -282,7 +282,12 @@ fn search_commands(query: String) -> Vec<command_palette::PaletteCommand> {
     command_palette::CommandRegistry::default_audio_workspace().search(&query)
 }
 
-#[tauri::command]
+// (async): iterates every asset in the library plus a duplicate-content
+// scan. A plain sync command runs on Tauri's main thread by default and
+// would block the whole UI for however long that takes — this used to
+// also run one extra query per asset (see asset_ids_with_source_record's
+// doc comment), which made it materially worse on every app launch.
+#[tauri::command(async)]
 fn maintenance_report(
     state: tauri::State<CatalogState>,
     library_id: String,
@@ -292,6 +297,9 @@ fn maintenance_report(
     let assets = catalog
         .list_assets(library_id)
         .map_err(storage_error_message)?;
+    let has_source_record = catalog
+        .asset_ids_with_source_record(library_id)
+        .map_err(storage_error_message)?;
 
     let mut findings = Vec::new();
 
@@ -300,11 +308,7 @@ fn maintenance_report(
             findings.push(maintenance::MaintenanceFinding::missing_media(asset.id));
         }
 
-        let has_license_context = catalog
-            .get_source_record(asset.id)
-            .map_err(storage_error_message)?
-            .is_some();
-        if !has_license_context {
+        if !has_source_record.contains(&asset.id) {
             findings.push(maintenance::MaintenanceFinding::license_review_required(
                 asset.id,
             ));
@@ -427,7 +431,11 @@ fn backup_restore_requirements() -> Vec<&'static str> {
     vec!["catalog_snapshot", "portable_manifest", "media_root"]
 }
 
-#[tauri::command]
+// (async): probes the media root path with a filesystem existence check,
+// which for a NAS/SMB path is a network round-trip, not a fast local
+// call — a plain sync command would block the main thread for however
+// long that takes, on every app launch.
+#[tauri::command(async)]
 fn media_root_status(
     state: tauri::State<CatalogState>,
     library_id: String,
@@ -634,7 +642,13 @@ fn delete_library(
     Ok(())
 }
 
-#[tauri::command]
+// (async): a plain sync command runs on Tauri's main thread by default,
+// and this one (like search_assets/search_assets_advanced below) fires on
+// every app launch and every keystroke in the search box — fine at a
+// desktop-library scale, but there's no reason to let a large enough
+// result set risk stalling the UI when running it off the main thread
+// costs nothing.
+#[tauri::command(async)]
 fn list_assets(
     state: tauri::State<CatalogState>,
     library_id: String,
@@ -646,7 +660,7 @@ fn list_assets(
         .map_err(storage_error_message)
 }
 
-#[tauri::command]
+#[tauri::command(async)]
 fn search_assets(
     state: tauri::State<CatalogState>,
     library_id: String,
@@ -706,7 +720,7 @@ fn build_search_query(filters: AssetSearchFilters) -> Result<storage::AssetSearc
     })
 }
 
-#[tauri::command]
+#[tauri::command(async)]
 fn search_assets_advanced(
     state: tauri::State<CatalogState>,
     library_id: String,
@@ -884,7 +898,11 @@ fn collect_audio_files(root: &std::path::Path) -> std::io::Result<Vec<PathBuf>> 
 /// into a watched NAS folder outside the app) and imports them as referenced assets.
 /// Registration is naturally idempotent: `register_asset` matches on content hash and
 /// file size, so files already cataloged are returned unchanged rather than duplicated.
-#[tauri::command]
+// (async): walks the entire media root directory tree and hashes every
+// new file — a plain sync command would run this on the main thread and
+// block the UI (the "sync button" freeze) for however long that scan
+// takes, which grows with library size and NAS latency.
+#[tauri::command(async)]
 fn refresh_library(
     state: tauri::State<CatalogState>,
     library_id: String,
@@ -1044,7 +1062,13 @@ fn cached_file_path(cache_dir: &std::path::Path, asset: &AssetRecord) -> PathBuf
 /// asset listing holds the catalog mutex; the actual file copies (the slow, network-bound
 /// part) happen after it's released, for the same reason `refresh_library` locks per file
 /// rather than for the whole operation.
-#[tauri::command]
+// (async): this runs unconditionally on every app launch (see the
+// activeLibraryId effect in App.tsx) and does a filesystem existence
+// check plus a possible file copy per asset — a plain sync command would
+// run all of that on the main thread, which is exactly what was making
+// the app appear to "resync everything and freeze" on every launch,
+// worse on Windows/SMB where each check is a real network round-trip.
+#[tauri::command(async)]
 fn warm_library_cache(app: tauri::AppHandle, state: tauri::State<CatalogState>, library_id: String) -> Result<usize, String> {
     let library_id = parse_uuid_field(&library_id, "library id")?;
     let (assets, media_root) = {
@@ -1123,7 +1147,10 @@ fn mark_waveform_ready(state: tauri::State<CatalogState>, asset_id: String) -> R
         .map_err(storage_error_message)
 }
 
-#[tauri::command]
+// (async): reads embedded metadata from each pending asset's file (ADR
+// 0021) — real file I/O, run on every app launch and every background
+// tick, so it shouldn't be on the main thread by default.
+#[tauri::command(async)]
 fn process_pending_jobs(state: tauri::State<CatalogState>) -> Result<usize, String> {
     let catalog = state.0.lock().expect("catalog mutex poisoned");
     let jobs = catalog

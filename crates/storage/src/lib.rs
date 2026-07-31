@@ -1553,6 +1553,34 @@ impl Catalog {
             .map_err(StorageError::from)
     }
 
+    /// Which of this library's assets already have a source/license record
+    /// — one query instead of `get_source_record` called once per asset.
+    /// Backs `maintenance_report`'s license-review-needed check, which used
+    /// to run a separate query per asset (an N+1 pattern that, held under
+    /// the same catalog mutex every other command needs, was a real
+    /// contributor to a multi-second stall on every app launch for
+    /// anything but a small library).
+    pub fn asset_ids_with_source_record(
+        &self,
+        library_id: Uuid,
+    ) -> Result<std::collections::HashSet<Uuid>, StorageError> {
+        let mut statement = self.connection.prepare(
+            "SELECT source_records.asset_id
+             FROM source_records
+             INNER JOIN assets ON assets.id = source_records.asset_id
+             WHERE assets.library_id = ?1",
+        )?;
+        let ids = statement
+            .query_map(params![library_id.to_string()], |row| {
+                row.get::<_, String>(0)
+            })?
+            .map(|result| result.map(|id| parse_uuid(id)))
+            .collect::<Result<std::collections::HashSet<_>, _>>()
+            .map_err(StorageError::from)?;
+
+        Ok(ids)
+    }
+
     pub fn move_asset_to_trash(
         &self,
         asset_id: Uuid,
@@ -3428,6 +3456,58 @@ mod tests {
         let asset = test_asset(&catalog, library.id, "no-source.wav", "hash-no-source");
 
         assert_eq!(catalog.get_source_record(asset.id).expect("query"), None);
+    }
+
+    #[test]
+    fn asset_ids_with_source_record_matches_per_asset_lookups_and_stays_library_scoped() {
+        let catalog_path = unique_catalog_path("source-ids-batch");
+        let catalog = Catalog::open(&catalog_path).expect("open catalog");
+        let library = catalog
+            .create_library("Batch", "/library")
+            .expect("library");
+        let other_library = catalog
+            .create_library("Other", "/other")
+            .expect("other library");
+
+        let with_source = test_asset(&catalog, library.id, "licensed.wav", "hash-batch-licensed");
+        let without_source = test_asset(&catalog, library.id, "unlicensed.wav", "hash-batch-unlicensed");
+        let other_with_source = test_asset(&catalog, other_library.id, "other.wav", "hash-batch-other");
+
+        catalog
+            .set_source_record(SourceRecordDraft {
+                asset_id: with_source.id,
+                provider: Some("Boom Library".to_string()),
+                source_url: None,
+                license_type: None,
+                license_status: None,
+                attribution: None,
+                restrictions: None,
+                receipt_path: None,
+            })
+            .expect("source");
+        catalog
+            .set_source_record(SourceRecordDraft {
+                asset_id: other_with_source.id,
+                provider: Some("Boom Library".to_string()),
+                source_url: None,
+                license_type: None,
+                license_status: None,
+                attribution: None,
+                restrictions: None,
+                receipt_path: None,
+            })
+            .expect("source");
+
+        let ids = catalog
+            .asset_ids_with_source_record(library.id)
+            .expect("batch query");
+
+        assert!(ids.contains(&with_source.id));
+        assert!(!ids.contains(&without_source.id));
+        assert!(
+            !ids.contains(&other_with_source.id),
+            "must stay scoped to the requested library"
+        );
     }
 
     #[test]
