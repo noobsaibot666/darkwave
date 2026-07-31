@@ -336,6 +336,30 @@ function formatMediaRootStatus(status: string | undefined): string {
   }
 }
 
+// Kind-specific copy for a finished batch — what actually happened, in
+// plain language, rather than a generic "N processed" that doesn't say
+// what the work even was or what to do about failures.
+function describeJobCompletion(summary: JobCompletionSummary): { headline: string; detail: string | null } {
+  const noun = summary.kind === "audio_analysis" ? "sound" : "file";
+  const headline =
+    summary.completed > 0
+      ? `Finished ${summary.kind === "audio_analysis" ? "analyzing" : "reading"} ${summary.completed} ${noun}${summary.completed === 1 ? "" : "s"}`
+      : "Finished";
+  if (summary.failed === 0) {
+    return {
+      headline,
+      detail:
+        summary.kind === "audio_analysis"
+          ? "Tempo, key, and vocal detection are ready — filter for them anytime under Sonic Radar."
+          : null
+    };
+  }
+  return {
+    headline,
+    detail: `${summary.failed} couldn't be read — retried automatically, up to 3 attempts each.`
+  };
+}
+
 const activeBarTrailLength = 10;
 
 async function computePeaks(path: string, bucketCount = 200): Promise<number[] | null> {
@@ -393,7 +417,8 @@ const smartFilters: { id: ActiveFilter; label: string }[] = [
   { id: "ambience", label: "Ambience" }
 ];
 
-type JobProgress = { kind: string; label: string; pending: number; total: number };
+type JobProgress = { kind: string; label: string; pending: number; total: number; failed: number };
+type JobCompletionSummary = { kind: string; label: string; completed: number; failed: number };
 
 const JOB_KINDS: { command: "process_pending_jobs" | "process_audio_analysis_jobs"; kind: string; label: string }[] = [
   { command: "process_pending_jobs", kind: "metadata_extraction", label: "Reading metadata" },
@@ -659,6 +684,7 @@ export function App() {
   const [formatFilter, setFormatFilter] = useState<AudioFormat | null>(null);
   const [similarStatus, setSimilarStatus] = useState<string | null>(null);
   const [jobProgress, setJobProgress] = useState<JobProgress[]>([]);
+  const [jobCompletionSummaries, setJobCompletionSummaries] = useState<Record<string, JobCompletionSummary>>({});
   const [audioAnalysisPaused, setAudioAnalysisPaused] = useState(false);
   const [backgroundActivityOpen, setBackgroundActivityOpen] = useState(false);
   const drainingJobKinds = useRef<Set<string>>(new Set());
@@ -832,12 +858,17 @@ export function App() {
     (libraryId: string, only?: string[]) => {
       const configs = only ? JOB_KINDS.filter((config) => only.includes(config.kind)) : JOB_KINDS;
 
-      invoke<{ kind: string; pending: number }[]>("job_status", { libraryId })
+      type JobStatus = { kind: string; pending: number; failed: number; completed: number };
+
+      invoke<JobStatus[]>("job_status", { libraryId })
         .then((statuses) => {
-          const pendingByKind = new Map(statuses.map((entry) => [entry.kind, entry.pending]));
+          const statusByKind = new Map(statuses.map((entry) => [entry.kind, entry]));
 
           configs.forEach((config) => {
-            const startPending = pendingByKind.get(config.kind) ?? 0;
+            const status = statusByKind.get(config.kind);
+            const startPending = status?.pending ?? 0;
+            const failedBefore = status?.failed ?? 0;
+            const completedBefore = status?.completed ?? 0;
             // A prior drain for this same kind (e.g. from the last
             // background-tick) may still be mid-flight — importing a large
             // batch of files can easily take longer than the ~20s tick
@@ -851,8 +882,14 @@ export function App() {
 
             setJobProgress((previous) => [
               ...previous.filter((entry) => entry.kind !== config.kind),
-              { kind: config.kind, label: config.label, pending: startPending, total: startPending }
+              { kind: config.kind, label: config.label, pending: startPending, total: startPending, failed: 0 }
             ]);
+            setJobCompletionSummaries((previous) => {
+              if (!(config.kind in previous)) return previous;
+              const next = { ...previous };
+              delete next[config.kind];
+              return next;
+            });
 
             (async () => {
               let remaining = startPending;
@@ -867,6 +904,21 @@ export function App() {
               setJobProgress((previous) => previous.filter((entry) => entry.kind !== config.kind));
               drainingJobKinds.current.delete(config.kind);
               refreshAssets(libraryId, searchQuery, activeFilter);
+
+              // Ground-truth diff against the DB (not the locally-tracked
+              // counters above) for the "what actually happened" summary —
+              // simpler and more trustworthy than reconciling React state
+              // timing with the per-job progress events.
+              const finalStatuses = await invoke<JobStatus[]>("job_status", { libraryId }).catch(() => []);
+              const finalStatus = finalStatuses.find((entry) => entry.kind === config.kind);
+              if (!finalStatus) return;
+              const completedDelta = Math.max(0, finalStatus.completed - completedBefore);
+              const failedDelta = Math.max(0, finalStatus.failed - failedBefore);
+              if (completedDelta === 0 && failedDelta === 0) return;
+              setJobCompletionSummaries((previous) => ({
+                ...previous,
+                [config.kind]: { kind: config.kind, label: config.label, completed: completedDelta, failed: failedDelta }
+              }));
             })();
           });
         })
@@ -1818,10 +1870,16 @@ export function App() {
   // work happening. This event (emitted per job, not per batch) is what
   // lets it move continuously instead.
   useEffect(() => {
-    const unlistenAnalysisProgress = listen("audio-analysis-progress", () => {
+    const unlistenAnalysisProgress = listen<{ succeeded: boolean }>("audio-analysis-progress", (event) => {
       setJobProgress((previous) =>
         previous.map((entry) =>
-          entry.kind === "audio_analysis" ? { ...entry, pending: Math.max(0, entry.pending - 1) } : entry
+          entry.kind === "audio_analysis"
+            ? {
+                ...entry,
+                pending: Math.max(0, entry.pending - 1),
+                failed: event.payload.succeeded ? entry.failed : entry.failed + 1
+              }
+            : entry
         )
       );
     });
@@ -3702,10 +3760,11 @@ export function App() {
                 <X size={16} />
               </button>
             </div>
-            {jobProgress.length === 0 && !refreshStatus && !audioAnalysisPaused ? (
-              <p className="empty-hint">
-                All caught up — nothing analyzing, importing, or scanning right now.
-              </p>
+            {jobProgress.length === 0 &&
+            !refreshStatus &&
+            !audioAnalysisPaused &&
+            Object.keys(jobCompletionSummaries).length === 0 ? (
+              <p className="empty-hint activity-empty-hint">All caught up — nothing running right now.</p>
             ) : (
               <div className="job-progress-panel" aria-label="Background work">
                 {refreshStatus ? (
@@ -3733,6 +3792,7 @@ export function App() {
                           <span className="job-progress-label">{job.label}</span>
                           <span className="job-progress-count">
                             {job.total - job.pending}/{job.total} · {percent}%
+                            {job.failed > 0 ? <span className="job-progress-failed"> · {job.failed} failed</span> : null}
                           </span>
                         </div>
                         <div className="job-progress-track">
@@ -3775,11 +3835,26 @@ export function App() {
                     </button>
                   </div>
                 ) : null}
+                {Object.values(jobCompletionSummaries).map((summary) => {
+                  const { headline, detail } = describeJobCompletion(summary);
+                  return (
+                    <div className={summary.failed > 0 ? "job-progress-row job-progress-done warning" : "job-progress-row job-progress-done"} key={summary.kind}>
+                      <span className="job-progress-icon">
+                        {summary.failed > 0 ? <FileWarning size={15} /> : <ShieldCheck size={15} />}
+                      </span>
+                      <div className="job-progress-body">
+                        <div className="job-progress-head">
+                          <span className="job-progress-label">{headline}</span>
+                        </div>
+                        {detail ? <div className="status-line">{detail}</div> : null}
+                      </div>
+                    </div>
+                  );
+                })}
               </div>
             )}
-            <p className="settings-hint">
-              Analysis (metadata, waveform, tempo, key, vocal detection) always runs in the background, one file at a
-              time, so browsing and playback stay responsive while it works.
+            <p className="settings-hint activity-footnote">
+              Analysis runs in the background, one file at a time — browsing and playback stay responsive.
             </p>
           </motion.div>
         </motion.div>

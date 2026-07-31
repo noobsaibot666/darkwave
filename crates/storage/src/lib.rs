@@ -131,6 +131,13 @@ pub struct JobRecord {
     pub priority: i64,
 }
 
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub struct JobStateCounts {
+    pub pending: usize,
+    pub failed: usize,
+    pub completed: usize,
+}
+
 #[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
 pub enum TagOrigin {
     Filename,
@@ -942,6 +949,41 @@ impl Catalog {
         )?;
 
         Ok(count as usize)
+    }
+
+    /// pending/failed/completed counts for one library + kind in a single
+    /// query — used for the Background Activity panel, which needs all
+    /// three (pending to know whether to start a drain, failed/completed to
+    /// report a real "what happened" summary once one finishes, not just
+    /// silently clear the progress bar).
+    pub fn job_state_counts_for_library(
+        &self,
+        library_id: Uuid,
+        kind: JobKind,
+    ) -> Result<JobStateCounts, StorageError> {
+        let mut statement = self.connection.prepare(
+            "SELECT background_jobs.state, COUNT(*) FROM background_jobs
+             INNER JOIN assets ON assets.id = background_jobs.asset_id
+             WHERE assets.library_id = ?1 AND background_jobs.kind = ?2
+             GROUP BY background_jobs.state",
+        )?;
+        let rows = statement
+            .query_map(params![library_id.to_string(), job_kind_to_db(&kind)], |row| {
+                Ok((row.get::<_, String>(0)?, row.get::<_, i64>(1)?))
+            })?
+            .collect::<Result<Vec<_>, _>>()?;
+
+        let mut counts = JobStateCounts::default();
+        for (state, count) in rows {
+            let count = count as usize;
+            match state.as_str() {
+                "pending" => counts.pending = count,
+                "failed" => counts.failed = count,
+                "completed" => counts.completed = count,
+                _ => {}
+            }
+        }
+        Ok(counts)
     }
 
     pub fn list_collections(
@@ -2487,6 +2529,36 @@ mod tests {
                 .expect("count"),
             0
         );
+    }
+
+    #[test]
+    fn job_state_counts_for_library_splits_pending_failed_and_completed() {
+        let catalog_path = unique_catalog_path("job-state-counts");
+        let catalog = Catalog::open(&catalog_path).expect("open catalog");
+        let library = catalog.create_library("Counts", "/counts").expect("library");
+        let pending_asset = test_asset(&catalog, library.id, "pending.wav", "hash-counts-pending");
+        let failed_asset = test_asset(&catalog, library.id, "failed.wav", "hash-counts-failed");
+        let done_asset = test_asset(&catalog, library.id, "done.wav", "hash-counts-done");
+
+        catalog
+            .enqueue_job(pending_asset.id, JobKind::AudioAnalysis, 40)
+            .expect("enqueue pending");
+        let failed_job = catalog
+            .enqueue_job(failed_asset.id, JobKind::AudioAnalysis, 40)
+            .expect("enqueue failed");
+        catalog.fail_job(failed_job.id).expect("fail job");
+        let done_job = catalog
+            .enqueue_job(done_asset.id, JobKind::AudioAnalysis, 40)
+            .expect("enqueue done");
+        catalog.complete_job(done_job.id).expect("complete job");
+
+        let counts = catalog
+            .job_state_counts_for_library(library.id, JobKind::AudioAnalysis)
+            .expect("job state counts");
+
+        assert_eq!(counts.pending, 1);
+        assert_eq!(counts.failed, 1);
+        assert_eq!(counts.completed, 1);
     }
 
     #[test]

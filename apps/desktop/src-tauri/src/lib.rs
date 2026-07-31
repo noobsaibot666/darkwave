@@ -1257,13 +1257,17 @@ fn process_pending_jobs(state: tauri::State<CatalogState>) -> Result<usize, Stri
 struct JobStatusEntry {
     kind: String,
     pending: usize,
+    failed: usize,
+    completed: usize,
 }
 
-/// Library-scoped pending counts for the two job kinds the frontend can
-/// actually drive to completion (`process_pending_jobs`,
+/// Library-scoped pending/failed/completed counts for the two job kinds the
+/// frontend can actually drive to completion (`process_pending_jobs`,
 /// `process_audio_analysis_jobs`). WaveformGeneration is deliberately
 /// excluded — it completes per-asset when the frontend previews a sound,
 /// not via any batch command, so there's no queue to report progress on.
+/// failed/completed exist so a finished batch can report what actually
+/// happened (and how many failed) instead of just disappearing silently.
 #[tauri::command]
 fn job_status(
     state: tauri::State<CatalogState>,
@@ -1279,14 +1283,21 @@ fn job_status(
     .into_iter()
     .map(|(kind, label)| {
         catalog
-            .pending_job_count_for_library(library_id, kind)
-            .map(|pending| JobStatusEntry {
+            .job_state_counts_for_library(library_id, kind)
+            .map(|counts| JobStatusEntry {
                 kind: label.to_string(),
-                pending,
+                pending: counts.pending,
+                failed: counts.failed,
+                completed: counts.completed,
             })
             .map_err(storage_error_message)
     })
     .collect()
+}
+
+#[derive(Clone, Copy, serde::Serialize)]
+struct AudioAnalysisProgressEvent {
+    succeeded: bool,
 }
 
 /// Real, content-based needs-review detection, best-effort action-tag
@@ -1350,7 +1361,7 @@ async fn process_audio_analysis_jobs(
             let catalog = state.0.lock().expect("catalog mutex poisoned");
             catalog.fail_job(job.id).map_err(storage_error_message)?;
             processed += 1;
-            let _ = app.emit("audio-analysis-progress", ());
+            let _ = app.emit("audio-analysis-progress", AudioAnalysisProgressEvent { succeeded: false });
             continue;
         };
 
@@ -1361,20 +1372,23 @@ async fn process_audio_analysis_jobs(
         // Referenced/NAS assets not yet warmed into the local cache: leave
         // the job pending rather than failing it, so a later warm+retry can
         // pick it up (mirrors how playback already treats an uncached path).
+        // Reported as "succeeded" to the UI since this isn't a real failure
+        // — reset_stuck_processing_jobs makes it claimable again next round.
         let Ok(local_path) = local_path else {
             processed += 1;
-            let _ = app.emit("audio-analysis-progress", ());
+            let _ = app.emit("audio-analysis-progress", AudioAnalysisProgressEvent { succeeded: true });
             continue;
         };
         if !std::path::Path::new(&local_path).exists() {
             processed += 1;
-            let _ = app.emit("audio-analysis-progress", ());
+            let _ = app.emit("audio-analysis-progress", AudioAnalysisProgressEvent { succeeded: true });
             continue;
         }
 
         let outcome = analyze_asset_audio(&app, &local_path).await;
 
         let catalog = state.0.lock().expect("catalog mutex poisoned");
+        let succeeded = outcome.is_ok();
         match outcome {
             Ok(outcome) => {
                 catalog
@@ -1406,7 +1420,7 @@ async fn process_audio_analysis_jobs(
             }
         }
         processed += 1;
-        let _ = app.emit("audio-analysis-progress", ());
+        let _ = app.emit("audio-analysis-progress", AudioAnalysisProgressEvent { succeeded });
     }
 
     Ok(processed)

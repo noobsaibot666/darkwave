@@ -711,6 +711,45 @@ button.panel-handle-right:active:not(:disabled) {
   font-variant-numeric: tabular-nums;
 }
 
+.job-progress-failed {
+  color: #f59e0b;
+}
+
+/* A finished batch's summary row — same shape as an in-progress row, but
+   a quieter background (no pulse, nothing left to show progress on) and a
+   warning tint when something in the batch failed. */
+.job-progress-done {
+  background: rgba(52, 211, 153, 0.08);
+}
+
+.job-progress-done .job-progress-icon {
+  background: rgba(52, 211, 153, 0.16);
+  color: #34d399;
+}
+
+.job-progress-done.warning {
+  background: rgba(245, 158, 11, 0.08);
+}
+
+.job-progress-done.warning .job-progress-icon {
+  background: rgba(245, 158, 11, 0.18);
+  color: #f59e0b;
+}
+
+/* Background Activity's own copy reads small next to everything else in
+   the modal (empty state, footer) — bumped up and given room to breathe,
+   scoped to this modal only. */
+.activity-modal .empty-hint.activity-empty-hint {
+  padding: 10px 2px 4px;
+  font-size: 14px;
+}
+
+.activity-modal .settings-hint.activity-footnote {
+  margin-top: 14px;
+  font-size: 13px;
+  line-height: 1.5;
+}
+
 .search {
   display: flex;
   flex: 1;
