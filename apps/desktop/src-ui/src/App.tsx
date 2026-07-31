@@ -2,6 +2,8 @@ import { convertFileSrc, invoke } from "@tauri-apps/api/core";
 import { listen } from "@tauri-apps/api/event";
 import { AnimatePresence, motion } from "motion/react";
 import { open as openDialog, save as saveDialog, confirm as confirmDialog } from "@tauri-apps/plugin-dialog";
+import { revealItemInDir } from "@tauri-apps/plugin-opener";
+import { writeText as writeClipboardText } from "@tauri-apps/plugin-clipboard-manager";
 import {
   Bell,
   ChevronDown,
@@ -9,6 +11,8 @@ import {
   ChevronRight,
   Clapperboard,
   Contrast,
+  Copy,
+  FolderOpen,
   Gauge,
   Import,
   Link2,
@@ -28,6 +32,7 @@ import {
   SlidersHorizontal,
   Star,
   Volume2,
+  Workflow,
   X,
   Zap
 } from "lucide-react";
@@ -325,6 +330,12 @@ const playerMoodTheme: Record<PlayerMood, { from: string; to: string; glow: stri
 // frames on a transient shouldn't flip a whole SFX into "has voice").
 const VOCAL_RATIO_THRESHOLD = 0.15;
 
+// Cosmetic only (labels, shortcut glyphs). Every actual keyboard/modifier
+// check in this file uses `event.metaKey || event.ctrlKey` so behavior is
+// correct on both platforms regardless of what this detects.
+const isMacPlatform = typeof navigator !== "undefined" && /Mac|iPhone|iPad/.test(navigator.userAgent);
+const modKeyLabel = isMacPlatform ? "⌘" : "Ctrl";
+
 function classifyPlayerMood(asset: AssetRecord | null, tags: TagRecord[], vocalRatio: number | null): PlayerMood | null {
   if (!asset) return null;
   const names = tags.map((tag) => tag.name.toLowerCase());
@@ -438,6 +449,8 @@ export function App() {
   const [newProjectExportPath, setNewProjectExportPath] = useState("");
   const [lastExportProjectId, setLastExportProjectId] = useState<string | null>(null);
   const [drExportStatus, setDrExportStatus] = useState<string | null>(null);
+  const [editorWorkflowOpen, setEditorWorkflowOpen] = useState(false);
+  const [editorActionStatus, setEditorActionStatus] = useState<string | null>(null);
 
   const [undoStack, setUndoStack] = useState<{ id: string; label: string }[]>([]);
   const [redoStack, setRedoStack] = useState<{ id: string; label: string }[]>([]);
@@ -1018,6 +1031,25 @@ export function App() {
     },
     []
   );
+
+  const handleRevealAssets = useCallback((assetIds: string[]) => {
+    if (assetIds.length === 0) return;
+    setEditorActionStatus(assetIds.length === 1 ? "Revealing…" : `Revealing ${assetIds.length} sounds…`);
+    Promise.all(assetIds.map((assetId) => invoke<string>("asset_playback_path", { assetId })))
+      .then((paths) => revealItemInDir(paths.length === 1 ? paths[0] : paths))
+      .then(() => setEditorActionStatus(`Revealed in ${isMacPlatform ? "Finder" : "Explorer"}`))
+      .catch((error) => setEditorActionStatus(`Reveal failed: ${String(error)}`));
+  }, []);
+
+  const handleCopyAssetPaths = useCallback((assetIds: string[]) => {
+    if (assetIds.length === 0) return;
+    Promise.all(assetIds.map((assetId) => invoke<string>("asset_playback_path", { assetId })))
+      .then((paths) => writeClipboardText(paths.join("\n")))
+      .then(() =>
+        setEditorActionStatus(assetIds.length === 1 ? "Copied file path" : `Copied ${assetIds.length} file paths`)
+      )
+      .catch((error) => setEditorActionStatus(`Copy failed: ${String(error)}`));
+  }, []);
 
   const handleCreateSmartCollection = useCallback(() => {
     if (!activeLibraryId || !smartCollectionName.trim()) return;
@@ -1614,6 +1646,20 @@ export function App() {
               ))}
             </select>
           ) : null}
+          <button
+            type="button"
+            className={editorWorkflowOpen ? "editor-workflow-trigger active" : "editor-workflow-trigger"}
+            onClick={() => setEditorWorkflowOpen((previous) => !previous)}
+            aria-pressed={editorWorkflowOpen}
+          >
+            <span className="editor-workflow-trigger-icon">
+              <Workflow size={15} />
+            </span>
+            <span className="editor-workflow-trigger-copy">
+              <strong>Editor Workflow</strong>
+              <small>Send, reveal, copy</small>
+            </span>
+          </button>
           {smartFilters.map((filter) => (
             <div key={filter.label}>
               <button
@@ -1979,6 +2025,140 @@ export function App() {
             })
           )}
         </section>
+        <AnimatePresence>
+          {editorWorkflowOpen ? (
+            <motion.section
+              className="editor-workflow"
+              aria-label="Editor workflow"
+              initial={{ opacity: 0, y: 18, scale: 0.98 }}
+              animate={{ opacity: 1, y: 0, scale: 1 }}
+              exit={{ opacity: 0, y: 18, scale: 0.98 }}
+              transition={{ duration: 0.28, ease: [0.4, 0, 0.2, 1] }}
+            >
+              <div className="editor-workflow-head">
+                <div className="editor-workflow-heading">
+                  <span className="editor-workflow-heading-icon">
+                    <Workflow size={17} />
+                  </span>
+                  <div>
+                    <h1>Editor Workflow</h1>
+                    <p>
+                      {bulkAssetIds.length === 0
+                        ? "Select a sound to send it into your edit"
+                        : bulkAssetIds.length === 1
+                        ? (selectedAsset?.display_name ?? "1 sound selected")
+                        : `${bulkAssetIds.length} sounds selected`}
+                    </p>
+                  </div>
+                </div>
+                <button
+                  type="button"
+                  className="icon-button"
+                  aria-label="Close editor workflow"
+                  onClick={() => setEditorWorkflowOpen(false)}
+                >
+                  <X size={16} />
+                </button>
+              </div>
+
+              <div className="editor-workflow-hero" aria-hidden="true">
+                <svg viewBox="0 0 640 148" className="editor-workflow-flow" preserveAspectRatio="xMidYMid meet">
+                  <defs>
+                    <linearGradient id="editorFlowGradient" x1="0" y1="0" x2="1" y2="0">
+                      <stop offset="0%" stopColor="var(--player-accent-from, #ff7940)" />
+                      <stop offset="100%" stopColor="var(--player-accent-to, #f14800)" />
+                    </linearGradient>
+                  </defs>
+                  <line x1="96" y1="74" x2="544" y2="74" className="ew-flow-track" />
+                  <motion.line
+                    x1="96"
+                    y1="74"
+                    x2="544"
+                    y2="74"
+                    className="ew-flow-dash"
+                    strokeDasharray="2 16"
+                    animate={{ strokeDashoffset: [0, -36] }}
+                    transition={{ repeat: Infinity, duration: 1.1, ease: "linear" }}
+                  />
+                  <g className="ew-node ew-node-source">
+                    <circle cx="60" cy="74" r="32" />
+                    <path d="M48 66 v16 M56 60 v28 M64 64 v20 M72 68 v12" className="ew-node-glyph" />
+                  </g>
+                  <g className="ew-node ew-node-project">
+                    <circle cx="320" cy="74" r="24" />
+                    <path d="M309 66h22v18h-22z M309 66l4-6h14l4 6" className="ew-node-glyph" />
+                  </g>
+                  <g className="ew-node ew-node-dest">
+                    <circle cx="580" cy="74" r="32" />
+                    <path d="M572 74 L588 63 M572 74 L588 85" className="ew-node-glyph" />
+                    <circle cx="571" cy="74" r="3.4" className="ew-node-glyph-dot" />
+                    <circle cx="589" cy="62" r="3.4" className="ew-node-glyph-dot" />
+                    <circle cx="589" cy="86" r="3.4" className="ew-node-glyph-dot" />
+                  </g>
+                </svg>
+              </div>
+
+              <div className="editor-workflow-actions">
+                <button
+                  type="button"
+                  className="editor-action-button"
+                  disabled={bulkAssetIds.length === 0}
+                  onClick={() => handleRevealAssets(bulkAssetIds)}
+                >
+                  <FolderOpen size={16} />
+                  Reveal in {isMacPlatform ? "Finder" : "Explorer"}
+                </button>
+                <button
+                  type="button"
+                  className="editor-action-button"
+                  disabled={bulkAssetIds.length === 0}
+                  onClick={() => handleCopyAssetPaths(bulkAssetIds)}
+                >
+                  <Copy size={16} />
+                  Copy File Path
+                  <kbd>{modKeyLabel}⇧C</kbd>
+                </button>
+              </div>
+
+              {editorActionStatus ? <div className="editor-workflow-status">{editorActionStatus}</div> : null}
+
+              <div className="editor-workflow-projects">
+                <h2>Send to project</h2>
+                {collections.filter((project) => project.collection_type === "Project").length === 0 ? (
+                  <p className="editor-workflow-empty">
+                    Create a project with an export folder to send sounds straight into it.
+                  </p>
+                ) : (
+                  <div className="editor-project-list">
+                    {collections
+                      .filter((project) => project.collection_type === "Project")
+                      .map((project) => (
+                        <div className="editor-project-card" key={project.id}>
+                          <span className="editor-project-thumb">
+                            <Music size={14} />
+                          </span>
+                          <div className="editor-project-meta">
+                            <strong>{project.name}</strong>
+                            <small>{project.export_path ?? "No export folder set"}</small>
+                          </div>
+                          <button
+                            type="button"
+                            className={project.export_path ? "dr-button" : "dr-button disabled"}
+                            disabled={!project.export_path || bulkAssetIds.length === 0}
+                            aria-label={`Send selected to ${project.name}`}
+                            onClick={() => handleExportToProject(project, bulkAssetIds)}
+                          >
+                            <Clapperboard size={15} />
+                            Send
+                          </button>
+                        </div>
+                      ))}
+                  </div>
+                )}
+              </div>
+            </motion.section>
+          ) : null}
+        </AnimatePresence>
       </section>
       <aside className={inspectorCollapsed ? "inspector collapsed" : "inspector"} aria-label="Inspector">
         <div className="panel-body">

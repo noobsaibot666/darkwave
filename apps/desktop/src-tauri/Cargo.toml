@@ -34,6 +34,7 @@ uuid.workspace = true
 viewport = { path = "../../../crates/viewport" }
 workspace-state = { path = "../../../crates/workspace-state" }
 tauri = { version = "2", features = ["protocol-asset"] }
+tauri-plugin-clipboard-manager = "2"
 tauri-plugin-dialog = "2"
 tauri-plugin-fs = "2"
 tauri-plugin-opener = "2"
