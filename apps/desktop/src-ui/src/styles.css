@@ -365,6 +365,7 @@ button.panel-handle-right:active:not(:disabled) {
 .workspace {
   display: flex;
   min-width: 0;
+  min-height: 0;
   flex-direction: column;
 }
 
@@ -578,7 +579,9 @@ button:disabled,
 }
 
 .browser {
+  flex: 1;
   min-width: 0;
+  min-height: 0;
   padding: 0 18px 96px;
   overflow: auto;
   scrollbar-width: thin;
