@@ -15,7 +15,6 @@ pub enum CommandId {
     ToggleFavorite,
     CommandPalette,
     Import,
-    FocusSearch,
     ExportSelected,
     ToggleLoop,
     CopyPath,
@@ -144,10 +143,6 @@ impl ShortcutMap {
                 ShortcutBinding {
                     command: CommandId::Import,
                     accelerator: "Mod+I".to_string(),
-                },
-                ShortcutBinding {
-                    command: CommandId::FocusSearch,
-                    accelerator: "Mod+F".to_string(),
                 },
                 ShortcutBinding {
                     command: CommandId::ExportSelected,

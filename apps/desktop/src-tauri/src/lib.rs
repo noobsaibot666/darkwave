@@ -2233,14 +2233,14 @@ mod tests {
     }
 
     #[test]
-    fn search_commands_include_import_and_search_first_for_empty_query() {
+    fn search_commands_include_import_and_apply_tag_first_for_empty_query() {
         let results = super::search_commands(String::new());
         assert_eq!(
             results[0..2]
                 .iter()
                 .map(|command| command.title.clone())
                 .collect::<Vec<_>>(),
-            ["Import Folder".to_string(), "Focus Search".to_string()]
+            ["Import Folder".to_string(), "Apply Tag".to_string()]
         );
     }
 

@@ -3,7 +3,6 @@ use serde::{Deserialize, Serialize};
 #[derive(Clone, Copy, Debug, Eq, Ord, PartialEq, PartialOrd, Serialize, Deserialize)]
 pub enum CommandId {
     Import,
-    Search,
     ApplyTag,
     AddToCollection,
     Export,
@@ -36,12 +35,6 @@ impl CommandRegistry {
                     "Import Folder",
                     "Import",
                     &["files", "folder", "add"],
-                ),
-                command(
-                    CommandId::Search,
-                    "Focus Search",
-                    "Search",
-                    &["find", "filter", "tag"],
                 ),
                 command(
                     CommandId::ApplyTag,
@@ -159,7 +152,6 @@ mod tests {
         let ids = registry.command_ids();
 
         assert!(ids.contains(&CommandId::Import));
-        assert!(ids.contains(&CommandId::Search));
         assert!(ids.contains(&CommandId::ApplyTag));
         assert!(ids.contains(&CommandId::AddToCollection));
         assert!(ids.contains(&CommandId::Export));
@@ -176,9 +168,6 @@ mod tests {
         let results = registry.search("tag");
 
         assert_eq!(results[0].id, CommandId::ApplyTag);
-        assert!(results
-            .iter()
-            .any(|command| command.id == CommandId::Search));
     }
 
     #[test]
@@ -187,6 +176,6 @@ mod tests {
         let results = registry.search("");
 
         assert_eq!(results[0].id, CommandId::Import);
-        assert_eq!(results[1].id, CommandId::Search);
+        assert_eq!(results[1].id, CommandId::ApplyTag);
     }
 }

@@ -148,7 +148,6 @@ type CollectionRecord = {
 
 type PaletteCommandId =
   | "Import"
-  | "Search"
   | "ApplyTag"
   | "AddToCollection"
   | "Export"
@@ -551,14 +550,6 @@ export function App() {
   const [libraryRoot, setLibraryRoot] = useState("");
   const [importStatus, setImportStatus] = useState<string | null>(null);
   const [activeFilter, setActiveFilter] = useState<ActiveFilter>("all");
-  const searchInputRef = useRef<HTMLInputElement | null>(null);
-  const focusSearch = useCallback(() => {
-    const input = searchInputRef.current;
-    if (!input) return;
-    input.scrollIntoView({ behavior: "smooth", inline: "nearest", block: "nearest" });
-    input.focus();
-    input.select();
-  }, []);
   const [sidebarCollapsed, setSidebarCollapsed] = useState(false);
   const [inspectorCollapsed, setInspectorCollapsed] = useState(false);
   const [settingsOpen, setSettingsOpen] = useState(false);
@@ -1613,9 +1604,6 @@ export function App() {
         case "Import":
           handleImportFolder();
           break;
-        case "Search":
-          focusSearch();
-          break;
         case "ApplyTag":
           document.getElementById("tags-section")?.scrollIntoView({ behavior: "smooth" });
           break;
@@ -1646,7 +1634,7 @@ export function App() {
           break;
       }
     },
-    [handleImportFolder, focusSearch, handleExportSelected, bulkAssetIds, handleRevealAssets, handleRefreshLibrary]
+    [handleImportFolder, handleExportSelected, bulkAssetIds, handleRevealAssets, handleRefreshLibrary]
   );
 
   const handleBulkFavorite = useCallback(() => {
@@ -1858,10 +1846,6 @@ export function App() {
         case "ToggleFavorite":
           if (selectedAsset) handleToggleFavorite(selectedAsset);
           break;
-        case "FocusSearch":
-          event.preventDefault();
-          focusSearch();
-          break;
         case "Import":
           event.preventDefault();
           handleImportFolder();
@@ -1896,7 +1880,6 @@ export function App() {
     loadAssetForPlayback,
     playRelative,
     handleToggleFavorite,
-    focusSearch,
     handleImportFolder,
     bulkAssetIds,
     handleCopyAssetPaths,
@@ -2335,9 +2318,6 @@ export function App() {
       </aside>
       <section className="workspace">
         <header className="topbar">
-          <button className="text-button" onClick={focusSearch}>
-            Focus Search
-          </button>
           <select
             aria-label="Export format"
             value={exportFormat}
@@ -2356,7 +2336,6 @@ export function App() {
           <label className="search">
             <Search size={16} />
             <input
-              ref={searchInputRef}
               placeholder="Search sounds, tags, source, license"
               value={searchQuery}
               onChange={(event) => setSearchQuery(event.target.value)}
