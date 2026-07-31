@@ -1455,7 +1455,7 @@ Acceptance:
 
 - **[Not verified]** Import 10,000 mixed audio files without UI lockup — no benchmark has been run at this scale.
 - **[Done]** Restart resumes incomplete jobs safely — the standing background worker (ADR 0026) ticks continuously once the app is running, draining any pending jobs left over from a prior session without requiring a new import to trigger it.
-- **[Done]** Duplicate import does not create unintended duplicate records — tested via content-hash lookup.
+- **[Done]** Duplicate import does not create unintended duplicate records — tested via content-hash lookup. A real gap alongside this was found and fixed: `register_asset` correctly returned the existing row for a duplicate, but the caller (`import_file_internal`) enqueued a fresh metadata/waveform/audio-analysis job trio and re-suggested tags regardless, so a rescan of a folder already in the catalog silently redid full decode+DSP+VAD analysis on every already-processed file. `register_asset` now reports whether the row was newly created, and none of that first-import-only work runs when it wasn't.
 
 ## Milestone 2 — Playback and waveform
 

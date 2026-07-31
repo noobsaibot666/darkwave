@@ -347,12 +347,22 @@ impl Catalog {
         Ok(())
     }
 
-    pub fn register_asset(&self, asset: NewAssetRecord) -> Result<AssetRecord, StorageError> {
+    /// Registers a new asset, or returns the existing one unchanged if its
+    /// content hash + size already match a row in this library — imports
+    /// are idempotent by content, not just by path. The `bool` tells the
+    /// caller which happened: `true` for a genuinely new row, `false` for
+    /// an existing match. Callers that enqueue analysis jobs or write
+    /// source/license metadata on import must check this — re-running
+    /// those for an asset that's already fully analyzed re-does real,
+    /// expensive work (decode + DSP + VAD) for nothing, and re-writing
+    /// source metadata over a user's existing edits is a data-loss bug,
+    /// not a no-op.
+    pub fn register_asset(&self, asset: NewAssetRecord) -> Result<(AssetRecord, bool), StorageError> {
         if let Some(content_hash) = &asset.content_hash {
             if let Some(existing) =
                 self.find_asset_by_hash(asset.library_id, content_hash, asset.file_size)?
             {
-                return Ok(existing);
+                return Ok((existing, false));
             }
         }
 
@@ -386,7 +396,7 @@ impl Catalog {
             ],
         )?;
         self.get_asset(id)
-            .map(|asset| asset.expect("inserted asset exists"))
+            .map(|asset| (asset.expect("inserted asset exists"), true))
     }
 
     pub fn list_assets(&self, library_id: Uuid) -> Result<Vec<AssetRecord>, StorageError> {
@@ -2285,13 +2295,13 @@ mod tests {
             availability_state: AvailabilityState::Local,
         };
 
-        let first_id = catalog
-            .register_asset(first.clone())
-            .expect("first import")
-            .id;
-        let duplicate_id = catalog.register_asset(first).expect("duplicate import").id;
+        let (first_asset, first_is_new) = catalog.register_asset(first.clone()).expect("first import");
+        let (duplicate_asset, duplicate_is_new) =
+            catalog.register_asset(first).expect("duplicate import");
 
-        assert_eq!(first_id, duplicate_id);
+        assert!(first_is_new);
+        assert!(!duplicate_is_new, "a content-hash duplicate must not report itself as new");
+        assert_eq!(first_asset.id, duplicate_asset.id);
         assert_eq!(catalog.list_assets(library.id).expect("assets").len(), 1);
     }
 
@@ -2300,7 +2310,7 @@ mod tests {
         let catalog_path = unique_catalog_path("jobs");
         let catalog = Catalog::open(&catalog_path).expect("open catalog");
         let library = catalog.create_library("Jobs", "/library").expect("library");
-        let asset = catalog
+        let (asset, _) = catalog
             .register_asset(NewAssetRecord {
                 library_id: library.id,
                 original_filename: "tone.wav".to_string(),
@@ -2780,6 +2790,7 @@ mod tests {
                 availability_state: AvailabilityState::Local,
             })
             .expect("asset")
+            .0
     }
 
     #[test]
@@ -2840,7 +2851,8 @@ mod tests {
                 file_size: 10,
                 availability_state: AvailabilityState::Local,
             })
-            .expect("asset");
+            .expect("asset")
+            .0;
         let untagged = test_asset(
             &catalog,
             library.id,

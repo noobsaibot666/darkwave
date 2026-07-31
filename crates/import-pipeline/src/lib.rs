@@ -296,7 +296,7 @@ fn import_file_internal(
         metadata.file_size,
     );
 
-    let asset = catalog.register_asset(NewAssetRecord {
+    let (asset, is_new) = catalog.register_asset(NewAssetRecord {
         library_id,
         original_filename,
         display_name,
@@ -308,27 +308,38 @@ fn import_file_internal(
         availability_state: AvailabilityState::Local,
     })?;
 
-    catalog.enqueue_job(asset.id, JobKind::MetadataExtraction, 10)?;
-    // No Hashing job: content_hash above is already a full-file SHA-256, not a partial
-    // sample, so there is no further hashing work for a background job to do.
-    catalog.enqueue_job(asset.id, JobKind::WaveformGeneration, 30)?;
-    catalog.enqueue_job(asset.id, JobKind::AudioAnalysis, 40)?;
-    suggest_import_tags(catalog, &asset, &tag_suggestions)?;
-    if let Some(source_context) = source_context {
-        catalog.set_source_record(SourceRecordDraft {
-            asset_id: asset.id,
-            provider: source_context.provider,
-            source_url: source_context.source_url,
-            license_type: source_context.license_type,
-            license_status: source_context.license_status,
-            attribution: source_context.attribution,
-            restrictions: source_context.restrictions,
-            receipt_path: source_context.receipt_path,
-        })?;
-    }
+    // register_asset is idempotent by content hash + size: a rescan that
+    // encounters a file already in the catalog (moved, re-scanned, seen by
+    // both the watched folder and a manual refresh, etc.) gets the
+    // existing row back, not a new one. Everything below this point is
+    // first-import-only work — enqueueing a fresh decode+DSP+VAD analysis
+    // pass, re-suggesting tags, or overwriting source/license metadata for
+    // an asset that's already fully processed would silently redo real,
+    // expensive work (and for source metadata, destroy any edits the user
+    // already made) on every rescan. Skip all of it for an existing asset.
+    if is_new {
+        catalog.enqueue_job(asset.id, JobKind::MetadataExtraction, 10)?;
+        // No Hashing job: content_hash above is already a full-file SHA-256, not a partial
+        // sample, so there is no further hashing work for a background job to do.
+        catalog.enqueue_job(asset.id, JobKind::WaveformGeneration, 30)?;
+        catalog.enqueue_job(asset.id, JobKind::AudioAnalysis, 40)?;
+        suggest_import_tags(catalog, &asset, &tag_suggestions)?;
+        if let Some(source_context) = source_context {
+            catalog.set_source_record(SourceRecordDraft {
+                asset_id: asset.id,
+                provider: source_context.provider,
+                source_url: source_context.source_url,
+                license_type: source_context.license_type,
+                license_status: source_context.license_status,
+                attribution: source_context.attribution,
+                restrictions: source_context.restrictions,
+                receipt_path: source_context.receipt_path,
+            })?;
+        }
 
-    if mode == ImportMode::Managed {
-        copy_managed_source(catalog, library_id, path, &asset)?;
+        if mode == ImportMode::Managed {
+            copy_managed_source(catalog, library_id, path, &asset)?;
+        }
     }
 
     Ok(asset)
@@ -642,6 +653,44 @@ mod tests {
         assert_eq!(imported.storage_mode, StorageMode::Referenced);
         assert_eq!(catalog.list_assets(library.id).expect("assets").len(), 1);
         assert!(catalog.next_pending_job().expect("job query").is_some());
+    }
+
+    #[test]
+    fn reimporting_the_same_file_does_not_reenqueue_analysis_jobs() {
+        // The exact bug reported in practice: a manual "refresh"/re-scan of
+        // a folder already in the catalog was re-running full decode + DSP
+        // + VAD analysis on files that were already fully processed,
+        // because register_asset correctly returned the existing asset for
+        // a content-hash match, but the caller enqueued a fresh round of
+        // jobs regardless of whether the asset was new or not.
+        let catalog_path = unique_catalog_path("reimport-no-reenqueue");
+        let audio_path = unique_audio_path("reimport-impact.wav");
+        fs::write(&audio_path, b"identical content on both scans").expect("fixture");
+
+        let catalog = Catalog::open(&catalog_path).expect("catalog");
+        let library = catalog
+            .create_library("Reimport", "/library")
+            .expect("library");
+
+        let first =
+            import_file(&catalog, library.id, &audio_path, ImportMode::Referenced).expect("first import");
+        let jobs_after_first = catalog
+            .pending_job_count(JobKind::AudioAnalysis)
+            .expect("job count");
+        assert_eq!(jobs_after_first, 1);
+
+        let second =
+            import_file(&catalog, library.id, &audio_path, ImportMode::Referenced).expect("second import");
+        let jobs_after_second = catalog
+            .pending_job_count(JobKind::AudioAnalysis)
+            .expect("job count");
+
+        assert_eq!(first.id, second.id, "same content must resolve to the same asset");
+        assert_eq!(
+            jobs_after_second, jobs_after_first,
+            "re-importing an already-known file must not enqueue a second analysis job"
+        );
+        assert_eq!(catalog.list_assets(library.id).expect("assets").len(), 1);
     }
 
     #[test]
