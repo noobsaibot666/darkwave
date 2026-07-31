@@ -1184,6 +1184,9 @@ async fn process_audio_analysis_jobs(
                 catalog
                     .set_audio_analysis(job.asset_id, outcome.update)
                     .map_err(storage_error_message)?;
+                catalog
+                    .set_vocal_ratio(job.asset_id, outcome.vocal_ratio.map(|ratio| ratio as f64))
+                    .map_err(storage_error_message)?;
 
                 if outcome.needs_review {
                     catalog
@@ -1215,6 +1218,7 @@ async fn process_audio_analysis_jobs(
 struct AudioAnalysisOutcome {
     needs_review: bool,
     suggested_tags: Vec<&'static str>,
+    vocal_ratio: Option<f32>,
     update: storage::AudioAnalysisUpdate,
 }
 
@@ -1230,6 +1234,7 @@ async fn analyze_asset_audio(app: &tauri::AppHandle, path: &str) -> Result<Audio
         .collect::<Vec<_>>();
     let tempo = audio_analysis::estimate_tempo(&buffer);
     let pitch = audio_analysis::estimate_pitch(&buffer);
+    let vocal_ratio = audio_analysis::detect_vocal_ratio(&buffer);
 
     let channels = buffer.channels.max(1) as u64;
     let duration_ms = if buffer.sample_rate > 0 {
@@ -1257,6 +1262,7 @@ async fn analyze_asset_audio(app: &tauri::AppHandle, path: &str) -> Result<Audio
     Ok(AudioAnalysisOutcome {
         needs_review,
         suggested_tags,
+        vocal_ratio,
         update,
     })
 }
@@ -1280,6 +1286,16 @@ async fn run_similarity_worker(app: &tauri::AppHandle, path: &str) -> Option<Str
         .get("analysis")
         .filter(|value| value.is_array())
         .map(|value| value.to_string())
+}
+
+/// Fetched on demand for the selected/playing asset (the player-color
+/// feature), not joined into asset list queries — `None` until the
+/// background audio-analysis job has run its Silero VAD pass on this asset.
+#[tauri::command]
+fn asset_vocal_ratio(state: tauri::State<CatalogState>, asset_id: String) -> Result<Option<f64>, String> {
+    let asset_id = parse_uuid_field(&asset_id, "asset id")?;
+    let catalog = state.0.lock().expect("catalog mutex poisoned");
+    catalog.get_vocal_ratio(asset_id).map_err(storage_error_message)
 }
 
 /// Loads every non-trashed asset in the library with a stored similarity
@@ -2018,6 +2034,7 @@ pub fn run() {
             process_pending_jobs,
             process_audio_analysis_jobs,
             job_status,
+            asset_vocal_ratio,
             similar_assets,
             mark_waveform_ready,
             trash_duplicate_group,

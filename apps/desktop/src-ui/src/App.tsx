@@ -320,12 +320,22 @@ const playerMoodTheme: Record<PlayerMood, { from: string; to: string; glow: stri
 // Derives a playback "mood" from the sound's applied tags (falling back to
 // media_type) — there's no dedicated speech/music classifier yet, so this
 // reuses the app's existing tagging system as the classification signal.
-function classifyPlayerMood(asset: AssetRecord | null, tags: TagRecord[]): PlayerMood | null {
+// Below this fraction of the clip detected as speech, treat it as noise in
+// the Silero VAD signal rather than a real vocal presence (a few misfired
+// frames on a transient shouldn't flip a whole SFX into "has voice").
+const VOCAL_RATIO_THRESHOLD = 0.15;
+
+function classifyPlayerMood(asset: AssetRecord | null, tags: TagRecord[], vocalRatio: number | null): PlayerMood | null {
   if (!asset) return null;
   const names = tags.map((tag) => tag.name.toLowerCase());
   const hasMusic = names.some((name) => name.includes("music")) || asset.media_type === "music";
-  const hasVoice = names.some((name) => name.includes("voice") || name.includes("dialogue"));
   const hasSfx = names.some((name) => name.includes("sound effect")) || asset.media_type === "sound_effect";
+  // Prefer the real Silero VAD measurement over the tag-based guess once
+  // the background analysis job has actually run on this asset.
+  const hasVoice =
+    vocalRatio != null
+      ? vocalRatio >= VOCAL_RATIO_THRESHOLD
+      : names.some((name) => name.includes("voice") || name.includes("dialogue"));
 
   if (hasMusic && hasVoice) return "soundtrack-voice";
   if (hasMusic) return "soundtrack";
@@ -419,6 +429,7 @@ export function App() {
   const [tags, setTags] = useState<TagRecord[]>([]);
   const [appliedTags, setAppliedTags] = useState<TagRecord[]>([]);
   const [suggestedTags, setSuggestedTags] = useState<TagRecord[]>([]);
+  const [vocalRatio, setVocalRatio] = useState<number | null>(null);
   const [newTagName, setNewTagName] = useState("");
   const [newTagFacet, setNewTagFacet] = useState("action");
 
@@ -737,9 +748,13 @@ export function App() {
       setAppliedTags([]);
       setSuggestedTags([]);
       setSourceDraft(null);
+      setVocalRatio(null);
       return;
     }
     refreshAssetTags(selectedAssetId);
+    invoke<number | null>("asset_vocal_ratio", { assetId: selectedAssetId })
+      .then(setVocalRatio)
+      .catch(() => setVocalRatio(null));
   }, [selectedAssetId, refreshAssetTags]);
 
   const loadAssetForPlayback = useCallback(async (asset: AssetRecord, autoplay: boolean) => {
@@ -1532,7 +1547,7 @@ export function App() {
   const waveformActiveIndex = peaks && duration > 0 ? Math.floor((currentTime / duration) * peaks.length) : -1;
   const drTargetAssetId = playingAssetId ?? selectedAssetId;
   const drTargetProject = collections.find((project) => project.id === lastExportProjectId) ?? null;
-  const playerMood = classifyPlayerMood(selectedAsset, appliedTags);
+  const playerMood = classifyPlayerMood(selectedAsset, appliedTags, vocalRatio);
   const playerMoodStyle = playerMood
     ? ({
         "--player-accent-from": playerMoodTheme[playerMood].from,

@@ -1008,6 +1008,32 @@ impl Catalog {
         Ok(())
     }
 
+    /// Fraction (0.0-1.0) of the clip the audio-analysis job's Silero VAD
+    /// pass classified as speech. Set once per asset by
+    /// `process_audio_analysis_jobs`; `None` until that job has run.
+    pub fn set_vocal_ratio(&self, asset_id: Uuid, vocal_ratio: Option<f64>) -> Result<(), StorageError> {
+        self.connection.execute(
+            "UPDATE assets SET vocal_ratio = ?1 WHERE id = ?2",
+            params![vocal_ratio, asset_id.to_string()],
+        )?;
+        Ok(())
+    }
+
+    /// Fetched on demand for one asset at a time (the selected/playing
+    /// sound), rather than joined into every asset list query — nothing
+    /// outside the player-color feature needs it yet.
+    pub fn get_vocal_ratio(&self, asset_id: Uuid) -> Result<Option<f64>, StorageError> {
+        self.connection
+            .query_row(
+                "SELECT vocal_ratio FROM assets WHERE id = ?1",
+                params![asset_id.to_string()],
+                |row| row.get(0),
+            )
+            .optional()
+            .map(Option::flatten)
+            .map_err(StorageError::from)
+    }
+
     pub fn search_assets(
         &self,
         library_id: Uuid,
@@ -1780,6 +1806,7 @@ impl Catalog {
         // that already exists from an earlier app version, so new columns on
         // existing tables need an explicit, idempotent ADD COLUMN step.
         self.ensure_column("collections", "export_path", "TEXT")?;
+        self.ensure_column("assets", "vocal_ratio", "REAL")?;
 
         Ok(())
     }
@@ -3071,6 +3098,22 @@ mod tests {
             collections.iter().map(|c| c.id).collect::<Vec<_>>(),
             vec![project.id]
         );
+    }
+
+    #[test]
+    fn vocal_ratio_defaults_to_none_and_can_be_set() {
+        let catalog_path = unique_catalog_path("vocal-ratio");
+        let catalog = Catalog::open(&catalog_path).expect("open catalog");
+        let library = catalog.create_library("One", "/library").expect("library");
+        let asset = test_asset(&catalog, library.id, "vo-take-3.wav", "hash-vocal-ratio");
+
+        assert_eq!(catalog.get_vocal_ratio(asset.id).expect("get"), None);
+
+        catalog
+            .set_vocal_ratio(asset.id, Some(0.82))
+            .expect("set vocal ratio");
+
+        assert_eq!(catalog.get_vocal_ratio(asset.id).expect("get"), Some(0.82));
     }
 
     #[test]

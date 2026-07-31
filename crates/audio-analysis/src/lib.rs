@@ -233,6 +233,77 @@ pub fn estimate_pitch(buffer: &DecodedAudioBuffer) -> Option<PitchEstimate> {
     })
 }
 
+const VAD_SAMPLE_RATE: u32 = 16_000;
+const VAD_CHUNK_SIZE: usize = 512;
+const VAD_SPEECH_PROBABILITY_THRESHOLD: f32 = 0.5;
+const MIN_SECONDS_FOR_VOCAL_DETECTION: f32 = 1.0;
+
+/// Fraction of the clip Silero VAD classifies as speech (0.0-1.0), or `None`
+/// for clips too short to meaningfully sample, or if the model fails to
+/// load. Silero only accepts 8kHz or 16kHz mono input, so this downmixes and
+/// resamples a copy of the buffer first — the original is untouched.
+pub fn detect_vocal_ratio(buffer: &DecodedAudioBuffer) -> Option<f32> {
+    let mono = mono_samples(buffer);
+    let duration_secs = mono.len() as f32 / buffer.sample_rate.max(1) as f32;
+    if duration_secs < MIN_SECONDS_FOR_VOCAL_DETECTION {
+        return None;
+    }
+
+    let resampled = resample_linear(&mono, buffer.sample_rate.max(1), VAD_SAMPLE_RATE);
+    if resampled.len() < VAD_CHUNK_SIZE {
+        return None;
+    }
+
+    let mut vad = voice_activity_detector::VoiceActivityDetector::builder()
+        .sample_rate(VAD_SAMPLE_RATE)
+        .chunk_size(VAD_CHUNK_SIZE)
+        .build()
+        .ok()?;
+
+    let mut speech_chunks = 0usize;
+    let mut total_chunks = 0usize;
+    for chunk in resampled.chunks(VAD_CHUNK_SIZE) {
+        // Drop a trailing partial chunk rather than padding it with silence,
+        // which would bias it toward "non-speech".
+        if chunk.len() < VAD_CHUNK_SIZE {
+            break;
+        }
+        let probability = vad.predict(chunk.to_vec());
+        total_chunks += 1;
+        if probability > VAD_SPEECH_PROBABILITY_THRESHOLD {
+            speech_chunks += 1;
+        }
+    }
+
+    if total_chunks == 0 {
+        return None;
+    }
+
+    Some(speech_chunks as f32 / total_chunks as f32)
+}
+
+/// Simple linear-interpolation resampler. Not audiophile-grade, but that's
+/// not the goal — it just needs to hand the VAD model a representative
+/// 16kHz signal, not produce audio for playback.
+fn resample_linear(input: &[f32], from_rate: u32, to_rate: u32) -> Vec<f32> {
+    if from_rate == to_rate || input.is_empty() {
+        return input.to_vec();
+    }
+
+    let ratio = from_rate as f64 / to_rate as f64;
+    let output_len = (input.len() as f64 / ratio).floor() as usize;
+    (0..output_len)
+        .map(|i| {
+            let position = i as f64 * ratio;
+            let index = position.floor() as usize;
+            let frac = (position - index as f64) as f32;
+            let a = input[index.min(input.len() - 1)];
+            let b = input[(index + 1).min(input.len() - 1)];
+            a + (b - a) * frac
+        })
+        .collect()
+}
+
 fn note_name_for_frequency(frequency_hz: f32) -> String {
     const NOTE_NAMES: [&str; 12] = [
         "C", "C#", "D", "D#", "E", "F", "F#", "G", "G#", "A", "A#", "B",
@@ -458,6 +529,42 @@ mod tests {
         let buffer = sine_wave(440.0, 0.2, 44_100, 0.8);
 
         assert_eq!(estimate_tempo(&buffer), None);
+    }
+
+    #[test]
+    fn resample_linear_preserves_a_constant_signal() {
+        let input = vec![0.5f32; 44_100];
+
+        let resampled = resample_linear(&input, 44_100, 16_000);
+
+        assert!((resampled.len() as i64 - 16_000).abs() <= 1);
+        assert!(resampled.iter().all(|sample| (sample - 0.5).abs() < 1e-6));
+    }
+
+    #[test]
+    fn resample_linear_is_a_no_op_when_rates_match() {
+        let input = vec![0.1, 0.2, 0.3];
+
+        assert_eq!(resample_linear(&input, 16_000, 16_000), input);
+    }
+
+    #[test]
+    fn too_short_clip_has_no_vocal_ratio() {
+        let buffer = sine_wave(220.0, 0.3, 44_100, 0.8);
+
+        assert_eq!(detect_vocal_ratio(&buffer), None);
+    }
+
+    #[test]
+    fn pure_tone_scores_low_vocal_ratio() {
+        // Silero VAD is trained on real speech; a steady sine tone is a
+        // reasonable negative control even without a real speech sample to
+        // hand — it should not be mistaken for a voice.
+        let buffer = sine_wave(220.0, 3.0, 44_100, 0.6);
+
+        let ratio = detect_vocal_ratio(&buffer).expect("long enough for a vocal ratio");
+
+        assert!(ratio < 0.2, "expected a low vocal ratio for a pure tone, got {ratio}");
     }
 
     #[test]
