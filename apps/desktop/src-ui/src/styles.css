@@ -191,10 +191,15 @@ button.panel-handle-right:active:not(:disabled) {
 }
 
 .sidebar .section-toggle {
-  width: 18px;
-  height: 18px;
+  width: 24px;
+  height: 24px;
   background: transparent;
   color: #8a7d6d;
+}
+
+.sidebar .section-toggle svg {
+  width: 16px;
+  height: 16px;
 }
 
 .sidebar .section-toggle:hover {
