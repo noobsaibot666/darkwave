@@ -1260,6 +1260,7 @@ h2 {
 
 .maintenance-row {
   display: flex;
+  flex-wrap: wrap;
   align-items: center;
   gap: 8px;
   min-height: 40px;
@@ -1268,6 +1269,11 @@ h2 {
   background: rgba(var(--ink-rgb), 0.05);
   color: var(--text-tertiary);
   font-size: 12px;
+}
+
+.maintenance-row .text-button {
+  flex: 0 0 auto;
+  margin-left: auto;
 }
 
 .maintenance-row > span:first-child {
@@ -1699,7 +1705,7 @@ dd {
 .settings-modal {
   display: flex;
   flex-direction: column;
-  width: 640px;
+  width: 720px;
   height: 78vh;
   max-height: 640px;
   padding: 0;
@@ -2211,8 +2217,13 @@ dd {
   gap: 8px;
 }
 
+/* flex-wrap so the action buttons drop to their own line instead of
+   forcing the row wider than .settings-content — three text buttons next
+   to a name/path is more than a narrow settings column can hold on one
+   line without the last button (Delete) getting cropped off the edge. */
 .library-admin-row {
   display: flex;
+  flex-wrap: wrap;
   align-items: center;
   gap: 10px;
   padding: 10px 12px;
@@ -2234,8 +2245,8 @@ dd {
 
 .library-admin-meta {
   display: flex;
-  flex: 1;
-  min-width: 0;
+  flex: 1 1 140px;
+  min-width: 140px;
   flex-direction: column;
   gap: 1px;
 }
@@ -2257,6 +2268,7 @@ dd {
   display: flex;
   flex: 0 0 auto;
   gap: 6px;
+  margin-left: auto;
 }
 
 .text-button.danger {
