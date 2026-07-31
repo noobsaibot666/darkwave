@@ -21,3 +21,16 @@ Ideas that come up while working on V1 but don't belong in it — either too lar
 - **No decision made on which to use** — that's a real product/legal call (accuracy vs. bundle size vs. licensing cost/friction) for whenever this gets prioritized, not something to resolve speculatively now.
 
 Sources: [Musical-Instrument-Classification-ONNX](https://huggingface.co/onnx-community/Musical-Instrument-Classification-ONNX) · [Essentia models](https://essentia.upf.edu/models.html) · [ort](https://ort.pyke.io/) · [tract](https://github.com/sonos/tract)
+
+## Extract audio from video files
+
+**What it would do:** Let a video file (a client's rough cut, a reference clip, a screen recording) be imported like any other source, pulling out just its audio track as a real catalog asset instead of requiring the user to already have a separate audio file.
+
+**Why it's not in V1:** Nobody's asked for it until now, and it touches the import pipeline's assumptions about what a "source" is (currently always an audio file).
+
+**Quick scoping (2026-07-31), not full research — this one leans on infrastructure already in the codebase rather than needing new dependencies:**
+
+- **The decode side is mostly already here.** `SymphoniaDecoder` (`crates/audio-metadata`) already demuxes containers to raw PCM for every other format. Symphonia 0.5.5 — the exact version already pinned — ships an `mkv` container feature (covers Matroska *and* WebM) alongside the `isomp4` feature already enabled (covers MP4/MOV, since they're the same underlying container family). Getting MP4/MOV/MKV/WebM audio-track demuxing would mostly mean turning on one more Cargo feature, not adopting a new dependency like `ffmpeg`. Real AVI wouldn't be covered — Symphonia doesn't have a format crate for it.
+- **The encode side already exists too.** `export-pipeline` already renders decoded PCM to 24-bit WAV files (see Exporting docs) — the exact step needed to turn an extracted audio stream into a real, storable asset.
+- **The one real gap:** `SymphoniaDecoder::decode_packaged_audio` currently picks the *first track with a non-null codec* — fine when every source is audio-only, wrong for a video file where that could just as easily be the video track. Needs to specifically select an audio-typed track, which Symphonia's track metadata supports but this codebase doesn't check for yet.
+- **Open product question, not resolved here:** does importing a video keep a reference to the original video file anywhere (for context / re-extraction later), or does it disappear once the audio's pulled out? Affects storage_mode and the asset's provenance story.
