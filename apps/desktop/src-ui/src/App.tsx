@@ -1578,7 +1578,7 @@ export function App() {
       <button
         type="button"
         className="panel-handle panel-handle-left"
-        style={{ left: sidebarCollapsed ? "8px" : "232px" }}
+        style={{ left: sidebarCollapsed ? "8px" : "260px" }}
         aria-label={sidebarCollapsed ? "Show library panel" : "Hide library panel"}
         onClick={() => setSidebarCollapsed((previous) => !previous)}
       >

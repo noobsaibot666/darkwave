@@ -51,7 +51,7 @@ input:focus-visible {
 .shell {
   position: relative;
   display: grid;
-  grid-template-columns: 232px minmax(460px, 1fr) 312px;
+  grid-template-columns: 260px minmax(460px, 1fr) 312px;
   grid-template-rows: 1fr;
   height: 100vh;
   background: #15130f;
@@ -63,7 +63,7 @@ input:focus-visible {
 }
 
 .shell.inspector-collapsed {
-  grid-template-columns: 232px minmax(460px, 1fr) 0px;
+  grid-template-columns: 260px minmax(460px, 1fr) 0px;
 }
 
 .shell.sidebar-collapsed.inspector-collapsed {
@@ -114,27 +114,36 @@ button.panel-handle-right:active:not(:disabled) {
 .inspector {
   display: flex;
   flex-direction: column;
+  margin: 10px 0;
   padding: 18px 16px;
   overflow: hidden;
-  border-color: rgba(243, 240, 231, 0.08);
+  border: 1px solid rgba(243, 240, 231, 0.08);
   background: rgba(26, 26, 26, 0.72);
   backdrop-filter: blur(24px) saturate(1);
-  transition: padding 320ms var(--ease-soft), border-width 320ms var(--ease-soft);
+  box-shadow: 0 12px 28px rgba(0, 0, 0, 0.24);
+  transition: padding 320ms var(--ease-soft), margin 320ms var(--ease-soft), border-width 320ms var(--ease-soft);
 }
 
+/* Floating panels: only the corners facing the canvas are rounded, so each
+   panel still hugs its corner of the window on the outer edge. */
 .sidebar {
-  border-right: 1px solid rgba(243, 240, 231, 0.08);
+  border-top-right-radius: var(--radius-lg);
+  border-bottom-right-radius: var(--radius-lg);
 }
 
 .inspector {
-  border-left: 1px solid rgba(243, 240, 231, 0.08);
+  border-top-left-radius: var(--radius-lg);
+  border-bottom-left-radius: var(--radius-lg);
 }
 
 .sidebar.collapsed,
 .inspector.collapsed {
+  margin: 0;
   padding-left: 0;
   padding-right: 0;
   border-width: 0;
+  border-radius: 0;
+  box-shadow: none;
 }
 
 .panel-body {
@@ -213,7 +222,7 @@ button.panel-handle-right:active:not(:disabled) {
   border: 0;
   border-radius: var(--radius-sm);
   background: transparent;
-  color: #b3a291;
+  color: #f3f0e7;
   font-size: 12px;
   text-align: left;
   text-overflow: ellipsis;
@@ -1204,7 +1213,7 @@ dd {
   position: fixed;
   right: 330px;
   bottom: 16px;
-  left: 250px;
+  left: 278px;
   display: grid;
   grid-template-columns: 34px 40px 34px 34px minmax(160px, 1fr) 84px auto auto;
   gap: 12px;
