@@ -599,6 +599,15 @@ fn empty_library_trash(state: tauri::State<CatalogState>, library_id: String) ->
         .map_err(storage_error_message)
 }
 
+/// Counts returned to the UI so "library deleted" can say what it actually
+/// cleaned up (cache files off disk, trash rows cascaded away) instead of
+/// just confirming the library itself is gone.
+#[derive(serde::Serialize)]
+struct DeleteLibraryResult {
+    cache_files_removed: usize,
+    trash_items_cleared: usize,
+}
+
 /// Deletes a library and everything the catalog knows about it (assets,
 /// tags applied to them, collections, jobs, trash records — see
 /// `storage::Catalog::delete_library` for the cascade). Deliberately never
@@ -607,21 +616,33 @@ fn empty_library_trash(state: tauri::State<CatalogState>, library_id: String) ->
 /// only Darkwave's own record of it. Also cleans up this library's own
 /// cache files (now orphaned) and clears the watched-folder preference if
 /// it pointed at the library being removed.
-#[tauri::command]
+// (async): real file I/O over every asset in the library plus a DB cascade
+// — see list_assets/warm_library_cache above for why sync commands doing
+// this kind of work can't run on Tauri's main thread.
+#[tauri::command(async)]
 fn delete_library(
     app: tauri::AppHandle,
     state: tauri::State<CatalogState>,
     library_id: String,
-) -> Result<(), String> {
+) -> Result<DeleteLibraryResult, String> {
     let library_id = parse_uuid_field(&library_id, "library id")?;
 
-    let assets = {
+    let (assets, trash_items_cleared) = {
         let catalog = state.0.lock().expect("catalog mutex poisoned");
-        catalog.list_assets(library_id).map_err(storage_error_message)?
+        let assets = catalog.list_assets(library_id).map_err(storage_error_message)?;
+        let trash_items = catalog
+            .list_trash_items(library_id)
+            .map_err(storage_error_message)?;
+        (assets, trash_items.len())
     };
+
+    let mut cache_files_removed = 0usize;
     if let Ok(cache_dir) = preview_cache_dir(&app) {
         for asset in &assets {
-            let _ = std::fs::remove_file(cached_file_path(&cache_dir, asset));
+            let cache_path = cached_file_path(&cache_dir, asset);
+            if cache_path.exists() && std::fs::remove_file(&cache_path).is_ok() {
+                cache_files_removed += 1;
+            }
         }
     }
 
@@ -639,7 +660,10 @@ fn delete_library(
         }
     }
 
-    Ok(())
+    Ok(DeleteLibraryResult {
+        cache_files_removed,
+        trash_items_cleared,
+    })
 }
 
 // (async): a plain sync command runs on Tauri's main thread by default,

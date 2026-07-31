@@ -43,6 +43,8 @@ A dedicated panel, opened from its own button in the topbar (before Export Selec
 
 A "+" button next to the library switcher at the top of the sidebar opens the same New Library dialog used on first run, so adding a second (or third) library doesn't require deleting the first one. Settings → General → Manage Libraries has its own **New Library** shortcut too, alongside every existing library's **Clean Cache**, **Empty Trash**, and **Delete** actions. All three only ever touch Darkwave's own catalog records (cached preview copies, trash entries, or the whole catalog row) — the audio files at a library's media root are never read, moved, or deleted by any of them. Deleting the active library also clears its assets, trash, and maintenance findings from the current view immediately, rather than leaving stale data on screen until something else happens to trigger a refresh.
 
+Delete already cascades to every trash record and removes the library's cached preview files as part of the same action — the confirmation message reports exactly how many of each were cleared, so "delete" doesn't leave orphaned cache or trash data behind without saying so.
+
 ## Background Activity
 
 A small activity icon next to Refresh Library lights up (a pulsing LED) whenever metadata extraction, audio analysis, or a library sync is actually running, and stays dim otherwise. Clicking it opens a panel with each running task's own progress bar and a plain-language note on why the app stays responsive while it works — background analysis runs off the main thread by design, so it never has to freeze the window to make progress.

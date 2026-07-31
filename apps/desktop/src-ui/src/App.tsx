@@ -101,6 +101,11 @@ type ImportFolderResult = {
   failed: ImportFailure[];
 };
 
+type DeleteLibraryResult = {
+  cache_files_removed: number;
+  trash_items_cleared: number;
+};
+
 type TagRecord = {
   id: string;
   name: string;
@@ -1536,8 +1541,10 @@ export function App() {
 
       setLibraryAdminStatus(`Deleting ${library.name}…`);
       try {
-        await invoke("delete_library", { libraryId: library.id });
-        setLibraryAdminStatus(`Deleted ${library.name}`);
+        const result = await invoke<DeleteLibraryResult>("delete_library", { libraryId: library.id });
+        setLibraryAdminStatus(
+          `Deleted ${library.name} — cleared ${result.cache_files_removed} cached file${result.cache_files_removed === 1 ? "" : "s"} and its trash is clean (${result.trash_items_cleared} item${result.trash_items_cleared === 1 ? "" : "s"} removed)`
+        );
         if (library.id === activeLibraryId) setSelectedAssetId(null);
         const loaded = await invoke<LibraryRecord[]>("list_libraries");
         setLibraries(loaded);
