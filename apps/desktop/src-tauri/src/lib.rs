@@ -1295,6 +1295,14 @@ fn job_status(
     .collect()
 }
 
+fn parse_job_kind_field(kind: &str) -> Result<JobKind, String> {
+    match kind {
+        "metadata_extraction" => Ok(JobKind::MetadataExtraction),
+        "audio_analysis" => Ok(JobKind::AudioAnalysis),
+        other => Err(format!("unknown job kind: {other}")),
+    }
+}
+
 /// Explicit, user-initiated "Retry Failed" action — see
 /// `Catalog::retry_failed_jobs_for_library` for why this needs to exist
 /// separately from the standing worker's attempt-capped auto-requeue: a fix
@@ -1308,14 +1316,28 @@ fn retry_failed_jobs(
     kind: String,
 ) -> Result<usize, String> {
     let library_id = parse_uuid_field(&library_id, "library id")?;
-    let job_kind = match kind.as_str() {
-        "metadata_extraction" => JobKind::MetadataExtraction,
-        "audio_analysis" => JobKind::AudioAnalysis,
-        other => return Err(format!("unknown job kind: {other}")),
-    };
+    let job_kind = parse_job_kind_field(&kind)?;
     let catalog = state.0.lock().expect("catalog mutex poisoned");
     catalog
         .retry_failed_jobs_for_library(library_id, job_kind)
+        .map_err(storage_error_message)
+}
+
+/// Distinct file extensions currently failing for one library + kind — see
+/// `Catalog::failed_job_extensions_for_library`. Queried once when building
+/// a completion summary, not on every job_status poll, since it's only
+/// useful once there's actually something to report.
+#[tauri::command]
+fn failed_job_extensions(
+    state: tauri::State<CatalogState>,
+    library_id: String,
+    kind: String,
+) -> Result<Vec<String>, String> {
+    let library_id = parse_uuid_field(&library_id, "library id")?;
+    let job_kind = parse_job_kind_field(&kind)?;
+    let catalog = state.0.lock().expect("catalog mutex poisoned");
+    catalog
+        .failed_job_extensions_for_library(library_id, job_kind)
         .map_err(storage_error_message)
 }
 
@@ -2308,6 +2330,7 @@ pub fn run() {
             audio_analysis_paused,
             job_status,
             retry_failed_jobs,
+            failed_job_extensions,
             similar_assets,
             mark_waveform_ready,
             trash_duplicate_group,

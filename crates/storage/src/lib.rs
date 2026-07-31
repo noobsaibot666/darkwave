@@ -1007,6 +1007,40 @@ impl Catalog {
         Ok(counts)
     }
 
+    /// Distinct, lowercased file extensions of currently-failed jobs — lets
+    /// a failure summary say "1 .aif file" instead of a generic count, so
+    /// the format actually at fault is visible without anyone needing to
+    /// go spelunking in the catalog database by hand.
+    pub fn failed_job_extensions_for_library(
+        &self,
+        library_id: Uuid,
+        kind: JobKind,
+    ) -> Result<Vec<String>, StorageError> {
+        let mut statement = self.connection.prepare(
+            "SELECT DISTINCT assets.original_filename FROM background_jobs
+             INNER JOIN assets ON assets.id = background_jobs.asset_id
+             WHERE assets.library_id = ?1 AND background_jobs.kind = ?2 AND background_jobs.state = 'failed'",
+        )?;
+        let filenames = statement
+            .query_map(params![library_id.to_string(), job_kind_to_db(&kind)], |row| {
+                row.get::<_, String>(0)
+            })?
+            .collect::<Result<Vec<_>, _>>()?;
+
+        let mut extensions: Vec<String> = filenames
+            .iter()
+            .filter_map(|filename| {
+                std::path::Path::new(filename)
+                    .extension()
+                    .and_then(|extension| extension.to_str())
+                    .map(|extension| format!(".{}", extension.to_ascii_lowercase()))
+            })
+            .collect();
+        extensions.sort();
+        extensions.dedup();
+        Ok(extensions)
+    }
+
     pub fn list_collections(
         &self,
         library_id: Uuid,
@@ -2580,6 +2614,33 @@ mod tests {
         assert_eq!(counts.pending, 1);
         assert_eq!(counts.failed, 1);
         assert_eq!(counts.completed, 1);
+    }
+
+    #[test]
+    fn failed_job_extensions_for_library_dedupes_and_ignores_other_states() {
+        let catalog_path = unique_catalog_path("job-failed-extensions");
+        let catalog = Catalog::open(&catalog_path).expect("open catalog");
+        let library = catalog.create_library("Extensions", "/extensions").expect("library");
+        let mp3_asset = test_asset(&catalog, library.id, "one.mp3", "hash-ext-mp3-1");
+        let mp3_asset_two = test_asset(&catalog, library.id, "two.MP3", "hash-ext-mp3-2");
+        let aif_asset = test_asset(&catalog, library.id, "three.aif", "hash-ext-aif");
+        let pending_asset = test_asset(&catalog, library.id, "four.wav", "hash-ext-pending");
+
+        for asset in [&mp3_asset, &mp3_asset_two, &aif_asset] {
+            let job = catalog
+                .enqueue_job(asset.id, JobKind::AudioAnalysis, 40)
+                .expect("enqueue");
+            catalog.fail_job(job.id).expect("fail job");
+        }
+        catalog
+            .enqueue_job(pending_asset.id, JobKind::AudioAnalysis, 40)
+            .expect("enqueue pending, should not appear");
+
+        let extensions = catalog
+            .failed_job_extensions_for_library(library.id, JobKind::AudioAnalysis)
+            .expect("failed extensions");
+
+        assert_eq!(extensions, vec![".aif".to_string(), ".mp3".to_string()]);
     }
 
     #[test]

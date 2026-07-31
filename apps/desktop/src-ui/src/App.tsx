@@ -355,9 +355,16 @@ function describeJobCompletion(summary: JobCompletionSummary): { headline: strin
           : null
     };
   }
+  const isAre = summary.failed === 1 ? "was" : "were";
+  const what =
+    summary.failedExtensions.length === 1
+      ? `${summary.failed} ${summary.failedExtensions[0]} file${summary.failed === 1 ? "" : "s"} ${isAre}`
+      : summary.failedExtensions.length > 1
+        ? `${summary.failed} file${summary.failed === 1 ? "" : "s"} (${summary.failedExtensions.join(", ")}) ${isAre}`
+        : `${summary.failed} ${isAre}`;
   return {
     headline,
-    detail: `${summary.failed} ${summary.failed === 1 ? "was" : "were"} skipped, usually an unusual file encoding. They'll retry automatically for a while, or you can retry them now.`
+    detail: `${what} skipped, usually an unusual file encoding. They'll retry automatically for a while, or you can retry them now.`
   };
 }
 
@@ -419,7 +426,13 @@ const smartFilters: { id: ActiveFilter; label: string }[] = [
 ];
 
 type JobProgress = { kind: string; label: string; pending: number; total: number; failed: number };
-type JobCompletionSummary = { kind: string; label: string; completed: number; failed: number };
+type JobCompletionSummary = {
+  kind: string;
+  label: string;
+  completed: number;
+  failed: number;
+  failedExtensions: string[];
+};
 
 const JOB_KINDS: { command: "process_pending_jobs" | "process_audio_analysis_jobs"; kind: string; label: string }[] = [
   { command: "process_pending_jobs", kind: "metadata_extraction", label: "Reading metadata" },
@@ -916,9 +929,19 @@ export function App() {
               const completedDelta = Math.max(0, finalStatus.completed - completedBefore);
               const failedDelta = Math.max(0, finalStatus.failed - failedBefore);
               if (completedDelta === 0 && failedDelta === 0) return;
+              const failedExtensions =
+                failedDelta > 0
+                  ? await invoke<string[]>("failed_job_extensions", { libraryId, kind: config.kind }).catch(() => [])
+                  : [];
               setJobCompletionSummaries((previous) => ({
                 ...previous,
-                [config.kind]: { kind: config.kind, label: config.label, completed: completedDelta, failed: failedDelta }
+                [config.kind]: {
+                  kind: config.kind,
+                  label: config.label,
+                  completed: completedDelta,
+                  failed: failedDelta,
+                  failedExtensions
+                }
               }));
             })();
           });
@@ -2103,6 +2126,16 @@ export function App() {
     );
   }
 
+  // Two distinct Background Activity states: "preparing" is indeterminate
+  // work with no live progress to show yet (scanning a folder, hashing
+  // files, walking the media root) — the blue sweep says "working" without
+  // implying a percentage that doesn't exist. "busy" is real job-queue
+  // draining with an actual pending count, which is what the steady green
+  // LED already meant. Collapsing import/refresh status into this one
+  // indicator (instead of also showing a separate topbar chip) means
+  // there's one place to check for anything happening in the background.
+  const activityPreparing = importStatus === "Importing…" || refreshStatus === "Scanning for new files…";
+  const activityBusy = jobProgress.length > 0;
   const waveformActiveIndex = peaks && duration > 0 ? Math.floor((currentTime / duration) * peaks.length) : -1;
   const drTargetAssetId = playingAssetId ?? selectedAssetId;
   const drTargetProject = collections.find((project) => project.id === lastExportProjectId) ?? null;
@@ -2592,11 +2625,25 @@ export function App() {
           </button>
           <button
             type="button"
-            className={jobProgress.length > 0 ? "icon-button activity-button busy" : "icon-button activity-button"}
+            className={[
+              "icon-button",
+              "activity-button",
+              activityBusy ? "busy" : "",
+              activityPreparing ? "preparing" : ""
+            ]
+              .filter(Boolean)
+              .join(" ")}
             aria-label="Background activity"
-            title={jobProgress.length > 0 ? "Background work is running — click for details" : "Background activity: all caught up"}
+            title={
+              activityBusy
+                ? "Background work is running — click for details"
+                : activityPreparing
+                  ? "Preparing — click for details"
+                  : "Background activity: all caught up"
+            }
             onClick={() => setBackgroundActivityOpen(true)}
           >
+            {activityPreparing ? <span className="activity-scan" aria-hidden="true" /> : null}
             <Activity size={16} />
             <span className="activity-led" aria-hidden="true" />
           </button>
@@ -2604,16 +2651,13 @@ export function App() {
             <Settings size={17} />
           </button>
         </header>
-        {queryFilters.length > 0 || refreshStatus || importStatus ? (
+        {queryFilters.length > 0 ? (
           <div className="chip-row status-strip" aria-label="Status">
             {queryFilters.map((filter, index) => (
               <span key={index} className="suggestion-chip">
                 {filter.field} {filter.operator} {filter.value}
               </span>
             ))}
-            {!queryFilters.length && (refreshStatus || importStatus) ? (
-              <span className="suggestion-chip">{refreshStatus ?? importStatus}</span>
-            ) : null}
           </div>
         ) : null}
         <section className="filter-panel" aria-label="Range filters">
@@ -3778,11 +3822,25 @@ export function App() {
             </div>
             {jobProgress.length === 0 &&
             !refreshStatus &&
+            !importStatus &&
             !audioAnalysisPaused &&
             Object.keys(jobCompletionSummaries).length === 0 ? (
               <p className="empty-hint activity-empty-hint">All caught up — nothing running right now.</p>
             ) : (
               <div className="job-progress-panel" aria-label="Background work">
+                {importStatus ? (
+                  <div className="job-progress-row">
+                    <span className="job-progress-icon">
+                      <Import size={15} />
+                    </span>
+                    <div className="job-progress-body">
+                      <div className="job-progress-head">
+                        <span className="job-progress-label">Import</span>
+                      </div>
+                      <div className="status-line">{importStatus}</div>
+                    </div>
+                  </div>
+                ) : null}
                 {refreshStatus ? (
                   <div className="job-progress-row">
                     <span className="job-progress-icon">
