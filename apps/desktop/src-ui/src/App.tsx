@@ -16,6 +16,7 @@ import {
   Database,
   FolderOpen,
   Gauge,
+  HardDrive,
   Import,
   Link2,
   ListFilter,
@@ -386,6 +387,16 @@ const ROW_HEIGHT_PX_BY_DENSITY: Record<string, number> = {
 
 const BROWSER_OVERSCAN_ROWS = 6;
 
+type SettingsCategory = "general" | "playback" | "storage" | "appearance" | "accessibility";
+
+const SETTINGS_CATEGORIES: { id: SettingsCategory; label: string; icon: typeof Database }[] = [
+  { id: "general", label: "General", icon: Database },
+  { id: "playback", label: "Playback", icon: Volume2 },
+  { id: "storage", label: "Storage", icon: HardDrive },
+  { id: "appearance", label: "Appearance", icon: Palette },
+  { id: "accessibility", label: "Accessibility", icon: Contrast }
+];
+
 type VisibleRowRange = {
   start: number;
   endExclusive: number;
@@ -501,6 +512,7 @@ export function App() {
   const [sidebarCollapsed, setSidebarCollapsed] = useState(false);
   const [inspectorCollapsed, setInspectorCollapsed] = useState(false);
   const [settingsOpen, setSettingsOpen] = useState(false);
+  const [settingsCategory, setSettingsCategory] = useState<SettingsCategory>("general");
   const [filterMenuOpen, setFilterMenuOpen] = useState(false);
   const [sfxSubcategoriesOpen, setSfxSubcategoriesOpen] = useState(false);
   const [collapsedSections, setCollapsedSections] = useState<Set<string>>(
@@ -2101,9 +2113,6 @@ export function App() {
           <button className="text-button" onClick={focusSearch}>
             Focus Search
           </button>
-          <button className="text-button" onClick={() => document.getElementById("tags-section")?.scrollIntoView({ behavior: "smooth" })}>
-            Apply Tag
-          </button>
           <select
             aria-label="Export format"
             value={exportFormat}
@@ -2569,7 +2578,7 @@ export function App() {
               ))
             )}
           </div>
-          <h2>Add Tag</h2>
+          <h2>Apply Tag</h2>
           <div className="tag-grid">
             {tags.map((tag) => (
               <button key={tag.id} onClick={() => handleApplyTag(tag)} disabled={bulkAssetIds.length === 0}>
@@ -2899,227 +2908,259 @@ export function App() {
               </button>
             </div>
 
-            <div className="settings-section">
-              <h2>Library</h2>
-              <div className="settings-grid">
-                <div className="settings-row">
-                  <SlidersHorizontal size={14} />
-                  <span>Name</span>
-                  <strong>{activeLibrary?.name ?? "—"}</strong>
-                </div>
-                <div className="settings-row">
-                  <Volume2 size={14} />
-                  <span>Media root</span>
-                  <strong className="settings-value-path" title={activeLibrary?.media_root}>
-                    {activeLibrary?.media_root ?? "—"}
-                  </strong>
-                </div>
-                <div className="settings-row">
-                  <Gauge size={14} />
-                  <span>Status</span>
-                  <strong>{mediaRootStatus?.status ?? "unknown"}</strong>
-                </div>
-              </div>
-            </div>
+            <div className="settings-body">
+              <nav className="settings-nav" aria-label="Settings categories">
+                {SETTINGS_CATEGORIES.map((category) => (
+                  <button
+                    key={category.id}
+                    type="button"
+                    className={settingsCategory === category.id ? "settings-nav-item active" : "settings-nav-item"}
+                    onClick={() => setSettingsCategory(category.id)}
+                  >
+                    <category.icon size={15} />
+                    {category.label}
+                  </button>
+                ))}
+              </nav>
 
-            <div className="settings-section">
-              <h2>Manage Libraries</h2>
-              <p className="settings-hint">
-                Deleting a library or emptying its trash only removes Darkwave's own catalog records — tags,
-                collections, source/license notes, trash entries. The audio files at each library's media root are
-                never touched.
-              </p>
-              <div className="library-admin-list">
-                {libraries.map((library) => (
-                  <div className="library-admin-row" key={library.id}>
-                    <span className="library-admin-icon">
-                      <Database size={14} />
-                    </span>
-                    <div className="library-admin-meta">
-                      <strong>{library.name}</strong>
-                      <small title={library.media_root}>{library.media_root}</small>
+              <div className="settings-content">
+                {settingsCategory === "general" ? (
+                  <>
+                    <div className="settings-section">
+                      <h2>Library</h2>
+                      <div className="settings-grid">
+                        <div className="settings-row">
+                          <SlidersHorizontal size={14} />
+                          <span>Name</span>
+                          <strong>{activeLibrary?.name ?? "—"}</strong>
+                        </div>
+                        <div className="settings-row">
+                          <Volume2 size={14} />
+                          <span>Media root</span>
+                          <strong className="settings-value-path" title={activeLibrary?.media_root}>
+                            {activeLibrary?.media_root ?? "—"}
+                          </strong>
+                        </div>
+                        <div className="settings-row">
+                          <Gauge size={14} />
+                          <span>Status</span>
+                          <strong>{mediaRootStatus?.status ?? "unknown"}</strong>
+                        </div>
+                      </div>
                     </div>
-                    <div className="library-admin-actions">
-                      <button type="button" className="text-button" onClick={() => handleCleanLibraryCache(library)}>
-                        Clean Cache
-                      </button>
-                      <button type="button" className="text-button" onClick={() => handleEmptyLibraryTrash(library)}>
-                        Empty Trash
-                      </button>
-                      <button
-                        type="button"
-                        className="text-button danger"
-                        onClick={() => handleDeleteLibrary(library)}
-                      >
-                        <Trash2 size={13} />
-                        Delete
-                      </button>
+
+                    <div className="settings-section">
+                      <h2>Manage Libraries</h2>
+                      <p className="settings-hint">
+                        Deleting a library or emptying its trash only removes Darkwave's own catalog records — tags,
+                        collections, source/license notes, trash entries. The audio files at each library's media
+                        root are never touched.
+                      </p>
+                      <div className="library-admin-list">
+                        {libraries.map((library) => (
+                          <div className="library-admin-row" key={library.id}>
+                            <span className="library-admin-icon">
+                              <Database size={14} />
+                            </span>
+                            <div className="library-admin-meta">
+                              <strong>{library.name}</strong>
+                              <small title={library.media_root}>{library.media_root}</small>
+                            </div>
+                            <div className="library-admin-actions">
+                              <button type="button" className="text-button" onClick={() => handleCleanLibraryCache(library)}>
+                                Clean Cache
+                              </button>
+                              <button type="button" className="text-button" onClick={() => handleEmptyLibraryTrash(library)}>
+                                Empty Trash
+                              </button>
+                              <button
+                                type="button"
+                                className="text-button danger"
+                                onClick={() => handleDeleteLibrary(library)}
+                              >
+                                <Trash2 size={13} />
+                                Delete
+                              </button>
+                            </div>
+                          </div>
+                        ))}
+                      </div>
+                      {libraryAdminStatus ? <div className="status-line">{libraryAdminStatus}</div> : null}
+                    </div>
+
+                    <div className="settings-section">
+                      <h2>Watched Folder</h2>
+                      <div className="settings-grid">
+                        <div className="settings-row">
+                          <Import size={14} />
+                          <span>Folder</span>
+                          <strong className="settings-value-path" title={preferences?.watched_folder_path ?? undefined}>
+                            {preferences?.watched_folder_path ?? "Not watching"}
+                          </strong>
+                        </div>
+                        <div className="status-line">
+                          New, stable files dropped here import automatically (as referenced files)
+                          into {preferences?.watched_folder_library_id === activeLibraryId
+                            ? activeLibrary?.name ?? "the active library"
+                            : "the library it was set up with"}
+                          , checked roughly every 20 seconds by the background worker.
+                        </div>
+                        <button type="button" className="text-button" onClick={handleChooseWatchedFolder} disabled={!activeLibraryId}>
+                          {preferences?.watched_folder_path ? "Change Folder…" : "Choose Folder…"}
+                        </button>
+                        {preferences?.watched_folder_path ? (
+                          <button type="button" className="text-button" onClick={handleClearWatchedFolder}>
+                            Stop Watching
+                          </button>
+                        ) : null}
+                      </div>
+                    </div>
+                  </>
+                ) : null}
+
+                {settingsCategory === "playback" ? (
+                  <div className="settings-section">
+                    <h2>Playback</h2>
+                    <div className="settings-grid">
+                      <label className="settings-row">
+                        <SlidersHorizontal size={14} />
+                        <span>Browser density</span>
+                        <select
+                          value={preferences?.browser_density ?? "Comfortable"}
+                          onChange={(event) => {
+                            setPreferences((previous) => {
+                              if (!previous) return previous;
+                              const next = {
+                                ...previous,
+                                browser_density: event.target.value as AppPreferences["browser_density"]
+                              };
+                              invoke("save_app_preferences", { preferences: next }).catch(() => {});
+                              return next;
+                            });
+                          }}
+                        >
+                          <option value="Compact">Compact</option>
+                          <option value="Comfortable">Comfortable</option>
+                          <option value="Expanded">Expanded</option>
+                        </select>
+                      </label>
+                      <div className="settings-row">
+                        <Volume2 size={14} />
+                        <span>Output route</span>
+                        <strong>{preferences?.output_device === "SystemDefault" ? "System default" : "Custom device"}</strong>
+                      </div>
+                      <div className="status-line">
+                        Output device selection isn't enforced yet on macOS — WKWebView doesn't
+                        support routing audio to a specific device.
+                      </div>
                     </div>
                   </div>
-                ))}
-              </div>
-              {libraryAdminStatus ? <div className="status-line">{libraryAdminStatus}</div> : null}
-            </div>
+                ) : null}
 
-            <div className="settings-section">
-              <h2>Watched Folder</h2>
-              <div className="settings-grid">
-                <div className="settings-row">
-                  <Import size={14} />
-                  <span>Folder</span>
-                  <strong className="settings-value-path" title={preferences?.watched_folder_path ?? undefined}>
-                    {preferences?.watched_folder_path ?? "Not watching"}
-                  </strong>
-                </div>
-                <div className="status-line">
-                  New, stable files dropped here import automatically (as referenced files)
-                  into {preferences?.watched_folder_library_id === activeLibraryId
-                    ? activeLibrary?.name ?? "the active library"
-                    : "the library it was set up with"}
-                  , checked roughly every 20 seconds by the background worker.
-                </div>
-                <button type="button" className="text-button" onClick={handleChooseWatchedFolder} disabled={!activeLibraryId}>
-                  {preferences?.watched_folder_path ? "Change Folder…" : "Choose Folder…"}
-                </button>
-                {preferences?.watched_folder_path ? (
-                  <button type="button" className="text-button" onClick={handleClearWatchedFolder}>
-                    Stop Watching
-                  </button>
+                {settingsCategory === "storage" ? (
+                  <>
+                    <div className="settings-section">
+                      <h2>Cache</h2>
+                      <div className="settings-grid">
+                        <label className="settings-row">
+                          <Gauge size={14} />
+                          <span>Local playback cache limit (MB)</span>
+                          <input
+                            type="number"
+                            min={64}
+                            step={64}
+                            value={preferences?.preview_cache_limit_mb ?? 0}
+                            onChange={(event) => {
+                              const value = Number(event.target.value);
+                              setPreferences((previous) => {
+                                if (!previous || Number.isNaN(value)) return previous;
+                                const next = { ...previous, preview_cache_limit_mb: value };
+                                invoke("save_app_preferences", { preferences: next }).catch(() => {});
+                                return next;
+                              });
+                            }}
+                          />
+                        </label>
+                        <div className="settings-row">
+                          <RefreshCw size={14} />
+                          <span>{cacheStatus ?? "Cache warms automatically while browsing"}</span>
+                          <button type="button" className="text-button" onClick={handlePurgeCache}>
+                            Purge Cache
+                          </button>
+                        </div>
+                      </div>
+                    </div>
+
+                    <div className="settings-section">
+                      <h2>Trash</h2>
+                      <div className="status-line">{trashRetentionDays} day retention before explicit purge</div>
+                      {trashItems.length === 0 ? (
+                        <span className="empty-hint">Trash is empty</span>
+                      ) : (
+                        <div className="maintenance-list">
+                          {trashItems.map((item) => (
+                            <div className="maintenance-row" key={item.asset_id}>
+                              <span>{item.original_path.split("/").pop()}</span>
+                              <button type="button" className="text-button" onClick={() => handleRestoreFromTrash(item)}>
+                                Restore
+                              </button>
+                              <button type="button" className="text-button" onClick={() => handlePurgeTrashItem(item)}>
+                                Purge
+                              </button>
+                            </div>
+                          ))}
+                        </div>
+                      )}
+                    </div>
+                  </>
+                ) : null}
+
+                {settingsCategory === "appearance" ? (
+                  <div className="settings-section">
+                    <h2>Appearance</h2>
+                    <div className="settings-grid">
+                      <label className="settings-row">
+                        <Palette size={14} />
+                        <span>Theme</span>
+                        <select
+                          value={preferences?.theme ?? "Dark"}
+                          onChange={(event) => handleSetTheme(event.target.value as AppPreferences["theme"])}
+                        >
+                          <option value="Dark">Dark</option>
+                          <option value="Light">Light</option>
+                          <option value="System">Match system</option>
+                        </select>
+                      </label>
+                    </div>
+                  </div>
+                ) : null}
+
+                {settingsCategory === "accessibility" ? (
+                  <div className="settings-section">
+                    <h2>Accessibility</h2>
+                    <div className="settings-grid">
+                      <label className="settings-row">
+                        <Contrast size={14} />
+                        <span>Reduced transparency</span>
+                        <input
+                          type="checkbox"
+                          checked={preferences?.reduced_transparency ?? false}
+                          onChange={handleToggleReducedTransparency}
+                        />
+                      </label>
+                      <label className="settings-row">
+                        <Zap size={14} />
+                        <span>Reduced motion</span>
+                        <input
+                          type="checkbox"
+                          checked={preferences?.reduced_motion ?? false}
+                          onChange={handleToggleReducedMotion}
+                        />
+                      </label>
+                    </div>
+                  </div>
                 ) : null}
               </div>
-            </div>
-
-            <div className="settings-section">
-              <h2>Playback</h2>
-              <div className="settings-grid">
-                <label className="settings-row">
-                  <SlidersHorizontal size={14} />
-                  <span>Browser density</span>
-                  <select
-                    value={preferences?.browser_density ?? "Comfortable"}
-                    onChange={(event) => {
-                      setPreferences((previous) => {
-                        if (!previous) return previous;
-                        const next = {
-                          ...previous,
-                          browser_density: event.target.value as AppPreferences["browser_density"]
-                        };
-                        invoke("save_app_preferences", { preferences: next }).catch(() => {});
-                        return next;
-                      });
-                    }}
-                  >
-                    <option value="Compact">Compact</option>
-                    <option value="Comfortable">Comfortable</option>
-                    <option value="Expanded">Expanded</option>
-                  </select>
-                </label>
-                <div className="settings-row">
-                  <Volume2 size={14} />
-                  <span>Output route</span>
-                  <strong>{preferences?.output_device === "SystemDefault" ? "System default" : "Custom device"}</strong>
-                </div>
-                <div className="status-line">
-                  Output device selection isn't enforced yet on macOS — WKWebView doesn't
-                  support routing audio to a specific device.
-                </div>
-              </div>
-            </div>
-
-            <div className="settings-section">
-              <h2>Cache</h2>
-              <div className="settings-grid">
-                <label className="settings-row">
-                  <Gauge size={14} />
-                  <span>Local playback cache limit (MB)</span>
-                  <input
-                    type="number"
-                    min={64}
-                    step={64}
-                    value={preferences?.preview_cache_limit_mb ?? 0}
-                    onChange={(event) => {
-                      const value = Number(event.target.value);
-                      setPreferences((previous) => {
-                        if (!previous || Number.isNaN(value)) return previous;
-                        const next = { ...previous, preview_cache_limit_mb: value };
-                        invoke("save_app_preferences", { preferences: next }).catch(() => {});
-                        return next;
-                      });
-                    }}
-                  />
-                </label>
-                <div className="settings-row">
-                  <RefreshCw size={14} />
-                  <span>{cacheStatus ?? "Cache warms automatically while browsing"}</span>
-                  <button type="button" className="text-button" onClick={handlePurgeCache}>
-                    Purge Cache
-                  </button>
-                </div>
-              </div>
-            </div>
-
-            <div className="settings-section">
-              <h2>Appearance</h2>
-              <div className="settings-grid">
-                <label className="settings-row">
-                  <Palette size={14} />
-                  <span>Theme</span>
-                  <select
-                    value={preferences?.theme ?? "Dark"}
-                    onChange={(event) => handleSetTheme(event.target.value as AppPreferences["theme"])}
-                  >
-                    <option value="Dark">Dark</option>
-                    <option value="Light">Light</option>
-                    <option value="System">Match system</option>
-                  </select>
-                </label>
-              </div>
-            </div>
-
-            <div className="settings-section">
-              <h2>Accessibility</h2>
-              <div className="settings-grid">
-                <label className="settings-row">
-                  <Contrast size={14} />
-                  <span>Reduced transparency</span>
-                  <input
-                    type="checkbox"
-                    checked={preferences?.reduced_transparency ?? false}
-                    onChange={handleToggleReducedTransparency}
-                  />
-                </label>
-                <label className="settings-row">
-                  <Zap size={14} />
-                  <span>Reduced motion</span>
-                  <input
-                    type="checkbox"
-                    checked={preferences?.reduced_motion ?? false}
-                    onChange={handleToggleReducedMotion}
-                  />
-                </label>
-              </div>
-            </div>
-
-            <div className="settings-section">
-              <h2>Trash</h2>
-              <div className="status-line">{trashRetentionDays} day retention before explicit purge</div>
-              {trashItems.length === 0 ? (
-                <span className="empty-hint">Trash is empty</span>
-              ) : (
-                <div className="maintenance-list">
-                  {trashItems.map((item) => (
-                    <div className="maintenance-row" key={item.asset_id}>
-                      <span>{item.original_path.split("/").pop()}</span>
-                      <button type="button" className="text-button" onClick={() => handleRestoreFromTrash(item)}>
-                        Restore
-                      </button>
-                      <button type="button" className="text-button" onClick={() => handlePurgeTrashItem(item)}>
-                        Purge
-                      </button>
-                    </div>
-                  ))}
-                </div>
-              )}
             </div>
           </motion.div>
         </motion.div>
@@ -3196,7 +3237,7 @@ export function App() {
       <AnimatePresence>
       {backgroundActivityOpen ? (
         <motion.div
-          className="modal-overlay"
+          className="modal-overlay activity-modal-overlay"
           onClick={() => setBackgroundActivityOpen(false)}
           initial={{ opacity: 0 }}
           animate={{ opacity: 1 }}
@@ -3204,7 +3245,7 @@ export function App() {
           transition={{ duration: 0.15 }}
         >
           <motion.div
-            className="modal-card"
+            className="modal-card activity-modal"
             onClick={(event) => event.stopPropagation()}
             aria-label="Background activity"
             initial={{ opacity: 0, scale: 0.96, y: 10 }}
