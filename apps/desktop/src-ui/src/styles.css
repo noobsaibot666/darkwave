@@ -1672,13 +1672,22 @@ dd {
   min-height: 0;
 }
 
+/* Sized to its widest label (width: max-content, bounded) rather than a
+   fixed guessed pixel value — "Release Readiness" was wider than the old
+   156px column and getting clipped since overflow-y:auto silently forces
+   overflow-x to auto too. Grows with whatever labels exist instead of
+   needing a hand-tuned constant every time one is added. */
 .settings-nav {
   display: flex;
-  flex: 0 0 156px;
+  flex: 0 0 auto;
+  width: max-content;
+  min-width: 140px;
+  max-width: 220px;
   flex-direction: column;
   gap: 2px;
   padding: 4px 10px 20px 16px;
   overflow-y: auto;
+  overflow-x: hidden;
   border-right: 1px solid rgba(var(--ink-rgb), 0.08);
 }
 
@@ -1695,6 +1704,8 @@ dd {
   font-size: 13px;
   text-align: left;
   white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
 }
 
 .settings-nav-item svg {
