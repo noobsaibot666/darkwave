@@ -42,6 +42,15 @@
   --accent-ink: #ffb088;
   --accent-rgb: 255, 92, 0;
   --accent-to-rgb: 241, 72, 0;
+
+  /* SFX mood/icon color (see playerMoodTheme in App.tsx and rowIconMeta) —
+     a token rather than a hardcoded hex so it can go darker in light mode;
+     the bright gold that reads fine on the near-black default background
+     nearly disappears against a bright surface otherwise. */
+  --sfx-from: #fbd34d;
+  --sfx-to: #d69e0a;
+  --sfx-ink: #fbd34d;
+  --sfx-glow: rgba(214, 158, 10, 0.45);
 }
 
 /* Light mode palette reference: Silver Mist #E4E4E4, Flameburst Orange
@@ -68,6 +77,11 @@
   --text-tertiary: #2e2e2e;
   --text-muted: #6e6e6e;
   --accent-ink: #c2410c;
+
+  --sfx-from: #b8860b;
+  --sfx-to: #7a5600;
+  --sfx-ink: #9c6b02;
+  --sfx-glow: rgba(154, 107, 2, 0.35);
 }
 
 * {
@@ -728,7 +742,7 @@ button.panel-handle-right:active:not(:disabled) {
   height: 34px;
   padding: 0 14px;
   border-radius: var(--radius-sm);
-  background: linear-gradient(180deg, #ff7940, #f14800);
+  background: var(--accent);
   color: var(--text-on-accent);
   font-weight: 650;
   white-space: nowrap;
@@ -739,7 +753,7 @@ button.panel-handle-right:active:not(:disabled) {
 }
 
 .primary-action.active {
-  background: linear-gradient(180deg, #f14800, #c23700);
+  background: var(--accent-to);
   box-shadow: inset 0 0 0 2px rgba(255, 255, 255, 0.28);
 }
 

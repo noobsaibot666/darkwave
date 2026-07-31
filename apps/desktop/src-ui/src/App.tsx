@@ -398,7 +398,7 @@ const playerMoodTheme: Record<PlayerMood, { from: string; to: string; glow: stri
   soundtrack: { from: "#4ade9c", to: "#0ea968", glow: "rgba(14, 169, 104, 0.45)" },
   "soundtrack-voice": { from: "#c4a6fa", to: "#8b5cf6", glow: "rgba(139, 92, 246, 0.45)" },
   "voice-over": { from: "#7c90f5", to: "#4c5fe0", glow: "rgba(76, 95, 224, 0.45)" },
-  sfx: { from: "#fbd34d", to: "#d69e0a", glow: "rgba(214, 158, 10, 0.45)" }
+  sfx: { from: "var(--sfx-from)", to: "var(--sfx-to)", glow: "var(--sfx-glow)" }
 };
 
 // Derives a playback "mood" from the sound's applied tags (falling back to
@@ -509,7 +509,7 @@ function rowIconMeta(asset: AssetRecord): { Icon: typeof Music; color: string } 
     return hasVoice ? { Icon: Mic, color: "#c4a6fa" } : { Icon: Music2, color: "#4ade9c" };
   }
   if (asset.media_type === "sound_effect") {
-    return { Icon: Waves, color: "#fbd34d" };
+    return { Icon: Waves, color: "var(--sfx-ink)" };
   }
   if (asset.media_type === "ambience") {
     return { Icon: Wind, color: "#5ec8d8" };
