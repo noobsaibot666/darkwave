@@ -100,6 +100,56 @@ npm run tauri dev
 
 `apps\desktop\src-tauri\binaries\` is gitignored (it's a compiled, machine-specific artifact), so `git pull` never brings a stale or foreign-platform copy — rebuilding it after every pull is cheap and keeps it correct, not optional busywork.
 
+## 7. Packaging a distributable build (optional — not yet release-ready)
+
+Everything above runs the app via `tauri dev`, which never touches
+`bundle.active` (`apps/desktop/src-tauri/tauri.conf.json`). It's currently
+`false` because no platform has a real packaging pipeline yet — "Windows
+platform audit" is still an open gate in
+[Release Readiness](/development/release-readiness/). Use this section to
+produce a real `.msi`/`.exe` installer for local testing, not to cut an
+actual release.
+
+Do the sidecar build from step 4 first if you haven't already in this
+session — packaging fails immediately without it, same as `tauri dev` does.
+
+Then override `bundle.active` for a single build without editing the
+committed config (PowerShell mangles embedded quotes when they're passed
+inline to a native `.exe`, so write the override to a file instead of
+trying to inline the JSON):
+
+```powershell
+cd apps\desktop
+'{"bundle":{"active":true}}' | Out-File -Encoding utf8 ..\..\bundle-override.json
+npx tauri build --config ..\..\bundle-override.json
+Remove-Item ..\..\bundle-override.json
+```
+
+If it succeeds, the installers land at:
+
+```text
+target\release\bundle\msi\Darkwave_<version>_x64_en-US.msi
+target\release\bundle\nsis\Darkwave_<version>_x64-setup.exe
+```
+
+**Known gaps this will surface, both already tracked, neither a build
+failure:**
+
+- **Vocal detection (Silero VAD) won't work in the installed app.** `ort`
+  needs `onnxruntime.dll` at runtime; nothing currently copies it into the
+  bundle (`bundle.resources` has no entry for it — see
+  `docs/adr/0027-real-vocal-detection-silero-vad.md`).
+  This degrades silently by design: the player just falls back to its
+  tag-only mood guess instead of crashing. Fixing it for real means either
+  adding a `bundle.resources` entry plus setting `ORT_DYLIB_PATH` at
+  startup, or switching `ort` to a statically-linked feature — an
+  architectural choice for whoever picks up Milestone 7, not something to
+  patch ad hoc here.
+- **No code signing.** The produced installer is unsigned, so Windows
+  SmartScreen will warn "unknown publisher" on first run. Expected until
+  the "Signing and notarization" release-readiness gate is addressed —
+  ignore it for local testing (click "More info" → "Run anyway").
+
 ## Troubleshooting
 
 | Symptom | Cause | Fix |

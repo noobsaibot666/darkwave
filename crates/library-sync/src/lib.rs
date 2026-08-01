@@ -241,14 +241,14 @@ pub fn plan_reconnect_validation(
         return None;
     }
 
-    let media_root = probe.media_root.trim_end_matches('/');
+    let media_root = Path::new(&probe.media_root);
     Some(ReconnectValidationJob {
         library_id: manifest.library_id,
         manifest_revision: manifest.revision,
         paths_to_validate: manifest
             .assets
             .iter()
-            .map(|asset| format!("{media_root}/{}", asset.relative_path))
+            .map(|asset| media_root.join(&asset.relative_path).to_string_lossy().to_string())
             .collect(),
     })
 }

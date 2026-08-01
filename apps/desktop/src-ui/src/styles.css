@@ -651,8 +651,9 @@ button.panel-handle-right:active:not(:disabled) {
   align-items: flex-start;
   gap: 12px;
   padding: 12px 14px;
+  border: 1px solid rgba(var(--ink-rgb), 0.08);
   border-radius: 14px;
-  background: rgba(var(--ink-rgb), 0.04);
+  background: rgba(var(--ink-rgb), 0.05);
 }
 
 .job-progress-icon {
@@ -717,23 +718,41 @@ button.panel-handle-right:active:not(:disabled) {
 
 /* A finished batch's summary row — same shape as an in-progress row, but
    a quieter background (no pulse, nothing left to show progress on) and a
-   warning tint when something in the batch failed. */
+   warning tint when something in the batch failed. Tint, border, and icon
+   badge are all deliberately saturated rather than a faint wash — a status
+   row should read as green/amber at a glance, not blend into the modal. */
 .job-progress-done {
-  background: rgba(52, 211, 153, 0.08);
+  border-color: rgba(52, 211, 153, 0.35);
+  background: rgba(52, 211, 153, 0.14);
 }
 
 .job-progress-done .job-progress-icon {
-  background: rgba(52, 211, 153, 0.16);
-  color: #34d399;
+  /* Solid fill + white icon rather than a translucent tint: a tint this
+     subtle reads fine on the app's near-black dark theme but washes out
+     to near-invisible on the light theme's near-white modal. A solid chip
+     holds its contrast regardless of what's behind it. */
+  background: #059669;
+  color: #ffffff;
 }
 
 .job-progress-done.warning {
-  background: rgba(245, 158, 11, 0.08);
+  border-color: rgba(245, 158, 11, 0.4);
+  background: rgba(245, 158, 11, 0.16);
 }
 
 .job-progress-done.warning .job-progress-icon {
-  background: rgba(245, 158, 11, 0.18);
-  color: #f59e0b;
+  background: #b45309;
+  color: #ffffff;
+}
+
+.job-progress-done .job-progress-label,
+.job-progress-done .status-line {
+  color: var(--text-primary);
+}
+
+.job-progress-done .text-button {
+  border-color: rgba(var(--ink-rgb), 0.22);
+  font-weight: 650;
 }
 
 /* Background Activity's own copy reads small next to everything else in
@@ -1729,9 +1748,12 @@ dd {
 }
 
 .filter-menu {
-  position: absolute;
-  top: 42px;
-  left: 0;
+  /* Fixed (not absolute) so it isn't clipped by .topbar's overflow-x: auto
+     — an ancestor with overflow-x set to anything but visible computes
+     overflow-y to auto too, which was silently cutting this dropdown off
+     at the topbar's bottom edge. Position is computed from the trigger
+     button's bounding rect in App.tsx. */
+  position: fixed;
   z-index: 20;
   width: 200px;
   padding: 8px;

@@ -650,6 +650,8 @@ export function App() {
   const [settingsOpen, setSettingsOpen] = useState(false);
   const [settingsCategory, setSettingsCategory] = useState<SettingsCategory>("general");
   const [filterMenuOpen, setFilterMenuOpen] = useState(false);
+  const [filterMenuPosition, setFilterMenuPosition] = useState<{ top: number; left: number } | null>(null);
+  const filterButtonRef = useRef<HTMLButtonElement | null>(null);
   const [sfxSubcategoriesOpen, setSfxSubcategoriesOpen] = useState(false);
   const [favoritesCategoriesOpen, setFavoritesCategoriesOpen] = useState(false);
   const [unreviewedCategoriesOpen, setUnreviewedCategoriesOpen] = useState(false);
@@ -2582,16 +2584,24 @@ export function App() {
           </label>
           <div style={{ position: "relative" }}>
             <button
+              ref={filterButtonRef}
               className="icon-button"
               aria-label="Filter"
-              onClick={() => setFilterMenuOpen((previous) => !previous)}
+              onClick={() => {
+                if (!filterMenuOpen && filterButtonRef.current) {
+                  const rect = filterButtonRef.current.getBoundingClientRect();
+                  setFilterMenuPosition({ top: rect.bottom + 6, left: rect.left });
+                }
+                setFilterMenuOpen((previous) => !previous);
+              }}
             >
               <ListFilter size={17} />
             </button>
             <AnimatePresence>
-              {filterMenuOpen ? (
+              {filterMenuOpen && filterMenuPosition ? (
                 <motion.div
                   className="modal-card filter-menu"
+                  style={{ top: filterMenuPosition.top, left: filterMenuPosition.left }}
                   initial={{ opacity: 0, scale: 0.95, y: -6 }}
                   animate={{ opacity: 1, scale: 1, y: 0 }}
                   exit={{ opacity: 0, scale: 0.95, y: -6 }}
@@ -3603,7 +3613,7 @@ export function App() {
                         <div className="maintenance-list">
                           {trashItems.map((item) => (
                             <div className="maintenance-row" key={item.asset_id}>
-                              <span>{item.original_path.split("/").pop()}</span>
+                              <span>{item.original_path.split(/[/\\]/).pop()}</span>
                               <button type="button" className="text-button" onClick={() => handleRestoreFromTrash(item)}>
                                 Restore
                               </button>

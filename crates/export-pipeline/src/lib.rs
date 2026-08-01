@@ -232,11 +232,10 @@ pub fn plan_editorial_export(request: ExportRequest) -> Result<ExportPlan, Expor
 
     Ok(ExportPlan {
         source_path: request.source_path,
-        destination_path: format!(
-            "{}/{}",
-            request.project_media_dir.trim_end_matches('/'),
-            filename
-        ),
+        destination_path: Path::new(&request.project_media_dir)
+            .join(&filename)
+            .to_string_lossy()
+            .to_string(),
         range: request.range,
         conversion,
         preserve_original: request.intent.preserve_original,
@@ -504,18 +503,72 @@ impl ExportLicenseAssessment {
     }
 }
 
+/// Real music/SFX titles routinely contain characters that are fine on
+/// macOS/Linux but make a filename unwritable on Windows — `?`, `"`, `*`,
+/// `|`, `<`, `>` in a stylized track name is common, and Windows also
+/// treats a handful of exact device names (CON, LPT1, ...) as reserved
+/// regardless of extension. This must catch all of it: a filename that's
+/// merely "mostly safe" still fails the export outright the moment a title
+/// happens to include one of these.
 fn sanitize_filename(value: &str) -> String {
-    value
+    let replaced: String = value
         .trim()
         .chars()
         .map(|character| {
-            if matches!(character, '/' | ':' | '\\') {
+            if character.is_control() || matches!(character, '/' | '\\' | ':' | '*' | '?' | '"' | '<' | '>' | '|') {
                 '-'
             } else {
                 character
             }
         })
-        .collect()
+        .collect();
+
+    // Windows silently disallows a trailing dot or space in a filename.
+    let trimmed = replaced.trim_end_matches(['.', ' ']);
+    let candidate = if trimmed.is_empty() { "untitled" } else { trimmed };
+
+    const RESERVED_DEVICE_NAMES: [&str; 22] = [
+        "CON", "PRN", "AUX", "NUL", "COM1", "COM2", "COM3", "COM4", "COM5", "COM6", "COM7",
+        "COM8", "COM9", "LPT1", "LPT2", "LPT3", "LPT4", "LPT5", "LPT6", "LPT7", "LPT8", "LPT9",
+    ];
+    if RESERVED_DEVICE_NAMES
+        .iter()
+        .any(|reserved| reserved.eq_ignore_ascii_case(candidate))
+    {
+        format!("{candidate}-")
+    } else {
+        candidate.to_string()
+    }
+}
+
+#[cfg(test)]
+mod sanitize_filename_tests {
+    use super::sanitize_filename;
+
+    #[test]
+    fn replaces_windows_reserved_characters() {
+        assert_eq!(sanitize_filename("What Is Love?"), "What Is Love-");
+        assert_eq!(sanitize_filename("Trap | Snare"), "Trap - Snare");
+        assert_eq!(sanitize_filename("\"Big\" Riser <Wet>"), "-Big- Riser -Wet-");
+    }
+
+    #[test]
+    fn strips_trailing_dots_and_spaces() {
+        assert_eq!(sanitize_filename("Kick Drum..."), "Kick Drum");
+        assert_eq!(sanitize_filename("Snare   "), "Snare");
+    }
+
+    #[test]
+    fn guards_reserved_device_names_case_insensitively() {
+        assert_eq!(sanitize_filename("con"), "con-");
+        assert_eq!(sanitize_filename("LPT1"), "LPT1-");
+        assert_eq!(sanitize_filename("Console"), "Console");
+    }
+
+    #[test]
+    fn falls_back_to_untitled_when_nothing_survives() {
+        assert_eq!(sanitize_filename("..."), "untitled");
+    }
 }
 
 fn csv_escape(value: &str) -> String {
@@ -527,11 +580,21 @@ fn csv_escape(value: &str) -> String {
 }
 
 fn file_url_for_path(path: &str) -> String {
-    let encoded_path = percent_encode_path(path);
-    if path.starts_with('/') {
-        format!("file://{}", encoded_path)
+    // A Windows absolute path (`C:\Users\foo\file.wav`) starts with a drive
+    // letter and colon, not `/` — the POSIX branch below would otherwise
+    // treat it as relative and its backslashes would get percent-encoded
+    // as literal characters instead of recognized as path separators.
+    // file:// URIs always use forward slashes and, per RFC 8089, a Windows
+    // drive path takes the three-slash form `file:///C:/Users/...`.
+    let is_windows_drive_path =
+        path.len() >= 2 && path.as_bytes()[0].is_ascii_alphabetic() && path.as_bytes()[1] == b':';
+
+    if is_windows_drive_path {
+        format!("file:///{}", percent_encode_path(&path.replace('\\', "/")))
+    } else if path.starts_with('/') {
+        format!("file://{}", percent_encode_path(path))
     } else {
-        format!("file:///{}", encoded_path)
+        format!("file:///{}", percent_encode_path(path))
     }
 }
 
@@ -539,7 +602,12 @@ fn percent_encode_path(path: &str) -> String {
     let mut encoded = String::new();
 
     for byte in path.bytes() {
-        if byte.is_ascii_alphanumeric() || matches!(byte, b'/' | b'.' | b'-' | b'_' | b'~') {
+        // `:` is deliberately left unencoded: it's not meaningful anywhere
+        // in a POSIX path, and encoding it in a Windows drive path
+        // (`C%3A/Users/...`) breaks drive-letter recognition for the
+        // consumers (OS drag-and-drop, media players) this URL is for.
+        if byte.is_ascii_alphanumeric() || matches!(byte, b'/' | b'.' | b'-' | b'_' | b'~' | b':')
+        {
             encoded.push(byte as char);
         } else {
             encoded.push_str(&format!("%{byte:02X}"));
@@ -639,6 +707,18 @@ fn encode_wav_24_bit_pcm(samples: &[f32], sample_rate: u32, channels: u16) -> Ve
 mod tests {
     use super::*;
     use std::path::PathBuf;
+
+    #[test]
+    fn file_url_for_path_handles_windows_drive_paths() {
+        assert_eq!(
+            file_url_for_path(r"C:\Users\foo\Music\Dark Hit.wav"),
+            "file:///C:/Users/foo/Music/Dark%20Hit.wav"
+        );
+        assert_eq!(
+            file_url_for_path(r"D:\Library\track.wav"),
+            "file:///D:/Library/track.wav"
+        );
+    }
 
     #[test]
     fn exports_preserve_traceability_by_default() {

@@ -215,9 +215,14 @@ fn backup_library(
 /// copied, so a failed or partial copy never corrupts the live database.
 #[tauri::command]
 fn restore_library(app: tauri::AppHandle, state: tauri::State<CatalogState>, backup_dir: String) -> Result<usize, String> {
-    let backup_dir = backup_dir.trim_end_matches('/');
-    let catalog_snapshot_path = format!("{backup_dir}/catalog.sqlite");
-    let manifest_snapshot_path = format!("{backup_dir}/library.darkwave-manifest.json");
+    let catalog_snapshot_path = PathBuf::from(&backup_dir)
+        .join("catalog.sqlite")
+        .to_string_lossy()
+        .to_string();
+    let manifest_snapshot_path = PathBuf::from(&backup_dir)
+        .join("library.darkwave-manifest.json")
+        .to_string_lossy()
+        .to_string();
 
     if !std::path::Path::new(&catalog_snapshot_path).exists() {
         return Err("no catalog.sqlite found in the selected backup folder".to_string());
@@ -1087,11 +1092,15 @@ fn resolve_asset_path(catalog: &Catalog, asset: &AssetRecord) -> Result<String, 
                 .get_library(asset.library_id)
                 .map_err(storage_error_message)?
                 .ok_or_else(|| "library not found".to_string())?;
-            Ok(format!(
-                "{}/{}",
-                library.media_root.trim_end_matches('/'),
-                relative_path
-            ))
+            // relative_path always uses `/` internally (see ImportMode::Managed),
+            // independent of host OS — PathBuf::join parses `/` as a separator on
+            // every platform including Windows, unlike manual string formatting,
+            // which produced double-separator or mixed-separator paths whenever
+            // media_root already ended in a native trailing separator.
+            Ok(PathBuf::from(&library.media_root)
+                .join(relative_path)
+                .to_string_lossy()
+                .to_string())
         }
     }
 }
@@ -1099,9 +1108,10 @@ fn resolve_asset_path(catalog: &Catalog, asset: &AssetRecord) -> Result<String, 
 fn asset_absolute_path(asset: &AssetRecord, media_root: &str) -> String {
     match &asset.path {
         AssetPath::Referenced(path) => path.clone(),
-        AssetPath::Managed(relative_path) => {
-            format!("{}/{}", media_root.trim_end_matches('/'), relative_path)
-        }
+        AssetPath::Managed(relative_path) => PathBuf::from(media_root)
+            .join(relative_path)
+            .to_string_lossy()
+            .to_string(),
     }
 }
 
@@ -1186,9 +1196,23 @@ fn warm_library_cache(app: tauri::AppHandle, state: tauri::State<CatalogState>, 
             continue;
         }
 
-        if std::fs::copy(&source_path, &cache_path).is_ok() {
+        // Copy to a sibling .partial path first, then rename into place —
+        // `std::fs::copy` writes directly to its destination as it goes, so
+        // a reader checking `cache_path.exists()` (local_asset_path, used by
+        // audio analysis) could previously see the file the instant it's
+        // created and start decoding it mid-copy. Large files over a slow
+        // NAS/WiFi link take long enough to copy that this is a real risk,
+        // not just theoretical. A same-filesystem rename is atomic, so
+        // cache_path only ever exists once the copy is actually complete.
+        let partial_path = cache_dir.join(format!(
+            "{}.partial",
+            cache_path.file_name().unwrap_or_default().to_string_lossy()
+        ));
+        if std::fs::copy(&source_path, &partial_path).is_ok() && std::fs::rename(&partial_path, &cache_path).is_ok() {
             used_bytes += metadata.len();
             cached_count += 1;
+        } else {
+            let _ = std::fs::remove_file(&partial_path);
         }
     }
 
@@ -1243,8 +1267,8 @@ fn process_pending_jobs(state: tauri::State<CatalogState>) -> Result<usize, Stri
                     .map_err(storage_error_message)?;
                 catalog.complete_job(job.id).map_err(storage_error_message)?;
             }
-            Err(_) => {
-                catalog.fail_job(job.id).map_err(storage_error_message)?;
+            Err(error) => {
+                catalog.fail_job(job.id, &error).map_err(storage_error_message)?;
             }
         }
         processed += 1;
@@ -1405,7 +1429,7 @@ async fn process_audio_analysis_jobs(
         };
         let Some(asset) = asset else {
             let catalog = state.0.lock().expect("catalog mutex poisoned");
-            catalog.fail_job(job.id).map_err(storage_error_message)?;
+            catalog.fail_job(job.id, "asset not found").map_err(storage_error_message)?;
             processed += 1;
             let _ = app.emit("audio-analysis-progress", AudioAnalysisProgressEvent { succeeded: false });
             continue;
@@ -1461,8 +1485,8 @@ async fn process_audio_analysis_jobs(
 
                 catalog.complete_job(job.id).map_err(storage_error_message)?;
             }
-            Err(_) => {
-                catalog.fail_job(job.id).map_err(storage_error_message)?;
+            Err(error) => {
+                catalog.fail_job(job.id, &error).map_err(storage_error_message)?;
             }
         }
         processed += 1;
@@ -1909,11 +1933,10 @@ fn export_asset_to_project(
                 .get_library(asset.library_id)
                 .map_err(storage_error_message)?
                 .ok_or_else(|| "library not found".to_string())?;
-            format!(
-                "{}/{}",
-                library.media_root.trim_end_matches('/'),
-                relative_path
-            )
+            PathBuf::from(&library.media_root)
+                .join(relative_path)
+                .to_string_lossy()
+                .to_string()
         }
     };
 
@@ -2019,11 +2042,10 @@ fn export_selected_asset(
                 .get_library(asset.library_id)
                 .map_err(storage_error_message)?
                 .ok_or_else(|| "library not found".to_string())?;
-            format!(
-                "{}/{}",
-                library.media_root.trim_end_matches('/'),
-                relative_path
-            )
+            PathBuf::from(&library.media_root)
+                .join(relative_path)
+                .to_string_lossy()
+                .to_string()
         }
     };
 

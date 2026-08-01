@@ -50,11 +50,14 @@ impl PackagedAudioDecoder for SymphoniaDecoder {
             .codec_params
             .sample_rate
             .ok_or_else(|| MetadataError::DecodeFailed(format!("{extension}: unknown sample rate")))?;
-        let channels = track
-            .codec_params
-            .channels
-            .map(|channels| channels.count() as u16)
-            .ok_or_else(|| MetadataError::DecodeFailed(format!("{extension}: unknown channel count")))?;
+        // Some containers (notably certain AAC-in-MP4 tracks) don't surface
+        // the channel count in the track's upfront codec params — it's only
+        // known once a packet is actually decoded and its own spec is
+        // read. Use the eager value when available (the common, fast case
+        // for wav/aiff/flac/mp3) and otherwise fall back to the first
+        // successfully decoded packet's spec below, rather than failing a
+        // file whose channel count is perfectly determinable, just not yet.
+        let mut channels = track.codec_params.channels.map(|channels| channels.count() as u16);
 
         let mut decoder = symphonia::default::get_codecs()
             .make(&track.codec_params, &DecoderOptions::default())
@@ -80,6 +83,9 @@ impl PackagedAudioDecoder for SymphoniaDecoder {
 
             match decoder.decode(&packet) {
                 Ok(decoded) => {
+                    if channels.is_none() {
+                        channels = Some(decoded.spec().channels.count() as u16);
+                    }
                     let mut sample_buffer =
                         SampleBuffer::<f32>::new(decoded.capacity() as u64, *decoded.spec());
                     sample_buffer.copy_interleaved_ref(decoded);
@@ -95,6 +101,8 @@ impl PackagedAudioDecoder for SymphoniaDecoder {
                 "{extension}: decoded zero samples"
             )));
         }
+        let channels = channels
+            .ok_or_else(|| MetadataError::DecodeFailed(format!("{extension}: unknown channel count")))?;
 
         Ok(DecodedAudioBuffer {
             sample_rate,

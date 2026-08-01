@@ -201,20 +201,32 @@ fn parse_wav_info_metadata(bytes: &[u8]) -> Result<EmbeddedFileMetadata, Metadat
     let mut metadata = EmbeddedFileMetadata::default();
     let mut cursor = 12usize;
 
+    // Some real-world WAV files (notably certain DAW/hardware-recorder
+    // bounces) have trailing zero-padding or other junk bytes after their
+    // last real chunk. Once a chunk header no longer makes sense — a
+    // declared size that doesn't fit in what's left of the file — there's
+    // nothing more to find, but that isn't a reason to fail: this function
+    // is a best-effort read of *optional* embedded tags, so stop scanning
+    // and return whatever was found rather than erroring the whole import
+    // over a file whose actual audio (already handled by Symphonia
+    // elsewhere) is perfectly fine.
     while cursor + 8 <= bytes.len() {
         let chunk_id = &bytes[cursor..cursor + 4];
-        let chunk_size = read_u32_le(bytes, cursor + 4)? as usize;
+        let Ok(chunk_size) = read_u32_le(bytes, cursor + 4) else {
+            break;
+        };
+        let chunk_size = chunk_size as usize;
         let chunk_start = cursor + 8;
-        let chunk_end = chunk_start
-            .checked_add(chunk_size)
-            .ok_or(MetadataError::InvalidWav)?;
+        let Some(chunk_end) = chunk_start.checked_add(chunk_size) else {
+            break;
+        };
         if chunk_end > bytes.len() {
-            return Err(MetadataError::InvalidWav);
+            break;
         }
 
         if chunk_id == b"LIST" && chunk_size >= 4 && &bytes[chunk_start..chunk_start + 4] == b"INFO"
         {
-            parse_wav_info_list(&bytes[chunk_start + 4..chunk_end], &mut metadata)?;
+            let _ = parse_wav_info_list(&bytes[chunk_start + 4..chunk_end], &mut metadata);
         }
 
         cursor = chunk_end + (chunk_size % 2);

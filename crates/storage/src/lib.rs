@@ -505,10 +505,10 @@ impl Catalog {
         Ok(())
     }
 
-    pub fn fail_job(&self, job_id: Uuid) -> Result<(), StorageError> {
+    pub fn fail_job(&self, job_id: Uuid, error: &str) -> Result<(), StorageError> {
         self.connection.execute(
-            "UPDATE background_jobs SET state = 'failed', attempts = attempts + 1, updated_at = ?1 WHERE id = ?2",
-            params![Utc::now().to_rfc3339(), job_id.to_string()],
+            "UPDATE background_jobs SET state = 'failed', attempts = attempts + 1, error = ?1, updated_at = ?2 WHERE id = ?3",
+            params![error, Utc::now().to_rfc3339(), job_id.to_string()],
         )?;
         Ok(())
     }
@@ -2601,7 +2601,7 @@ mod tests {
         let failed_job = catalog
             .enqueue_job(failed_asset.id, JobKind::AudioAnalysis, 40)
             .expect("enqueue failed");
-        catalog.fail_job(failed_job.id).expect("fail job");
+        catalog.fail_job(failed_job.id, "test error").expect("fail job");
         let done_job = catalog
             .enqueue_job(done_asset.id, JobKind::AudioAnalysis, 40)
             .expect("enqueue done");
@@ -2630,7 +2630,7 @@ mod tests {
             let job = catalog
                 .enqueue_job(asset.id, JobKind::AudioAnalysis, 40)
                 .expect("enqueue");
-            catalog.fail_job(job.id).expect("fail job");
+            catalog.fail_job(job.id, "test error").expect("fail job");
         }
         catalog
             .enqueue_job(pending_asset.id, JobKind::AudioAnalysis, 40)
@@ -2710,7 +2710,7 @@ mod tests {
             .enqueue_job(asset.id, JobKind::AudioAnalysis, 40)
             .expect("enqueue");
 
-        catalog.fail_job(job.id).expect("fail once");
+        catalog.fail_job(job.id, "test error").expect("fail once");
         let requeued = catalog.requeue_failed_jobs(3).expect("requeue");
         assert_eq!(requeued, 1);
         assert_eq!(
@@ -2722,8 +2722,8 @@ mod tests {
         );
 
         // Fail it two more times (3 attempts total) — the cap should stop requeuing.
-        catalog.fail_job(job.id).expect("fail twice");
-        catalog.fail_job(job.id).expect("fail thrice");
+        catalog.fail_job(job.id, "test error").expect("fail twice");
+        catalog.fail_job(job.id, "test error").expect("fail thrice");
         let requeued_after_cap = catalog.requeue_failed_jobs(3).expect("requeue at cap");
         assert_eq!(requeued_after_cap, 0);
         assert!(catalog
@@ -2750,12 +2750,12 @@ mod tests {
         // Exhaust the normal 3-attempt cap for both jobs (the second library's
         // job stays failed throughout — it's here to prove retry is scoped
         // to the target library, not to exercise the cap itself).
-        catalog.fail_job(job.id).expect("fail once");
-        catalog.fail_job(job.id).expect("fail twice");
-        catalog.fail_job(job.id).expect("fail thrice");
-        catalog.fail_job(other_job.id).expect("fail once");
-        catalog.fail_job(other_job.id).expect("fail twice");
-        catalog.fail_job(other_job.id).expect("fail thrice");
+        catalog.fail_job(job.id, "test error").expect("fail once");
+        catalog.fail_job(job.id, "test error").expect("fail twice");
+        catalog.fail_job(job.id, "test error").expect("fail thrice");
+        catalog.fail_job(other_job.id, "test error").expect("fail once");
+        catalog.fail_job(other_job.id, "test error").expect("fail twice");
+        catalog.fail_job(other_job.id, "test error").expect("fail thrice");
 
         let retried = catalog
             .retry_failed_jobs_for_library(library.id, JobKind::AudioAnalysis)
@@ -2770,7 +2770,7 @@ mod tests {
 
         // Attempts reset, so it survives the normal cap again if it fails once
         // more — other_job stays excluded since it's still at 3 attempts.
-        catalog.fail_job(job.id).expect("fail after manual retry");
+        catalog.fail_job(job.id, "test error").expect("fail after manual retry");
         assert_eq!(catalog.requeue_failed_jobs(3).expect("requeue after retry"), 1);
     }
 
@@ -2810,7 +2810,7 @@ mod tests {
             .enqueue_job(asset.id, JobKind::MetadataExtraction, 10)
             .expect("enqueue");
 
-        catalog.fail_job(job.id).expect("fail job");
+        catalog.fail_job(job.id, "test error").expect("fail job");
 
         assert!(catalog
             .pending_jobs_of_kind(JobKind::MetadataExtraction, 10)

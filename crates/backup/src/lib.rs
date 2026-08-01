@@ -1,3 +1,5 @@
+use std::path::Path;
+
 use serde::{Deserialize, Serialize};
 use uuid::Uuid;
 
@@ -50,9 +52,12 @@ pub fn create_backup(
     created_at_ms: u64,
     mut copy: impl FnMut(&str, &str) -> bool,
 ) -> Result<BackupPackage, BackupError> {
-    let backup_dir = source.backup_dir.trim_end_matches('/');
-    let catalog_snapshot_path = format!("{backup_dir}/catalog.sqlite");
-    let manifest_path = format!("{backup_dir}/library.darkwave-manifest.json");
+    let backup_dir = Path::new(&source.backup_dir);
+    let catalog_snapshot_path = backup_dir.join("catalog.sqlite").to_string_lossy().to_string();
+    let manifest_path = backup_dir
+        .join("library.darkwave-manifest.json")
+        .to_string_lossy()
+        .to_string();
 
     if !copy(&source.catalog_path, &catalog_snapshot_path) {
         return Err(BackupError::CatalogSnapshotFailed);
