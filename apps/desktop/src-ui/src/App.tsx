@@ -2138,6 +2138,12 @@ export function App() {
   // there's one place to check for anything happening in the background.
   const activityPreparing = importStatus === "Importing…" || refreshStatus === "Scanning for new files…";
   const activityBusy = jobProgress.length > 0;
+  // A ~3-minute analysis batch previously had no on-screen sign of life
+  // beyond a small toolbar icon (easy to miss, no sense of how much work is
+  // left) — a completely healthy run read as a hang. This renders as its
+  // own banner right under the topbar instead, visible from any tab/section
+  // without needing to notice and open Background Activity.
+  const activityBannerText = activityPreparing ? importStatus ?? refreshStatus ?? "Working…" : null;
   const waveformActiveIndex = peaks && duration > 0 ? Math.floor((currentTime / duration) * peaks.length) : -1;
   const drTargetAssetId = playingAssetId ?? selectedAssetId;
   const drTargetProject = collections.find((project) => project.id === lastExportProjectId) ?? null;
@@ -2670,6 +2676,35 @@ export function App() {
             <Settings size={17} />
           </button>
         </header>
+        {activityBusy || activityPreparing ? (
+          <button
+            type="button"
+            className="background-activity-banner"
+            onClick={() => setBackgroundActivityOpen(true)}
+            aria-label="Background activity in progress — click for details"
+          >
+            {activityBannerText ? (
+              <span className="background-activity-banner-item">
+                <span className="background-activity-banner-label">{activityBannerText}</span>
+              </span>
+            ) : null}
+            {jobProgress.map((job) => {
+              const done = job.total - job.pending;
+              const percent = job.total > 0 ? Math.round((done / job.total) * 100) : 0;
+              return (
+                <span className="background-activity-banner-item" key={job.kind}>
+                  <span className="background-activity-banner-label">
+                    {job.label}: {done}/{job.total}
+                    {job.failed > 0 ? ` · ${job.failed} failed` : ""}
+                  </span>
+                  <span className="background-activity-banner-track">
+                    <span className="background-activity-banner-fill" style={{ width: `${percent}%` }} />
+                  </span>
+                </span>
+              );
+            })}
+          </button>
+        ) : null}
         {queryFilters.length > 0 ? (
           <div className="chip-row status-strip" aria-label="Status">
             {queryFilters.map((filter, index) => (

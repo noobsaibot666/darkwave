@@ -586,6 +586,61 @@ button.panel-handle-right:active:not(:disabled) {
   padding: 4px 18px 0;
 }
 
+/* A completely healthy multi-minute analysis batch previously had no
+   on-screen sign of life beyond a small, easy-to-miss toolbar icon — this
+   is the fix: a full-width, always-visible banner right under the topbar,
+   present on every tab/section, not just inside the Background Activity
+   modal a user has to think to open. */
+.background-activity-banner {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 16px;
+  align-items: center;
+  width: 100%;
+  padding: 8px 18px;
+  border: 0;
+  border-bottom: 1px solid rgba(var(--ink-rgb), 0.08);
+  background: rgba(255, 121, 64, 0.08);
+  color: var(--text-primary);
+  text-align: left;
+  cursor: pointer;
+}
+
+.background-activity-banner:hover {
+  background: rgba(255, 121, 64, 0.14);
+}
+
+.background-activity-banner-item {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  min-width: 0;
+}
+
+.background-activity-banner-label {
+  overflow: hidden;
+  font-size: 12px;
+  font-weight: 600;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.background-activity-banner-track {
+  width: 90px;
+  height: 5px;
+  border-radius: 999px;
+  background: rgba(var(--ink-rgb), 0.12);
+  overflow: hidden;
+}
+
+.background-activity-banner-fill {
+  display: block;
+  height: 100%;
+  border-radius: 999px;
+  background: linear-gradient(90deg, var(--player-accent-from, #ff7940), var(--player-accent-to, #f14800));
+  transition: width 220ms var(--ease-soft);
+}
+
 .filter-panel {
   display: flex;
   flex-wrap: wrap;
