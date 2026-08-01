@@ -30,6 +30,18 @@ struct JobControlState {
     audio_analysis_paused: std::sync::atomic::AtomicBool,
 }
 
+/// A resident similarity-worker subprocess, spawned once and reused across
+/// every analysis job instead of respawning (and re-paying process-start
+/// cost) per file. See `run_similarity_worker` for the request/response
+/// protocol and why a single `tokio::sync::Mutex` around it is enough to
+/// serialize concurrent callers correctly.
+struct ResidentSimilarityWorker {
+    child: tauri_plugin_shell::process::CommandChild,
+    events: tauri::async_runtime::Receiver<tauri_plugin_shell::process::CommandEvent>,
+}
+
+struct SimilarityWorkerState(tokio::sync::Mutex<Option<ResidentSimilarityWorker>>);
+
 #[derive(Debug, serde::Serialize)]
 struct ImportFailure {
     filename: String,
@@ -1392,8 +1404,8 @@ async fn process_audio_analysis_jobs(
     state: tauri::State<'_, CatalogState>,
     job_control: tauri::State<'_, JobControlState>,
 ) -> Result<usize, String> {
+    use futures::stream::{self, StreamExt};
     use std::sync::atomic::Ordering;
-    use tauri::Emitter;
 
     if job_control.audio_analysis_paused.load(Ordering::SeqCst) {
         return Ok(0);
@@ -1414,86 +1426,142 @@ async fn process_audio_analysis_jobs(
             .map_err(storage_error_message)?
     };
 
+    let worker_state = app.state::<SimilarityWorkerState>();
+
+    // Bounded rather than "all claimed jobs at once": the CPU-bound
+    // decode/DSP/VAD work already gets real OS-thread parallelism via
+    // spawn_blocking inside analyze_asset_audio, so this just caps how many
+    // files are in flight together at a time — a big batch shouldn't launch
+    // 20 concurrent NAS reads simultaneously. Previously this was a strict
+    // one-at-a-time loop, which left a 32-thread machine mostly idle during
+    // a large import (see docs/.../bug-log.md OPEN-3).
+    const AUDIO_ANALYSIS_CONCURRENCY: usize = 4;
+
+    let mut results = stream::iter(jobs)
+        .map(|job| process_one_audio_analysis_job(&app, &state, &job_control, worker_state.inner(), job))
+        .buffer_unordered(AUDIO_ANALYSIS_CONCURRENCY);
+
     let mut processed = 0usize;
-    for job in jobs {
-        if job_control.audio_analysis_paused.load(Ordering::SeqCst) {
-            // Whatever's left of this claimed batch stays 'processing' —
-            // reset_stuck_processing_jobs picks it back up on the next
-            // (unpaused) call, so nothing here is lost, just deferred.
-            break;
-        }
-
-        let asset = {
-            let catalog = state.0.lock().expect("catalog mutex poisoned");
-            catalog.get_asset(job.asset_id).map_err(storage_error_message)?
-        };
-        let Some(asset) = asset else {
-            let catalog = state.0.lock().expect("catalog mutex poisoned");
-            catalog.fail_job(job.id, "asset not found").map_err(storage_error_message)?;
+    while let Some(counted) = results.next().await {
+        if counted {
             processed += 1;
-            let _ = app.emit("audio-analysis-progress", AudioAnalysisProgressEvent { succeeded: false });
-            continue;
-        };
-
-        let local_path = {
-            let catalog = state.0.lock().expect("catalog mutex poisoned");
-            local_asset_path(&app, &catalog, &asset)
-        };
-        // Referenced/NAS assets not yet warmed into the local cache: leave
-        // the job pending rather than failing it, so a later warm+retry can
-        // pick it up (mirrors how playback already treats an uncached path).
-        // Reported as "succeeded" to the UI since this isn't a real failure
-        // — reset_stuck_processing_jobs makes it claimable again next round.
-        let Ok(local_path) = local_path else {
-            processed += 1;
-            let _ = app.emit("audio-analysis-progress", AudioAnalysisProgressEvent { succeeded: true });
-            continue;
-        };
-        if !std::path::Path::new(&local_path).exists() {
-            processed += 1;
-            let _ = app.emit("audio-analysis-progress", AudioAnalysisProgressEvent { succeeded: true });
-            continue;
         }
-
-        let outcome = analyze_asset_audio(&app, &local_path).await;
-
-        let catalog = state.0.lock().expect("catalog mutex poisoned");
-        let succeeded = outcome.is_ok();
-        match outcome {
-            Ok(outcome) => {
-                catalog
-                    .set_audio_analysis(job.asset_id, outcome.update)
-                    .map_err(storage_error_message)?;
-                catalog
-                    .set_vocal_ratio(job.asset_id, outcome.vocal_ratio.map(|ratio| ratio as f64))
-                    .map_err(storage_error_message)?;
-
-                if outcome.needs_review {
-                    catalog
-                        .set_media_type(job.asset_id, "needs_review")
-                        .map_err(storage_error_message)?;
-                }
-
-                for tag_name in outcome.suggested_tags {
-                    let tag = catalog
-                        .create_tag(tag_name, "action", true)
-                        .map_err(storage_error_message)?;
-                    catalog
-                        .suggest_tag_for_asset(job.asset_id, tag.id, TagOrigin::AcousticModel, 0.6)
-                        .map_err(storage_error_message)?;
-                }
-
-                catalog.complete_job(job.id).map_err(storage_error_message)?;
-            }
-            Err(error) => {
-                catalog.fail_job(job.id, &error).map_err(storage_error_message)?;
-            }
-        }
-        processed += 1;
-        let _ = app.emit("audio-analysis-progress", AudioAnalysisProgressEvent { succeeded });
     }
 
     Ok(processed)
+}
+
+/// Processes a single already-claimed audio-analysis job: resolves the
+/// asset, analyzes it (or defers it if it isn't cached locally yet),
+/// persists the result, and emits a progress event. Returns `false` only
+/// when the queue was paused before this job's turn came up — the job is
+/// left `'processing'` and picked back up by `reset_stuck_processing_jobs`
+/// next time, the same "leave it for later, don't lose it" behavior the
+/// pre-concurrency version had when it broke out of its loop early on pause.
+///
+/// A per-job storage error is logged and treated as a skip rather than
+/// aborting the whole batch (the previous sequential version's `?` would
+/// have failed the entire command on any single job's DB error) — with
+/// several jobs now running concurrently, one bad write shouldn't take
+/// down every other job already in flight, and the standing background
+/// worker retries pending/failed work on its own schedule regardless.
+async fn process_one_audio_analysis_job(
+    app: &tauri::AppHandle,
+    state: &tauri::State<'_, CatalogState>,
+    job_control: &tauri::State<'_, JobControlState>,
+    worker_state: &SimilarityWorkerState,
+    job: storage::JobRecord,
+) -> bool {
+    use std::sync::atomic::Ordering;
+    use tauri::Emitter;
+
+    if job_control.audio_analysis_paused.load(Ordering::SeqCst) {
+        return false;
+    }
+
+    let asset = {
+        let catalog = state.0.lock().expect("catalog mutex poisoned");
+        catalog.get_asset(job.asset_id)
+    };
+    let asset = match asset {
+        Ok(asset) => asset,
+        Err(error) => {
+            eprintln!("audio-analysis: failed to load asset {}: {error:?}", job.asset_id);
+            return false;
+        }
+    };
+    let Some(asset) = asset else {
+        let catalog = state.0.lock().expect("catalog mutex poisoned");
+        if let Err(error) = catalog.fail_job(job.id, "asset not found") {
+            eprintln!("audio-analysis: failed to record missing-asset failure: {error:?}");
+        }
+        let _ = app.emit("audio-analysis-progress", AudioAnalysisProgressEvent { succeeded: false });
+        return true;
+    };
+
+    let local_path = {
+        let catalog = state.0.lock().expect("catalog mutex poisoned");
+        local_asset_path(app, &catalog, &asset)
+    };
+    // Referenced/NAS assets not yet warmed into the local cache: leave the
+    // job pending rather than failing it, so a later warm+retry can pick it
+    // up (mirrors how playback already treats an uncached path). Reported
+    // as "succeeded" to the UI since this isn't a real failure —
+    // reset_stuck_processing_jobs makes it claimable again next round.
+    let Ok(local_path) = local_path else {
+        let _ = app.emit("audio-analysis-progress", AudioAnalysisProgressEvent { succeeded: true });
+        return true;
+    };
+    if !std::path::Path::new(&local_path).exists() {
+        let _ = app.emit("audio-analysis-progress", AudioAnalysisProgressEvent { succeeded: true });
+        return true;
+    }
+
+    let outcome = analyze_asset_audio(app, worker_state, &local_path).await;
+    let succeeded = outcome.is_ok();
+
+    let catalog = state.0.lock().expect("catalog mutex poisoned");
+    let saved = match outcome {
+        Ok(outcome) => save_audio_analysis_outcome(&catalog, job.asset_id, job.id, outcome),
+        Err(error) => catalog.fail_job(job.id, &error).map_err(storage_error_message),
+    };
+    if let Err(error) = saved {
+        eprintln!("audio-analysis: failed to persist result for job {}: {error}", job.id);
+    }
+
+    let _ = app.emit("audio-analysis-progress", AudioAnalysisProgressEvent { succeeded });
+    true
+}
+
+fn save_audio_analysis_outcome(
+    catalog: &Catalog,
+    asset_id: Uuid,
+    job_id: Uuid,
+    outcome: AudioAnalysisOutcome,
+) -> Result<(), String> {
+    catalog
+        .set_audio_analysis(asset_id, outcome.update)
+        .map_err(storage_error_message)?;
+    catalog
+        .set_vocal_ratio(asset_id, outcome.vocal_ratio.map(|ratio| ratio as f64))
+        .map_err(storage_error_message)?;
+
+    if outcome.needs_review {
+        catalog
+            .set_media_type(asset_id, "needs_review")
+            .map_err(storage_error_message)?;
+    }
+
+    for tag_name in outcome.suggested_tags {
+        let tag = catalog
+            .create_tag(tag_name, "action", true)
+            .map_err(storage_error_message)?;
+        catalog
+            .suggest_tag_for_asset(asset_id, tag.id, TagOrigin::AcousticModel, 0.6)
+            .map_err(storage_error_message)?;
+    }
+
+    catalog.complete_job(job_id).map_err(storage_error_message)
 }
 
 /// Pausing is a session-only control (not a saved preference): stops new
@@ -1519,7 +1587,11 @@ struct AudioAnalysisOutcome {
     update: storage::AudioAnalysisUpdate,
 }
 
-async fn analyze_asset_audio(app: &tauri::AppHandle, path: &str) -> Result<AudioAnalysisOutcome, String> {
+async fn analyze_asset_audio(
+    app: &tauri::AppHandle,
+    worker_state: &SimilarityWorkerState,
+    path: &str,
+) -> Result<AudioAnalysisOutcome, String> {
     // Decode + DSP + VAD inference are all synchronous, CPU-bound Rust —
     // running them inline in this async fn would occupy one of Tauri's
     // async-runtime worker threads for the whole duration. Those same
@@ -1571,7 +1643,7 @@ async fn analyze_asset_audio(app: &tauri::AppHandle, path: &str) -> Result<Audio
         .await
         .map_err(|error| format!("audio analysis task panicked: {error}"))??;
 
-    update.perceptual_fingerprint = run_similarity_worker(app, path).await;
+    update.perceptual_fingerprint = run_similarity_worker(app, worker_state, path).await;
 
     Ok(AudioAnalysisOutcome {
         needs_review,
@@ -1581,27 +1653,97 @@ async fn analyze_asset_audio(app: &tauri::AppHandle, path: &str) -> Result<Audio
     })
 }
 
-/// Spawns the GPL-isolated similarity-worker subprocess and parses its
-/// stdout. Returns `None` on any failure (missing sidecar, decode error,
-/// malformed output, or timeout) — similarity is a nice-to-have, never a
-/// reason to fail or indefinitely stall the whole analysis job. Bounded at
-/// 90s: a debug build of the sidecar (unoptimized) has been observed taking
-/// 20-40s for an ordinary file, so this is generous headroom for that, not
-/// a tight production budget — without any bound at all, one pathological
-/// file hangs that job's slot forever with nothing to recover it.
-async fn run_similarity_worker(app: &tauri::AppHandle, path: &str) -> Option<String> {
+/// Sends one file path to the resident similarity-worker subprocess
+/// (spawning it on first use, or respawning it if a previous call left it
+/// dead) and returns its parsed fingerprint. Returns `None` on any failure
+/// (missing sidecar, decode error, malformed output, or timeout) —
+/// similarity is a nice-to-have, never a reason to fail or indefinitely
+/// stall the whole analysis job.
+///
+/// A single subprocess, reused across every call, replaces the previous
+/// spawn-a-fresh-process-per-file approach (see docs/.../bug-log.md's
+/// OPEN-3): every file used to pay a full process-start cost on top of its
+/// actual analysis time. Holding `worker_state`'s mutex for the whole
+/// "write request, read its one response line" round trip is enough to
+/// serialize concurrent callers correctly — the worker processes requests
+/// one at a time, in the order it receives them (see
+/// `crates/similarity-worker`'s `--stdin-loop` mode), so whoever holds the
+/// lock is guaranteed to read back its own response, never someone else's.
+/// This does mean concurrent analysis jobs take turns at the fingerprint
+/// step specifically, even though their much heavier decode/DSP/VAD work
+/// (see `analyze_asset_audio`) runs fully in parallel — a small pool of
+/// resident workers instead of one would remove that serialization point
+/// too, but isn't implemented here; the fixed per-file spawn/model-start
+/// cost this replaces was the actually-measured problem, not fingerprint
+/// throughput itself, so this is deliberately the simpler fix until
+/// real-world measurement says otherwise.
+async fn run_similarity_worker(
+    app: &tauri::AppHandle,
+    worker_state: &SimilarityWorkerState,
+    path: &str,
+) -> Option<String> {
+    use tauri_plugin_shell::process::CommandEvent;
     use tauri_plugin_shell::ShellExt;
 
-    let sidecar = app.shell().sidecar("similarity-worker").ok()?;
-    let output = tokio::time::timeout(std::time::Duration::from_secs(90), sidecar.args([path]).output())
-        .await
-        .ok()?
-        .ok()?;
-    if !output.status.success() {
+    let mut guard = worker_state.0.lock().await;
+
+    if guard.is_none() {
+        let sidecar = app.shell().sidecar("similarity-worker").ok()?;
+        let (events, child) = sidecar.args(["--stdin-loop"]).spawn().ok()?;
+        *guard = Some(ResidentSimilarityWorker { child, events });
+    }
+
+    let worker = guard.as_mut().expect("just ensured it's Some");
+    let wrote_request =
+        worker.child.write(path.as_bytes()).is_ok() && worker.child.write(b"\n").is_ok();
+    if !wrote_request {
+        if let Some(dead_worker) = guard.take() {
+            let _ = dead_worker.child.kill();
+        }
         return None;
     }
 
-    let stdout = String::from_utf8_lossy(&output.stdout);
+    let worker = guard.as_mut().expect("just ensured it's Some");
+    // Deliberately generous — a debug build of the sidecar (unoptimized)
+    // has been observed taking 20-40s for an ordinary file even before
+    // this change, so this is headroom for that, not a tight production
+    // budget. Without any bound at all, one pathological file hangs this
+    // job's slot forever with nothing to recover it.
+    let response = tokio::time::timeout(std::time::Duration::from_secs(90), async {
+        loop {
+            match worker.events.recv().await {
+                Some(CommandEvent::Stdout(bytes)) => return Some(bytes),
+                // Surfaced to the terminal rather than silently dropped: a
+                // Rust panic in the worker (e.g. bliss-audio choking on a
+                // pathological file) prints here, which is the only signal
+                // that would otherwise explain an unexpected respawn below.
+                Some(CommandEvent::Stderr(bytes)) => {
+                    eprintln!("similarity-worker stderr: {}", String::from_utf8_lossy(&bytes));
+                    continue;
+                }
+                // Error/Terminated, any future non-exhaustive variant, or
+                // the channel closing (None) all mean "no usable response
+                // is coming" — treat them the same as a hard failure.
+                _ => return None,
+            }
+        }
+    })
+    .await;
+
+    let stdout_bytes = match response {
+        Ok(Some(bytes)) => bytes,
+        _ => {
+            // Timed out, the worker errored/exited, or the event channel
+            // closed — drop it so the next call spawns a fresh one instead
+            // of writing into a dead or desynced pipe.
+            if let Some(dead_worker) = guard.take() {
+                let _ = dead_worker.child.kill();
+            }
+            return None;
+        }
+    };
+
+    let stdout = String::from_utf8_lossy(&stdout_bytes);
     let parsed: serde_json::Value = serde_json::from_str(stdout.trim()).ok()?;
     parsed
         .get("analysis")
@@ -2127,6 +2269,7 @@ pub fn run() {
             app.manage(JobControlState {
                 audio_analysis_paused: std::sync::atomic::AtomicBool::new(false),
             });
+            app.manage(SimilarityWorkerState(tokio::sync::Mutex::new(None)));
 
             // Standing background worker: requeues jobs that failed with
             // retries left, polls the configured watched folder (if any),
