@@ -18,6 +18,7 @@ pub enum CommandId {
     ExportSelected,
     ToggleLoop,
     CopyPath,
+    ToggleReviewed,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
@@ -128,9 +129,23 @@ impl ShortcutMap {
                     command: CommandId::NextAsset,
                     accelerator: "ArrowDown".to_string(),
                 },
+                // A second accelerator for the same command — one command
+                // can have more than one binding, `validate()` only rejects
+                // the same accelerator mapping to *different* commands.
+                // Keeps the arrow keys while adding WASD-style D/A so a
+                // hand already on the keyboard doesn't need to reach for
+                // arrows during a long review session.
+                ShortcutBinding {
+                    command: CommandId::NextAsset,
+                    accelerator: "D".to_string(),
+                },
                 ShortcutBinding {
                     command: CommandId::PreviousAsset,
                     accelerator: "ArrowUp".to_string(),
+                },
+                ShortcutBinding {
+                    command: CommandId::PreviousAsset,
+                    accelerator: "A".to_string(),
                 },
                 ShortcutBinding {
                     command: CommandId::ToggleFavorite,
@@ -155,6 +170,10 @@ impl ShortcutMap {
                 ShortcutBinding {
                     command: CommandId::CopyPath,
                     accelerator: "Mod+Shift+C".to_string(),
+                },
+                ShortcutBinding {
+                    command: CommandId::ToggleReviewed,
+                    accelerator: "Mod+R".to_string(),
                 },
             ],
         }
@@ -269,6 +288,36 @@ mod tests {
             Some("Mod+K")
         );
         assert_eq!(shortcuts.binding_for(CommandId::Import), Some("Mod+I"));
+    }
+
+    #[test]
+    fn default_shortcuts_have_no_internal_conflicts() {
+        assert_eq!(ShortcutMap::default_audio_workspace().validate(), Ok(()));
+    }
+
+    #[test]
+    fn next_and_previous_asset_each_have_a_second_letter_key_binding() {
+        let shortcuts = ShortcutMap::default_audio_workspace();
+
+        // binding_for only returns the first match — the arrow keys stay
+        // primary — but both accelerators must be present in the full list
+        // for D/A to actually fire NextAsset/PreviousAsset at runtime.
+        assert!(shortcuts
+            .bindings
+            .iter()
+            .any(|binding| binding.command == CommandId::NextAsset && binding.accelerator == "D"));
+        assert!(shortcuts
+            .bindings
+            .iter()
+            .any(|binding| binding.command == CommandId::PreviousAsset && binding.accelerator == "A"));
+    }
+
+    #[test]
+    fn toggle_reviewed_is_bound_to_mod_r() {
+        assert_eq!(
+            ShortcutMap::default_audio_workspace().binding_for(CommandId::ToggleReviewed),
+            Some("Mod+R")
+        );
     }
 
     #[test]

@@ -881,6 +881,56 @@ button.panel-handle-right:active:not(:disabled) {
   color: #ff5c00;
 }
 
+.quick-action-row {
+  display: flex;
+  gap: 8px;
+}
+
+.classification-row {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 8px;
+}
+
+.classification-chip {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  height: 30px;
+  padding: 0 12px;
+  border: 1px solid rgba(var(--ink-rgb), 0.1);
+  border-radius: 999px;
+  background: var(--surface-hover);
+  color: var(--text-primary);
+  font-size: 12px;
+}
+
+.classification-chip.active {
+  border-color: color-mix(in srgb, var(--classification-color) 55%, transparent);
+  background: color-mix(in srgb, var(--classification-color) 16%, transparent);
+  font-weight: 650;
+}
+
+/* Higher specificity than .icon-button.active on purpose — reviewed state
+   gets the app's established green "done/success" color (matches
+   .job-progress-done), not the generic orange "panel is open" active
+   tint, so the two kinds of "on" state don't look interchangeable. */
+.icon-button.reviewed.active {
+  background: rgba(52, 211, 153, 0.18);
+  border-color: rgba(52, 211, 153, 0.5);
+  color: #059669;
+}
+
+.icon-button.danger {
+  border-color: rgba(220, 38, 38, 0.3);
+  background: rgba(220, 38, 38, 0.1);
+  color: #f87171;
+}
+
+.icon-button.danger:hover:not(:disabled) {
+  background: rgba(220, 38, 38, 0.18);
+}
+
 .primary-action {
   gap: 7px;
   height: 34px;

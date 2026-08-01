@@ -190,6 +190,49 @@ pub fn suggest_action_tags(
     tags
 }
 
+/// Files under this length are assumed to be sound effects rather than
+/// music or ambience — matches the intent of import-time's file-size-based
+/// heuristic (`SOUND_EFFECT_MAX_BYTES` in `import-pipeline`, ~28s at a
+/// typical 16-bit/44.1kHz stereo bitrate), now using real decoded duration
+/// instead of a byte-count proxy for it.
+const CLASSIFICATION_SHORT_DURATION_MS: i64 = 30_000;
+
+/// Below this, a detected tempo is treated as noise rather than a real
+/// beat — autocorrelation on non-rhythmic material (a drone, room tone,
+/// wind) can still return *some* bpm value with low confidence.
+const CLASSIFICATION_MIN_BPM_CONFIDENCE: f64 = 0.5;
+
+/// Best-effort media-type classification from the signals `analyze_asset_audio`
+/// already computes — duration and detected tempo. This is the "first
+/// funnel": real acoustic signal, not filename guessing, deciding a file's
+/// category before anyone has to review it by hand. Returns `None` when
+/// there isn't enough signal to decide (no duration at all), so a caller
+/// can leave whatever classification already exists untouched rather than
+/// overwriting it with a guess.
+///
+/// Deliberately only two signals, both already computed for every analyzed
+/// file at no extra cost — not a new classifier model, consistent with this
+/// project's preference for small hand-written heuristics (see ADR 0025)
+/// over new ML dependencies for a problem two numbers already answer well
+/// enough: short clips are effects; long clips with a confident beat are
+/// music; long clips without one are ambience.
+pub fn classify_media_type_from_analysis(
+    duration_ms: Option<i64>,
+    bpm: Option<f64>,
+    bpm_confidence: Option<f64>,
+) -> Option<&'static str> {
+    let duration_ms = duration_ms?;
+
+    if duration_ms <= CLASSIFICATION_SHORT_DURATION_MS {
+        return Some("sound_effect");
+    }
+
+    let has_confident_beat = bpm.is_some()
+        && bpm_confidence.is_some_and(|confidence| confidence >= CLASSIFICATION_MIN_BPM_CONFIDENCE);
+
+    Some(if has_confident_beat { "music" } else { "ambience" })
+}
+
 const PITCH_WINDOW_SIZE: usize = 2048;
 const PITCH_POWER_THRESHOLD: f32 = 5.0;
 const PITCH_CLARITY_THRESHOLD: f32 = 0.6;
@@ -405,6 +448,42 @@ fn low_frequency_energy_ratio(mono: &[f32], sample_rate: u32) -> f32 {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn classification_treats_short_clips_as_sound_effects_regardless_of_tempo() {
+        assert_eq!(
+            classify_media_type_from_analysis(Some(5_000), Some(120.0), Some(0.9)),
+            Some("sound_effect")
+        );
+        assert_eq!(
+            classify_media_type_from_analysis(Some(30_000), None, None),
+            Some("sound_effect")
+        );
+    }
+
+    #[test]
+    fn classification_treats_long_confident_tempo_as_music() {
+        assert_eq!(
+            classify_media_type_from_analysis(Some(180_000), Some(96.0), Some(0.8)),
+            Some("music")
+        );
+    }
+
+    #[test]
+    fn classification_treats_long_clips_without_a_confident_beat_as_ambience() {
+        assert_eq!(classify_media_type_from_analysis(Some(180_000), None, None), Some("ambience"));
+        // A spurious low-confidence tempo on non-rhythmic material
+        // shouldn't be enough to call it "music".
+        assert_eq!(
+            classify_media_type_from_analysis(Some(180_000), Some(70.0), Some(0.2)),
+            Some("ambience")
+        );
+    }
+
+    #[test]
+    fn classification_declines_to_guess_without_a_duration() {
+        assert_eq!(classify_media_type_from_analysis(None, Some(120.0), Some(0.9)), None);
+    }
 
     fn sine_wave(
         freq: f32,

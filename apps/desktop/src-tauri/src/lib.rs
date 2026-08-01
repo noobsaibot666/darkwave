@@ -1522,7 +1522,7 @@ async fn process_one_audio_analysis_job(
 
     let catalog = state.0.lock().expect("catalog mutex poisoned");
     let saved = match outcome {
-        Ok(outcome) => save_audio_analysis_outcome(&catalog, job.asset_id, job.id, outcome),
+        Ok(outcome) => save_audio_analysis_outcome(&catalog, job.asset_id, job.id, &asset.media_type, outcome),
         Err(error) => catalog.fail_job(job.id, &error).map_err(storage_error_message),
     };
     if let Err(error) = saved {
@@ -1537,8 +1537,13 @@ fn save_audio_analysis_outcome(
     catalog: &Catalog,
     asset_id: Uuid,
     job_id: Uuid,
+    current_media_type: &str,
     outcome: AudioAnalysisOutcome,
 ) -> Result<(), String> {
+    let duration_ms = outcome.update.duration_ms;
+    let bpm = outcome.update.bpm;
+    let bpm_confidence = outcome.update.bpm_confidence;
+
     catalog
         .set_audio_analysis(asset_id, outcome.update)
         .map_err(storage_error_message)?;
@@ -1550,6 +1555,20 @@ fn save_audio_analysis_outcome(
         catalog
             .set_media_type(asset_id, "needs_review")
             .map_err(storage_error_message)?;
+    } else if current_media_type == "other" {
+        // "First funnel": import-time classification only has a filename/
+        // embedded-metadata keyword guess (or nothing, hence "other"). Now
+        // that real duration and tempo are known, reclassify from actual
+        // acoustic signal instead of leaving it in the generic bucket — but
+        // only when nothing more specific (an import-time keyword match, or
+        // a manual pick from the inspector's Classify row) already claimed
+        // this asset, so a real decision never gets silently overwritten by
+        // a guess.
+        if let Some(media_type) = audio_analysis::classify_media_type_from_analysis(duration_ms, bpm, bpm_confidence) {
+            catalog
+                .set_media_type(asset_id, media_type)
+                .map_err(storage_error_message)?;
+        }
     }
 
     for tag_name in outcome.suggested_tags {
@@ -1952,6 +1971,20 @@ fn set_reviewed(
     catalog
         .set_asset_flags(asset_id, None, Some(review_state))
         .map_err(storage_error_message)
+}
+
+/// Manual classification from the inspector's Quick Actions. Restricted to
+/// the real, user-facing categories — not `needs_review`, which is a
+/// system-set flag for corrupt/silent files, not something a user should be
+/// able to assign to a perfectly good file by hand.
+#[tauri::command]
+fn set_media_type(state: tauri::State<CatalogState>, asset_id: String, media_type: String) -> Result<(), String> {
+    let asset_id = parse_uuid_field(&asset_id, "asset id")?;
+    if !matches!(media_type.as_str(), "music" | "sound_effect" | "ambience" | "other") {
+        return Err(format!("unsupported media type: {media_type}"));
+    }
+    let catalog = state.0.lock().expect("catalog mutex poisoned");
+    catalog.set_media_type(asset_id, media_type).map_err(storage_error_message)
 }
 
 /// Points a Missing asset at a new file location the user picked, flipping
@@ -2465,6 +2498,7 @@ pub fn run() {
             reject_suggested_tag,
             set_favorite,
             set_reviewed,
+            set_media_type,
             relink_asset,
             undo_action,
             redo_action,

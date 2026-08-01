@@ -20,6 +20,7 @@ import {
   FolderOpen,
   Gauge,
   HardDrive,
+  HelpCircle,
   Import,
   Library,
   Link2,
@@ -351,7 +352,7 @@ function describeJobCompletion(summary: JobCompletionSummary): { headline: strin
       headline,
       detail:
         summary.kind === "audio_analysis"
-          ? "Tempo, key, and vocal detection are ready — filter for them anytime under Sonic Radar."
+          ? "Tempo, key, vocal detection, and an automatic Soundtrack/Sound Effect/Ambience classification are ready — filter for them anytime under Sonic Radar."
           : null
     };
   }
@@ -423,6 +424,16 @@ const smartFilters: { id: ActiveFilter; label: string }[] = [
   { id: "music", label: "Soundtracks" },
   { id: "sound_effect", label: "Sound Effects" },
   { id: "ambience", label: "Ambience" }
+];
+
+// Same icon/color per category as rowIconMeta uses for browser rows, so the
+// classification buttons in the inspector read as "the same categories,"
+// not a second, differently-styled taxonomy.
+const mediaTypeOptions: { value: string; label: string; Icon: typeof Music2; color: string }[] = [
+  { value: "music", label: "Soundtrack", Icon: Music2, color: "#4ade9c" },
+  { value: "sound_effect", label: "Sound Effect", Icon: Waves, color: "var(--sfx-ink)" },
+  { value: "ambience", label: "Ambience", Icon: Wind, color: "#5ec8d8" },
+  { value: "other", label: "Other", Icon: HelpCircle, color: "var(--text-muted)" }
 ];
 
 type JobProgress = { kind: string; label: string; pending: number; total: number; failed: number };
@@ -1262,6 +1273,17 @@ export function App() {
       .catch(() => {});
   }, []);
 
+  const handleSetMediaType = useCallback((asset: AssetRecord, mediaType: string) => {
+    if (asset.media_type === mediaType) return;
+    invoke("set_media_type", { assetId: asset.id, mediaType })
+      .then(() => {
+        setAssets((previous) =>
+          previous.map((entry) => (entry.id === asset.id ? { ...entry, media_type: mediaType } : entry))
+        );
+      })
+      .catch(() => {});
+  }, []);
+
   const handleFindSimilar = useCallback(() => {
     if (!selectedAssetId || !activeLibraryId) return;
     setSimilarStatus("Finding similar sounds…");
@@ -2075,6 +2097,14 @@ export function App() {
           event.preventDefault();
           if (bulkAssetIds.length > 0) handleCopyAssetPaths(bulkAssetIds);
           break;
+        case "ToggleReviewed":
+          // preventDefault unconditionally, not just when an asset is
+          // selected — Mod+R is the browser/webview's native "reload"
+          // accelerator, and letting that through with nothing selected
+          // would reload the whole app instead of doing nothing.
+          event.preventDefault();
+          if (selectedAsset) handleToggleReviewed(selectedAsset);
+          break;
         default:
           break;
       }
@@ -2089,6 +2119,7 @@ export function App() {
     loadAssetForPlayback,
     playRelative,
     handleToggleFavorite,
+    handleToggleReviewed,
     handleImportFolder,
     bulkAssetIds,
     handleCopyAssetPaths,
@@ -3069,17 +3100,46 @@ export function App() {
             collapsed={collapsedSections.has("quick")}
             onToggle={toggleSection}
           >
-            <label className="setting-row">
-              <input
-                type="checkbox"
-                checked={selectedAsset.review_state === "Reviewed"}
-                onChange={() => handleToggleReviewed(selectedAsset)}
-              />
-              <span>Mark reviewed</span>
-            </label>
-            <button type="button" className="text-button" onClick={handleMoveToTrash}>
-              Move to Trash
-            </button>
+            <div className="quick-action-row">
+              <button
+                type="button"
+                className={selectedAsset.review_state === "Reviewed" ? "icon-button reviewed active" : "icon-button reviewed"}
+                aria-pressed={selectedAsset.review_state === "Reviewed"}
+                aria-label={selectedAsset.review_state === "Reviewed" ? "Mark unreviewed" : "Mark reviewed"}
+                title={`${selectedAsset.review_state === "Reviewed" ? "Mark unreviewed" : "Mark reviewed"} (${modKeyLabel}R)`}
+                onClick={() => handleToggleReviewed(selectedAsset)}
+              >
+                <ShieldCheck size={17} />
+              </button>
+              <button
+                type="button"
+                className="icon-button danger"
+                aria-label="Move to Trash"
+                title="Move to Trash"
+                onClick={handleMoveToTrash}
+              >
+                <Trash2 size={17} />
+              </button>
+            </div>
+            <h2>Classify</h2>
+            <div className="classification-row">
+              {mediaTypeOptions.map(({ value, label, Icon, color }) => {
+                const active = selectedAsset.media_type === value;
+                return (
+                  <button
+                    key={value}
+                    type="button"
+                    className={active ? "classification-chip active" : "classification-chip"}
+                    style={active ? ({ "--classification-color": color } as CSSProperties) : undefined}
+                    aria-pressed={active}
+                    onClick={() => handleSetMediaType(selectedAsset, value)}
+                  >
+                    <Icon size={14} style={{ color: active ? color : undefined }} />
+                    {label}
+                  </button>
+                );
+              })}
+            </div>
           </CollapsibleSection>
         ) : null}
         <CollapsibleSection id="tags-section" title="Tags" collapsed={collapsedSections.has("tags-section")} onToggle={toggleSection}>
@@ -4203,7 +4263,7 @@ export function App() {
             </div>
             <div className="shortcut-list">
               {(preferences?.shortcuts.bindings ?? []).map((item) => (
-                <div className="shortcut-row" key={item.command}>
+                <div className="shortcut-row" key={`${item.command}-${item.accelerator}`}>
                   <span>{item.command}</span>
                   <kbd>{item.accelerator}</kbd>
                 </div>
