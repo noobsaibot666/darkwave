@@ -429,6 +429,40 @@ fn purge_from_trash(state: tauri::State<CatalogState>, asset_id: String) -> Resu
         .map_err(storage_error_message)
 }
 
+/// The trash view's "Delete" action — unlike `purge_from_trash` (which only
+/// ever removes the catalog row, gated by the retention window), this
+/// actually deletes the real file from wherever it lives on disk (the
+/// managed library folder or the original referenced location), then
+/// finalizes the catalog side. No retention gate: the user explicitly chose
+/// this action, on this one item, right now — that confirmation is the
+/// safety check, not a time delay. A file that's already missing (moved or
+/// deleted outside the app) is treated as success, since the goal state —
+/// no file left on disk — already holds.
+#[tauri::command]
+fn delete_trash_item_permanently(
+    state: tauri::State<CatalogState>,
+    asset_id: String,
+) -> Result<(), String> {
+    let asset_id = parse_uuid_field(&asset_id, "asset id")?;
+    let catalog = state.0.lock().expect("catalog mutex poisoned");
+
+    let asset = catalog
+        .get_asset(asset_id)
+        .map_err(storage_error_message)?
+        .ok_or_else(|| "asset not found".to_string())?;
+
+    let absolute_path = resolve_asset_path(&catalog, &asset)?;
+    match std::fs::remove_file(&absolute_path) {
+        Ok(()) => {}
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+        Err(error) => return Err(format!("failed to delete file: {error}")),
+    }
+
+    catalog
+        .finalize_permanent_deletion(asset_id)
+        .map_err(storage_error_message)
+}
+
 #[tauri::command]
 fn trash_duplicate_group(
     state: tauri::State<CatalogState>,
@@ -1522,7 +1556,14 @@ async fn process_one_audio_analysis_job(
 
     let catalog = state.0.lock().expect("catalog mutex poisoned");
     let saved = match outcome {
-        Ok(outcome) => save_audio_analysis_outcome(&catalog, job.asset_id, job.id, &asset.media_type, outcome),
+        Ok(outcome) => save_audio_analysis_outcome(
+            &catalog,
+            job.asset_id,
+            job.id,
+            &asset.media_type,
+            asset.review_state,
+            outcome,
+        ),
         Err(error) => catalog.fail_job(job.id, &error).map_err(storage_error_message),
     };
     if let Err(error) = saved {
@@ -1538,33 +1579,41 @@ fn save_audio_analysis_outcome(
     asset_id: Uuid,
     job_id: Uuid,
     current_media_type: &str,
+    review_state: storage::ReviewState,
     outcome: AudioAnalysisOutcome,
 ) -> Result<(), String> {
     let duration_ms = outcome.update.duration_ms;
     let bpm = outcome.update.bpm;
     let bpm_confidence = outcome.update.bpm_confidence;
+    let vocal_ratio = outcome.vocal_ratio.map(|ratio| ratio as f64);
 
     catalog
         .set_audio_analysis(asset_id, outcome.update)
         .map_err(storage_error_message)?;
     catalog
-        .set_vocal_ratio(asset_id, outcome.vocal_ratio.map(|ratio| ratio as f64))
+        .set_vocal_ratio(asset_id, vocal_ratio)
         .map_err(storage_error_message)?;
 
     if outcome.needs_review {
         catalog
             .set_media_type(asset_id, "needs_review")
             .map_err(storage_error_message)?;
-    } else if current_media_type == "other" {
+    } else if current_media_type == "other"
+        || (current_media_type == "sound_effect" && review_state == storage::ReviewState::Unreviewed)
+    {
         // "First funnel": import-time classification only has a filename/
-        // embedded-metadata keyword guess (or nothing, hence "other"). Now
-        // that real duration and tempo are known, reclassify from actual
-        // acoustic signal instead of leaving it in the generic bucket — but
-        // only when nothing more specific (an import-time keyword match, or
-        // a manual pick from the inspector's Classify row) already claimed
-        // this asset, so a real decision never gets silently overwritten by
-        // a guess.
-        if let Some(media_type) = audio_analysis::classify_media_type_from_analysis(duration_ms, bpm, bpm_confidence) {
+        // embedded-metadata keyword guess, or a crude file-size heuristic
+        // that assumes uncompressed audio (~28s per 5MB) and can lock a
+        // compressed (mp3/aac) long vocal track to "sound_effect" before any
+        // real signal is known (bug-log-v2). Now that real duration, tempo,
+        // and vocal ratio are known, reclassify from actual acoustic signal
+        // — but only when nothing more specific already claimed this asset:
+        // an import-time keyword match, any manual media type other than
+        // "sound_effect", or a "sound_effect" the user has already reviewed
+        // (and therefore explicitly confirmed) are all left untouched.
+        if let Some(media_type) =
+            audio_analysis::classify_media_type_from_analysis(duration_ms, bpm, bpm_confidence, vocal_ratio)
+        {
             catalog
                 .set_media_type(asset_id, media_type)
                 .map_err(storage_error_message)?;
@@ -1980,7 +2029,10 @@ fn set_reviewed(
 #[tauri::command]
 fn set_media_type(state: tauri::State<CatalogState>, asset_id: String, media_type: String) -> Result<(), String> {
     let asset_id = parse_uuid_field(&asset_id, "asset id")?;
-    if !matches!(media_type.as_str(), "music" | "sound_effect" | "ambience" | "other") {
+    if !matches!(
+        media_type.as_str(),
+        "music" | "sound_effect" | "ambience" | "voiceover" | "foley" | "other"
+    ) {
         return Err(format!("unsupported media type: {media_type}"));
     }
     let catalog = state.0.lock().expect("catalog mutex poisoned");
@@ -2027,6 +2079,18 @@ fn list_collections(
     let catalog = state.0.lock().expect("catalog mutex poisoned");
     catalog
         .list_collections(library_id)
+        .map_err(storage_error_message)
+}
+
+#[tauri::command]
+fn project_memberships_for_library(
+    state: tauri::State<CatalogState>,
+    library_id: String,
+) -> Result<Vec<storage::AssetProjectMembership>, String> {
+    let library_id = parse_uuid_field(&library_id, "library id")?;
+    let catalog = state.0.lock().expect("catalog mutex poisoned");
+    catalog
+        .project_memberships_for_library(library_id)
         .map_err(storage_error_message)
 }
 
@@ -2115,6 +2179,14 @@ fn export_asset_to_project(
         }
     };
 
+    let primary_tag_name = catalog
+        .tags_for_asset(asset_id)
+        .map_err(storage_error_message)?
+        .into_iter()
+        .next()
+        .map(|tag| tag.name);
+    let category_subfolder = export_category_subfolder(&asset.media_type, primary_tag_name.as_deref());
+
     let plan = export_pipeline::plan_editorial_export(export_pipeline::ExportRequest {
         source_path: source_path.clone(),
         project_media_dir: destination_folder,
@@ -2122,6 +2194,7 @@ fn export_asset_to_project(
         preset: export_pipeline::ExportPreset::Original,
         range: None,
         intent: export_pipeline::default_editorial_export_intent(),
+        category_subfolder,
     })
     .map_err(|error| format!("{error:?}"))?;
 
@@ -2139,6 +2212,29 @@ fn export_asset_to_project(
         .map_err(storage_error_message)?;
 
     Ok(destination_path)
+}
+
+/// Maps a classified media type to the editor's on-disk export folder
+/// convention (01_MUSIC / 02_VO / 03_SFX / 04_FOLEY). Foley additionally
+/// nests under a tag-named folder (e.g. `04_FOLEY/door`) when the asset has
+/// at least one tag, since "Foley" alone gets unwieldy once a project
+/// accumulates more than a handful of one-shots — falls back to the bare
+/// `04_FOLEY` folder when the asset isn't tagged yet. Ambience, "other", and
+/// "needs_review" have no folder convention of their own, so they export
+/// straight into the project's root (`None`).
+fn export_category_subfolder(media_type: &str, primary_tag_name: Option<&str>) -> Option<String> {
+    match media_type {
+        "music" => Some("01_MUSIC".to_string()),
+        "voiceover" => Some("02_VO".to_string()),
+        "sound_effect" => Some("03_SFX".to_string()),
+        "foley" => match primary_tag_name {
+            Some(tag) if !tag.trim().is_empty() => {
+                Some(format!("04_FOLEY/{}", export_pipeline::sanitize_filename(tag)))
+            }
+            _ => Some("04_FOLEY".to_string()),
+        },
+        _ => None,
+    }
 }
 
 #[tauri::command]
@@ -2236,6 +2332,9 @@ fn export_selected_asset(
         preset,
         range: None,
         intent: export_pipeline::default_editorial_export_intent(),
+        // A manual "export to any folder" pick, not a project send — the
+        // user chose this exact destination, so no auto-subfoldering.
+        category_subfolder: None,
     })
     .map_err(|error| format!("{error:?}"))?;
 
@@ -2503,6 +2602,7 @@ pub fn run() {
             undo_action,
             redo_action,
             list_collections,
+            project_memberships_for_library,
             create_project,
             set_project_export_path,
             export_asset_to_project,
@@ -2520,6 +2620,7 @@ pub fn run() {
             list_trash_items,
             restore_from_trash,
             purge_from_trash,
+            delete_trash_item_permanently,
             apply_offline_control,
             backup_library,
             restore_library,

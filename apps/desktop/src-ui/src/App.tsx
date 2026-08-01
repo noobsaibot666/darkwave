@@ -17,7 +17,9 @@ import {
   Eye,
   FileWarning,
   Flag,
+  FolderCheck,
   FolderOpen,
+  Footprints,
   Gauge,
   HardDrive,
   HelpCircle,
@@ -152,6 +154,14 @@ type CollectionRecord = {
   export_path: string | null;
 };
 
+type AssetProjectMembership = {
+  asset_id: string;
+  project_id: string;
+  project_name: string;
+  export_path: string | null;
+  exported: boolean;
+};
+
 type PaletteCommandId =
   | "Import"
   | "ApplyTag"
@@ -218,6 +228,8 @@ type ActiveFilter =
   | "music"
   | "sound_effect"
   | "ambience"
+  | "voiceover"
+  | "foley"
   | "has_vocals"
   | "instrumental"
   | "has_tempo"
@@ -422,16 +434,22 @@ const smartFilters: { id: ActiveFilter; label: string }[] = [
   { id: "missing", label: "Missing Files" },
   { id: "needs_review", label: "Needs Review" },
   { id: "music", label: "Soundtracks" },
+  { id: "voiceover", label: "Voiceover" },
   { id: "sound_effect", label: "Sound Effects" },
+  { id: "foley", label: "Foley" },
   { id: "ambience", label: "Ambience" }
 ];
 
 // Same icon/color per category as rowIconMeta uses for browser rows, so the
 // classification buttons in the inspector read as "the same categories,"
-// not a second, differently-styled taxonomy.
+// not a second, differently-styled taxonomy. Ordered to mirror the export
+// folder numbering (01_MUSIC/02_VO/03_SFX/04_FOLEY) for the four foldered
+// categories, with the two unfoldered ones (Ambience, Other) trailing.
 const mediaTypeOptions: { value: string; label: string; Icon: typeof Music2; color: string }[] = [
   { value: "music", label: "Soundtrack", Icon: Music2, color: "#4ade9c" },
+  { value: "voiceover", label: "Voiceover", Icon: Mic, color: "#f0a6d8" },
   { value: "sound_effect", label: "Sound Effect", Icon: Waves, color: "var(--sfx-ink)" },
+  { value: "foley", label: "Foley", Icon: Footprints, color: "#e0a458" },
   { value: "ambience", label: "Ambience", Icon: Wind, color: "#5ec8d8" },
   { value: "other", label: "Other", Icon: HelpCircle, color: "var(--text-muted)" }
 ];
@@ -582,6 +600,12 @@ function rowIconMeta(asset: AssetRecord): { Icon: typeof Music; color: string } 
   if (asset.media_type === "sound_effect") {
     return { Icon: Waves, color: "var(--sfx-ink)" };
   }
+  if (asset.media_type === "voiceover") {
+    return { Icon: Mic, color: "#f0a6d8" };
+  }
+  if (asset.media_type === "foley") {
+    return { Icon: Footprints, color: "#e0a458" };
+  }
   if (asset.media_type === "ambience") {
     return { Icon: Wind, color: "#5ec8d8" };
   }
@@ -689,10 +713,13 @@ export function App() {
   const [newTagFacet, setNewTagFacet] = useState("action");
 
   const [collections, setCollections] = useState<CollectionRecord[]>([]);
+  const [projectMemberships, setProjectMemberships] = useState<AssetProjectMembership[]>([]);
   const [newProjectName, setNewProjectName] = useState("");
   const [newProjectExportPath, setNewProjectExportPath] = useState("");
   const [lastExportProjectId, setLastExportProjectId] = useState<string | null>(null);
   const [drExportStatus, setDrExportStatus] = useState<string | null>(null);
+  const [projectAddToast, setProjectAddToast] = useState<{ projectId: string; message: string } | null>(null);
+  const [trashModalOpen, setTrashModalOpen] = useState(false);
   const [editorWorkflowOpen, setEditorWorkflowOpen] = useState(false);
   const [editorActionStatus, setEditorActionStatus] = useState<string | null>(null);
   const [commandPaletteOpen, setCommandPaletteOpen] = useState(false);
@@ -745,6 +772,16 @@ export function App() {
   const bulkAssetIds = selectedCount > 1 ? selectedAssetIds : selectedAssetId ? [selectedAssetId] : [];
   const activeLibrary = libraries.find((library) => library.id === activeLibraryId) ?? null;
 
+  const membershipsByAsset = useMemo(() => {
+    const map = new Map<string, AssetProjectMembership[]>();
+    for (const membership of projectMemberships) {
+      const existing = map.get(membership.asset_id);
+      if (existing) existing.push(membership);
+      else map.set(membership.asset_id, [membership]);
+    }
+    return map;
+  }, [projectMemberships]);
+
   const visibleAssets = useMemo(() => {
     let base: AssetRecord[];
     if (activeFilter === "favorites") {
@@ -757,7 +794,9 @@ export function App() {
       activeFilter === "needs_review" ||
       activeFilter === "music" ||
       activeFilter === "sound_effect" ||
-      activeFilter === "ambience"
+      activeFilter === "ambience" ||
+      activeFilter === "voiceover" ||
+      activeFilter === "foley"
     ) {
       base = assets.filter((asset) => asset.media_type === activeFilter);
     } else if (activeFilter === "has_vocals") {
@@ -976,6 +1015,12 @@ export function App() {
       .catch(() => setCollections([]));
   }, []);
 
+  const refreshProjectMemberships = useCallback((libraryId: string) => {
+    invoke<AssetProjectMembership[]>("project_memberships_for_library", { libraryId })
+      .then(setProjectMemberships)
+      .catch(() => setProjectMemberships([]));
+  }, []);
+
   const refreshTrashItems = useCallback((libraryId: string) => {
     invoke<TrashItem[]>("list_trash_items", { libraryId })
       .then(setTrashItems)
@@ -1064,6 +1109,7 @@ export function App() {
   useEffect(() => {
     if (!activeLibraryId) return;
     refreshCollections(activeLibraryId);
+    refreshProjectMemberships(activeLibraryId);
     refreshMaintenance(activeLibraryId);
     refreshTrashItems(activeLibraryId);
     invoke<[string, boolean]>("media_root_status", { libraryId: activeLibraryId })
@@ -1081,7 +1127,14 @@ export function App() {
     invoke<number>("warm_library_cache", { libraryId: activeLibraryId })
       .then(() => runJobDrain(activeLibraryId, ["audio_analysis"]))
       .catch(() => {});
-  }, [activeLibraryId, refreshCollections, refreshMaintenance, refreshTrashItems, runJobDrain]);
+  }, [
+    activeLibraryId,
+    refreshCollections,
+    refreshProjectMemberships,
+    refreshMaintenance,
+    refreshTrashItems,
+    runJobDrain
+  ]);
 
   useEffect(() => {
     if (activeLibrary) {
@@ -1193,7 +1246,13 @@ export function App() {
     const audio = audioRef.current;
     if (!audio) return;
 
-    if (playingAssetId && playingAssetId === selectedAssetId) {
+    // Keyed on playingAssetId alone (matching the per-row play button) so
+    // this stays a "pause/resume what's actually playing" control even
+    // after the user selects a different row without playing it — merely
+    // browsing the list is the normal case, not an edge case, and
+    // selectedAssetId routinely diverges from playingAssetId once that
+    // happens (bug-log-v2 OPEN-1).
+    if (playingAssetId) {
       if (audio.paused) audio.play().catch(() => {});
       else audio.pause();
       return;
@@ -1202,7 +1261,7 @@ export function App() {
     if (selectedAsset) {
       loadAssetForPlayback(selectedAsset, true);
     }
-  }, [playingAssetId, selectedAssetId, selectedAsset, loadAssetForPlayback]);
+  }, [playingAssetId, selectedAsset, loadAssetForPlayback]);
 
   const playRelative = useCallback(
     (direction: 1 | -1) => {
@@ -1431,10 +1490,45 @@ export function App() {
               ? `Sent to ${project.name}`
               : `Sent ${destinations.length} sounds to ${project.name}`
           );
+          if (activeLibraryId) refreshProjectMemberships(activeLibraryId);
         })
         .catch((error) => setDrExportStatus(`Send to ${project.name} failed: ${String(error)}`));
     },
-    []
+    [activeLibraryId, refreshProjectMemberships]
+  );
+
+  // Per-row "send to folder" — independent of the sidebar/bulk-selection
+  // export buttons above: any track already associated with a project can
+  // be sent straight to that project's folder at any time, right from its
+  // own row. If the user is currently browsing a specific project, that's
+  // the target (matches "the button in the tracks after status" request);
+  // otherwise it sends to every project the track belongs to that has an
+  // export folder configured.
+  const handleSendAssetToItsProjects = useCallback(
+    (asset: AssetRecord, memberships: AssetProjectMembership[]) => {
+      const currentProjectId =
+        typeof activeFilter === "object" && "project" in activeFilter ? activeFilter.project : null;
+      const inCurrentProject = currentProjectId
+        ? memberships.find((membership) => membership.project_id === currentProjectId && membership.export_path)
+        : undefined;
+      const targets = inCurrentProject ? [inCurrentProject] : memberships.filter((membership) => membership.export_path);
+      if (targets.length === 0) return;
+
+      setDrExportStatus(`Sending ${asset.display_name}…`);
+      Promise.all(
+        targets.map((target) =>
+          invoke<string>("export_asset_to_project", { assetId: asset.id, projectId: target.project_id })
+        )
+      )
+        .then(() => {
+          setDrExportStatus(
+            targets.length === 1 ? `Sent to ${targets[0].project_name}` : `Sent to ${targets.length} projects`
+          );
+          if (activeLibraryId) refreshProjectMemberships(activeLibraryId);
+        })
+        .catch((error) => setDrExportStatus(`Send failed: ${String(error)}`));
+    },
+    [activeFilter, activeLibraryId, refreshProjectMemberships]
   );
 
   const handleRevealAssets = useCallback((assetIds: string[]) => {
@@ -1508,10 +1602,32 @@ export function App() {
         .then((undoId) => {
           setUndoStack((previous) => [...previous, { id: undoId, label: `Add to "${project.name}"` }]);
           setRedoStack([]);
+          if (activeLibraryId) refreshProjectMemberships(activeLibraryId);
         })
         .catch(() => {});
     },
-    [bulkAssetIds]
+    [bulkAssetIds, activeLibraryId, refreshProjectMemberships]
+  );
+
+  // The sidebar's per-project "+" — a one-click way to add whatever's
+  // currently playing to a project without first selecting it in the
+  // browser, independent of the bulk-selection Projects chips above.
+  const handleAddPlayingToProject = useCallback(
+    (project: CollectionRecord) => {
+      if (!playingAssetId) return;
+      invoke<string>("add_to_collection", { collectionId: project.id, assetIds: [playingAssetId] })
+        .then((undoId) => {
+          setUndoStack((previous) => [...previous, { id: undoId, label: `Add to "${project.name}"` }]);
+          setRedoStack([]);
+          if (activeLibraryId) refreshProjectMemberships(activeLibraryId);
+          setProjectAddToast({ projectId: project.id, message: "Music added" });
+          window.setTimeout(() => {
+            setProjectAddToast((current) => (current?.projectId === project.id ? null : current));
+          }, 2000);
+        })
+        .catch(() => {});
+    },
+    [playingAssetId, activeLibraryId, refreshProjectMemberships]
   );
 
   const handleSaveSource = useCallback(() => {
@@ -1560,12 +1676,22 @@ export function App() {
     [activeLibraryId, searchQuery, activeFilter, refreshAssets, refreshTrashItems]
   );
 
-  const handlePurgeTrashItem = useCallback(
+  // The real thing: deletes the file itself from wherever it lives on disk
+  // (not just the catalog row) — no retention wait, since the user just
+  // confirmed it explicitly for this one item.
+  const handleDeleteTrashItemPermanently = useCallback(
     (item: TrashItem) => {
       if (!activeLibraryId) return;
-      invoke<boolean>("purge_from_trash", { assetId: item.asset_id })
-        .then((purged) => {
-          if (purged && activeLibraryId) refreshTrashItems(activeLibraryId);
+      const filename = item.original_path.split(/[/\\]/).pop() ?? item.original_path;
+      confirmDialog(`Permanently delete "${filename}"? This removes the actual file from disk and cannot be undone.`, {
+        title: "Delete Permanently",
+        kind: "warning"
+      })
+        .then((confirmed) => {
+          if (!confirmed) return;
+          return invoke("delete_trash_item_permanently", { assetId: item.asset_id }).then(() => {
+            if (activeLibraryId) refreshTrashItems(activeLibraryId);
+          });
         })
         .catch(() => {});
     },
@@ -2483,6 +2609,13 @@ export function App() {
                 Soundtracks
               </button>
               <button
+                className={activeFilter === "voiceover" ? "nav-item sidebar-styled-item active" : "nav-item sidebar-styled-item"}
+                onClick={() => setActiveFilter("voiceover")}
+              >
+                <Mic size={13} />
+                Voiceover
+              </button>
+              <button
                 className={activeFilter === "sound_effect" ? "nav-item sidebar-styled-item active" : "nav-item sidebar-styled-item"}
                 onClick={() => setActiveFilter("sound_effect")}
               >
@@ -2512,6 +2645,13 @@ export function App() {
                       </button>
                     ))
                 : null}
+              <button
+                className={activeFilter === "foley" ? "nav-item sidebar-styled-item active" : "nav-item sidebar-styled-item"}
+                onClick={() => setActiveFilter("foley")}
+              >
+                <Footprints size={13} />
+                Foley
+              </button>
               <button
                 className={activeFilter === "ambience" ? "nav-item sidebar-styled-item active" : "nav-item sidebar-styled-item"}
                 onClick={() => setActiveFilter("ambience")}
@@ -2551,6 +2691,32 @@ export function App() {
             ? null
             : collections.map((project) => (
                 <div className="nav-item-row" key={project.id}>
+                  {project.collection_type === "Project" ? (
+                    <button
+                      type="button"
+                      className="project-quick-add"
+                      aria-label={
+                        playingAssetId
+                          ? `Add currently playing track to ${project.name}`
+                          : "Play a track first to add it to a project"
+                      }
+                      title={
+                        playingAssetId
+                          ? `Add currently playing track to ${project.name}`
+                          : "Play a track first to add it to a project"
+                      }
+                      disabled={!playingAssetId}
+                      onClick={(event) => {
+                        event.stopPropagation();
+                        handleAddPlayingToProject(project);
+                      }}
+                    >
+                      <Plus size={14} />
+                      {projectAddToast?.projectId === project.id ? (
+                        <span className="project-add-toast">{projectAddToast.message}</span>
+                      ) : null}
+                    </button>
+                  ) : null}
                   <button
                     className={
                       typeof activeFilter === "object" && "project" in activeFilter && activeFilter.project === project.id
@@ -2702,6 +2868,15 @@ export function App() {
               </span>
             ) : null}
             <span className="activity-led" aria-hidden="true" />
+          </button>
+          <button
+            className="icon-button"
+            aria-label={trashItems.length > 0 ? `Open Trash (${trashItems.length} items)` : "Open Trash"}
+            title="Trash"
+            onClick={() => setTrashModalOpen(true)}
+          >
+            <Trash2 size={17} />
+            {trashItems.length > 0 ? <span className="icon-button-badge">{trashItems.length}</span> : null}
           </button>
           <button className="icon-button" aria-label="Open settings" onClick={() => setSettingsOpen(true)}>
             <Settings size={17} />
@@ -2857,6 +3032,7 @@ export function App() {
             <span>Storage</span>
             <span>Size</span>
             <span>Status</span>
+            <span aria-hidden="true" />
           </div>
           {visibleAssets.length === 0 ? (
             <p className="empty-browser">No sounds here yet.</p>
@@ -2902,6 +3078,33 @@ export function App() {
                 <span>{asset.storage_mode}</span>
                 <span>{formatFileSize(asset.file_size)}</span>
                 <span>{asset.availability_state}</span>
+                {(() => {
+                  const memberships = membershipsByAsset.get(asset.id) ?? [];
+                  if (memberships.length === 0) return <span />;
+                  const anyExported = memberships.some((membership) => membership.exported);
+                  const sendableCount = memberships.filter((membership) => membership.export_path).length;
+                  const projectNames = memberships.map((membership) => membership.project_name).join(", ");
+                  const label = anyExported
+                    ? `Already sent to a project folder (${projectNames}) — click to send again`
+                    : sendableCount > 0
+                      ? `Send to project folder (${projectNames})`
+                      : `In project "${projectNames}" — no export folder configured yet`;
+                  return (
+                    <button
+                      type="button"
+                      className={anyExported ? "icon-button project-status exported" : "icon-button project-status pending"}
+                      aria-label={label}
+                      title={label}
+                      disabled={sendableCount === 0}
+                      onClick={(event) => {
+                        event.stopPropagation();
+                        handleSendAssetToItsProjects(asset, memberships);
+                      }}
+                    >
+                      {anyExported ? <FolderCheck size={15} /> : <FolderOpen size={15} />}
+                    </button>
+                  );
+                })()}
                 <button
                   className="favorite"
                   aria-label={`Favorite ${asset.display_name}`}
@@ -3712,8 +3915,12 @@ export function App() {
                               <button type="button" className="text-button" onClick={() => handleRestoreFromTrash(item)}>
                                 Restore
                               </button>
-                              <button type="button" className="text-button" onClick={() => handlePurgeTrashItem(item)}>
-                                Purge
+                              <button
+                                type="button"
+                                className="text-button danger"
+                                onClick={() => handleDeleteTrashItemPermanently(item)}
+                              >
+                                Delete
                               </button>
                             </div>
                           ))}
@@ -4285,6 +4492,57 @@ export function App() {
                 <kbd>Mod+/</kbd>
               </div>
             </div>
+          </motion.div>
+        </motion.div>
+      ) : null}
+      </AnimatePresence>
+      <AnimatePresence>
+      {trashModalOpen ? (
+        <motion.div
+          className="modal-overlay"
+          onClick={() => setTrashModalOpen(false)}
+          initial={{ opacity: 0 }}
+          animate={{ opacity: 1 }}
+          exit={{ opacity: 0 }}
+          transition={{ duration: 0.18 }}
+        >
+          <motion.div
+            className="modal-card"
+            onClick={(event) => event.stopPropagation()}
+            aria-label="Trash"
+            initial={{ opacity: 0, scale: 0.96, y: 10 }}
+            animate={{ opacity: 1, scale: 1, y: 0 }}
+            exit={{ opacity: 0, scale: 0.96, y: 10 }}
+            transition={{ duration: 0.2, ease: [0.4, 0, 0.2, 1] }}
+          >
+            <div className="modal-head">
+              <h1>Trash</h1>
+              <button type="button" className="icon-button" aria-label="Close" onClick={() => setTrashModalOpen(false)}>
+                <X size={16} />
+              </button>
+            </div>
+            <div className="status-line">{trashRetentionDays} day retention before automatic purge</div>
+            {trashItems.length === 0 ? (
+              <p className="empty-hint">Trash is empty</p>
+            ) : (
+              <div className="maintenance-list">
+                {trashItems.map((item) => (
+                  <div className="maintenance-row" key={item.asset_id}>
+                    <span>{item.original_path.split(/[/\\]/).pop()}</span>
+                    <button type="button" className="text-button" onClick={() => handleRestoreFromTrash(item)}>
+                      Restore
+                    </button>
+                    <button
+                      type="button"
+                      className="text-button danger"
+                      onClick={() => handleDeleteTrashItemPermanently(item)}
+                    >
+                      Delete
+                    </button>
+                  </div>
+                ))}
+              </div>
+            )}
           </motion.div>
         </motion.div>
       ) : null}

@@ -336,10 +336,68 @@ button.panel-handle-right:active:not(:disabled) {
 }
 
 .nav-item-row {
+  position: relative;
   display: flex;
   align-items: center;
   gap: 4px;
   margin-bottom: 3px;
+}
+
+.project-quick-add {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  width: 24px;
+  height: 24px;
+  padding: 0;
+  flex: 0 0 auto;
+  border: none;
+  border-radius: 6px;
+  background: transparent;
+  color: var(--text-muted);
+  transition: background-color 140ms var(--ease-soft), color 140ms var(--ease-soft);
+}
+
+.project-quick-add:hover:not(:disabled) {
+  background: var(--surface-hover);
+  color: var(--text-primary);
+}
+
+.project-quick-add:disabled {
+  opacity: 0.35;
+  cursor: default;
+}
+
+.project-add-toast {
+  position: absolute;
+  left: 26px;
+  top: -4px;
+  font-size: 10px;
+  font-weight: 650;
+  padding: 2px 6px;
+  border-radius: 999px;
+  background: rgba(52, 211, 153, 0.18);
+  color: #059669;
+  white-space: nowrap;
+  pointer-events: none;
+  animation: project-add-toast-fade 2s ease forwards;
+}
+
+@keyframes project-add-toast-fade {
+  0% {
+    opacity: 0;
+    transform: translateY(2px);
+  }
+  10% {
+    opacity: 1;
+    transform: translateY(0);
+  }
+  80% {
+    opacity: 1;
+  }
+  100% {
+    opacity: 0;
+  }
 }
 
 .nav-item-row .nav-item {
@@ -865,6 +923,23 @@ button.panel-handle-right:active:not(:disabled) {
   height: 34px;
   border-radius: var(--radius-sm);
   background: var(--surface-hover);
+  position: relative;
+}
+
+.icon-button-badge {
+  position: absolute;
+  top: -5px;
+  right: -5px;
+  min-width: 16px;
+  height: 16px;
+  padding: 0 4px;
+  border-radius: 999px;
+  background: #f87171;
+  color: #fff;
+  font-size: 10px;
+  font-weight: 700;
+  line-height: 16px;
+  text-align: center;
 }
 
 .icon-button:hover:not(:disabled),
@@ -929,6 +1004,35 @@ button.panel-handle-right:active:not(:disabled) {
 
 .icon-button.danger:hover:not(:disabled) {
   background: rgba(220, 38, 38, 0.18);
+}
+
+/* Per-row "send to project folder" badge/button. Pending (in a project,
+   not yet exported there) gets the same orange the DR/export button
+   already uses; exported gets the established green "done" color, same
+   language as .icon-button.reviewed.active. */
+.icon-button.project-status.pending {
+  border-color: rgba(255, 92, 0, 0.3);
+  background: rgba(255, 92, 0, 0.1);
+  color: #ff5c00;
+}
+
+.icon-button.project-status.pending:hover:not(:disabled) {
+  background: rgba(255, 92, 0, 0.18);
+}
+
+.icon-button.project-status.exported {
+  border-color: rgba(52, 211, 153, 0.35);
+  background: rgba(52, 211, 153, 0.14);
+  color: #059669;
+}
+
+.icon-button.project-status.exported:hover:not(:disabled) {
+  background: rgba(52, 211, 153, 0.22);
+}
+
+.icon-button.project-status:disabled {
+  opacity: 0.55;
+  cursor: default;
 }
 
 .primary-action {
@@ -1057,7 +1161,7 @@ button:disabled,
 .browser-header,
 .asset-row {
   display: grid;
-  grid-template-columns: 34px 36px minmax(170px, 1fr) 110px 74px 78px 88px 34px 34px;
+  grid-template-columns: 34px 36px minmax(170px, 1fr) 110px 74px 78px 88px 34px 34px 34px;
   gap: 10px;
   align-items: center;
 }

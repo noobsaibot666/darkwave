@@ -34,6 +34,14 @@ pub struct ExportRequest {
     pub preset: ExportPreset,
     pub range: Option<ExportRangeMs>,
     pub intent: ExportIntent,
+    /// Category subfolder to nest the export under, relative to
+    /// `project_media_dir` (e.g. `"01_MUSIC"`, or `"04_FOLEY/door"` for a
+    /// tagged Foley sound) — keeps a project's export folder organized by
+    /// type instead of a flat dump. `None`/empty exports straight into
+    /// `project_media_dir`, same as before this field existed. The caller
+    /// decides the category (from the asset's media type and tags); this
+    /// crate just plans the resulting path.
+    pub category_subfolder: Option<String>,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -230,12 +238,16 @@ pub fn plan_editorial_export(request: ExportRequest) -> Result<ExportPlan, Expor
         extension
     );
 
+    let destination_dir = match request.category_subfolder.as_deref() {
+        Some(subfolder) if !subfolder.trim().is_empty() => {
+            Path::new(&request.project_media_dir).join(subfolder)
+        }
+        _ => Path::new(&request.project_media_dir).to_path_buf(),
+    };
+
     Ok(ExportPlan {
         source_path: request.source_path,
-        destination_path: Path::new(&request.project_media_dir)
-            .join(&filename)
-            .to_string_lossy()
-            .to_string(),
+        destination_path: destination_dir.join(&filename).to_string_lossy().to_string(),
         range: request.range,
         conversion,
         preserve_original: request.intent.preserve_original,
@@ -510,7 +522,7 @@ impl ExportLicenseAssessment {
 /// regardless of extension. This must catch all of it: a filename that's
 /// merely "mostly safe" still fails the export outright the moment a title
 /// happens to include one of these.
-fn sanitize_filename(value: &str) -> String {
+pub fn sanitize_filename(value: &str) -> String {
     let replaced: String = value
         .trim()
         .chars()
@@ -740,6 +752,7 @@ mod tests {
             preset: ExportPreset::Original,
             range: None,
             intent: default_editorial_export_intent(),
+            category_subfolder: None,
         })
         .expect("plan");
 
@@ -765,6 +778,7 @@ mod tests {
                 end_ms: 4_000,
             }),
             intent: default_editorial_export_intent(),
+            category_subfolder: None,
         })
         .expect("plan");
 
@@ -787,6 +801,44 @@ mod tests {
     }
 
     #[test]
+    fn category_subfolder_nests_the_destination_under_the_project_folder() {
+        let plan = plan_editorial_export(ExportRequest {
+            source_path: "/library/Media/00/door.wav".to_string(),
+            project_media_dir: "/projects/trailer/audio".to_string(),
+            asset_display_name: "Door Open".to_string(),
+            preset: ExportPreset::Original,
+            range: None,
+            intent: default_editorial_export_intent(),
+            category_subfolder: Some("04_FOLEY/door".to_string()),
+        })
+        .expect("plan");
+
+        assert_eq!(
+            plan.destination_path,
+            "/projects/trailer/audio/04_FOLEY/door/Door Open.wav"
+        );
+    }
+
+    #[test]
+    fn blank_category_subfolder_exports_straight_into_the_project_folder() {
+        let plan = plan_editorial_export(ExportRequest {
+            source_path: "/library/Media/00/room.wav".to_string(),
+            project_media_dir: "/projects/trailer/audio".to_string(),
+            asset_display_name: "Room Tone".to_string(),
+            preset: ExportPreset::Original,
+            range: None,
+            intent: default_editorial_export_intent(),
+            category_subfolder: Some("".to_string()),
+        })
+        .expect("plan");
+
+        assert_eq!(
+            plan.destination_path,
+            "/projects/trailer/audio/Room Tone.wav"
+        );
+    }
+
+    #[test]
     fn export_range_must_have_positive_duration() {
         let result = plan_editorial_export(ExportRequest {
             source_path: "/library/hit.wav".to_string(),
@@ -798,6 +850,7 @@ mod tests {
                 end_ms: 4_000,
             }),
             intent: default_editorial_export_intent(),
+            category_subfolder: None,
         });
 
         assert_eq!(result, Err(ExportPlanError::InvalidRange));

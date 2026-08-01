@@ -202,24 +202,34 @@ const CLASSIFICATION_SHORT_DURATION_MS: i64 = 30_000;
 /// wind) can still return *some* bpm value with low confidence.
 const CLASSIFICATION_MIN_BPM_CONFIDENCE: f64 = 0.5;
 
+/// Threshold for treating a clip as *primarily* speech for classification
+/// purposes. Deliberately higher than the frontend's `VOCAL_RATIO_THRESHOLD`
+/// (0.15, used only to flag "has some vocals" for filtering/row icons) —
+/// here we're deciding whether the whole track basically *is* a voiceover,
+/// which needs a stronger majority-of-the-clip bar than "contains a chorus."
+const CLASSIFICATION_VOCAL_RATIO_THRESHOLD: f64 = 0.5;
+
 /// Best-effort media-type classification from the signals `analyze_asset_audio`
-/// already computes — duration and detected tempo. This is the "first
-/// funnel": real acoustic signal, not filename guessing, deciding a file's
-/// category before anyone has to review it by hand. Returns `None` when
-/// there isn't enough signal to decide (no duration at all), so a caller
-/// can leave whatever classification already exists untouched rather than
-/// overwriting it with a guess.
+/// already computes — duration, detected tempo, and vocal ratio. This is the
+/// "first funnel": real acoustic signal, not filename guessing, deciding a
+/// file's category before anyone has to review it by hand. Returns `None`
+/// when there isn't enough signal to decide (no duration at all), so a
+/// caller can leave whatever classification already exists untouched rather
+/// than overwriting it with a guess.
 ///
-/// Deliberately only two signals, both already computed for every analyzed
-/// file at no extra cost — not a new classifier model, consistent with this
+/// Deliberately few signals, all already computed for every analyzed file at
+/// no extra cost — not a new classifier model, consistent with this
 /// project's preference for small hand-written heuristics (see ADR 0025)
-/// over new ML dependencies for a problem two numbers already answer well
-/// enough: short clips are effects; long clips with a confident beat are
-/// music; long clips without one are ambience.
+/// over new ML dependencies: short clips are effects; long clips with a
+/// confident beat are music (even if they also have vocals — a sung chorus
+/// over a beat is a soundtrack, not a voiceover); long clips without a beat
+/// but with substantial vocals are voiceover; everything else long is
+/// ambience.
 pub fn classify_media_type_from_analysis(
     duration_ms: Option<i64>,
     bpm: Option<f64>,
     bpm_confidence: Option<f64>,
+    vocal_ratio: Option<f64>,
 ) -> Option<&'static str> {
     let duration_ms = duration_ms?;
 
@@ -229,8 +239,14 @@ pub fn classify_media_type_from_analysis(
 
     let has_confident_beat = bpm.is_some()
         && bpm_confidence.is_some_and(|confidence| confidence >= CLASSIFICATION_MIN_BPM_CONFIDENCE);
+    if has_confident_beat {
+        return Some("music");
+    }
 
-    Some(if has_confident_beat { "music" } else { "ambience" })
+    let has_substantial_vocals =
+        vocal_ratio.is_some_and(|ratio| ratio >= CLASSIFICATION_VOCAL_RATIO_THRESHOLD);
+
+    Some(if has_substantial_vocals { "voiceover" } else { "ambience" })
 }
 
 const PITCH_WINDOW_SIZE: usize = 2048;
@@ -452,37 +468,65 @@ mod tests {
     #[test]
     fn classification_treats_short_clips_as_sound_effects_regardless_of_tempo() {
         assert_eq!(
-            classify_media_type_from_analysis(Some(5_000), Some(120.0), Some(0.9)),
+            classify_media_type_from_analysis(Some(5_000), Some(120.0), Some(0.9), None),
             Some("sound_effect")
         );
         assert_eq!(
-            classify_media_type_from_analysis(Some(30_000), None, None),
+            classify_media_type_from_analysis(Some(30_000), None, None, Some(0.9)),
             Some("sound_effect")
         );
     }
 
     #[test]
-    fn classification_treats_long_confident_tempo_as_music() {
+    fn classification_treats_long_confident_tempo_as_music_even_with_vocals() {
         assert_eq!(
-            classify_media_type_from_analysis(Some(180_000), Some(96.0), Some(0.8)),
+            classify_media_type_from_analysis(Some(180_000), Some(96.0), Some(0.8), None),
+            Some("music")
+        );
+        // A sung chorus over a real beat is a soundtrack, not a voiceover —
+        // the beat wins even when vocals are dominant (bug-log-v2: long
+        // vocal tracks were wrongly ending up as sound effects/ambience
+        // instead of soundtracks).
+        assert_eq!(
+            classify_media_type_from_analysis(Some(180_000), Some(96.0), Some(0.8), Some(0.9)),
             Some("music")
         );
     }
 
     #[test]
-    fn classification_treats_long_clips_without_a_confident_beat_as_ambience() {
-        assert_eq!(classify_media_type_from_analysis(Some(180_000), None, None), Some("ambience"));
+    fn classification_treats_long_clips_with_substantial_vocals_and_no_beat_as_voiceover() {
+        assert_eq!(
+            classify_media_type_from_analysis(Some(180_000), None, None, Some(0.6)),
+            Some("voiceover")
+        );
+    }
+
+    #[test]
+    fn classification_treats_long_clips_without_a_confident_beat_or_vocals_as_ambience() {
+        assert_eq!(
+            classify_media_type_from_analysis(Some(180_000), None, None, None),
+            Some("ambience")
+        );
         // A spurious low-confidence tempo on non-rhythmic material
         // shouldn't be enough to call it "music".
         assert_eq!(
-            classify_media_type_from_analysis(Some(180_000), Some(70.0), Some(0.2)),
+            classify_media_type_from_analysis(Some(180_000), Some(70.0), Some(0.2), None),
+            Some("ambience")
+        );
+        // Some incidental speech in the background isn't enough to call the
+        // whole clip a voiceover.
+        assert_eq!(
+            classify_media_type_from_analysis(Some(180_000), None, None, Some(0.2)),
             Some("ambience")
         );
     }
 
     #[test]
     fn classification_declines_to_guess_without_a_duration() {
-        assert_eq!(classify_media_type_from_analysis(None, Some(120.0), Some(0.9)), None);
+        assert_eq!(
+            classify_media_type_from_analysis(None, Some(120.0), Some(0.9), Some(0.9)),
+            None
+        );
     }
 
     fn sine_wave(

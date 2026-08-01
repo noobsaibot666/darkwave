@@ -184,6 +184,16 @@ pub struct CollectionRecord {
     pub export_path: Option<String>,
 }
 
+/// One (asset, project) membership row — see `project_memberships_for_library`.
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+pub struct AssetProjectMembership {
+    pub asset_id: Uuid,
+    pub project_id: Uuid,
+    pub project_name: String,
+    pub export_path: Option<String>,
+    pub exported: bool,
+}
+
 #[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
 pub enum UsageEventType {
     Played,
@@ -1104,6 +1114,48 @@ impl Catalog {
         Ok(assets)
     }
 
+    /// One row per (asset, project) membership across an entire library —
+    /// batched like this so the browser can badge every visible row ("in a
+    /// project" / "already exported") and offer a one-click per-row send
+    /// without an N+1 query per asset. `exported` reflects whether a
+    /// `usage_events` row already recorded that exact (asset, project) pair
+    /// being exported, not just exported anywhere.
+    pub fn project_memberships_for_library(
+        &self,
+        library_id: Uuid,
+    ) -> Result<Vec<AssetProjectMembership>, StorageError> {
+        let mut statement = self.connection.prepare(
+            "SELECT collection_assets.asset_id, collections.id, collections.name, collections.export_path,
+                EXISTS(
+                    SELECT 1 FROM usage_events
+                    WHERE usage_events.asset_id = collection_assets.asset_id
+                      AND usage_events.project_id = collections.id
+                      AND usage_events.event_type = 'exported'
+                ) AS exported
+             FROM collection_assets
+             INNER JOIN collections ON collections.id = collection_assets.collection_id
+             WHERE collections.library_id = ?1 AND collections.type = 'project'
+             ORDER BY collections.created_at ASC",
+        )?;
+
+        let memberships = statement
+            .query_map(params![library_id.to_string()], |row| {
+                Ok(AssetProjectMembership {
+                    asset_id: Uuid::parse_str(&row.get::<_, String>(0)?)
+                        .map_err(|_| rusqlite::Error::InvalidQuery)?,
+                    project_id: Uuid::parse_str(&row.get::<_, String>(1)?)
+                        .map_err(|_| rusqlite::Error::InvalidQuery)?,
+                    project_name: row.get(2)?,
+                    export_path: row.get(3)?,
+                    exported: row.get(4)?,
+                })
+            })?
+            .collect::<Result<Vec<_>, _>>()
+            .map_err(StorageError::from)?;
+
+        Ok(memberships)
+    }
+
     /// The "evaluate" half `create_smart_collection` never had: loads the
     /// collection's stored query definition and re-runs it through
     /// `search_assets`, returning live results rather than a static
@@ -1838,6 +1890,29 @@ impl Catalog {
         )?;
 
         Ok(true)
+    }
+
+    /// Finalizes a trash item's removal same as `purge_trash_item`, but
+    /// without the retention-window gate and marking `file_deleted = 1`
+    /// instead of leaving it `0` — this is the DB half of an explicit,
+    /// user-confirmed "Delete" action from the trash view (see
+    /// `delete_trash_item_permanently` in the Tauri command layer), which
+    /// deletes the real file itself. Deliberately kept out of this crate:
+    /// every other trash function here only ever touches SQLite rows, and
+    /// that's a real invariant other code (and this crate's own docs) rely
+    /// on — actual filesystem deletion belongs one layer up, next to the
+    /// asset-path resolution logic it needs.
+    pub fn finalize_permanent_deletion(&self, asset_id: Uuid) -> Result<(), StorageError> {
+        self.connection.execute(
+            "UPDATE trash_items SET state = 'purged', file_deleted = 1 WHERE asset_id = ?1",
+            params![asset_id.to_string()],
+        )?;
+        self.connection.execute(
+            "DELETE FROM assets WHERE id = ?1",
+            params![asset_id.to_string()],
+        )?;
+
+        Ok(())
     }
 
     fn migrate(&self) -> Result<(), StorageError> {
@@ -3948,6 +4023,75 @@ mod tests {
             .purge_trash_item(asset.id, 1_000 + 7_000, 7_000)
             .expect("purge"));
         assert!(catalog.get_asset(asset.id).expect("query").is_none());
+    }
+
+    #[test]
+    fn finalize_permanent_deletion_bypasses_retention_and_removes_asset() {
+        let catalog_path = unique_catalog_path("trash-permanent-delete");
+        let catalog = Catalog::open(&catalog_path).expect("open catalog");
+        let library = catalog
+            .create_library("Trash", "/library")
+            .expect("library");
+        let asset = test_asset(&catalog, library.id, "old.wav", "hash-permanent-delete");
+
+        catalog
+            .move_asset_to_trash(asset.id, "manual", 1_000)
+            .expect("trash asset");
+
+        // No retention wait needed, unlike purge_trash_item — a freshly
+        // trashed item can be force-deleted immediately.
+        catalog
+            .finalize_permanent_deletion(asset.id)
+            .expect("finalize permanent deletion");
+
+        assert!(catalog.get_asset(asset.id).expect("query").is_none());
+        assert!(catalog
+            .list_trash_items(library.id)
+            .expect("list trash items")
+            .is_empty());
+    }
+
+    #[test]
+    fn project_memberships_reports_export_status_per_asset_and_project() {
+        let catalog_path = unique_catalog_path("project-memberships");
+        let catalog = Catalog::open(&catalog_path).expect("open catalog");
+        let library = catalog
+            .create_library("Memberships", "/library")
+            .expect("library");
+        let asset = test_asset(&catalog, library.id, "theme.wav", "hash-memberships");
+        let project = catalog
+            .create_collection(library.id, "Trailer", CollectionType::Project)
+            .expect("project");
+        let manual_collection = catalog
+            .create_collection(library.id, "Favorites", CollectionType::Manual)
+            .expect("manual collection");
+
+        catalog
+            .add_assets_to_collection(project.id, &[asset.id])
+            .expect("add to project");
+        catalog
+            .add_assets_to_collection(manual_collection.id, &[asset.id])
+            .expect("add to manual collection");
+
+        let memberships = catalog
+            .project_memberships_for_library(library.id)
+            .expect("memberships");
+
+        // Only the Project-type collection shows up, not the Manual one.
+        assert_eq!(memberships.len(), 1);
+        assert_eq!(memberships[0].asset_id, asset.id);
+        assert_eq!(memberships[0].project_id, project.id);
+        assert_eq!(memberships[0].project_name, "Trailer");
+        assert!(!memberships[0].exported);
+
+        catalog
+            .record_usage_event(asset.id, Some(project.id), UsageEventType::Exported, "/export/theme.wav")
+            .expect("record export");
+
+        let memberships = catalog
+            .project_memberships_for_library(library.id)
+            .expect("memberships after export");
+        assert!(memberships[0].exported);
     }
 
     fn unique_catalog_path(name: &str) -> PathBuf {
