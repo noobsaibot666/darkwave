@@ -1,0 +1,8 @@
+{
+  "identifier": "dev.darkwave.app.direct",
+  "bundle": {
+    "macOS": {
+      "entitlements": "entitlements.direct.plist"
+    }
+  }
+}

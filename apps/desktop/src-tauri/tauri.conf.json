@@ -37,6 +37,22 @@
       "icons/icon.icns",
       "icons/icon.ico"
     ],
-    "externalBin": ["binaries/similarity-worker"]
+    "externalBin": ["binaries/similarity-worker"],
+    "macOS": {
+      "entitlements": "entitlements.mas.plist",
+      "hardenedRuntime": true,
+      "minimumSystemVersion": "12.0"
+    },
+    "windows": {
+      "webviewInstallMode": {
+        "type": "skip"
+      },
+      "nsis": {
+        "languages": ["English"],
+        "displayLanguageSelector": false,
+        "compression": "lzma",
+        "installMode": "perMachine"
+      }
+    }
   }
 }

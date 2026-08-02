@@ -699,6 +699,34 @@ button.panel-handle-right:active:not(:disabled) {
   transition: width 220ms var(--ease-soft);
 }
 
+.trial-banner {
+  display: flex;
+  gap: 12px;
+  align-items: center;
+  width: 100%;
+  padding: 8px 18px;
+  border: 0;
+  border-bottom: 1px solid rgba(var(--ink-rgb), 0.08);
+  background: rgba(139, 92, 246, 0.1);
+  color: var(--text-primary);
+  font-size: 12px;
+  font-weight: 600;
+  text-align: left;
+  cursor: pointer;
+}
+
+.trial-banner:hover {
+  background: rgba(139, 92, 246, 0.16);
+}
+
+.trial-banner-action {
+  padding: 2px 9px;
+  border-radius: 999px;
+  background: rgba(139, 92, 246, 0.2);
+  color: #8b5cf6;
+  font-weight: 700;
+}
+
 .filter-panel {
   display: flex;
   flex-wrap: wrap;
@@ -1843,6 +1871,15 @@ dd {
 
 .setup-card .primary-action:disabled {
   opacity: 0.5;
+}
+
+.setup-error {
+  margin: 0;
+  padding: 8px 12px;
+  border-radius: var(--radius-sm);
+  background: rgba(239, 68, 68, 0.12);
+  color: #ef4444;
+  font-size: 12px;
 }
 
 .transport.sidebar-collapsed {

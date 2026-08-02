@@ -1,3 +1,5 @@
+mod license;
+
 use std::collections::HashSet;
 use std::path::PathBuf;
 use std::sync::Mutex;
@@ -2638,7 +2640,12 @@ pub fn run() {
             create_browser_state,
             apply_browser_command,
             export_project_license_report,
-            validate_reconnect
+            validate_reconnect,
+            license::get_hwid,
+            license::get_license_status,
+            license::activate_license,
+            license::recover_license_key,
+            license::init_trial
         ])
         .run(tauri::generate_context!())
         .expect("failed to run Darkwave desktop shell");

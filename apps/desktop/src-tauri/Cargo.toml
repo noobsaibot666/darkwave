@@ -43,3 +43,23 @@ trash = { path = "../../../crates/trash" }
 tauri-plugin-shell = "2.3.5"
 tokio = { version = "1", default-features = false, features = ["time", "sync"] }
 futures = { version = "0.3", default-features = false, features = ["std"] }
+
+# direct-dist only (see src/license.rs) — kept optional so the Mac App
+# Store build's dependency tree (and binary) carries none of this at all,
+# not just dead code behind a cfg.
+chrono = { workspace = true, optional = true }
+ed25519-dalek = { version = "2", optional = true }
+machine-uid = { version = "0.3", optional = true }
+reqwest = { version = "0.12", features = ["json"], optional = true }
+base64 = { version = "0.22", optional = true }
+keyring = { version = "3", features = ["apple-native", "windows-native"], optional = true }
+
+[features]
+direct-dist = [
+  "dep:chrono",
+  "dep:ed25519-dalek",
+  "dep:machine-uid",
+  "dep:reqwest",
+  "dep:base64",
+  "dep:keyring",
+]

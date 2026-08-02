@@ -417,6 +417,31 @@ type ReleaseReadinessItem = {
   state: "Passed" | "Planned";
 };
 
+// Mirrors src-tauri/src/license.rs's LicenseStatus. In the Mac App Store
+// build (no direct-dist feature) get_license_status always resolves
+// { active: true, ... }, so every field below is effectively unused there —
+// this type/state exists once for both build variants rather than branching
+// the frontend per-build.
+type LicenseStatus = {
+  active: boolean;
+  key: string | null;
+  hwid: string;
+  message: string | null;
+  is_trial: boolean;
+  trial_days_remaining: number | null;
+  trial_expired: boolean;
+};
+
+type LicenseMode = "loading" | "trial" | "trial_expired" | "inactive" | "full";
+
+function licenseModeFor(status: LicenseStatus | null): LicenseMode {
+  if (!status) return "loading";
+  if (status.active) return "full";
+  if (status.is_trial) return "trial";
+  if (status.trial_expired) return "trial_expired";
+  return "inactive";
+}
+
 const fallbackReleaseItems: ReleaseReadinessItem[] = [
   { label: "macOS audit", blocker: "macos_audit", state: "Passed" },
   { label: "Windows audit", blocker: "windows_audit", state: "Passed" },
@@ -688,6 +713,48 @@ function CollapsibleSection({
 export function App() {
   const [releaseItems, setReleaseItems] = useState(fallbackReleaseItems);
   const updateChannelState = releaseItems.find((item) => item.blocker === "update_system")?.state ?? "Planned";
+
+  const [licenseStatus, setLicenseStatus] = useState<LicenseStatus | null>(null);
+  const [licenseFormOpen, setLicenseFormOpen] = useState(false);
+  const [licenseKeyInput, setLicenseKeyInput] = useState("");
+  const [licenseEmailInput, setLicenseEmailInput] = useState("");
+  const [licenseFormBusy, setLicenseFormBusy] = useState(false);
+  const [licenseFormError, setLicenseFormError] = useState<string | null>(null);
+  const licenseMode = licenseModeFor(licenseStatus);
+
+  const handleActivateLicense = useCallback(async () => {
+    setLicenseFormBusy(true);
+    setLicenseFormError(null);
+    try {
+      const status = await invoke<LicenseStatus>("activate_license", {
+        key: licenseKeyInput,
+        email: licenseEmailInput
+      });
+      setLicenseStatus(status);
+      setLicenseFormOpen(false);
+      setLicenseKeyInput("");
+      setLicenseEmailInput("");
+    } catch (error) {
+      setLicenseFormError(String(error));
+    } finally {
+      setLicenseFormBusy(false);
+    }
+  }, [licenseKeyInput, licenseEmailInput]);
+
+  const handleRecoverLicenseKey = useCallback(async () => {
+    setLicenseFormBusy(true);
+    setLicenseFormError(null);
+    try {
+      const result = await invoke<{ message: string }>("recover_license_key", {
+        email: licenseEmailInput
+      });
+      setLicenseFormError(result.message);
+    } catch (error) {
+      setLicenseFormError(String(error));
+    } finally {
+      setLicenseFormBusy(false);
+    }
+  }, [licenseEmailInput]);
 
   const [librariesLoaded, setLibrariesLoaded] = useState(false);
   const [libraries, setLibraries] = useState<LibraryRecord[]>([]);
@@ -1077,6 +1144,37 @@ export function App() {
     invoke<ReleaseReadinessItem[]>("release_readiness_items")
       .then(setReleaseItems)
       .catch(() => setReleaseItems(fallbackReleaseItems));
+  }, []);
+
+  // Mac App Store build: get_license_status always resolves { active: true }
+  // (crates/preferences has no equivalent — this is the src-tauri
+  // license.rs stub compiled in place of the real direct-dist licensing
+  // code), so licenseMode becomes "full" immediately and none of the
+  // trial/paywall UI below ever renders. Same JS for both build variants.
+  useEffect(() => {
+    invoke<LicenseStatus>("get_license_status")
+      .then((status) => {
+        // Fresh install, direct-dist build, no trial started yet and no
+        // license on file — init_trial is idempotent, so this is safe to
+        // call unconditionally whenever the initial check comes back with
+        // nothing on record.
+        if (!status.active && !status.is_trial && !status.trial_expired) {
+          return invoke<LicenseStatus>("init_trial");
+        }
+        return status;
+      })
+      .then(setLicenseStatus)
+      .catch(() =>
+        setLicenseStatus({
+          active: true,
+          key: null,
+          hwid: "",
+          message: null,
+          is_trial: false,
+          trial_days_remaining: null,
+          trial_expired: false
+        })
+      );
   }, []);
 
   useEffect(() => {
@@ -2305,6 +2403,65 @@ export function App() {
     browserState
   ]);
 
+  // Hard paywall: only reachable in the direct-dist build (the MAS build's
+  // license.rs stub always reports active:true, so licenseMode is "full"
+  // before this ever renders). Gates everything, including library
+  // creation, which is why this early-return sits ahead of it.
+  if (licenseMode === "trial_expired" || licenseMode === "inactive") {
+    return (
+      <main className="shell setup-shell">
+        <section className="setup-card" aria-label="Activate Darkwave">
+          <div className="brand">Darkwave</div>
+          <h1>{licenseMode === "trial_expired" ? "Your trial has ended" : "Activate Darkwave"}</h1>
+          <p>
+            {licenseMode === "trial_expired"
+              ? "Enter your license key to keep using Darkwave."
+              : "Enter the license key from your purchase email to activate this copy of Darkwave."}
+          </p>
+          <label className="setup-field">
+            <span>License key</span>
+            <input
+              autoFocus
+              value={licenseKeyInput}
+              onChange={(event) => setLicenseKeyInput(event.target.value)}
+              placeholder="DW-XXXXXXXX-XXXXXXXX-XXXXXXXX"
+            />
+          </label>
+          <label className="setup-field">
+            <span>Email used at purchase</span>
+            <input
+              value={licenseEmailInput}
+              onChange={(event) => setLicenseEmailInput(event.target.value)}
+              placeholder="you@example.com"
+              onKeyDown={(event) => {
+                if (event.key === "Enter" && licenseKeyInput.trim() && licenseEmailInput.trim()) {
+                  handleActivateLicense();
+                }
+              }}
+            />
+          </label>
+          {licenseFormError ? <p className="setup-error">{licenseFormError}</p> : null}
+          <button
+            className="primary-action"
+            type="button"
+            onClick={handleActivateLicense}
+            disabled={!licenseKeyInput.trim() || !licenseEmailInput.trim() || licenseFormBusy}
+          >
+            {licenseFormBusy ? "Activating…" : "Activate"}
+          </button>
+          <button
+            className="text-button"
+            type="button"
+            onClick={handleRecoverLicenseKey}
+            disabled={!licenseEmailInput.trim() || licenseFormBusy}
+          >
+            Resend my license key
+          </button>
+        </section>
+      </main>
+    );
+  }
+
   if (librariesLoaded && libraries.length === 0) {
     return (
       <main className="shell setup-shell">
@@ -2961,6 +3118,20 @@ export function App() {
                 </span>
               );
             })}
+          </button>
+        ) : null}
+        {licenseMode === "trial" ? (
+          <button
+            type="button"
+            className="trial-banner"
+            onClick={() => setLicenseFormOpen(true)}
+            aria-label="Trial active — click to activate your license"
+          >
+            <span>
+              {licenseStatus?.trial_days_remaining ?? 0} day
+              {(licenseStatus?.trial_days_remaining ?? 0) === 1 ? "" : "s"} left in trial
+            </span>
+            <span className="trial-banner-action">Activate</span>
           </button>
         ) : null}
         {queryFilters.length > 0 ? (
@@ -4564,6 +4735,71 @@ export function App() {
                 <span>Keyboard Shortcuts</span>
                 <kbd>Mod+/</kbd>
               </div>
+            </div>
+          </motion.div>
+        </motion.div>
+      ) : null}
+      </AnimatePresence>
+      <AnimatePresence>
+      {licenseFormOpen ? (
+        <motion.div
+          className="modal-overlay"
+          onClick={() => setLicenseFormOpen(false)}
+          initial={{ opacity: 0 }}
+          animate={{ opacity: 1 }}
+          exit={{ opacity: 0 }}
+          transition={{ duration: 0.18 }}
+        >
+          <motion.div
+            className="modal-card"
+            onClick={(event) => event.stopPropagation()}
+            aria-label="Activate license"
+            initial={{ opacity: 0, scale: 0.96, y: 10 }}
+            animate={{ opacity: 1, scale: 1, y: 0 }}
+            exit={{ opacity: 0, scale: 0.96, y: 10 }}
+            transition={{ duration: 0.2, ease: [0.4, 0, 0.2, 1] }}
+          >
+            <div className="modal-head">
+              <h1>Activate License</h1>
+              <button type="button" className="icon-button" aria-label="Close" onClick={() => setLicenseFormOpen(false)}>
+                <X size={16} />
+              </button>
+            </div>
+            <div className="settings-grid">
+              <label className="setup-field">
+                <span>License key</span>
+                <input
+                  autoFocus
+                  value={licenseKeyInput}
+                  onChange={(event) => setLicenseKeyInput(event.target.value)}
+                  placeholder="DW-XXXXXXXX-XXXXXXXX-XXXXXXXX"
+                />
+              </label>
+              <label className="setup-field">
+                <span>Email used at purchase</span>
+                <input
+                  value={licenseEmailInput}
+                  onChange={(event) => setLicenseEmailInput(event.target.value)}
+                  placeholder="you@example.com"
+                />
+              </label>
+              {licenseFormError ? <p className="setup-error">{licenseFormError}</p> : null}
+              <button
+                className="primary-action"
+                type="button"
+                onClick={handleActivateLicense}
+                disabled={!licenseKeyInput.trim() || !licenseEmailInput.trim() || licenseFormBusy}
+              >
+                {licenseFormBusy ? "Activating…" : "Activate"}
+              </button>
+              <button
+                className="text-button"
+                type="button"
+                onClick={handleRecoverLicenseKey}
+                disabled={!licenseEmailInput.trim() || licenseFormBusy}
+              >
+                Resend my license key
+              </button>
             </div>
           </motion.div>
         </motion.div>

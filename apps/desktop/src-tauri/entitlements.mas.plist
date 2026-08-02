@@ -1,0 +1,27 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+    <!-- Required for any Mac App Store submission. -->
+    <key>com.apple.security.app-sandbox</key>
+    <true/>
+
+    <!-- Darkwave has the user explicitly pick each library's source folder
+         (Tauri dialog plugin) rather than scanning arbitrary paths, so this
+         plus the bookmark entitlement below is the whole sandboxed
+         file-access story: grant access to what was picked, remember it
+         across launches via a security-scoped bookmark (not yet
+         implemented — see the distribution plan's Phase B). -->
+    <key>com.apple.security.files.user-selected.read-write</key>
+    <true/>
+    <key>com.apple.security.files.bookmarks.app-scope</key>
+    <true/>
+
+    <!-- Fill in once the app is registered in the Apple Developer portal
+         (Phase I) — these are placeholders, not real values. -->
+    <key>com.apple.developer.team-identifier</key>
+    <string>TEAMID_PLACEHOLDER</string>
+    <key>com.apple.application-identifier</key>
+    <string>TEAMID_PLACEHOLDER.dev.darkwave.app</string>
+</dict>
+</plist>
