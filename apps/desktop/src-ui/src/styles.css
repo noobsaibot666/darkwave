@@ -986,6 +986,16 @@ button.panel-handle-right:active:not(:disabled) {
   font-weight: 650;
 }
 
+.classification-chip-shortcut {
+  min-width: 16px;
+  height: 16px;
+  padding: 0 4px;
+  border-radius: 4px;
+  font-size: 10px;
+  line-height: 16px;
+  opacity: 0.6;
+}
+
 /* Higher specificity than .icon-button.active on purpose — reviewed state
    gets the app's established green "done/success" color (matches
    .job-progress-done), not the generic orange "panel is open" active
@@ -2146,6 +2156,46 @@ dd {
   width: 16px;
   height: 16px;
   accent-color: #ff5c00;
+}
+
+.settings-subhead {
+  margin: 18px 0 10px;
+  font-size: 13px;
+  font-weight: 700;
+}
+
+.accent-legend {
+  display: grid;
+  gap: 4px;
+}
+
+.accent-legend-row {
+  display: grid;
+  grid-template-columns: 14px auto minmax(0, 1fr);
+  gap: 10px;
+  align-items: center;
+  min-height: 30px;
+  padding: 4px 8px;
+  border-radius: var(--radius-sm);
+  color: var(--text-tertiary);
+  font-size: 12px;
+}
+
+.accent-legend-row:hover {
+  background: rgba(var(--ink-rgb), 0.03);
+}
+
+.accent-legend-swatch {
+  width: 14px;
+  height: 14px;
+  border-radius: 50%;
+  box-shadow: inset 0 0 0 1px rgba(var(--ink-rgb), 0.1);
+}
+
+.accent-legend-row strong {
+  color: var(--text-primary);
+  font-size: 12px;
+  white-space: nowrap;
 }
 
 /* Editor Workflow */

@@ -19,6 +19,12 @@ pub enum CommandId {
     ToggleLoop,
     CopyPath,
     ToggleReviewed,
+    ClassifySoundtrack,
+    ClassifyVoiceover,
+    ClassifySoundEffect,
+    ClassifyFoley,
+    ClassifyAmbience,
+    ClassifyOther,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
@@ -175,6 +181,58 @@ impl ShortcutMap {
                     command: CommandId::ToggleReviewed,
                     accelerator: "Mod+R".to_string(),
                 },
+                // Classify shortcuts: top-row digits plus their numeric-keypad
+                // equivalents (full keyboards only) both fire the same
+                // command — each pair shares a command like NextAsset's
+                // ArrowDown/D does above, so either key works interchangeably.
+                ShortcutBinding {
+                    command: CommandId::ClassifySoundtrack,
+                    accelerator: "1".to_string(),
+                },
+                ShortcutBinding {
+                    command: CommandId::ClassifySoundtrack,
+                    accelerator: "Numpad1".to_string(),
+                },
+                ShortcutBinding {
+                    command: CommandId::ClassifyVoiceover,
+                    accelerator: "2".to_string(),
+                },
+                ShortcutBinding {
+                    command: CommandId::ClassifyVoiceover,
+                    accelerator: "Numpad2".to_string(),
+                },
+                ShortcutBinding {
+                    command: CommandId::ClassifySoundEffect,
+                    accelerator: "3".to_string(),
+                },
+                ShortcutBinding {
+                    command: CommandId::ClassifySoundEffect,
+                    accelerator: "Numpad3".to_string(),
+                },
+                ShortcutBinding {
+                    command: CommandId::ClassifyFoley,
+                    accelerator: "4".to_string(),
+                },
+                ShortcutBinding {
+                    command: CommandId::ClassifyFoley,
+                    accelerator: "Numpad4".to_string(),
+                },
+                ShortcutBinding {
+                    command: CommandId::ClassifyAmbience,
+                    accelerator: "5".to_string(),
+                },
+                ShortcutBinding {
+                    command: CommandId::ClassifyAmbience,
+                    accelerator: "Numpad5".to_string(),
+                },
+                ShortcutBinding {
+                    command: CommandId::ClassifyOther,
+                    accelerator: "0".to_string(),
+                },
+                ShortcutBinding {
+                    command: CommandId::ClassifyOther,
+                    accelerator: "Numpad0".to_string(),
+                },
             ],
         }
     }
@@ -318,6 +376,53 @@ mod tests {
             ShortcutMap::default_audio_workspace().binding_for(CommandId::ToggleReviewed),
             Some("Mod+R")
         );
+    }
+
+    #[test]
+    fn classify_shortcuts_cover_digits_zero_through_five() {
+        let shortcuts = ShortcutMap::default_audio_workspace();
+
+        assert_eq!(
+            shortcuts.binding_for(CommandId::ClassifySoundtrack),
+            Some("1")
+        );
+        assert_eq!(
+            shortcuts.binding_for(CommandId::ClassifyVoiceover),
+            Some("2")
+        );
+        assert_eq!(
+            shortcuts.binding_for(CommandId::ClassifySoundEffect),
+            Some("3")
+        );
+        assert_eq!(shortcuts.binding_for(CommandId::ClassifyFoley), Some("4"));
+        assert_eq!(
+            shortcuts.binding_for(CommandId::ClassifyAmbience),
+            Some("5")
+        );
+        assert_eq!(shortcuts.binding_for(CommandId::ClassifyOther), Some("0"));
+    }
+
+    #[test]
+    fn classify_shortcuts_also_bind_the_numeric_keypad() {
+        let shortcuts = ShortcutMap::default_audio_workspace();
+        let numpad_pairs = [
+            (CommandId::ClassifySoundtrack, "Numpad1"),
+            (CommandId::ClassifyVoiceover, "Numpad2"),
+            (CommandId::ClassifySoundEffect, "Numpad3"),
+            (CommandId::ClassifyFoley, "Numpad4"),
+            (CommandId::ClassifyAmbience, "Numpad5"),
+            (CommandId::ClassifyOther, "Numpad0"),
+        ];
+
+        for (command, accelerator) in numpad_pairs {
+            assert!(
+                shortcuts
+                    .bindings
+                    .iter()
+                    .any(|binding| binding.command == command && binding.accelerator == accelerator),
+                "missing numpad binding {accelerator} for {command:?}"
+            );
+        }
     }
 
     #[test]

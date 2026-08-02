@@ -6,6 +6,7 @@ import { revealItemInDir } from "@tauri-apps/plugin-opener";
 import { writeText as writeClipboardText } from "@tauri-apps/plugin-clipboard-manager";
 import {
   Activity,
+  Archive,
   Bell,
   ChevronDown,
   ChevronLeft,
@@ -445,14 +446,26 @@ const smartFilters: { id: ActiveFilter; label: string }[] = [
 // not a second, differently-styled taxonomy. Ordered to mirror the export
 // folder numbering (01_MUSIC/02_VO/03_SFX/04_FOLEY) for the four foldered
 // categories, with the two unfoldered ones (Ambience, Other) trailing.
-const mediaTypeOptions: { value: string; label: string; Icon: typeof Music2; color: string }[] = [
-  { value: "music", label: "Soundtrack", Icon: Music2, color: "#4ade9c" },
-  { value: "voiceover", label: "Voiceover", Icon: Mic, color: "#f0a6d8" },
-  { value: "sound_effect", label: "Sound Effect", Icon: Waves, color: "var(--sfx-ink)" },
-  { value: "foley", label: "Foley", Icon: Footprints, color: "#e0a458" },
-  { value: "ambience", label: "Ambience", Icon: Wind, color: "#5ec8d8" },
-  { value: "other", label: "Other", Icon: HelpCircle, color: "var(--text-muted)" }
+const mediaTypeOptions: { value: string; label: string; Icon: typeof Music2; color: string; shortcutDigit: string }[] = [
+  { value: "music", label: "Soundtrack", Icon: Music2, color: "#4ade9c", shortcutDigit: "1" },
+  { value: "voiceover", label: "Voiceover", Icon: Mic, color: "#f0a6d8", shortcutDigit: "2" },
+  { value: "sound_effect", label: "Sound Effect", Icon: Waves, color: "var(--sfx-ink)", shortcutDigit: "3" },
+  { value: "foley", label: "Foley", Icon: Footprints, color: "#e0a458", shortcutDigit: "4" },
+  { value: "ambience", label: "Ambience", Icon: Wind, color: "#5ec8d8", shortcutDigit: "5" },
+  { value: "other", label: "Other", Icon: HelpCircle, color: "var(--text-muted)", shortcutDigit: "0" }
 ];
+
+// value -> CommandId, for the classify keyboard shortcuts registered in
+// crates/preferences (ClassifySoundtrack..ClassifyOther) — keeps the
+// keydown switch below from having to hardcode media-type strings twice.
+const MEDIA_TYPE_CLASSIFY_COMMAND: Record<string, string> = {
+  music: "ClassifySoundtrack",
+  voiceover: "ClassifyVoiceover",
+  sound_effect: "ClassifySoundEffect",
+  foley: "ClassifyFoley",
+  ambience: "ClassifyAmbience",
+  other: "ClassifyOther"
+};
 
 type JobProgress = { kind: string; label: string; pending: number; total: number; failed: number };
 type JobCompletionSummary = {
@@ -489,6 +502,16 @@ const playerMoodTheme: Record<PlayerMood, { from: string; to: string; glow: stri
   "voice-over": { from: "#7c90f5", to: "#4c5fe0", glow: "rgba(76, 95, 224, 0.45)" },
   sfx: { from: "var(--sfx-from)", to: "var(--sfx-to)", glow: "var(--sfx-glow)" }
 };
+
+// Mirrors classifyPlayerMood's decision order, for the Settings legend —
+// keep in sync if that function's logic changes.
+const PLAYER_ACCENT_LEGEND: { mood: PlayerMood | "default"; label: string; description: string }[] = [
+  { mood: "soundtrack", label: "Soundtrack", description: "Music with no significant vocals detected" },
+  { mood: "soundtrack-voice", label: "Soundtrack (vocal)", description: "Music with vocals present" },
+  { mood: "voice-over", label: "Voice-over", description: "Non-music audio with vocals detected" },
+  { mood: "sfx", label: "Sound effect", description: "Tagged or classified as a sound effect" },
+  { mood: "default", label: "Default", description: "No mood could be classified — falls back to the app's brand orange" }
+];
 
 // Derives a playback "mood" from the sound's applied tags (falling back to
 // media_type) — there's no dedicated speech/music classifier yet, so this
@@ -2155,7 +2178,20 @@ export function App() {
       // Every check here reads metaKey OR ctrlKey, never one alone, so the
       // same accelerator string fires from Cmd on macOS and Ctrl on Windows.
       const mod = event.metaKey || event.ctrlKey;
-      const key = event.key === " " ? "Space" : event.key.length === 1 ? event.key.toUpperCase() : event.key;
+      // event.key alone can't tell a numpad digit from a top-row one — with
+      // NumLock on both report key "1", and with NumLock off the numpad
+      // reports a navigation key ("End", "Home", ...) instead of a digit at
+      // all. event.code encodes the physical key regardless of NumLock, so
+      // numpad digits get their own "Numpad1".."Numpad0" accelerator,
+      // bindable separately from (but alongside) the top-row digit.
+      const isNumpadDigit = /^Numpad[0-9]$/.test(event.code);
+      const key = isNumpadDigit
+        ? event.code
+        : event.key === " "
+          ? "Space"
+          : event.key.length === 1
+            ? event.key.toUpperCase()
+            : event.key;
       const parts: string[] = [];
       if (mod) parts.push("Mod");
       if (event.shiftKey) parts.push("Shift");
@@ -2231,6 +2267,21 @@ export function App() {
           event.preventDefault();
           if (selectedAsset) handleToggleReviewed(selectedAsset);
           break;
+        case "ClassifySoundtrack":
+        case "ClassifyVoiceover":
+        case "ClassifySoundEffect":
+        case "ClassifyFoley":
+        case "ClassifyAmbience":
+        case "ClassifyOther": {
+          const mediaType = mediaTypeOptions.find(
+            (option) => MEDIA_TYPE_CLASSIFY_COMMAND[option.value] === binding.command
+          )?.value;
+          if (selectedAsset && mediaType) {
+            event.preventDefault();
+            handleSetMediaType(selectedAsset, mediaType);
+          }
+          break;
+        }
         default:
           break;
       }
@@ -2246,6 +2297,7 @@ export function App() {
     playRelative,
     handleToggleFavorite,
     handleToggleReviewed,
+    handleSetMediaType,
     handleImportFolder,
     bulkAssetIds,
     handleCopyAssetPaths,
@@ -2875,7 +2927,7 @@ export function App() {
             title="Trash"
             onClick={() => setTrashModalOpen(true)}
           >
-            <Trash2 size={17} />
+            <Archive size={17} />
             {trashItems.length > 0 ? <span className="icon-button-badge">{trashItems.length}</span> : null}
           </button>
           <button className="icon-button" aria-label="Open settings" onClick={() => setSettingsOpen(true)}>
@@ -3326,7 +3378,7 @@ export function App() {
             </div>
             <h2>Classify</h2>
             <div className="classification-row">
-              {mediaTypeOptions.map(({ value, label, Icon, color }) => {
+              {mediaTypeOptions.map(({ value, label, Icon, color, shortcutDigit }) => {
                 const active = selectedAsset.media_type === value;
                 return (
                   <button
@@ -3335,10 +3387,12 @@ export function App() {
                     className={active ? "classification-chip active" : "classification-chip"}
                     style={active ? ({ "--classification-color": color } as CSSProperties) : undefined}
                     aria-pressed={active}
+                    title={`${label} (${shortcutDigit})`}
                     onClick={() => handleSetMediaType(selectedAsset, value)}
                   >
                     <Icon size={14} style={{ color: active ? color : undefined }} />
                     {label}
+                    <kbd className="classification-chip-shortcut">{shortcutDigit}</kbd>
                   </button>
                 );
               })}
@@ -3946,6 +4000,25 @@ export function App() {
                           <option value="System">Match system</option>
                         </select>
                       </label>
+                    </div>
+
+                    <h2 className="settings-subhead">Player accent colors</h2>
+                    <div className="accent-legend">
+                      {PLAYER_ACCENT_LEGEND.map((entry) => (
+                        <div className="accent-legend-row" key={entry.mood}>
+                          <span
+                            className="accent-legend-swatch"
+                            style={{
+                              background:
+                                entry.mood === "default"
+                                  ? "linear-gradient(135deg, #ff7940, #f14800)"
+                                  : `linear-gradient(135deg, ${playerMoodTheme[entry.mood].from}, ${playerMoodTheme[entry.mood].to})`
+                            }}
+                          />
+                          <strong>{entry.label}</strong>
+                          <span>{entry.description}</span>
+                        </div>
+                      ))}
                     </div>
                   </div>
                 ) : null}
