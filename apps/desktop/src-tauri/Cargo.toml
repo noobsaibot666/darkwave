@@ -53,6 +53,9 @@ ed25519-dalek = { version = "2", optional = true }
 machine-uid = { version = "0.3", optional = true }
 reqwest = { version = "0.12", features = ["json"], optional = true }
 keyring = { version = "3", features = ["apple-native", "windows-native"], optional = true }
+# The MAS build relies entirely on Apple's own updater — this plugin only
+# makes sense for the direct-sale channel.
+tauri-plugin-updater = { version = "2", optional = true }
 
 [target.'cfg(target_os = "macos")'.dependencies]
 # Used only by src/security_scoped_bookmark.rs, itself cfg-gated to
@@ -70,4 +73,5 @@ direct-dist = [
   "dep:machine-uid",
   "dep:reqwest",
   "dep:keyring",
+  "dep:tauri-plugin-updater",
 ]

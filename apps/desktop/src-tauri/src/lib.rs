@@ -123,6 +123,15 @@ fn release_blockers() -> Vec<&'static str> {
         license_review_reference: None,
     };
 
+    // update_system deliberately isn't wired here yet, even though
+    // tauri.direct.conf.json already has a real Ed25519 keypair
+    // (secrets/darkwave-updater.key, gitignored) and a plausible-shaped
+    // manifest endpoint: that endpoint doesn't exist as a live server yet
+    // (web_three licensing-server generalization is still open). This gate
+    // is what Settings > Release Readiness shows the user as "ready to
+    // ship" — wiring a URL that 404s in production would make that panel
+    // lie. Flip this once the endpoint is actually deployed and serving
+    // real manifests.
     ReleaseReadinessConfig::code_gates_passed()
         .with_codec_distribution(codec_distribution)
         .candidate()
@@ -2522,12 +2531,20 @@ fn storage_error_message(error: StorageError) -> String {
 
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
-    tauri::Builder::default()
+    let builder = tauri::Builder::default()
         .plugin(tauri_plugin_clipboard_manager::init())
         .plugin(tauri_plugin_dialog::init())
         .plugin(tauri_plugin_fs::init())
         .plugin(tauri_plugin_opener::init())
-        .plugin(tauri_plugin_shell::init())
+        .plugin(tauri_plugin_shell::init());
+
+    // MAS build relies entirely on Apple's own updater (see
+    // docs/development/release-readiness.md) — this plugin only makes
+    // sense for the direct-sale channel.
+    #[cfg(feature = "direct-dist")]
+    let builder = builder.plugin(tauri_plugin_updater::Builder::new().build());
+
+    builder
         .setup(|app| {
             let app_data_dir = app
                 .path()

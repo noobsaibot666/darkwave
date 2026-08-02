@@ -4,5 +4,13 @@
     "macOS": {
       "entitlements": "entitlements.direct.plist"
     }
+  },
+  "plugins": {
+    "updater": {
+      "pubkey": "dW50cnVzdGVkIGNvbW1lbnQ6IG1pbmlzaWduIHB1YmxpYyBrZXk6IDRGQjMzMjk1RjE1QTZGQUMKUldTc2IxcnhsVEt6VDgrd2xsUHpWdnF4ZDVMZmpkQzltcWovVUk5TEp1TlRtSzMzV01QU0k2WDUK",
+      "endpoints": [
+        "https://alan-design.com/darkwave/updates/{{target}}/{{arch}}/{{current_version}}"
+      ]
+    }
   }
 }

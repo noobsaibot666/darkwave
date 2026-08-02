@@ -29,6 +29,8 @@ Decode coverage for the analysis pipeline (waveform/tempo/pitch/needs-review/sim
 
 The update system gate now validates source-owned channel metadata: an HTTPS update manifest URL and a non-empty release public-key identifier. The desktop shell still reports the update gate as planned until real channel metadata is configured for a release build.
 
+The direct-sale build's plumbing for this is in place: `tauri-plugin-updater` is wired (direct-dist only — the MAS build relies entirely on Apple's own updater), a real Ed25519 signing keypair exists at `secrets/darkwave-updater.key` (gitignored, **not** in version control — back it up somewhere durable, losing it means old installs can never verify a future signed update again), and `tauri.direct.conf.json` points at a manifest endpoint shaped like `https://alan-design.com/darkwave/updates/{{target}}/{{arch}}/{{current_version}}`. That endpoint doesn't exist as a deployed server yet — it's the same licensing-server generalization work needed for licensing itself (web_three, currently CineFlow-only end to end). `release_blockers()` deliberately does not mark this gate `Passed` until that endpoint is actually live, since this panel is what tells a user the release is ready — a URL that would 404 in production shouldn't read as done.
+
 The signing/notarization gate now validates source-owned identity metadata: macOS Developer ID, macOS team ID, and Windows certificate thumbprint. The desktop shell still reports signing/notarization as planned until real certificates and notarization credentials are configured for a release build.
 
 Before a release candidate, run:
