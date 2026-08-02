@@ -18,20 +18,33 @@
 
 use serde::{Deserialize, Serialize};
 
-// Placeholder — the licensing server for Darkwave doesn't exist yet
-// (Phase G of the distribution plan generalizes web_three's
-// licensing-server to serve more than one product). Point this at the
-// real endpoint once it's live.
+// Same shared endpoints CineFlow already uses (/activate, /resend-key —
+// see licensing-server/server.js) — product is resolved server-side from
+// the license row itself, not from the URL, so this deliberately isn't
+// "/licensing/darkwave".
 #[cfg(feature = "direct-dist")]
-const LICENSE_SERVER_URL: &str = "https://alan-design.com/licensing/darkwave";
+const LICENSE_SERVER_URL: &str = "https://alan-design.com/licensing";
 
-// Placeholder — replace with the real Ed25519 public key once a
-// Darkwave-specific keypair is generated for the licensing server (Phase E).
-// A placeholder key still fails closed: it just can't validate any
-// server-issued token yet, which is the correct behavior until the real
-// keypair exists.
+// Raw 32-byte Ed25519 public key, base64-encoded — must be exactly 32 bytes
+// once decoded, since ed25519-dalek's VerifyingKey::try_from requires the
+// bare key, not an SPKI-wrapped one (an SPKI export, e.g. from Node's
+// `publicKey.export({format:'der',type:'spki'})`, is 44 bytes with a
+// 12-byte ASN.1 header and would fail try_into::<[u8;32]>() every time —
+// this is a real bug found in exposeu_wrapkit's own license.rs while
+// building this, not a hypothetical; that one embeds an SPKI-formatted key,
+// so its verify_signature() should always return false in practice. Worth
+// fixing there separately — not done here since that's a different,
+// already-shipping product. Generate this key's raw form the same way this
+// one was: `publicKey.export({format:'jwk'})`, base64url-decode `.x`, then
+// base64-encode those 32 bytes.
+//
+// The matching private key (PKCS8 DER, base64) lives in
+// secrets/darkwave-license-signing.key, to be set as
+// DARKWAVE_LICENSE_PRIVATE_KEY_B64 in the licensing server's environment —
+// distinct from secrets/darkwave-updater.key (Phase D's update-signing key,
+// a different purpose entirely).
 #[cfg(feature = "direct-dist")]
-const PUBLIC_KEY_B64: &str = "REPLACE_WITH_DARKWAVE_ED25519_PUBLIC_KEY_BASE64";
+const PUBLIC_KEY_B64: &str = "28F/mm6cMaNzARkb0rmg9LLA+fGLEkz2bq45iFsWM0Y=";
 
 #[cfg(feature = "direct-dist")]
 const TRIAL_DURATION_DAYS: i64 = 14;
@@ -259,6 +272,7 @@ pub async fn activate_license(key: String, email: String) -> Result<LicenseStatu
             "key": clean_key,
             "email": clean_email,
             "hwid": hwid,
+            "product": "darkwave",
         }))
         .send()
         .await
@@ -324,7 +338,13 @@ pub async fn recover_license_key(email: String) -> Result<LicenseRecoveryStatus,
     let client = reqwest::Client::new();
     let response = client
         .post(format!("{LICENSE_SERVER_URL}/resend-key"))
-        .json(&serde_json::json!({ "email": clean_email }))
+        // Unlike /activate (which can derive product from the matched
+        // license row), the server has no key to look up here — that's
+        // the whole point of key recovery. Sending "product" lets it
+        // filter to the right one for a customer who's bought more than
+        // one product with this email, instead of resending whichever
+        // license happens to be newest overall.
+        .json(&serde_json::json!({ "email": clean_email, "product": "darkwave" }))
         .send()
         .await
         .map_err(|error| format!("Network error: {error}"))?;
