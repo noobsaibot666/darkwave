@@ -66,7 +66,13 @@ No objectionable content — expect 4+.
 
 ## Support URL / Marketing URL / Privacy Policy URL
 
-Point these at the docs site's published versions of [Support](/user-guide/support/), the docs site root, and [Privacy Policy](/legal/privacy-policy/) respectively — **once the docs site is actually deployed to a public URL**. It currently only builds locally (`npm run build` in `docs/`); there's no live hosting configured yet as far as this repo shows. This is a real submission blocker, not just a nice-to-have: App Store Connect requires a live, reachable Privacy Policy URL at submission time.
+Live now at **<https://docs.alan-design.com>**:
+
+- Support URL: `https://docs.alan-design.com/user-guide/support/`
+- Marketing URL: `https://docs.alan-design.com/`
+- Privacy Policy URL: `https://docs.alan-design.com/legal/privacy-policy/`
+
+Hosted via the same Cloudflare Tunnel + Traefik infrastructure as `alan-design.com` — `docs-nginx` service in `web_three`'s `docker-compose.traefik.yml`, deployed by copying `docs/dist` directly to the NAS (same pattern as the main site) rather than building on the NAS itself. Redeploy after doc changes: rebuild locally (`npm run build` in `docs/`), swap `dist/` into `docs-site/dist` on the shared mount, **then restart the `docs-nginx` container** (`docker restart docs-nginx` on the NAS) — a full directory swap (not an incremental rsync) leaves nginx serving stale/inaccessible file handles otherwise, confirmed the hard way.
 
 ## What's-New text (first submission)
 
