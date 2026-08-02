@@ -6,7 +6,10 @@ use std::path::PathBuf;
 use std::sync::Mutex;
 
 use import_pipeline::{ImportError, ImportMode};
-use release_readiness::{ReleaseBlocker, ReleaseReadinessConfig};
+use release_readiness::{
+    CodecDistributionConfig, ReleaseBlocker, ReleaseReadinessConfig,
+    REQUIRED_PACKAGED_DECODER_EXTENSIONS,
+};
 use storage::{
     AssetPath, AssetRecord, Catalog, CollectionRecord, CollectionType, JobKind, LibraryRecord,
     SourceRecordDraft, StorageError, TagApprovalState, TagOrigin, TagRecord,
@@ -104,7 +107,24 @@ fn release_blocker_id(blocker: ReleaseBlocker) -> &'static str {
 
 #[tauri::command]
 fn release_blockers() -> Vec<&'static str> {
+    // Decode coverage for the analysis pipeline (waveform/tempo/pitch/
+    // needs-review/similarity) is real and complete via Symphonia — see
+    // docs/adr/0025-real-audio-analysis.md — which is what flips codec
+    // packaging to Passed below. codec_license_review deliberately has no
+    // reference yet: MP3's patents have expired, but Symphonia's AAC
+    // decoder is an independent implementation with its own unresolved
+    // patent-licensing question (see release-readiness.md), not something
+    // to mark reviewed without an actual answer.
+    let codec_distribution = CodecDistributionConfig {
+        packaged_decoder_extensions: REQUIRED_PACKAGED_DECODER_EXTENSIONS
+            .iter()
+            .map(|extension| extension.to_string())
+            .collect(),
+        license_review_reference: None,
+    };
+
     ReleaseReadinessConfig::code_gates_passed()
+        .with_codec_distribution(codec_distribution)
         .candidate()
         .blockers()
         .into_iter()
@@ -2816,14 +2836,12 @@ mod tests {
 
     #[test]
     fn release_blockers_expose_planned_distribution_work() {
+        // codec_packaging passes now — Symphonia covers every required
+        // extension for real (docs/adr/0025). The remaining three are
+        // still genuinely unconfigured.
         assert_eq!(
             super::release_blockers(),
-            vec![
-                "codec_packaging",
-                "codec_license_review",
-                "update_system",
-                "signing_notarization"
-            ]
+            vec!["codec_license_review", "update_system", "signing_notarization"]
         );
     }
 
@@ -2837,13 +2855,13 @@ mod tests {
             .collect();
 
         assert_eq!(
+            // codec_packaging is intentionally absent here: Symphonia now
+            // covers every required extension (docs/adr/0025), so that
+            // gate passes. codec_license_review stays open on its own —
+            // it's a distinct question (AAC patent licensing), not the
+            // same thing as having a decoder at all.
             planned,
-            vec![
-                "codec_packaging",
-                "codec_license_review",
-                "update_system",
-                "signing_notarization"
-            ]
+            vec!["codec_license_review", "update_system", "signing_notarization"]
         );
         assert_eq!(items[0].label, "macOS audit");
         assert_eq!(items[0].state, "Passed");
