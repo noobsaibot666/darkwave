@@ -7,14 +7,18 @@ Draft copy for App Store Connect's listing fields, sized to Apple's actual limit
 
 ## App name (30 char limit)
 
+Plain "Darkwave" is already taken by another App Store listing (name conflict discovered at submission time, unrelated to trademark — App Store names are globally unique). Using this instead:
+
 ```
-Darkwave
+Darkwave — Sound Library
 ```
 
 ## Subtitle (30 char limit)
 
+"Sound Library" is now in the name itself, so the subtitle leads with a different angle instead of repeating it:
+
 ```
-Sound Library & SFX Manager
+SFX & Music Manager
 ```
 
 ## Promotional text (170 char limit, editable anytime without a new review)
