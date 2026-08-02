@@ -35,6 +35,12 @@ pub struct LibraryRecord {
     pub id: Uuid,
     pub name: String,
     pub media_root: String,
+    /// macOS App Store build only: a base64-encoded NSURL security-scoped
+    /// bookmark for `media_root`, so a sandboxed process can regain access
+    /// to a user-picked folder (including an SMB/NAS mount) on a later
+    /// launch without a fresh folder-picker prompt. `None` on every other
+    /// build — the direct-sale build is unsandboxed and never needs one.
+    pub media_root_bookmark: Option<String>,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
@@ -297,6 +303,7 @@ impl Catalog {
             id: Uuid::new_v4(),
             name: name.as_ref().to_string(),
             media_root: media_root.as_ref().to_string(),
+            media_root_bookmark: None,
         };
         let now = Utc::now().to_rfc3339();
 
@@ -314,15 +321,16 @@ impl Catalog {
     }
 
     pub fn list_libraries(&self) -> Result<Vec<LibraryRecord>, StorageError> {
-        let mut statement = self
-            .connection
-            .prepare("SELECT id, name, media_root FROM libraries ORDER BY created_at ASC")?;
+        let mut statement = self.connection.prepare(
+            "SELECT id, name, media_root, media_root_bookmark FROM libraries ORDER BY created_at ASC",
+        )?;
         let libraries = statement
             .query_map([], |row| {
                 Ok(LibraryRecord {
                     id: parse_uuid(row.get::<_, String>(0)?),
                     name: row.get(1)?,
                     media_root: row.get(2)?,
+                    media_root_bookmark: row.get(3)?,
                 })
             })?
             .collect::<Result<Vec<_>, _>>()?;
@@ -333,13 +341,14 @@ impl Catalog {
     pub fn get_library(&self, id: Uuid) -> Result<Option<LibraryRecord>, StorageError> {
         self.connection
             .query_row(
-                "SELECT id, name, media_root FROM libraries WHERE id = ?1",
+                "SELECT id, name, media_root, media_root_bookmark FROM libraries WHERE id = ?1",
                 params![id.to_string()],
                 |row| {
                     Ok(LibraryRecord {
                         id: parse_uuid(row.get::<_, String>(0)?),
                         name: row.get(1)?,
                         media_root: row.get(2)?,
+                        media_root_bookmark: row.get(3)?,
                     })
                 },
             )
@@ -360,6 +369,21 @@ impl Catalog {
         self.connection.execute(
             "UPDATE libraries SET media_root = ?1 WHERE id = ?2",
             params![media_root.as_ref(), library_id.to_string()],
+        )?;
+        Ok(())
+    }
+
+    /// macOS App Store build only (see `LibraryRecord::media_root_bookmark`).
+    /// `None` clears a stale bookmark — e.g. after the user re-picks the
+    /// folder via a fresh dialog and a new bookmark hasn't been minted yet.
+    pub fn set_library_media_root_bookmark(
+        &self,
+        library_id: Uuid,
+        media_root_bookmark: Option<&str>,
+    ) -> Result<(), StorageError> {
+        self.connection.execute(
+            "UPDATE libraries SET media_root_bookmark = ?1 WHERE id = ?2",
+            params![media_root_bookmark, library_id.to_string()],
         )?;
         Ok(())
     }
@@ -2100,6 +2124,7 @@ impl Catalog {
         // existing tables need an explicit, idempotent ADD COLUMN step.
         self.ensure_column("collections", "export_path", "TEXT")?;
         self.ensure_column("assets", "vocal_ratio", "REAL")?;
+        self.ensure_column("libraries", "media_root_bookmark", "TEXT")?;
 
         Ok(())
     }
@@ -2504,6 +2529,37 @@ mod tests {
             .expect("load library")
             .expect("library exists");
         assert_eq!(loaded.media_root, "/Volumes/TrueNAS/SFX");
+    }
+
+    #[test]
+    fn media_root_bookmark_defaults_to_none_and_can_be_set_and_cleared() {
+        let catalog_path = unique_catalog_path("media-root-bookmark");
+        let catalog = Catalog::open(&catalog_path).expect("open catalog");
+        let library = catalog
+            .create_library("Home Studio", "/Volumes/TrueNAS/SFX")
+            .expect("create library");
+        assert_eq!(library.media_root_bookmark, None);
+
+        catalog
+            .set_library_media_root_bookmark(library.id, Some("base64bookmarkbytes"))
+            .expect("set bookmark");
+        let with_bookmark = catalog
+            .get_library(library.id)
+            .expect("load library")
+            .expect("library exists");
+        assert_eq!(
+            with_bookmark.media_root_bookmark.as_deref(),
+            Some("base64bookmarkbytes")
+        );
+
+        catalog
+            .set_library_media_root_bookmark(library.id, None)
+            .expect("clear bookmark");
+        let cleared = catalog
+            .get_library(library.id)
+            .expect("load library")
+            .expect("library exists");
+        assert_eq!(cleared.media_root_bookmark, None);
     }
 
     #[test]

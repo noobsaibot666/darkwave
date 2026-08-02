@@ -1,4 +1,5 @@
 mod license;
+mod security_scoped_bookmark;
 
 use std::collections::HashSet;
 use std::path::PathBuf;
@@ -23,6 +24,13 @@ const ALL_TAG_ORIGINS: [TagOrigin; 6] = [
 ];
 
 struct CatalogState(Mutex<Catalog>);
+
+/// Mac App Store build only: holds each library's live security-scoped
+/// access for as long as the app is running (see
+/// src/security_scoped_bookmark.rs). Keyed by library id so re-resolving
+/// on every list_libraries call is a no-op for libraries already held open.
+#[cfg(all(target_os = "macos", not(feature = "direct-dist")))]
+struct BookmarkAccessState(Mutex<std::collections::HashMap<Uuid, security_scoped_bookmark::BookmarkAccess>>);
 
 /// In-memory, not persisted — pausing is a "stop for this session" control,
 /// not a saved preference. Checked at the top of process_audio_analysis_jobs
@@ -597,9 +605,108 @@ fn apply_offline_control(
 }
 
 #[tauri::command]
-fn list_libraries(state: tauri::State<CatalogState>) -> Result<Vec<LibraryRecord>, String> {
-    let catalog = state.0.lock().expect("catalog mutex poisoned");
-    catalog.list_libraries().map_err(storage_error_message)
+fn list_libraries(
+    app: tauri::AppHandle,
+    state: tauri::State<CatalogState>,
+) -> Result<Vec<LibraryRecord>, String> {
+    let libraries = {
+        let catalog = state.0.lock().expect("catalog mutex poisoned");
+        let libraries = catalog.list_libraries().map_err(storage_error_message)?;
+        for library in &libraries {
+            resolve_library_bookmark_access(&app, &catalog, library);
+        }
+        libraries
+    };
+    Ok(libraries)
+}
+
+/// Mac App Store build only: regains security-scoped access to a library's
+/// media root on this launch, using the bookmark minted the last time its
+/// folder was freshly picked (see `store_library_bookmark_for_freshly_picked_folder`).
+/// A no-op everywhere else — the direct-sale build is unsandboxed and never
+/// needs this.
+///
+/// Also self-heals `media_root` itself: a security-scoped bookmark tracks a
+/// stable file reference, not a path string, so it can still resolve
+/// correctly after an SMB/NAS share remounts under a different `/Volumes/…`
+/// path than last session. When that happens, every other command in this
+/// file that reads `library.media_root` as a plain string would otherwise
+/// keep pointing at the stale, now-wrong mount path even though the
+/// sandbox access itself is fine — so the resolved path is written back
+/// here, once, right after resolution.
+#[cfg(all(target_os = "macos", not(feature = "direct-dist")))]
+fn resolve_library_bookmark_access(app: &tauri::AppHandle, catalog: &Catalog, library: &LibraryRecord) {
+    let Some(bookmark) = library.media_root_bookmark.as_deref() else {
+        return;
+    };
+    let state = app.state::<BookmarkAccessState>();
+    let mut held = state.0.lock().expect("bookmark access mutex poisoned");
+    if held.contains_key(&library.id) {
+        return;
+    }
+    // A resolution failure (folder moved/deleted, permission revoked) isn't
+    // treated as an error here: media_root_status already surfaces
+    // "missing media" to the user through the normal offline-detection
+    // path, so this fails open rather than erroring the whole library list.
+    if let Ok(access) = security_scoped_bookmark::resolve_bookmark(bookmark) {
+        if let Some(resolved_path) = access.path() {
+            let resolved_path = resolved_path.to_string_lossy();
+            if resolved_path != library.media_root {
+                let _ = catalog.set_library_media_root(library.id, resolved_path.as_ref());
+            }
+        }
+        held.insert(library.id, access);
+    }
+}
+
+#[cfg(not(all(target_os = "macos", not(feature = "direct-dist"))))]
+fn resolve_library_bookmark_access(
+    _app: &tauri::AppHandle,
+    _catalog: &Catalog,
+    _library: &LibraryRecord,
+) {
+}
+
+/// Mac App Store build only: mints and persists a security-scoped bookmark
+/// for a folder the user just picked (see the call site in import_folder),
+/// and immediately holds access open for the rest of this session too —
+/// not strictly required (the dialog's own grant already covers this
+/// session), but keeps `BookmarkAccessState` consistent with what
+/// `resolve_library_bookmark_access` would produce on the next launch.
+#[cfg(all(target_os = "macos", not(feature = "direct-dist")))]
+fn store_library_bookmark_for_freshly_picked_folder(
+    app: &tauri::AppHandle,
+    catalog: &Catalog,
+    library_id: Uuid,
+    folder_path: &str,
+) {
+    let Ok(bookmark) = security_scoped_bookmark::create_bookmark(std::path::Path::new(folder_path))
+    else {
+        // Not fatal — media_root is already set from folder_path itself,
+        // just without persisted sandbox access across relaunch. Recovery
+        // path: media_root_status reports the library unreachable next
+        // launch, the user re-picks the folder, which retries this.
+        return;
+    };
+    let _ = catalog.set_library_media_root_bookmark(library_id, Some(&bookmark));
+
+    if let Ok(access) = security_scoped_bookmark::resolve_bookmark(&bookmark) {
+        let state = app.state::<BookmarkAccessState>();
+        state
+            .0
+            .lock()
+            .expect("bookmark access mutex poisoned")
+            .insert(library_id, access);
+    }
+}
+
+#[cfg(not(all(target_os = "macos", not(feature = "direct-dist"))))]
+fn store_library_bookmark_for_freshly_picked_folder(
+    _app: &tauri::AppHandle,
+    _catalog: &Catalog,
+    _library_id: Uuid,
+    _folder_path: &str,
+) {
 }
 
 #[tauri::command]
@@ -911,6 +1018,7 @@ fn apply_browser_command(
 // fixed for list_assets/warm_library_cache/etc. above.
 #[tauri::command(async)]
 fn import_folder(
+    app: tauri::AppHandle,
     state: tauri::State<CatalogState>,
     library_id: String,
     folder_path: String,
@@ -939,6 +1047,16 @@ fn import_folder(
             catalog
                 .set_library_media_root(library_id, &folder_path)
                 .map_err(storage_error_message)?;
+            // The dialog that produced folder_path just gave this process
+            // sandbox access to it — the one moment a security-scoped
+            // bookmark can actually be minted for it (Mac App Store build
+            // only; see store_library_bookmark_for_freshly_picked_folder).
+            store_library_bookmark_for_freshly_picked_folder(
+                &app,
+                &catalog,
+                library_id,
+                &folder_path,
+            );
         }
     }
 
@@ -2404,6 +2522,8 @@ pub fn run() {
                 audio_analysis_paused: std::sync::atomic::AtomicBool::new(false),
             });
             app.manage(SimilarityWorkerState(tokio::sync::Mutex::new(None)));
+            #[cfg(all(target_os = "macos", not(feature = "direct-dist")))]
+            app.manage(BookmarkAccessState(Mutex::new(std::collections::HashMap::new())));
 
             // Standing background worker: requeues jobs that failed with
             // retries left, polls the configured watched folder (if any),

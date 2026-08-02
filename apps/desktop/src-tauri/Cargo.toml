@@ -43,6 +43,7 @@ trash = { path = "../../../crates/trash" }
 tauri-plugin-shell = "2.3.5"
 tokio = { version = "1", default-features = false, features = ["time", "sync"] }
 futures = { version = "0.3", default-features = false, features = ["std"] }
+base64 = "0.22"
 
 # direct-dist only (see src/license.rs) — kept optional so the Mac App
 # Store build's dependency tree (and binary) carries none of this at all,
@@ -51,8 +52,16 @@ chrono = { workspace = true, optional = true }
 ed25519-dalek = { version = "2", optional = true }
 machine-uid = { version = "0.3", optional = true }
 reqwest = { version = "0.12", features = ["json"], optional = true }
-base64 = { version = "0.22", optional = true }
 keyring = { version = "3", features = ["apple-native", "windows-native"], optional = true }
+
+[target.'cfg(target_os = "macos")'.dependencies]
+# Used only by src/security_scoped_bookmark.rs, itself cfg-gated to
+# `not(feature = "direct-dist")` (the MAS build) — Cargo has no way to
+# combine a target-cfg with a feature-cfg on a dependency line, so this
+# crate is present in the direct-dist macOS build's dependency graph too,
+# just never called there.
+objc2 = "0.6"
+objc2-foundation = { version = "0.3", default-features = false, features = ["std", "NSURL", "NSError", "NSString", "NSData", "NSArray"] }
 
 [features]
 direct-dist = [
@@ -60,6 +69,5 @@ direct-dist = [
   "dep:ed25519-dalek",
   "dep:machine-uid",
   "dep:reqwest",
-  "dep:base64",
   "dep:keyring",
 ]

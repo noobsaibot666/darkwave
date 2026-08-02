@@ -847,6 +847,8 @@ dependencies = [
  "library-sync",
  "machine-uid",
  "maintenance",
+ "objc2",
+ "objc2-foundation",
  "preferences",
  "release-readiness",
  "reqwest 0.12.28",
