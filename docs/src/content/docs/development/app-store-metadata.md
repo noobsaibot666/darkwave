@@ -68,9 +68,9 @@ No objectionable content — expect 4+.
 
 Live now at **<https://docs.alan-design.com>**:
 
-- Support URL: `https://docs.alan-design.com/user-guide/support/`
-- Marketing URL: `https://docs.alan-design.com/`
-- Privacy Policy URL: `https://docs.alan-design.com/legal/privacy-policy/`
+- Support URL: `https://docs.alan-design.com/darkwave/user-guide/support/`
+- Marketing URL: `https://docs.alan-design.com/darkwave/`
+- Privacy Policy URL: `https://docs.alan-design.com/darkwave/legal/privacy-policy/`
 
 Hosted via the same Cloudflare Tunnel + Traefik infrastructure as `alan-design.com` — `docs-nginx` service in `web_three`'s `docker-compose.traefik.yml`, deployed by copying `docs/dist` directly to the NAS (same pattern as the main site) rather than building on the NAS itself. Redeploy after doc changes: rebuild locally (`npm run build` in `docs/`), swap `dist/` into `docs-site/dist` on the shared mount, **then restart the `docs-nginx` container** (`docker restart docs-nginx` on the NAS) — a full directory swap (not an incremental rsync) leaves nginx serving stale/inaccessible file handles otherwise, confirmed the hard way.
 
@@ -86,4 +86,4 @@ Initial release.
 - **Bundle ID registration** — `dev.darkwave.app` needs to be registered in the Apple Developer portal before an App Store Connect app record can be created for it.
 - **Provisioning profile** — needed for `apps/desktop/scripts/mac_sign_and_package_mas.sh` to actually produce a signable `.pkg`; requires the bundle ID above to exist first.
 - **Screenshots** — Mac App Store requires screenshots at specific sizes; none exist yet (curated ones, not the raw verification screenshots from development).
-- **The codec-license-review and GPL/MAS gates** in [Release Readiness](/development/release-readiness/) — both still open, both are real legal questions, not paperwork.
+- **The codec-license-review and GPL/MAS gates** in [Release Readiness](/darkwave/development/release-readiness/) — both still open, both are real legal questions, not paperwork.

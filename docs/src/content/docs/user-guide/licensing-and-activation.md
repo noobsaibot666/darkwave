@@ -15,7 +15,7 @@ The direct-download build starts a 14-day free trial automatically the first tim
 
 **Activating a key**: enter the license key from your purchase email along with the email address you used to buy it. Activation is tied to that specific machine (identified by a hardware id, not anything personally identifying beyond the purchase email) — each key can be activated on **up to two machines** at once, so you can use Darkwave on both a desktop and a laptop, for instance.
 
-**Moving to a new machine**: if you've already used both activations and need to move to a new machine, contact support (see the [Support](/user-guide/support/) page) to have one freed up.
+**Moving to a new machine**: if you've already used both activations and need to move to a new machine, contact support (see the [Support](/darkwave/user-guide/support/) page) to have one freed up.
 
 **Lost your key**: use "Resend my license key" on the activation screen, or the trial-expired screen, with the email address you purchased with — a fresh copy is emailed to you.
 

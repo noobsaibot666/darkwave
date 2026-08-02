@@ -3,13 +3,13 @@ title: FAQ
 description: Common questions about Darkwave.
 ---
 
-**What is Darkwave?** A local-first desktop app that turns imported sound effects and music into a searchable, reusable personal library — drop audio in once, find it instantly forever. See [Vision](/product/vision/) for the full pitch.
+**What is Darkwave?** A local-first desktop app that turns imported sound effects and music into a searchable, reusable personal library — drop audio in once, find it instantly forever. See [Vision](/darkwave/product/vision/) for the full pitch.
 
-**Does my audio leave my computer?** No. Your library — files, tags, notes, everything — stays on your machine or wherever you point it (including a NAS share). Darkwave has no cloud sync and no telemetry. See the [Privacy Policy](/legal/privacy-policy/) for the exact details, which differ slightly between the Mac App Store and direct-download builds.
+**Does my audio leave my computer?** No. Your library — files, tags, notes, everything — stays on your machine or wherever you point it (including a NAS share). Darkwave has no cloud sync and no telemetry. See the [Privacy Policy](/darkwave/legal/privacy-policy/) for the exact details, which differ slightly between the Mac App Store and direct-download builds.
 
 **What formats does it support?** WAV, MP3, FLAC, AAC/M4A, AIFF, and OGG.
 
-**What's the difference between the Mac App Store version and the direct download?** Same app. The Mac App Store version is sandboxed per Apple's requirements and licensed/updated entirely through your Apple ID. The direct download (macOS DMG or Windows installer) runs unsandboxed with full filesystem access, uses a 14-day trial plus a license key you buy directly, and updates itself in the background. See [Licensing & Activation](/user-guide/licensing-and-activation/).
+**What's the difference between the Mac App Store version and the direct download?** Same app. The Mac App Store version is sandboxed per Apple's requirements and licensed/updated entirely through your Apple ID. The direct download (macOS DMG or Windows installer) runs unsandboxed with full filesystem access, uses a 14-day trial plus a license key you buy directly, and updates itself in the background. See [Licensing & Activation](/darkwave/user-guide/licensing-and-activation/).
 
 **Is Windows available on the Microsoft Store?** No — Windows is direct-download only.
 
@@ -23,4 +23,4 @@ description: Common questions about Darkwave.
 
 **Is there a trial?** The direct-download build includes a 14-day free trial with every feature available. The Mac App Store build is a standard paid purchase with no separate trial.
 
-**Where do I get help?** See [Support](/user-guide/support/).
+**Where do I get help?** See [Support](/darkwave/user-guide/support/).

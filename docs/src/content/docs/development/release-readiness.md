@@ -33,6 +33,8 @@ The direct-sale build's plumbing for this is in place: `tauri-plugin-updater` is
 
 The signing/notarization gate now validates source-owned identity metadata: macOS Developer ID, macOS team ID, and Windows certificate thumbprint. The desktop shell still reports signing/notarization as planned until real certificates and notarization credentials are configured for a release build.
 
+**Decision: Windows ships unsigned for V1, matching exposeu_wrapkit's (CineFlow Suite) precedent.** No EV code-signing certificate purchase planned right now — buyers will see a SmartScreen "unknown publisher" warning on first run, same as CineFlow's Windows build always has. macOS signing (Developer ID + notarization for direct-sale, Apple Distribution + Mac App Store for the App Store build) still goes ahead fully — see `apps/desktop/scripts/`. Because `SigningNotarizationConfig.has_complete_metadata()` requires all three fields (macOS Developer ID, macOS team ID, *and* Windows certificate thumbprint) to be non-empty, `signing_notarization_gate` will correctly stay `Planned` even once macOS signing is fully wired — that's an accurate reflection of a real, deliberate gap, not a bug to chase. Revisit if Windows sales volume ever justifies the EV cert's cost and lead time.
+
 Before a release candidate, run:
 
 ```sh

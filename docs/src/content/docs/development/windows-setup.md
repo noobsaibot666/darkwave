@@ -45,7 +45,7 @@ Everything above runs the app via `tauri dev`, which never touches
 `bundle.active` (`apps/desktop/src-tauri/tauri.conf.json`). It's currently
 `false` because no platform has a real packaging pipeline yet — "Windows
 platform audit" is still an open gate in
-[Release Readiness](/development/release-readiness/). Use this section to
+[Release Readiness](/darkwave/development/release-readiness/). Use this section to
 produce a real `.msi`/`.exe` installer for local testing, not to cut an
 actual release.
 
@@ -78,10 +78,13 @@ target\release\bundle\nsis\Darkwave_<version>_x64-setup.exe
 (`msi` isn't produced — `tauri.conf.json`'s `bundle.windows.nsis` block
 means NSIS is the configured Windows target, not WiX/MSI.)
 
-**Signing** (needs the EV code-signing certificate — see the distribution
-plan's Phase E; not yet purchased as of this writing). Once it's installed
-in the Windows certificate store, find its SHA-1 thumbprint via
-`certmgr.msc` or `Get-ChildItem Cert:\CurrentUser\My`, then:
+**Signing — deliberately skipped for V1.** Decision: Windows ships unsigned,
+matching exposeu_wrapkit's (CineFlow Suite) precedent — buyers see a
+SmartScreen "unknown publisher" warning on first run. No EV certificate
+purchase planned. If that ever changes, this is the process: get an EV
+code-signing certificate installed in the Windows certificate store, find
+its SHA-1 thumbprint via `certmgr.msc` or `Get-ChildItem Cert:\CurrentUser\My`,
+then:
 
 ```powershell
 & "C:\Program Files (x86)\Windows Kits\10\bin\<version>\x64\signtool.exe" sign `
@@ -95,7 +98,7 @@ in the Windows certificate store, find its SHA-1 thumbprint via
 This is the one gap the reference distribution pattern (exposeu_wrapkit)
 never closed — it shipped Windows builds unsigned. Closing it here is
 what flips `signing_notarization`'s Windows half in
-[Release Readiness](/development/release-readiness/) (the macOS half
+[Release Readiness](/darkwave/development/release-readiness/) (the macOS half
 still needs a Developer ID identity — see `apps/desktop/scripts/`).
 
 **Known gaps this will surface, both already tracked, neither a build

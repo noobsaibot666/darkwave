@@ -17,7 +17,7 @@ Subject to this agreement and full payment, [LEGAL ENTITY NAME] ("we", "us") gra
 
 ## 2. Trial
 
-Before purchase, Darkwave may be used under a 14-day free trial with full functionality, as described in [Licensing & Activation](/user-guide/licensing-and-activation/). The trial is provided "as is" with no purchase obligation, and automatically ends after 14 days from first launch.
+Before purchase, Darkwave may be used under a 14-day free trial with full functionality, as described in [Licensing & Activation](/darkwave/user-guide/licensing-and-activation/). The trial is provided "as is" with no purchase obligation, and automatically ends after 14 days from first launch.
 
 ## 3. Restrictions
 
@@ -25,7 +25,7 @@ You may not: redistribute, resell, sublicense, or share your license key with an
 
 ## 4. Updates
 
-We may release updates, which this license also covers. We're not obligated to provide updates indefinitely, and some updates may require a currently-supported operating system version (see [System Requirements](/user-guide/system-requirements/)).
+We may release updates, which this license also covers. We're not obligated to provide updates indefinitely, and some updates may require a currently-supported operating system version (see [System Requirements](/darkwave/user-guide/system-requirements/)).
 
 ## 5. Refunds
 
@@ -45,4 +45,4 @@ To the maximum extent permitted by applicable law, [LEGAL ENTITY NAME] is not li
 
 ## 9. Contact
 
-Questions about this agreement: see the [Support](/user-guide/support/) page.
+Questions about this agreement: see the [Support](/darkwave/user-guide/support/) page.

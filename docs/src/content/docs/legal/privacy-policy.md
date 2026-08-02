@@ -20,7 +20,7 @@ Your library — imported audio files, tags, notes, and everything else Darkwave
 
 ## Direct-download version
 
-The direct-download build is identical in this respect, with one addition: **license activation**. When you activate a license key, the app sends your license key, purchase email, and a hardware identifier (not tied to your real-world identity beyond the email you provided at purchase) to our licensing server, solely to verify the key and enforce the two-device activation limit described in [Licensing & Activation](/user-guide/licensing-and-activation/). This data is used only for license administration — not analytics, not marketing, not shared with any third party — and retained for as long as your license/purchase record exists.
+The direct-download build is identical in this respect, with one addition: **license activation**. When you activate a license key, the app sends your license key, purchase email, and a hardware identifier (not tied to your real-world identity beyond the email you provided at purchase) to our licensing server, solely to verify the key and enforce the two-device activation limit described in [Licensing & Activation](/darkwave/user-guide/licensing-and-activation/). This data is used only for license administration — not analytics, not marketing, not shared with any third party — and retained for as long as your license/purchase record exists.
 
 The direct-download build also checks a remote server periodically for available app updates. This check does not send any information about your library, your usage, or you personally — only enough to determine which update, if any, applies to your platform and current version.
 
@@ -30,4 +30,4 @@ No telemetry, no usage analytics, no tracking, no advertising, no data sale or s
 
 ## Contact
 
-Questions about this policy: see the [Support](/user-guide/support/) page.
+Questions about this policy: see the [Support](/darkwave/user-guide/support/) page.

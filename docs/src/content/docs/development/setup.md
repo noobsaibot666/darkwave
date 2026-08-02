@@ -3,7 +3,7 @@ title: Setup
 description: Local development setup.
 ---
 
-Install Node.js 20 or newer, npm 10 or newer, Rust 1.80 or newer, and the platform prerequisites for Tauri 2 (on Windows: Rust via rustup with the `x86_64-pc-windows-msvc` toolchain, VS Build Tools with the C++ workload for `link.exe`, and the WebView2 Runtime — already installed on the project's Windows machine). Once that machine is set up, use [Windows Update Workflow](/development/windows-setup/) for the PowerShell commands to run after every pull.
+Install Node.js 20 or newer, npm 10 or newer, Rust 1.80 or newer, and the platform prerequisites for Tauri 2 (on Windows: Rust via rustup with the `x86_64-pc-windows-msvc` toolchain, VS Build Tools with the C++ workload for `link.exe`, and the WebView2 Runtime — already installed on the project's Windows machine). Once that machine is set up, use [Windows Update Workflow](/darkwave/development/windows-setup/) for the PowerShell commands to run after every pull.
 
 ```sh
 npm install
