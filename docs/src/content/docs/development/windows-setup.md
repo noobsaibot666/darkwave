@@ -52,24 +52,51 @@ actual release.
 Rebuild the sidecar first if you haven't already this session — packaging
 fails immediately without it, same as `tauri dev` does.
 
-Then override `bundle.active` for a single build without editing the
-committed config (PowerShell mangles embedded quotes when they're passed
-inline to a native `.exe`, so write the override to a file instead of
-trying to inline the JSON):
+Windows has no App Store distribution channel for Darkwave (direct-sale
+only — see the distribution plan) — every Windows build is the
+`direct-dist` feature, using `tauri.direct.conf.json`'s identifier and the
+real licensing/updater plumbing (`src/license.rs`), not the base
+sandboxed-for-macOS config. Override `bundle.active` for a single build
+without editing the committed config (PowerShell mangles embedded quotes
+when they're passed inline to a native `.exe`, so write the override to a
+file instead of trying to inline the JSON — this gets merged on top of
+`tauri.direct.conf.json`, not in place of it):
 
 ```powershell
 cd apps\desktop
 '{"bundle":{"active":true}}' | Out-File -Encoding utf8 ..\..\bundle-override.json
-npx tauri build --config ..\..\bundle-override.json
+npx tauri build --features direct-dist --config src-tauri\tauri.direct.conf.json --config ..\..\bundle-override.json
 Remove-Item ..\..\bundle-override.json
 ```
 
-If it succeeds, the installers land at:
+If it succeeds, the installer lands at:
 
 ```text
-target\release\bundle\msi\Darkwave_<version>_x64_en-US.msi
 target\release\bundle\nsis\Darkwave_<version>_x64-setup.exe
 ```
+
+(`msi` isn't produced — `tauri.conf.json`'s `bundle.windows.nsis` block
+means NSIS is the configured Windows target, not WiX/MSI.)
+
+**Signing** (needs the EV code-signing certificate — see the distribution
+plan's Phase E; not yet purchased as of this writing). Once it's installed
+in the Windows certificate store, find its SHA-1 thumbprint via
+`certmgr.msc` or `Get-ChildItem Cert:\CurrentUser\My`, then:
+
+```powershell
+& "C:\Program Files (x86)\Windows Kits\10\bin\<version>\x64\signtool.exe" sign `
+  /sha1 <CERT_THUMBPRINT> `
+  /fd SHA256 `
+  /tr http://timestamp.digicert.com `
+  /td SHA256 `
+  target\release\bundle\nsis\Darkwave_<version>_x64-setup.exe
+```
+
+This is the one gap the reference distribution pattern (exposeu_wrapkit)
+never closed — it shipped Windows builds unsigned. Closing it here is
+what flips `signing_notarization`'s Windows half in
+[Release Readiness](/development/release-readiness/) (the macOS half
+still needs a Developer ID identity — see `apps/desktop/scripts/`).
 
 **Known gaps this will surface, both already tracked, neither a build
 failure:**

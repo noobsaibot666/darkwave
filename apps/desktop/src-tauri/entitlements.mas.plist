@@ -10,18 +10,16 @@
          (Tauri dialog plugin) rather than scanning arbitrary paths, so this
          plus the bookmark entitlement below is the whole sandboxed
          file-access story: grant access to what was picked, remember it
-         across launches via a security-scoped bookmark (not yet
-         implemented — see the distribution plan's Phase B). -->
+         across launches via a security-scoped bookmark (implemented —
+         see src/security_scoped_bookmark.rs). -->
     <key>com.apple.security.files.user-selected.read-write</key>
     <true/>
     <key>com.apple.security.files.bookmarks.app-scope</key>
     <true/>
 
-    <!-- Fill in once the app is registered in the Apple Developer portal
-         (Phase I) — these are placeholders, not real values. -->
     <key>com.apple.developer.team-identifier</key>
-    <string>TEAMID_PLACEHOLDER</string>
+    <string>RD7UU4Z3D2</string>
     <key>com.apple.application-identifier</key>
-    <string>TEAMID_PLACEHOLDER.dev.darkwave.app</string>
+    <string>RD7UU4Z3D2.dev.darkwave.app</string>
 </dict>
 </plist>
