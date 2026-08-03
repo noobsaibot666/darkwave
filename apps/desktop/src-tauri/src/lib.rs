@@ -8,7 +8,7 @@ use std::sync::Mutex;
 use import_pipeline::{ImportError, ImportMode};
 use release_readiness::{
     CodecDistributionConfig, ReleaseBlocker, ReleaseReadinessConfig, SigningNotarizationConfig,
-    REQUIRED_PACKAGED_DECODER_EXTENSIONS,
+    UpdateChannel, UpdateChannelConfig, REQUIRED_PACKAGED_DECODER_EXTENSIONS,
 };
 use storage::{
     AssetPath, AssetRecord, Catalog, CollectionRecord, CollectionType, JobKind, LibraryRecord,
@@ -128,15 +128,22 @@ fn release_blockers() -> Vec<&'static str> {
         ),
     };
 
-    // update_system deliberately isn't wired here yet, even though
-    // tauri.direct.conf.json already has a real Ed25519 keypair
-    // (secrets/darkwave-updater.key, gitignored) and a plausible-shaped
-    // manifest endpoint: that endpoint doesn't exist as a live server yet
-    // (web_three licensing-server generalization is still open). This gate
-    // is what Settings > Release Readiness shows the user as "ready to
-    // ship" — wiring a URL that 404s in production would make that panel
-    // lie. Flip this once the endpoint is actually deployed and serving
-    // real manifests.
+    // update_system is now real: web_three/licensing-server's
+    // /darkwave/updates/:target/:arch/:currentVersion route is live and
+    // verified end to end — a stale-version request returns a real signed
+    // manifest (curl'd and confirmed 200 with the actual Ed25519
+    // signature), a current-version request correctly returns 204, and
+    // the download route serves the real notarized DMG (content-length
+    // verified to match the actual file). public_key_id is the minisign
+    // key ID from secrets/darkwave-updater.key.pub's own comment line.
+    let update_channel = UpdateChannelConfig {
+        channel: UpdateChannel::Stable,
+        manifest_url:
+            "https://alan-design.com/licensing/darkwave/updates/{{target}}/{{arch}}/{{current_version}}"
+                .to_string(),
+        public_key_id: "4FB33295F15A6FAC".to_string(),
+    };
+
     // macOS signing/notarization is real (see apps/desktop/scripts/
     // deploy_direct_macos.sh and mac_sign_and_package_mas.sh — both
     // produce a real notarized DMG / MAS-signed .pkg with these exact
@@ -156,6 +163,7 @@ fn release_blockers() -> Vec<&'static str> {
 
     ReleaseReadinessConfig::code_gates_passed()
         .with_codec_distribution(codec_distribution)
+        .with_update_channel(update_channel)
         .with_signing_notarization(signing_notarization)
         .candidate()
         .blockers()
@@ -2879,12 +2887,12 @@ mod tests {
         // codec_packaging and codec_license_review both pass now: AAC/M4A
         // (the one format with a real open patent question) were removed
         // from the required set entirely rather than shipped with an open
-        // question — see docs/adr/0028. The remaining two are still
-        // genuinely unconfigured.
-        assert_eq!(
-            super::release_blockers(),
-            vec!["update_system", "signing_notarization"]
-        );
+        // question — see docs/adr/0028. update_system passes too: the
+        // manifest/download endpoint on licensing-server is live and
+        // verified. signing_notarization is the one genuinely, permanently
+        // unconfigured field — Windows ships unsigned by deliberate
+        // decision, not an oversight (see release-readiness.md).
+        assert_eq!(super::release_blockers(), vec!["signing_notarization"]);
     }
 
     #[test]
@@ -2896,9 +2904,11 @@ mod tests {
             .map(|item| item.blocker)
             .collect();
 
-        // codec_packaging and codec_license_review are both intentionally
-        // absent — see docs/adr/0028-defer-aac-decode-pending-patent-question.md.
-        assert_eq!(planned, vec!["update_system", "signing_notarization"]);
+        // codec_packaging, codec_license_review, and update_system are all
+        // intentionally absent now — see
+        // docs/adr/0028-defer-aac-decode-pending-patent-question.md and
+        // release-readiness.md's update-system section.
+        assert_eq!(planned, vec!["signing_notarization"]);
         assert_eq!(items[0].label, "macOS audit");
         assert_eq!(items[0].state, "Passed");
     }
