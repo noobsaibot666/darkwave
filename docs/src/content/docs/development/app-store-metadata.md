@@ -80,10 +80,14 @@ Hosted via the same Cloudflare Tunnel + Traefik infrastructure as `alan-design.c
 Initial release.
 ```
 
-## Still genuinely blocking submission (not just content to fill in)
+## Submission status
 
-- **Docs site hosting** — see above. Needs a real domain/deploy target before Support/Privacy Policy URLs can be entered.
-- **Bundle ID registration** — `dev.darkwave.app` needs to be registered in the Apple Developer portal before an App Store Connect app record can be created for it.
-- **Provisioning profile** — needed for `apps/desktop/scripts/mac_sign_and_package_mas.sh` to actually produce a signable `.pkg`; requires the bundle ID above to exist first.
-- **Screenshots** — Mac App Store requires screenshots at specific sizes; none exist yet (curated ones, not the raw verification screenshots from development).
-- **The codec-license-review and GPL/MAS gates** in [Release Readiness](/darkwave/development/release-readiness/) — both still open, both are real legal questions, not paperwork.
+Nothing is blocking submission anymore. For the record:
+
+- **Docs site hosting** — live, as above.
+- **Bundle ID registration** — `dev.darkwave.app` registered.
+- **Provisioning profile** — in place at `apps/desktop/src-tauri/embedded.provisionprofile`; `mac_sign_and_package_mas.sh` produces a real signed `.pkg`.
+- **Screenshots + App Store icon** — real assets at `apps/desktop/macappstore/` (1024×1024 icon, no alpha; screenshots at 2560×1600). Build already uploaded to App Store Connect and reports `VALID_BINARY` / `APP_STORE_ELIGIBLE`.
+- **Codec-license-review and GPL/MAS gates** — both closed, see [Release Readiness](/darkwave/development/release-readiness/).
+
+What's left is entirely inside the App Store Connect dashboard (App Privacy questionnaire, age rating, pricing tier, attaching the uploaded build to a version, and submitting) — a UI workflow, not something scriptable from here.
