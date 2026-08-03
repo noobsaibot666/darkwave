@@ -7,6 +7,12 @@ repository.workspace = true
 rust-version.workspace = true
 
 [dependencies]
-symphonia = { version = "0.5.5", features = ["mp3", "aac", "flac", "isomp4", "ogg", "vorbis", "wav", "aiff"] }
+# "aac" and "isomp4" deliberately excluded — AAC/M4A decode is deferred
+# (see docs/adr/0028-defer-aac-decode-pending-patent-question.md): Via LA's
+# AAC patent pool (merged with MPEG LA in 2022) still charges a per-unit
+# royalty for decoder *software*, unlike MP3 (patents expired) or
+# FLAC/Vorbis (royalty-free by design). Not linking the codec in at all is
+# the actual closure of that question for V1, not a workaround.
+symphonia = { version = "0.5.5", features = ["mp3", "flac", "ogg", "vorbis", "wav", "aiff"] }
 thiserror.workspace = true
 uuid.workspace = true

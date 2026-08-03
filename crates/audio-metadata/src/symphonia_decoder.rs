@@ -11,9 +11,11 @@ use symphonia::core::probe::Hint;
 
 use crate::{DecodedAudioBuffer, MetadataError, PackagedAudioDecoder};
 
-/// Decodes any format Symphonia supports (mp3, flac, aac, ogg/vorbis, aiff,
-/// m4a) into normalized f32 PCM. Plugs into the `PackagedAudioDecoder` seam
-/// that `decode_supported_audio` has always had but nothing implemented.
+/// Decodes any format this crate's Cargo.toml enables Symphonia support for
+/// (mp3, flac, ogg/vorbis, aiff — deliberately not aac/m4a, see the
+/// Cargo.toml comment on the symphonia dependency) into normalized f32 PCM.
+/// Plugs into the `PackagedAudioDecoder` seam that `decode_supported_audio`
+/// has always had but nothing implemented.
 pub struct SymphoniaDecoder;
 
 impl PackagedAudioDecoder for SymphoniaDecoder {

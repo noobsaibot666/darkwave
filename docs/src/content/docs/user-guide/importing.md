@@ -22,7 +22,7 @@ When a supported audio file is imported, Darkwave:
 - Discovers watched-folder candidates only after supported audio files have stabilized.
 - Maintains watched-folder size snapshots across polls so new files are imported only after a later stable scan.
 - Ingests platform filesystem notifications and emits import candidates only after repeat stable events.
-- Decodes WAV PCM files natively, and every other MVP-supported format (mp3, flac, aac, m4a, ogg, aiff) via a real Symphonia-backed decoder.
+- Decodes WAV PCM files natively, and every other MVP-supported format (mp3, flac, ogg, aiff) via a real Symphonia-backed decoder. AAC/M4A are importable and taggable but not decoder-supported yet — a deliberate scope decision, not a gap (see release readiness).
 - Reports codec capability for imported extensions: native WAV PCM, packaged-decoder formats, or unsupported with conversion available.
 
 Watched folders ignore incomplete browser download files such as `.crdownload`, `.download`, `.part`, and `.tmp`. A watched file is considered ready only after its file size has stabilized.
@@ -31,7 +31,7 @@ Referenced imports remain catalog-only and keep pointing at their original file 
 
 ## Folder import is recursive
 
-Choosing a folder to import walks every subfolder underneath it — real libraries are rarely flat, and a folder full of vendor/pack subfolders imports in one pass. Dotfiles and dot-directories (`.DS_Store`, `.git`, and similar) are skipped. Recognized audio extensions are intentionally broader than what the app can natively decode yet (adding formats like WMA, CAF, WV, APE, and Opus on top of the core WAV/AIFF/MP3/FLAC/AAC/OGG set): a file can be cataloged, tagged, and organized before Darkwave can play it.
+Choosing a folder to import walks every subfolder underneath it — real libraries are rarely flat, and a folder full of vendor/pack subfolders imports in one pass. Dotfiles and dot-directories (`.DS_Store`, `.git`, and similar) are skipped. Recognized audio extensions are intentionally broader than what the app can natively decode yet (adding formats like AAC, M4A, WMA, CAF, WV, APE, and Opus on top of the core WAV/AIFF/MP3/FLAC/OGG decoder set): a file can be cataloged, tagged, and organized before Darkwave's own decoder can process it.
 
 ## Smart categorization on import
 

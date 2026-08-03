@@ -84,17 +84,23 @@ impl PartialEq for MetadataError {
 
 impl Eq for MetadataError {}
 
+// "aac"/"m4a" deliberately absent — see the Cargo.toml comment on the
+// symphonia dependency. Files with these extensions are still importable
+// (crates/import-pipeline's RECOGNIZED_AUDIO_EXTENSIONS is intentionally
+// broader than this), just not decodable for analysis/playback yet; they
+// fall through to CodecSupportStatus::Unsupported below, the same
+// conversion-prompt path any other unsupported format already gets.
 pub fn supported_mvp_format(extension: &str) -> bool {
     matches!(
         extension.to_ascii_lowercase().as_str(),
-        "wav" | "aiff" | "aif" | "mp3" | "flac" | "aac" | "m4a" | "ogg"
+        "wav" | "aiff" | "aif" | "mp3" | "flac" | "ogg"
     )
 }
 
 pub fn codec_support_for_extension(extension: &str) -> CodecSupport {
     let extension = extension.to_ascii_lowercase();
     let status = match extension.as_str() {
-        "wav" | "aiff" | "aif" | "mp3" | "flac" | "aac" | "m4a" | "ogg" => {
+        "wav" | "aiff" | "aif" | "mp3" | "flac" | "ogg" => {
             CodecSupportStatus::RequiresPackagedDecoder
         }
         _ => CodecSupportStatus::Unsupported,
@@ -366,9 +372,21 @@ mod tests {
 
     #[test]
     fn mvp_supports_required_formats() {
-        for extension in ["wav", "aiff", "mp3", "flac", "m4a", "ogg"] {
+        for extension in ["wav", "aiff", "mp3", "flac", "ogg"] {
             assert!(supported_mvp_format(extension));
         }
+    }
+
+    #[test]
+    fn aac_and_m4a_are_deliberately_unsupported_pending_the_patent_question() {
+        // See docs/adr/0028-defer-aac-decode-pending-patent-question.md —
+        // not a bug, a deliberate scope decision for V1.
+        assert!(!supported_mvp_format("aac"));
+        assert!(!supported_mvp_format("m4a"));
+        assert_eq!(
+            codec_support_for_extension("m4a").status,
+            CodecSupportStatus::Unsupported
+        );
     }
 
     #[test]

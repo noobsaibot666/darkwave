@@ -121,8 +121,13 @@ pub fn signing_notarization_gate(config: Option<&SigningNotarizationConfig>) -> 
         .unwrap_or(GateState::Planned)
 }
 
-pub const REQUIRED_PACKAGED_DECODER_EXTENSIONS: [&str; 6] =
-    ["mp3", "flac", "aac", "m4a", "aiff", "ogg"];
+// "aac"/"m4a" deliberately excluded from V1's required set — see
+// docs/adr/0028-defer-aac-decode-pending-patent-question.md. The four
+// formats here (MP3: patents expired; FLAC/Vorbis: royalty-free by
+// design; AIFF: uncompressed PCM, no codec at all) have no open patent
+// question, which is what actually lets codec_license_review_gate pass
+// for real once wired — not a workaround.
+pub const REQUIRED_PACKAGED_DECODER_EXTENSIONS: [&str; 4] = ["mp3", "flac", "aiff", "ogg"];
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct CodecDistributionConfig {
@@ -412,8 +417,6 @@ mod tests {
             packaged_decoder_extensions: vec![
                 "mp3".to_string(),
                 "flac".to_string(),
-                "aac".to_string(),
-                "m4a".to_string(),
                 "aiff".to_string(),
                 "ogg".to_string(),
             ],

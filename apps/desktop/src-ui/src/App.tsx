@@ -255,9 +255,12 @@ function matchesSoundCategory(asset: AssetRecord, category: SoundCategory): bool
   }
 }
 
-/** Every format the real Symphonia-backed decoder accepts (see Exporting
- * docs) — a format filter that only covered WAV/MP3 would silently miss
- * whatever fraction of the library came in as FLAC, AAC, M4A, OGG, or AIFF. */
+/** Every audio extension the browser's Format filter recognizes — broader
+ * than what the analysis pipeline can actually decode (AAC/M4A are
+ * importable and filterable here but not decoder-supported, see
+ * docs/adr/0028-defer-aac-decode-pending-patent-question.md). A filter
+ * that only covered WAV/MP3 would silently miss whatever fraction of the
+ * library came in as FLAC, AAC, M4A, OGG, or AIFF. */
 const AUDIO_FORMATS = ["wav", "mp3", "flac", "aac", "m4a", "ogg", "aiff"] as const;
 type AudioFormat = (typeof AUDIO_FORMATS)[number];
 

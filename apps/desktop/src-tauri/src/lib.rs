@@ -110,17 +110,22 @@ fn release_blockers() -> Vec<&'static str> {
     // Decode coverage for the analysis pipeline (waveform/tempo/pitch/
     // needs-review/similarity) is real and complete via Symphonia — see
     // docs/adr/0025-real-audio-analysis.md — which is what flips codec
-    // packaging to Passed below. codec_license_review deliberately has no
-    // reference yet: MP3's patents have expired, but Symphonia's AAC
-    // decoder is an independent implementation with its own unresolved
-    // patent-licensing question (see release-readiness.md), not something
-    // to mark reviewed without an actual answer.
+    // packaging to Passed below. codec_license_review now has a real
+    // reference too: AAC/M4A were removed from the required set entirely
+    // (crates/audio-metadata no longer even links Symphonia's AAC decoder)
+    // specifically because AAC's patent pool (Via LA) is still active —
+    // see docs/adr/0028-defer-aac-decode-pending-patent-question.md for
+    // the researched basis. What's left (MP3: patents expired; FLAC/Vorbis:
+    // royalty-free by design; AIFF: uncompressed, no codec at all) has no
+    // open question, so this is a real closure, not a workaround.
     let codec_distribution = CodecDistributionConfig {
         packaged_decoder_extensions: REQUIRED_PACKAGED_DECODER_EXTENSIONS
             .iter()
             .map(|extension| extension.to_string())
             .collect(),
-        license_review_reference: None,
+        license_review_reference: Some(
+            "docs/adr/0028-defer-aac-decode-pending-patent-question.md".to_string(),
+        ),
     };
 
     // update_system deliberately isn't wired here yet, even though
@@ -2853,12 +2858,14 @@ mod tests {
 
     #[test]
     fn release_blockers_expose_planned_distribution_work() {
-        // codec_packaging passes now — Symphonia covers every required
-        // extension for real (docs/adr/0025). The remaining three are
-        // still genuinely unconfigured.
+        // codec_packaging and codec_license_review both pass now: AAC/M4A
+        // (the one format with a real open patent question) were removed
+        // from the required set entirely rather than shipped with an open
+        // question — see docs/adr/0028. The remaining two are still
+        // genuinely unconfigured.
         assert_eq!(
             super::release_blockers(),
-            vec!["codec_license_review", "update_system", "signing_notarization"]
+            vec!["update_system", "signing_notarization"]
         );
     }
 
@@ -2871,15 +2878,9 @@ mod tests {
             .map(|item| item.blocker)
             .collect();
 
-        assert_eq!(
-            // codec_packaging is intentionally absent here: Symphonia now
-            // covers every required extension (docs/adr/0025), so that
-            // gate passes. codec_license_review stays open on its own —
-            // it's a distinct question (AAC patent licensing), not the
-            // same thing as having a decoder at all.
-            planned,
-            vec!["codec_license_review", "update_system", "signing_notarization"]
-        );
+        // codec_packaging and codec_license_review are both intentionally
+        // absent — see docs/adr/0028-defer-aac-decode-pending-patent-question.md.
+        assert_eq!(planned, vec!["update_system", "signing_notarization"]);
         assert_eq!(items[0].label, "macOS audit");
         assert_eq!(items[0].state, "Passed");
     }

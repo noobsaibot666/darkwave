@@ -13,7 +13,7 @@ Darkwave can:
 - Queue exports whose source paths are temporarily offline.
 - Prepare external drag-and-drop payloads for ready original-copy exports.
 - Render decoded PCM to 24-bit WAV files with resampling and selected range slicing.
-- Decode any MVP-supported source format (WAV, MP3, FLAC, AAC, M4A, OGG, AIFF) through a real Symphonia-backed decoder — no separate release-only decoder artifact is required; this works the same in every build.
+- Decode any MVP-supported source format (WAV, MP3, FLAC, OGG, AIFF) through a real Symphonia-backed decoder — no separate release-only decoder artifact is required; this works the same in every build. AAC/M4A aren't decoder-supported yet (a deliberate scope decision, not a gap — see release readiness).
 - Offer a WAV (24-bit) conversion path via the command palette's "Convert to WAV" action, alongside the default original-file copy behind Export Selected.
 - Prepare drag-and-drop payloads for completed rendered WAV exports.
 - Validate selected in/out export ranges.
