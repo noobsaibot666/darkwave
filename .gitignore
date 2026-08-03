@@ -11,5 +11,6 @@ target/
 *.db
 apps/desktop/src-tauri/gen/
 apps/desktop/src-tauri/binaries/
+apps/desktop/builds/
 .claude/settings.local.json
 secrets/

@@ -7,7 +7,7 @@ use std::sync::Mutex;
 
 use import_pipeline::{ImportError, ImportMode};
 use release_readiness::{
-    CodecDistributionConfig, ReleaseBlocker, ReleaseReadinessConfig,
+    CodecDistributionConfig, ReleaseBlocker, ReleaseReadinessConfig, SigningNotarizationConfig,
     REQUIRED_PACKAGED_DECODER_EXTENSIONS,
 };
 use storage::{
@@ -137,8 +137,26 @@ fn release_blockers() -> Vec<&'static str> {
     // ship" — wiring a URL that 404s in production would make that panel
     // lie. Flip this once the endpoint is actually deployed and serving
     // real manifests.
+    // macOS signing/notarization is real (see apps/desktop/scripts/
+    // deploy_direct_macos.sh and mac_sign_and_package_mas.sh — both
+    // produce a real notarized DMG / MAS-signed .pkg with these exact
+    // identities). windows_certificate_thumbprint is deliberately left
+    // empty: Windows ships unsigned for V1, matching exposeu_wrapkit's
+    // (CineFlow Suite) precedent — no EV certificate purchased. Because
+    // has_complete_metadata() requires all three fields non-empty,
+    // signing_notarization_gate correctly stays Planned despite macOS
+    // being fully wired — an accurate reflection of a real, deliberate
+    // gap, not a bug to chase (see docs/development/release-readiness.md).
+    let signing_notarization = SigningNotarizationConfig {
+        macos_developer_id: "Developer ID Application: Nudson Alan Terrinha Alves (RD7UU4Z3D2)"
+            .to_string(),
+        macos_team_id: "RD7UU4Z3D2".to_string(),
+        windows_certificate_thumbprint: String::new(),
+    };
+
     ReleaseReadinessConfig::code_gates_passed()
         .with_codec_distribution(codec_distribution)
+        .with_signing_notarization(signing_notarization)
         .candidate()
         .blockers()
         .into_iter()

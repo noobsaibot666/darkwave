@@ -2,19 +2,5 @@
 <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
 <plist version="1.0">
 <dict>
-    <!-- Unsandboxed direct-sale build. Deliberately empty of exception
-         entitlements (allow-jit, allow-unsigned-executable-memory,
-         disable-library-validation): unlike exposeu_wrapkit, Darkwave
-         bundles no non-Rust native frameworks (no Qt/ffmpeg/OpenCV — see
-         apps/desktop/src-tauri/Cargo.toml), so none of those exceptions
-         should be needed under Developer ID + hardened runtime.
-
-         One dependency to verify during Phase E's actual notarization
-         pass: `ort` (ONNX Runtime, used transitively for Silero VAD voice
-         detection) links a dylib that must itself be properly signed and
-         included in bundle.resources. If notarization or
-         `codesign --verify --deep` flags it as an unsigned/unexpected
-         library, that's the first place to look — not a preemptive
-         disable-library-validation entitlement. -->
 </dict>
 </plist>

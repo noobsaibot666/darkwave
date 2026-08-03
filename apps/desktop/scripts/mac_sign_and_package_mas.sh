@@ -24,7 +24,10 @@ INSTALLER_IDENTITY="3rd Party Mac Developer Installer: Nudson Alan Terrinha Alve
 PROJECT_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 cd "$PROJECT_ROOT"
 
-APP_PATH="src-tauri/target/release/bundle/macos/Darkwave.app"
+# This is a Cargo workspace, so the build output lands under the workspace
+# root's target/, not apps/desktop/src-tauri/target/.
+WORKSPACE_ROOT="$(cd "$PROJECT_ROOT/../.." && pwd)"
+APP_PATH="$WORKSPACE_ROOT/target/release/bundle/macos/Darkwave.app"
 PROVISION="src-tauri/embedded.provisionprofile"
 APP_ENTITLEMENTS="src-tauri/entitlements.mas.plist"
 
