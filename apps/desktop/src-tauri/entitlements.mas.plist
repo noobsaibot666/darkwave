@@ -6,6 +6,15 @@
     <key>com.apple.security.app-sandbox</key>
     <true/>
 
+    <!-- Without this, the sandbox blocks Tauri's frontend<->backend IPC
+         (it's treated as outbound networking even though nothing leaves
+         the machine) — the webview never receives anything to render,
+         producing a permanently blank window. Not needed for actual
+         internet access; Darkwave has none in the MAS build. See
+         https://github.com/tauri-apps/tauri-docs/issues/3171. -->
+    <key>com.apple.security.network.client</key>
+    <true/>
+
     <!-- Darkwave has the user explicitly pick each library's source folder
          (Tauri dialog plugin) rather than scanning arbitrary paths, so this
          plus the bookmark entitlement below is the whole sandboxed
