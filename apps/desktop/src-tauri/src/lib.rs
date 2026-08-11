@@ -2560,8 +2560,73 @@ fn storage_error_message(error: StorageError) -> String {
     error.to_string()
 }
 
+// Both this file and Cargo's default release profile leave panics
+// unwinding rather than aborting, but `.setup()` runs on the objc runloop
+// thread on macOS — a panic unwinding across that FFI boundary is UB and
+// in practice just kills the process with no window and no dialog, which
+// is indistinguishable from "app failed to launch" to anyone watching
+// (including App Review). This hook exists so a startup failure at least
+// leaves a paper trail in a fixed, discoverable location before whatever
+// happens next happens.
+fn startup_log_path() -> PathBuf {
+    std::env::temp_dir().join("darkwave-startup.log")
+}
+
+fn log_startup_event(message: &str) {
+    use std::io::Write;
+    let unix_seconds = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|duration| duration.as_secs())
+        .unwrap_or(0);
+    let line = format!("[{unix_seconds}] {message}\n");
+    if let Ok(mut file) = std::fs::OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(startup_log_path())
+    {
+        let _ = file.write_all(line.as_bytes());
+    }
+    eprintln!("{line}");
+}
+
+fn install_startup_panic_hook() {
+    let default_hook = std::panic::take_hook();
+    std::panic::set_hook(Box::new(move |panic_info| {
+        log_startup_event(&format!("PANIC: {panic_info}"));
+        default_hook(panic_info);
+    }));
+}
+
+// Turns a fatal early-startup failure into a visible native dialog instead
+// of a silent crash before any window exists — a real dialog satisfies
+// "the app launched a window" even when the app itself can't do anything
+// useful past that point, and gives whoever hits it (a reviewer, a user, a
+// future debugging session) something concrete to report instead of just
+// "it never opened."
+fn report_fatal_setup_error<R: tauri::Runtime>(
+    app: &tauri::AppHandle<R>,
+    step: &str,
+    error: impl std::fmt::Display,
+) {
+    use tauri_plugin_dialog::DialogExt;
+
+    let message =
+        format!("Darkwave couldn't finish starting up.\n\nFailed to {step}: {error}\n\nLog: {}", startup_log_path().display());
+    log_startup_event(&format!("FATAL during startup ({step}): {error}"));
+
+    let _ = app
+        .dialog()
+        .message(message)
+        .kind(tauri_plugin_dialog::MessageDialogKind::Error)
+        .title("Darkwave failed to start")
+        .blocking_show();
+}
+
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
+    install_startup_panic_hook();
+    log_startup_event("run() starting");
+
     let builder = tauri::Builder::default()
         .plugin(tauri_plugin_clipboard_manager::init())
         .plugin(tauri_plugin_dialog::init())
@@ -2577,14 +2642,28 @@ pub fn run() {
 
     builder
         .setup(|app| {
-            let app_data_dir = app
-                .path()
-                .app_data_dir()
-                .expect("resolve app data directory");
-            std::fs::create_dir_all(&app_data_dir).expect("create app data directory");
+            log_startup_event("setup() entered");
 
-            let catalog = Catalog::open(app_data_dir.join("catalog.sqlite"))
-                .expect("open local catalog database");
+            let app_data_dir = match app.path().app_data_dir() {
+                Ok(dir) => dir,
+                Err(error) => {
+                    report_fatal_setup_error(app.handle(), "resolve the app data directory", error);
+                    return Ok(());
+                }
+            };
+            if let Err(error) = std::fs::create_dir_all(&app_data_dir) {
+                report_fatal_setup_error(app.handle(), "create the app data directory", error);
+                return Ok(());
+            }
+
+            let catalog = match Catalog::open(app_data_dir.join("catalog.sqlite")) {
+                Ok(catalog) => catalog,
+                Err(error) => {
+                    report_fatal_setup_error(app.handle(), "open the local catalog database", error);
+                    return Ok(());
+                }
+            };
+            log_startup_event("catalog opened");
             app.manage(CatalogState(Mutex::new(catalog)));
             app.manage(JobControlState {
                 audio_analysis_paused: std::sync::atomic::AtomicBool::new(false),
