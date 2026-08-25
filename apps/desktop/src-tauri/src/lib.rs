@@ -792,6 +792,53 @@ fn create_library(
     Ok(library)
 }
 
+/// Explicitly sets a library's media root — used by the first-run wizard's
+/// "root folder" step, as an alternative to the older implicit path (the
+/// first folder someone imports into an empty-media_root library becomes
+/// its root, see `import_folder`).
+#[tauri::command]
+fn set_library_media_root(
+    app: tauri::AppHandle,
+    state: tauri::State<CatalogState>,
+    library_id: String,
+    media_root: String,
+) -> Result<LibraryRecord, String> {
+    let library_id = parse_uuid_field(&library_id, "library id")?;
+    let catalog = state.0.lock().expect("catalog mutex poisoned");
+    catalog
+        .set_library_media_root(library_id, &media_root)
+        .map_err(storage_error_message)?;
+    // The dialog that produced media_root just gave this process sandbox
+    // access to it — the one moment a security-scoped bookmark can actually
+    // be minted for it (Mac App Store build only; see
+    // store_library_bookmark_for_freshly_picked_folder).
+    store_library_bookmark_for_freshly_picked_folder(&app, &catalog, library_id, &media_root);
+    catalog
+        .get_library(library_id)
+        .map_err(storage_error_message)?
+        .ok_or_else(|| "library not found after setting media root".to_string())
+}
+
+/// Sets (or clears, with `null`) the folder the app scans for new sounds to
+/// auto-import — see `scan_import_folder`. Distinct from `media_root`,
+/// which is where the organized library itself lives.
+#[tauri::command]
+fn set_library_import_root(
+    state: tauri::State<CatalogState>,
+    library_id: String,
+    import_root: Option<String>,
+) -> Result<LibraryRecord, String> {
+    let library_id = parse_uuid_field(&library_id, "library id")?;
+    let catalog = state.0.lock().expect("catalog mutex poisoned");
+    catalog
+        .set_library_import_root(library_id, import_root.as_deref())
+        .map_err(storage_error_message)?;
+    catalog
+        .get_library(library_id)
+        .map_err(storage_error_message)?
+        .ok_or_else(|| "library not found after setting import folder".to_string())
+}
+
 /// Removes this library's cached preview files (the local, disposable
 /// speed-up copies referenced/NAS assets get, keyed by asset id — see
 /// `cached_file_path`), scoped to only this library's assets rather than
@@ -1247,6 +1294,67 @@ fn refresh_library(
 
         let catalog = state.0.lock().expect("catalog mutex poisoned");
         match import_pipeline::import_file(&catalog, library_id, &path, ImportMode::Referenced) {
+            Ok(asset) => imported.push(asset),
+            Err(ImportError::UnsupportedFormat(_)) => {}
+            Err(error) => failed.push(ImportFailure {
+                filename,
+                reason: error.to_string(),
+            }),
+        }
+    }
+
+    Ok(ImportFolderResult { imported, failed })
+}
+
+/// Scans a library's configured import folder — a staging drop zone,
+/// distinct from `media_root` — for audio files and copies new ones into
+/// the library as Managed assets. This is the "auto-import" half of the
+/// first-run wizard's root-folder/import-folder setup: called once when a
+/// library becomes active, and folded into the manual "Refresh Library"
+/// action, rather than watched live. A no-op if no import folder is
+/// configured. Imported files are left in place in the import folder
+/// afterward — `import_file`'s content-hash dedup makes re-scanning
+/// already-imported files harmless, and deleting user files automatically
+/// is exactly the kind of surprise this app avoids.
+// (async): same reasoning as import_folder/refresh_library above — a
+// directory walk plus per-file hashing must not block the main thread.
+#[tauri::command(async)]
+fn scan_import_folder(
+    state: tauri::State<CatalogState>,
+    library_id: String,
+) -> Result<ImportFolderResult, String> {
+    let library_id = parse_uuid_field(&library_id, "library id")?;
+
+    let import_root = {
+        let catalog = state.0.lock().expect("catalog mutex poisoned");
+        catalog
+            .get_library(library_id)
+            .map_err(storage_error_message)?
+            .ok_or_else(|| "library not found".to_string())?
+            .import_root
+    };
+    let Some(import_root) = import_root else {
+        return Ok(ImportFolderResult {
+            imported: Vec::new(),
+            failed: Vec::new(),
+        });
+    };
+
+    let mut paths = collect_audio_files(std::path::Path::new(&import_root))
+        .map_err(|error| format!("could not read {import_root}: {error}"))?;
+    paths.sort();
+
+    let mut imported = Vec::new();
+    let mut failed = Vec::new();
+
+    for path in paths {
+        let filename = path
+            .file_name()
+            .map(|name| name.to_string_lossy().to_string())
+            .unwrap_or_default();
+
+        let catalog = state.0.lock().expect("catalog mutex poisoned");
+        match import_pipeline::import_file(&catalog, library_id, &path, ImportMode::Managed) {
             Ok(asset) => imported.push(asset),
             Err(ImportError::UnsupportedFormat(_)) => {}
             Err(error) => failed.push(ImportFailure {
@@ -2280,6 +2388,7 @@ fn create_project(
     library_id: String,
     name: String,
     export_path: Option<String>,
+    sfx_export_path: Option<String>,
 ) -> Result<CollectionRecord, String> {
     let library_id = parse_uuid_field(&library_id, "library id")?;
     let catalog = state.0.lock().expect("catalog mutex poisoned");
@@ -2287,12 +2396,19 @@ fn create_project(
         .create_collection(library_id, name, CollectionType::Project)
         .map_err(storage_error_message)?;
 
-    if export_path.is_none() {
+    if export_path.is_none() && sfx_export_path.is_none() {
         return Ok(project);
     }
-    catalog
-        .set_collection_export_path(project.id, export_path.as_deref())
-        .map_err(storage_error_message)?;
+    if export_path.is_some() {
+        catalog
+            .set_collection_export_path(project.id, export_path.as_deref())
+            .map_err(storage_error_message)?;
+    }
+    if sfx_export_path.is_some() {
+        catalog
+            .set_collection_sfx_export_path(project.id, sfx_export_path.as_deref())
+            .map_err(storage_error_message)?;
+    }
     catalog
         .get_collection(project.id)
         .map_err(storage_error_message)?
@@ -2316,12 +2432,31 @@ fn set_project_export_path(
         .ok_or_else(|| "project not found".to_string())
 }
 
+#[tauri::command]
+fn set_project_sfx_export_path(
+    state: tauri::State<CatalogState>,
+    project_id: String,
+    sfx_export_path: Option<String>,
+) -> Result<CollectionRecord, String> {
+    let project_id = parse_uuid_field(&project_id, "project id")?;
+    let catalog = state.0.lock().expect("catalog mutex poisoned");
+    catalog
+        .set_collection_sfx_export_path(project_id, sfx_export_path.as_deref())
+        .map_err(storage_error_message)?;
+    catalog
+        .get_collection(project_id)
+        .map_err(storage_error_message)?
+        .ok_or_else(|| "project not found".to_string())
+}
+
 /// The "editor's dream" button: copies one sound straight into a project's
-/// configured folder (e.g. a DaVinci Resolve watch folder) so it can be
+/// configured folder (e.g. an editing app's watch folder) so it can be
 /// dragged into a timeline immediately, without an export-destination
 /// dialog. Reuses the same editorial export pipeline as
-/// `export_selected_asset`, just with the destination pre-resolved from the
-/// project's `export_path` instead of a user-picked folder.
+/// `export_selected_asset`, just with the destination pre-resolved from one
+/// of the project's two configured folders instead of a user-picked one —
+/// music goes to `export_path` (the "sound folder"), everything else goes
+/// to `sfx_export_path` (the "sound effects folder").
 #[tauri::command]
 fn export_asset_to_project(
     state: tauri::State<CatalogState>,
@@ -2336,14 +2471,25 @@ fn export_asset_to_project(
         .get_collection(project_id)
         .map_err(storage_error_message)?
         .ok_or_else(|| "project not found".to_string())?;
-    let destination_folder = project
-        .export_path
-        .ok_or_else(|| "this project has no DaVinci Resolve folder configured".to_string())?;
 
     let asset = catalog
         .get_asset(asset_id)
         .map_err(storage_error_message)?
         .ok_or_else(|| "asset not found".to_string())?;
+
+    let is_music = asset.media_type == "music";
+    let destination_folder = if is_music {
+        project.export_path
+    } else {
+        project.sfx_export_path
+    }
+    .ok_or_else(|| {
+        if is_music {
+            "this project has no sound folder configured".to_string()
+        } else {
+            "this project has no sound effects folder configured".to_string()
+        }
+    })?;
 
     let source_path = match &asset.path {
         AssetPath::Referenced(path) => path.clone(),
@@ -2365,7 +2511,11 @@ fn export_asset_to_project(
         .into_iter()
         .next()
         .map(|tag| tag.name);
-    let category_subfolder = export_category_subfolder(&asset.media_type, primary_tag_name.as_deref());
+    let category_subfolder = if is_music {
+        None
+    } else {
+        Some(sfx_export_subfolder(&asset.media_type, primary_tag_name.as_deref()))
+    };
 
     let plan = export_pipeline::plan_editorial_export(export_pipeline::ExportRequest {
         source_path: source_path.clone(),
@@ -2394,27 +2544,23 @@ fn export_asset_to_project(
     Ok(destination_path)
 }
 
-/// Maps a classified media type to the editor's on-disk export folder
-/// convention (01_MUSIC / 02_VO / 03_SFX / 04_FOLEY). Foley additionally
-/// nests under a tag-named folder (e.g. `04_FOLEY/door`) when the asset has
-/// at least one tag, since "Foley" alone gets unwieldy once a project
-/// accumulates more than a handful of one-shots — falls back to the bare
-/// `04_FOLEY` folder when the asset isn't tagged yet. Ambience, "other", and
-/// "needs_review" have no folder convention of their own, so they export
-/// straight into the project's root (`None`).
-fn export_category_subfolder(media_type: &str, primary_tag_name: Option<&str>) -> Option<String> {
-    match media_type {
-        "music" => Some("01_MUSIC".to_string()),
-        "voiceover" => Some("02_VO".to_string()),
-        "sound_effect" => Some("03_SFX".to_string()),
-        "foley" => match primary_tag_name {
-            Some(tag) if !tag.trim().is_empty() => {
-                Some(format!("04_FOLEY/{}", export_pipeline::sanitize_filename(tag)))
-            }
-            _ => Some("04_FOLEY".to_string()),
-        },
-        _ => None,
+/// Chooses the subfolder a non-music asset lands in inside a project's
+/// sound effects folder. Tag-named when the asset has a primary tag (e.g.
+/// `Foley`, `Whoosh`, `Rise`) — mirrors how editors already hand-organize
+/// SFX libraries by category — falling back to a readable name keyed off
+/// `media_type` when the asset isn't tagged yet.
+fn sfx_export_subfolder(media_type: &str, primary_tag_name: Option<&str>) -> String {
+    if let Some(tag) = primary_tag_name.filter(|tag| !tag.trim().is_empty()) {
+        return export_pipeline::sanitize_filename(tag);
     }
+    match media_type {
+        "voiceover" => "Voiceover",
+        "foley" => "Foley",
+        "ambience" => "Ambience",
+        "sound_effect" => "Sound Effects",
+        _ => "Other",
+    }
+    .to_string()
 }
 
 #[tauri::command]
@@ -2845,6 +2991,8 @@ pub fn run() {
             media_root_status,
             list_libraries,
             create_library,
+            set_library_media_root,
+            set_library_import_root,
             purge_library_cache,
             empty_library_trash,
             delete_library,
@@ -2852,6 +3000,7 @@ pub fn run() {
             search_assets,
             import_folder,
             refresh_library,
+            scan_import_folder,
             assets_for_tag,
             warm_library_cache,
             purge_preview_cache,
@@ -2874,6 +3023,7 @@ pub fn run() {
             project_memberships_for_library,
             create_project,
             set_project_export_path,
+            set_project_sfx_export_path,
             export_asset_to_project,
             add_to_collection,
             assets_in_collection,
@@ -2959,6 +3109,21 @@ mod tests {
         assert_eq!(files.len(), 2);
         assert!(files.iter().any(|path| path.ends_with("top-level.wav")));
         assert!(files.iter().any(|path| path.ends_with("buried.wav")));
+    }
+
+    #[test]
+    fn sfx_export_subfolder_prefers_the_primary_tag_over_media_type() {
+        assert_eq!(super::sfx_export_subfolder("foley", Some("Door")), "Door");
+        assert_eq!(super::sfx_export_subfolder("sound_effect", Some("Whoosh")), "Whoosh");
+    }
+
+    #[test]
+    fn sfx_export_subfolder_falls_back_to_media_type_when_untagged() {
+        assert_eq!(super::sfx_export_subfolder("voiceover", None), "Voiceover");
+        assert_eq!(super::sfx_export_subfolder("foley", None), "Foley");
+        assert_eq!(super::sfx_export_subfolder("ambience", Some("   ")), "Ambience");
+        assert_eq!(super::sfx_export_subfolder("sound_effect", None), "Sound Effects");
+        assert_eq!(super::sfx_export_subfolder("needs_review", None), "Other");
     }
 
     #[test]

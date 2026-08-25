@@ -1864,6 +1864,15 @@ dd {
   color: var(--text-primary);
 }
 
+/* A hint nested inside a .setup-field (e.g. New Project's sound/SFX folder
+   fields) sits between two option blocks in the same .settings-stack, so it
+   needs more breathing room below it than a hint used as a stack sibling
+   elsewhere gets by default — otherwise consecutive folder fields read as
+   one dense block instead of two distinct options. */
+.setup-field .settings-hint {
+  margin: 2px 0 16px;
+}
+
 .setup-card .primary-action {
   justify-content: center;
   margin-top: 4px;

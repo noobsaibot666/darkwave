@@ -60,6 +60,7 @@ type LibraryRecord = {
   id: string;
   name: string;
   media_root: string;
+  import_root: string | null;
 };
 
 type AssetPath = { Managed: string } | { Referenced: string };
@@ -153,6 +154,7 @@ type CollectionRecord = {
   collection_type: "Manual" | "Smart" | "Project";
   query_definition: string | null;
   export_path: string | null;
+  sfx_export_path: string | null;
 };
 
 type AssetProjectMembership = {
@@ -160,8 +162,34 @@ type AssetProjectMembership = {
   project_id: string;
   project_name: string;
   export_path: string | null;
+  sfx_export_path: string | null;
   exported: boolean;
 };
+
+// A project's "DR button" quick-export is enabled once either folder is
+// configured — music routes to export_path (the sound folder), everything
+// else routes to sfx_export_path (the sound effects folder); which one a
+// given send actually needs is resolved per-asset on the backend.
+function projectHasExportFolder(project: { export_path: string | null; sfx_export_path: string | null }): boolean {
+  return Boolean(project.export_path || project.sfx_export_path);
+}
+
+function projectExportFolderSummary(project: {
+  name: string;
+  export_path: string | null;
+  sfx_export_path: string | null;
+}): string {
+  if (project.export_path && project.sfx_export_path) {
+    return `Send selected to ${project.name}'s sound folder (music) or sound effects folder (everything else)`;
+  }
+  if (project.export_path) {
+    return `Send selected to ${project.name}'s sound folder (${project.export_path})`;
+  }
+  if (project.sfx_export_path) {
+    return `Send selected to ${project.name}'s sound effects folder (${project.sfx_export_path})`;
+  }
+  return `${project.name} has no sound or sound effects folder configured yet`;
+}
 
 type PaletteCommandId =
   | "Import"
@@ -771,6 +799,18 @@ export function App() {
   const [smartCollectionName, setSmartCollectionName] = useState("");
   const [queryFilters, setQueryFilters] = useState<VisibleFilter[]>([]);
   const [libraryName, setLibraryName] = useState("");
+  // First-run wizard state (see the `librariesLoaded && (libraries.length
+  // === 0 || onboardingLibrary)` branch below). Keeping the just-created
+  // library here — not just its id — is what keeps the wizard on screen
+  // through steps 2/3: `libraries.length` stops being 0 the moment step 1
+  // creates it, so `onboardingLibrary` is what the branch condition falls
+  // back on until the wizard explicitly finishes.
+  const [onboardingStep, setOnboardingStep] = useState<0 | 1 | 2>(0);
+  const [onboardingLibrary, setOnboardingLibrary] = useState<LibraryRecord | null>(null);
+  const [onboardingMediaRoot, setOnboardingMediaRoot] = useState("");
+  const [onboardingImportRoot, setOnboardingImportRoot] = useState("");
+  const [onboardingBusy, setOnboardingBusy] = useState(false);
+  const [onboardingError, setOnboardingError] = useState<string | null>(null);
   const [importStatus, setImportStatus] = useState<string | null>(null);
   const [activeFilter, setActiveFilter] = useState<ActiveFilter>("all");
   const [sidebarCollapsed, setSidebarCollapsed] = useState(false);
@@ -809,6 +849,7 @@ export function App() {
   const [projectMemberships, setProjectMemberships] = useState<AssetProjectMembership[]>([]);
   const [newProjectName, setNewProjectName] = useState("");
   const [newProjectExportPath, setNewProjectExportPath] = useState("");
+  const [newProjectSfxExportPath, setNewProjectSfxExportPath] = useState("");
   const [lastExportProjectId, setLastExportProjectId] = useState<string | null>(null);
   const [drExportStatus, setDrExportStatus] = useState<string | null>(null);
   const [projectAddToast, setProjectAddToast] = useState<{ projectId: string; message: string } | null>(null);
@@ -864,6 +905,7 @@ export function App() {
   const selectedCount = selectedAssetIds.length;
   const bulkAssetIds = selectedCount > 1 ? selectedAssetIds : selectedAssetId ? [selectedAssetId] : [];
   const activeLibrary = libraries.find((library) => library.id === activeLibraryId) ?? null;
+  const importFolderScannedRef = useRef<Set<string>>(new Set());
 
   const membershipsByAsset = useMemo(() => {
     const map = new Map<string, AssetProjectMembership[]>();
@@ -1260,6 +1302,29 @@ export function App() {
     runJobDrain
   ]);
 
+  // Auto-import, scan-on-launch half: once per library per session, checks
+  // its configured import folder (if any) for new sounds and copies them
+  // in — see scan_import_folder. The manual half of the same check lives in
+  // handleRefreshLibrary. Guarded by a ref rather than component state so a
+  // library switch back to an already-scanned library doesn't re-trigger it.
+  useEffect(() => {
+    if (!activeLibraryId || !activeLibrary?.import_root) return;
+    if (importFolderScannedRef.current.has(activeLibraryId)) return;
+    importFolderScannedRef.current.add(activeLibraryId);
+
+    invoke<ImportFolderResult>("scan_import_folder", { libraryId: activeLibraryId })
+      .then((result) => {
+        if (result.imported.length === 0) return;
+        runJobDrain(activeLibraryId);
+        refreshAssets(activeLibraryId, searchQuery, activeFilter);
+        refreshMaintenance(activeLibraryId);
+        setImportStatus(
+          `Imported ${result.imported.length} new sound${result.imported.length === 1 ? "" : "s"} from the import folder`
+        );
+      })
+      .catch(() => {});
+  }, [activeLibraryId, activeLibrary?.import_root, runJobDrain, refreshAssets, refreshMaintenance, searchQuery, activeFilter]);
+
   useEffect(() => {
     if (activeLibrary) {
       setOfflineControl({
@@ -1583,28 +1648,39 @@ export function App() {
     invoke<CollectionRecord>("create_project", {
       libraryId: activeLibraryId,
       name: newProjectName.trim(),
-      exportPath: newProjectExportPath.trim() || null
+      exportPath: newProjectExportPath.trim() || null,
+      sfxExportPath: newProjectSfxExportPath.trim() || null
     })
       .then((project) => {
         setCollections((previous) => [...previous, project]);
         setNewProjectName("");
         setNewProjectExportPath("");
+        setNewProjectSfxExportPath("");
       })
       .catch(() => {});
-  }, [activeLibraryId, newProjectName, newProjectExportPath]);
+  }, [activeLibraryId, newProjectName, newProjectExportPath, newProjectSfxExportPath]);
 
   const handleChooseProjectExportPath = useCallback(async () => {
     const selected = await openDialog({
       directory: true,
       multiple: false,
-      title: "Choose a DaVinci Resolve sounds folder"
+      title: "Choose a sound folder"
     });
     if (typeof selected === "string") setNewProjectExportPath(selected);
   }, []);
 
+  const handleChooseProjectSfxExportPath = useCallback(async () => {
+    const selected = await openDialog({
+      directory: true,
+      multiple: false,
+      title: "Choose a sound effects folder"
+    });
+    if (typeof selected === "string") setNewProjectSfxExportPath(selected);
+  }, []);
+
   const handleExportToProject = useCallback(
     (project: CollectionRecord, assetIds: string[]) => {
-      if (assetIds.length === 0 || !project.export_path) return;
+      if (assetIds.length === 0 || (!project.export_path && !project.sfx_export_path)) return;
       setDrExportStatus(`Sending to ${project.name}…`);
       Promise.all(assetIds.map((assetId) => invoke<string>("export_asset_to_project", { assetId, projectId: project.id })))
         .then((destinations) => {
@@ -1626,16 +1702,19 @@ export function App() {
   // be sent straight to that project's folder at any time, right from its
   // own row. If the user is currently browsing a specific project, that's
   // the target (matches "the button in the tracks after status" request);
-  // otherwise it sends to every project the track belongs to that has an
-  // export folder configured.
+  // otherwise it sends to every project the track belongs to that has
+  // either a sound or a sound effects folder configured — the backend
+  // picks the right one per asset based on its media type.
   const handleSendAssetToItsProjects = useCallback(
     (asset: AssetRecord, memberships: AssetProjectMembership[]) => {
+      const hasAnyFolder = (membership: AssetProjectMembership) =>
+        Boolean(membership.export_path || membership.sfx_export_path);
       const currentProjectId =
         typeof activeFilter === "object" && "project" in activeFilter ? activeFilter.project : null;
       const inCurrentProject = currentProjectId
-        ? memberships.find((membership) => membership.project_id === currentProjectId && membership.export_path)
+        ? memberships.find((membership) => membership.project_id === currentProjectId && hasAnyFolder(membership))
         : undefined;
-      const targets = inCurrentProject ? [inCurrentProject] : memberships.filter((membership) => membership.export_path);
+      const targets = inCurrentProject ? [inCurrentProject] : memberships.filter(hasAnyFolder);
       if (targets.length === 0) return;
 
       setDrExportStatus(`Sending ${asset.display_name}…`);
@@ -1964,6 +2043,125 @@ export function App() {
     setCreateLibraryModalOpen(false);
   };
 
+  // First-run wizard step 1: name the library and create it — separate from
+  // handleCreateLibrary above (used by the always-available "New Library"
+  // modal for anyone who already has a library) since this one hands off
+  // into steps 2/3 instead of finishing immediately.
+  const handleOnboardingCreateLibrary = useCallback(async () => {
+    if (!libraryName.trim()) return;
+    setOnboardingBusy(true);
+    setOnboardingError(null);
+    try {
+      const library = await invoke<LibraryRecord>("create_library", {
+        name: libraryName.trim(),
+        mediaRoot: ""
+      });
+      setLibraries((previous) => [...previous, library]);
+      setOnboardingLibrary(library);
+      setLibraryName("");
+      setOnboardingStep(1);
+    } catch (error) {
+      setOnboardingError(String(error));
+    } finally {
+      setOnboardingBusy(false);
+    }
+  }, [libraryName]);
+
+  const handleOnboardingChooseMediaRoot = useCallback(async () => {
+    const selected = await openDialog({
+      directory: true,
+      multiple: false,
+      title: "Choose where Darkwave should keep your sound library"
+    });
+    if (typeof selected === "string") setOnboardingMediaRoot(selected);
+  }, []);
+
+  const handleOnboardingConfirmMediaRoot = useCallback(async () => {
+    if (!onboardingLibrary || !onboardingMediaRoot.trim()) return;
+    setOnboardingBusy(true);
+    setOnboardingError(null);
+    try {
+      const updated = await invoke<LibraryRecord>("set_library_media_root", {
+        libraryId: onboardingLibrary.id,
+        mediaRoot: onboardingMediaRoot.trim()
+      });
+      setOnboardingLibrary(updated);
+      setLibraries((previous) => previous.map((library) => (library.id === updated.id ? updated : library)));
+      setOnboardingStep(2);
+    } catch (error) {
+      setOnboardingError(String(error));
+    } finally {
+      setOnboardingBusy(false);
+    }
+  }, [onboardingLibrary, onboardingMediaRoot]);
+
+  const handleOnboardingChooseImportRoot = useCallback(async () => {
+    const selected = await openDialog({
+      directory: true,
+      multiple: false,
+      title: "Choose a folder to auto-import new sounds from"
+    });
+    if (typeof selected === "string") setOnboardingImportRoot(selected);
+  }, []);
+
+  // Finishes the wizard — called by both "Finish" and "Skip for now" on
+  // step 3, since set_library_import_root only actually sets anything when
+  // onboardingImportRoot is non-empty. On finish, an initial scan of the
+  // import folder (if one was set) runs once so anything already sitting
+  // there gets pulled in right away rather than waiting for the next
+  // launch/refresh.
+  const handleOnboardingFinish = useCallback(async () => {
+    if (!onboardingLibrary) return;
+    setOnboardingBusy(true);
+    setOnboardingError(null);
+    try {
+      let finalLibrary = onboardingLibrary;
+      if (onboardingImportRoot.trim()) {
+        finalLibrary = await invoke<LibraryRecord>("set_library_import_root", {
+          libraryId: onboardingLibrary.id,
+          importRoot: onboardingImportRoot.trim()
+        });
+        setLibraries((previous) => previous.map((library) => (library.id === finalLibrary.id ? finalLibrary : library)));
+        invoke<ImportFolderResult>("scan_import_folder", { libraryId: finalLibrary.id }).catch(() => {});
+      }
+      setActiveLibraryId(finalLibrary.id);
+      setOnboardingLibrary(null);
+      setOnboardingStep(0);
+      setOnboardingMediaRoot("");
+      setOnboardingImportRoot("");
+    } catch (error) {
+      setOnboardingError(String(error));
+    } finally {
+      setOnboardingBusy(false);
+    }
+  }, [onboardingLibrary, onboardingImportRoot]);
+
+  // Settings → General → Library's "Import folder" row — sets or clears a
+  // library's import folder after the fact, outside the first-run wizard.
+  const handleChangeLibraryImportRoot = useCallback(async () => {
+    if (!activeLibraryId) return;
+    const selected = await openDialog({
+      directory: true,
+      multiple: false,
+      title: "Choose a folder to auto-import new sounds from"
+    });
+    if (typeof selected !== "string") return;
+    const updated = await invoke<LibraryRecord>("set_library_import_root", {
+      libraryId: activeLibraryId,
+      importRoot: selected
+    });
+    setLibraries((previous) => previous.map((library) => (library.id === updated.id ? updated : library)));
+  }, [activeLibraryId]);
+
+  const handleClearLibraryImportRoot = useCallback(async () => {
+    if (!activeLibraryId) return;
+    const updated = await invoke<LibraryRecord>("set_library_import_root", {
+      libraryId: activeLibraryId,
+      importRoot: null
+    });
+    setLibraries((previous) => previous.map((library) => (library.id === updated.id ? updated : library)));
+  }, [activeLibraryId]);
+
   const handleImportFolder = useCallback(async () => {
     if (!activeLibraryId) return;
 
@@ -1997,23 +2195,36 @@ export function App() {
     }
   }, [activeLibraryId, activeLibrary, searchQuery, activeFilter, refreshAssets, refreshMaintenance, runJobDrain]);
 
+  // Checks both of a library's folders for new sounds: media_root (via
+  // refresh_library, unchanged) and, if one is configured, the separate
+  // import_root staging folder (via scan_import_folder) — the manual half
+  // of the "scan on launch/refresh" auto-import described in the first-run
+  // wizard. Promise.allSettled rather than Promise.all since a library
+  // without a media_root yet (refresh_library rejects) shouldn't block the
+  // import-folder scan from still running, and vice versa.
   const handleRefreshLibrary = useCallback(() => {
     if (!activeLibraryId) return;
     setRefreshStatus("Scanning for new files…");
-    invoke<ImportFolderResult>("refresh_library", { libraryId: activeLibraryId })
-      .then((result) => {
-        if (result.imported.length > 0) {
-          runJobDrain(activeLibraryId);
-        }
-        setRefreshStatus(
-          result.imported.length > 0
-            ? `Found ${result.imported.length} new sound${result.imported.length === 1 ? "" : "s"}`
-            : "No new files found"
-        );
-        refreshAssets(activeLibraryId, searchQuery, activeFilter);
-        refreshMaintenance(activeLibraryId);
-      })
-      .catch((error) => setRefreshStatus(`Refresh failed: ${String(error)}`));
+    Promise.allSettled([
+      invoke<ImportFolderResult>("refresh_library", { libraryId: activeLibraryId }),
+      invoke<ImportFolderResult>("scan_import_folder", { libraryId: activeLibraryId })
+    ]).then(([refreshResult, importResult]) => {
+      if (refreshResult.status === "rejected" && importResult.status === "rejected") {
+        setRefreshStatus(`Refresh failed: ${String(refreshResult.reason)}`);
+        return;
+      }
+      const importedCount =
+        (refreshResult.status === "fulfilled" ? refreshResult.value.imported.length : 0) +
+        (importResult.status === "fulfilled" ? importResult.value.imported.length : 0);
+      if (importedCount > 0) {
+        runJobDrain(activeLibraryId);
+      }
+      setRefreshStatus(
+        importedCount > 0 ? `Found ${importedCount} new sound${importedCount === 1 ? "" : "s"}` : "No new files found"
+      );
+      refreshAssets(activeLibraryId, searchQuery, activeFilter);
+      refreshMaintenance(activeLibraryId);
+    });
   }, [activeLibraryId, searchQuery, activeFilter, refreshAssets, refreshMaintenance, runJobDrain]);
 
   const handleExportSelected = useCallback(
@@ -2465,33 +2676,101 @@ export function App() {
     );
   }
 
-  if (librariesLoaded && libraries.length === 0) {
+  if (librariesLoaded && (libraries.length === 0 || onboardingLibrary)) {
     return (
       <main className="shell setup-shell">
-        <section className="setup-card" aria-label="Create library">
+        <section className="setup-card" aria-label="Set up Darkwave">
           <div className="brand">Darkwave</div>
-          <h1>Create your library</h1>
-          <p>Choose a name. The first folder you import becomes this library's media location automatically.</p>
-          <label className="setup-field">
-            <span>Library name</span>
-            <input
-              autoFocus
-              value={libraryName}
-              onChange={(event) => setLibraryName(event.target.value)}
-              placeholder="Home Studio"
-              onKeyDown={(event) => {
-                if (event.key === "Enter" && libraryName.trim()) handleCreateLibrary();
-              }}
-            />
-          </label>
-          <button
-            className="primary-action"
-            type="button"
-            onClick={handleCreateLibrary}
-            disabled={!libraryName.trim()}
-          >
-            Create Library
-          </button>
+          <p className="settings-hint">Step {onboardingStep + 1} of 3</p>
+          {onboardingStep === 0 ? (
+            <>
+              <h1>Create your library</h1>
+              <p>Choose a name for your sound library.</p>
+              <label className="setup-field">
+                <span>Library name</span>
+                <input
+                  autoFocus
+                  value={libraryName}
+                  onChange={(event) => setLibraryName(event.target.value)}
+                  placeholder="Home Studio"
+                  onKeyDown={(event) => {
+                    if (event.key === "Enter" && libraryName.trim() && !onboardingBusy) handleOnboardingCreateLibrary();
+                  }}
+                />
+              </label>
+              <button
+                className="primary-action"
+                type="button"
+                onClick={handleOnboardingCreateLibrary}
+                disabled={!libraryName.trim() || onboardingBusy}
+              >
+                Continue
+              </button>
+            </>
+          ) : onboardingStep === 1 ? (
+            <>
+              <h1>Where should Darkwave keep your sound library?</h1>
+              <p>This is the root folder your organized library lives in on disk.</p>
+              <label className="setup-field">
+                <span>Root folder</span>
+                <div className="setup-field-row">
+                  <input
+                    autoFocus
+                    placeholder="/Volumes/Sound Library"
+                    value={onboardingMediaRoot}
+                    onChange={(event) => setOnboardingMediaRoot(event.target.value)}
+                  />
+                  <button type="button" onClick={handleOnboardingChooseMediaRoot}>
+                    Browse
+                  </button>
+                </div>
+              </label>
+              <button
+                className="primary-action"
+                type="button"
+                onClick={handleOnboardingConfirmMediaRoot}
+                disabled={!onboardingMediaRoot.trim() || onboardingBusy}
+              >
+                Continue
+              </button>
+            </>
+          ) : (
+            <>
+              <h1>Where do you drop new sounds to import?</h1>
+              <p>
+                Darkwave checks this folder for new files on launch and refresh, and copies anything new straight
+                into your library. Optional — you can set or change this later in Settings.
+              </p>
+              <label className="setup-field">
+                <span>Import folder</span>
+                <div className="setup-field-row">
+                  <input
+                    autoFocus
+                    placeholder="/Users/you/Downloads/New Sounds"
+                    value={onboardingImportRoot}
+                    onChange={(event) => setOnboardingImportRoot(event.target.value)}
+                  />
+                  <button type="button" onClick={handleOnboardingChooseImportRoot}>
+                    Browse
+                  </button>
+                </div>
+              </label>
+              <div className="setup-field-row">
+                <button className="text-button" type="button" onClick={handleOnboardingFinish} disabled={onboardingBusy}>
+                  Skip for now
+                </button>
+                <button
+                  className="primary-action"
+                  type="button"
+                  onClick={handleOnboardingFinish}
+                  disabled={onboardingBusy}
+                >
+                  Finish
+                </button>
+              </div>
+            </>
+          )}
+          {onboardingError ? <p className="settings-hint">{onboardingError}</p> : null}
         </section>
       </main>
     );
@@ -2943,18 +3222,14 @@ export function App() {
                   {project.collection_type === "Project" ? (
                     <button
                       type="button"
-                      className={project.export_path ? "dr-button" : "dr-button disabled"}
-                      aria-label={
-                        project.export_path
-                          ? `Send selected to ${project.name}'s DaVinci Resolve folder`
-                          : `${project.name} has no DaVinci Resolve folder configured yet`
-                      }
+                      className={projectHasExportFolder(project) ? "dr-button" : "dr-button disabled"}
+                      aria-label={projectExportFolderSummary(project)}
                       title={
-                        project.export_path
-                          ? `Send selected to ${project.name} (${project.export_path})`
-                          : "Set a DaVinci Resolve sounds folder for this project to enable quick export"
+                        projectHasExportFolder(project)
+                          ? projectExportFolderSummary(project)
+                          : "Set a sound folder or sound effects folder for this project to enable quick export"
                       }
-                      disabled={!project.export_path || bulkAssetIds.length === 0}
+                      disabled={!projectHasExportFolder(project) || bulkAssetIds.length === 0}
                       onClick={(event) => {
                         event.stopPropagation();
                         handleExportToProject(project, bulkAssetIds);
@@ -3308,7 +3583,7 @@ export function App() {
                   const memberships = membershipsByAsset.get(asset.id) ?? [];
                   if (memberships.length === 0) return <span />;
                   const anyExported = memberships.some((membership) => membership.exported);
-                  const sendableCount = memberships.filter((membership) => membership.export_path).length;
+                  const sendableCount = memberships.filter((membership) => projectHasExportFolder(membership)).length;
                   const projectNames = memberships.map((membership) => membership.project_name).join(", ");
                   const label = anyExported
                     ? `Already sent to a project folder (${projectNames}) — click to send again`
@@ -3478,12 +3753,21 @@ export function App() {
                           </span>
                           <div className="editor-project-meta">
                             <strong>{project.name}</strong>
-                            <small>{project.export_path ?? "No export folder set"}</small>
+                            <small>
+                              {project.export_path || project.sfx_export_path
+                                ? [
+                                    project.export_path ? `Sound: ${project.export_path}` : null,
+                                    project.sfx_export_path ? `SFX: ${project.sfx_export_path}` : null
+                                  ]
+                                    .filter(Boolean)
+                                    .join(" · ")
+                                : "No export folder set"}
+                            </small>
                           </div>
                           <button
                             type="button"
-                            className={project.export_path ? "dr-button" : "dr-button disabled"}
-                            disabled={!project.export_path || bulkAssetIds.length === 0}
+                            className={projectHasExportFolder(project) ? "dr-button" : "dr-button disabled"}
+                            disabled={!projectHasExportFolder(project) || bulkAssetIds.length === 0}
                             aria-label={`Send selected to ${project.name}`}
                             onClick={() => handleExportToProject(project, bulkAssetIds)}
                           >
@@ -3896,13 +4180,13 @@ export function App() {
           className={drTargetProject ? "dr-button" : "dr-button disabled"}
           aria-label={
             drTargetProject
-              ? `Send to ${drTargetProject.name}'s DaVinci Resolve folder`
-              : "Send selected to a project's DaVinci Resolve folder — click a project's DR button first to set the target"
+              ? projectExportFolderSummary(drTargetProject)
+              : "Send selected to a project's sound/SFX folder — click a project's send button first to set the target"
           }
           title={
             drTargetProject
-              ? `Send to ${drTargetProject.name} (${drTargetProject.export_path})`
-              : "No DaVinci Resolve target yet — click a project's DR button in the sidebar first"
+              ? projectExportFolderSummary(drTargetProject)
+              : "No send target yet — click a project's send button in the sidebar first"
           }
           disabled={!drTargetProject || !drTargetAssetId}
           onClick={() => {
@@ -3971,6 +4255,21 @@ export function App() {
                           <strong className="settings-value-path" title={activeLibrary?.media_root || undefined}>
                             {activeLibrary?.media_root || "Not set yet — import a folder"}
                           </strong>
+                        </div>
+                        <div className="settings-row">
+                          <Import size={14} />
+                          <span>Import folder</span>
+                          <strong className="settings-value-path" title={activeLibrary?.import_root || undefined}>
+                            {activeLibrary?.import_root || "Not set — new sounds aren't auto-imported"}
+                          </strong>
+                          <button type="button" className="text-button" onClick={handleChangeLibraryImportRoot}>
+                            {activeLibrary?.import_root ? "Change" : "Set"}
+                          </button>
+                          {activeLibrary?.import_root ? (
+                            <button type="button" className="text-button" onClick={handleClearLibraryImportRoot}>
+                              Clear
+                            </button>
+                          ) : null}
                         </div>
                         <div className="settings-row">
                           <Gauge size={14} />
@@ -4546,7 +4845,7 @@ export function App() {
                 }}
               />
               <label className="setup-field">
-                <span>DaVinci Resolve sounds folder (optional)</span>
+                <span>Sound folder</span>
                 <div className="setup-field-row">
                   <input
                     placeholder="/Volumes/Edit/MyFilm/Sounds"
@@ -4557,6 +4856,21 @@ export function App() {
                     Browse
                   </button>
                 </div>
+                <p className="settings-hint">For music.</p>
+              </label>
+              <label className="setup-field">
+                <span>Sound effects folder</span>
+                <div className="setup-field-row">
+                  <input
+                    placeholder="/Volumes/Edit/MyFilm/SFX"
+                    value={newProjectSfxExportPath}
+                    onChange={(event) => setNewProjectSfxExportPath(event.target.value)}
+                  />
+                  <button type="button" onClick={handleChooseProjectSfxExportPath}>
+                    Browse
+                  </button>
+                </div>
+                <p className="settings-hint">Everything else — auto-sorted into subfolders.</p>
               </label>
               <button
                 type="button"

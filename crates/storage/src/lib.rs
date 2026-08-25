@@ -41,6 +41,11 @@ pub struct LibraryRecord {
     /// launch without a fresh folder-picker prompt. `None` on every other
     /// build — the direct-sale build is unsandboxed and never needs one.
     pub media_root_bookmark: Option<String>,
+    /// Folder the app scans for new sounds to auto-import (on launch and on
+    /// manual refresh — see `scan_import_folder`), distinct from
+    /// `media_root` where the organized library actually lives. `None`
+    /// until the user sets one, e.g. in the first-run wizard.
+    pub import_root: Option<String>,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
@@ -184,10 +189,14 @@ pub struct CollectionRecord {
     pub name: String,
     pub collection_type: CollectionType,
     pub query_definition: Option<String>,
-    /// Folder on disk this project's sounds get quick-exported to (e.g. a
-    /// DaVinci Resolve "Sounds" watch folder), so an editor can drag them
-    /// straight into a timeline. `None` until the editor configures one.
+    /// Project's "sound folder" — where music quick-exports to (e.g. an
+    /// editing app's watch folder), so an editor can drag it straight into
+    /// a timeline. `None` until the editor configures one.
     pub export_path: Option<String>,
+    /// Project's "sound effects folder" — where everything that isn't
+    /// music quick-exports to (sound effects, foley, voiceover, ambience),
+    /// organized into tag-named subfolders. `None` until configured.
+    pub sfx_export_path: Option<String>,
 }
 
 /// One (asset, project) membership row — see `project_memberships_for_library`.
@@ -197,6 +206,7 @@ pub struct AssetProjectMembership {
     pub project_id: Uuid,
     pub project_name: String,
     pub export_path: Option<String>,
+    pub sfx_export_path: Option<String>,
     pub exported: bool,
 }
 
@@ -304,6 +314,7 @@ impl Catalog {
             name: name.as_ref().to_string(),
             media_root: media_root.as_ref().to_string(),
             media_root_bookmark: None,
+            import_root: None,
         };
         let now = Utc::now().to_rfc3339();
 
@@ -322,7 +333,7 @@ impl Catalog {
 
     pub fn list_libraries(&self) -> Result<Vec<LibraryRecord>, StorageError> {
         let mut statement = self.connection.prepare(
-            "SELECT id, name, media_root, media_root_bookmark FROM libraries ORDER BY created_at ASC",
+            "SELECT id, name, media_root, media_root_bookmark, import_root FROM libraries ORDER BY created_at ASC",
         )?;
         let libraries = statement
             .query_map([], |row| {
@@ -331,6 +342,7 @@ impl Catalog {
                     name: row.get(1)?,
                     media_root: row.get(2)?,
                     media_root_bookmark: row.get(3)?,
+                    import_root: row.get(4)?,
                 })
             })?
             .collect::<Result<Vec<_>, _>>()?;
@@ -341,7 +353,7 @@ impl Catalog {
     pub fn get_library(&self, id: Uuid) -> Result<Option<LibraryRecord>, StorageError> {
         self.connection
             .query_row(
-                "SELECT id, name, media_root, media_root_bookmark FROM libraries WHERE id = ?1",
+                "SELECT id, name, media_root, media_root_bookmark, import_root FROM libraries WHERE id = ?1",
                 params![id.to_string()],
                 |row| {
                     Ok(LibraryRecord {
@@ -349,6 +361,7 @@ impl Catalog {
                         name: row.get(1)?,
                         media_root: row.get(2)?,
                         media_root_bookmark: row.get(3)?,
+                        import_root: row.get(4)?,
                     })
                 },
             )
@@ -384,6 +397,22 @@ impl Catalog {
         self.connection.execute(
             "UPDATE libraries SET media_root_bookmark = ?1 WHERE id = ?2",
             params![media_root_bookmark, library_id.to_string()],
+        )?;
+        Ok(())
+    }
+
+    /// Sets (or clears, with `None`) the folder the app scans for new
+    /// sounds to auto-import. `Some("")` is treated the same as `None` so
+    /// clearing the field from a text input works naturally.
+    pub fn set_library_import_root(
+        &self,
+        library_id: Uuid,
+        import_root: Option<&str>,
+    ) -> Result<(), StorageError> {
+        let import_root = import_root.filter(|path| !path.trim().is_empty());
+        self.connection.execute(
+            "UPDATE libraries SET import_root = ?1 WHERE id = ?2",
+            params![import_root, library_id.to_string()],
         )?;
         Ok(())
     }
@@ -898,6 +927,7 @@ impl Catalog {
             collection_type,
             query_definition: None,
             export_path: None,
+            sfx_export_path: None,
         };
         let now = Utc::now().to_rfc3339();
 
@@ -929,6 +959,7 @@ impl Catalog {
             collection_type: CollectionType::Smart,
             query_definition: Some(serde_json::to_string(query).expect("query serializes")),
             export_path: None,
+            sfx_export_path: None,
         };
         let now = Utc::now().to_rfc3339();
 
@@ -953,7 +984,7 @@ impl Catalog {
     ) -> Result<Option<CollectionRecord>, StorageError> {
         self.connection
             .query_row(
-                "SELECT id, library_id, name, type, query_definition, export_path FROM collections WHERE id = ?1",
+                "SELECT id, library_id, name, type, query_definition, export_path, sfx_export_path FROM collections WHERE id = ?1",
                 params![collection_id.to_string()],
                 collection_from_row,
             )
@@ -973,6 +1004,22 @@ impl Catalog {
         self.connection.execute(
             "UPDATE collections SET export_path = ?1 WHERE id = ?2",
             params![export_path, collection_id.to_string()],
+        )?;
+        Ok(())
+    }
+
+    /// Sets (or clears, with `None`) the folder a project's non-music
+    /// sounds are quick-exported to for the "send to project" button. Same
+    /// empty-string-clears-the-field behavior as `set_collection_export_path`.
+    pub fn set_collection_sfx_export_path(
+        &self,
+        collection_id: Uuid,
+        sfx_export_path: Option<&str>,
+    ) -> Result<(), StorageError> {
+        let sfx_export_path = sfx_export_path.filter(|path| !path.trim().is_empty());
+        self.connection.execute(
+            "UPDATE collections SET sfx_export_path = ?1 WHERE id = ?2",
+            params![sfx_export_path, collection_id.to_string()],
         )?;
         Ok(())
     }
@@ -1080,7 +1127,7 @@ impl Catalog {
         library_id: Uuid,
     ) -> Result<Vec<CollectionRecord>, StorageError> {
         let mut statement = self.connection.prepare(
-            "SELECT id, library_id, name, type, query_definition, export_path FROM collections
+            "SELECT id, library_id, name, type, query_definition, export_path, sfx_export_path FROM collections
              WHERE library_id = ?1 ORDER BY created_at ASC",
         )?;
 
@@ -1150,6 +1197,7 @@ impl Catalog {
     ) -> Result<Vec<AssetProjectMembership>, StorageError> {
         let mut statement = self.connection.prepare(
             "SELECT collection_assets.asset_id, collections.id, collections.name, collections.export_path,
+                collections.sfx_export_path,
                 EXISTS(
                     SELECT 1 FROM usage_events
                     WHERE usage_events.asset_id = collection_assets.asset_id
@@ -1171,7 +1219,8 @@ impl Catalog {
                         .map_err(|_| rusqlite::Error::InvalidQuery)?,
                     project_name: row.get(2)?,
                     export_path: row.get(3)?,
-                    exported: row.get(4)?,
+                    sfx_export_path: row.get(4)?,
+                    exported: row.get(5)?,
                 })
             })?
             .collect::<Result<Vec<_>, _>>()
@@ -2123,8 +2172,10 @@ impl Catalog {
         // that already exists from an earlier app version, so new columns on
         // existing tables need an explicit, idempotent ADD COLUMN step.
         self.ensure_column("collections", "export_path", "TEXT")?;
+        self.ensure_column("collections", "sfx_export_path", "TEXT")?;
         self.ensure_column("assets", "vocal_ratio", "REAL")?;
         self.ensure_column("libraries", "media_root_bookmark", "TEXT")?;
+        self.ensure_column("libraries", "import_root", "TEXT")?;
 
         Ok(())
     }
@@ -2258,6 +2309,7 @@ fn collection_from_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<CollectionRe
         collection_type: collection_type_from_db(&row.get::<_, String>(3)?),
         query_definition: row.get(4)?,
         export_path: row.get(5)?,
+        sfx_export_path: row.get(6)?,
     })
 }
 
@@ -2529,6 +2581,34 @@ mod tests {
             .expect("load library")
             .expect("library exists");
         assert_eq!(loaded.media_root, "/Volumes/TrueNAS/SFX");
+    }
+
+    #[test]
+    fn import_root_defaults_to_none_and_can_be_set_and_cleared() {
+        let catalog_path = unique_catalog_path("set-import-root");
+        let catalog = Catalog::open(&catalog_path).expect("open catalog");
+        let library = catalog
+            .create_library("Home Studio", "/Volumes/TrueNAS/SFX")
+            .expect("create library");
+        assert_eq!(library.import_root, None);
+
+        catalog
+            .set_library_import_root(library.id, Some("/Users/editor/Drop"))
+            .expect("set import root");
+        let with_import_root = catalog
+            .get_library(library.id)
+            .expect("load library")
+            .expect("library exists");
+        assert_eq!(with_import_root.import_root.as_deref(), Some("/Users/editor/Drop"));
+
+        catalog
+            .set_library_import_root(library.id, Some("   "))
+            .expect("clear import root with blank string");
+        let cleared = catalog
+            .get_library(library.id)
+            .expect("load library")
+            .expect("library exists");
+        assert_eq!(cleared.import_root, None);
     }
 
     #[test]
@@ -3648,6 +3728,37 @@ mod tests {
             .expect("get collection")
             .expect("collection exists");
         assert_eq!(cleared.export_path, None);
+    }
+
+    #[test]
+    fn project_sfx_export_path_defaults_to_none_and_can_be_set_and_cleared() {
+        let catalog_path = unique_catalog_path("project-sfx-export-path");
+        let catalog = Catalog::open(&catalog_path).expect("open catalog");
+        let library = catalog.create_library("One", "/library").expect("library");
+        let project = catalog
+            .create_collection(library.id, "Trailer", CollectionType::Project)
+            .expect("project");
+        assert_eq!(project.sfx_export_path, None);
+
+        catalog
+            .set_collection_sfx_export_path(project.id, Some("/Volumes/Edit/Trailer/SFX"))
+            .expect("set sfx export path");
+        let reloaded = catalog
+            .get_collection(project.id)
+            .expect("get collection")
+            .expect("collection exists");
+        assert_eq!(reloaded.sfx_export_path.as_deref(), Some("/Volumes/Edit/Trailer/SFX"));
+        // export_path is independent of sfx_export_path.
+        assert_eq!(reloaded.export_path, None);
+
+        catalog
+            .set_collection_sfx_export_path(project.id, Some("   "))
+            .expect("clear sfx export path with blank string");
+        let cleared = catalog
+            .get_collection(project.id)
+            .expect("get collection")
+            .expect("collection exists");
+        assert_eq!(cleared.sfx_export_path, None);
     }
 
     #[test]
