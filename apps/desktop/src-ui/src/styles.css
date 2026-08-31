@@ -223,6 +223,16 @@ button.panel-handle-right:active:not(:disabled) {
   border-bottom-left-radius: var(--radius-lg);
 }
 
+/* The inspector is just a stack of self-contained option cards
+   (.panel-body > section), so it carries no panel chrome of its own —
+   no grey fill, border, blur or shadow. Only the cards float. */
+.inspector {
+  background: transparent;
+  border-color: transparent;
+  box-shadow: none;
+  backdrop-filter: none;
+}
+
 .sidebar.collapsed,
 .inspector.collapsed {
   margin: 0;
@@ -284,11 +294,11 @@ button.panel-handle-right:active:not(:disabled) {
 
 .sidebar .section-header h2 svg {
   flex: 0 0 auto;
-  color: var(--accent-ink);
+  color: var(--text-secondary);
 }
 
 .sidebar .section-header.accent h2 {
-  color: var(--accent-ink);
+  color: var(--text-muted);
 }
 
 .section-header-actions {
@@ -499,7 +509,7 @@ button.panel-handle-right:active:not(:disabled) {
 
 .nav-heading-lg svg {
   flex: 0 0 auto;
-  color: var(--accent-ink);
+  color: var(--text-secondary);
 }
 
 .nav-heading-add {
@@ -2000,6 +2010,7 @@ dd {
   display: flex;
   align-items: center;
   justify-content: center;
+  padding: 24px;
   background: rgba(10, 10, 10, 0.55);
   backdrop-filter: blur(6px);
 }
@@ -2053,10 +2064,14 @@ dd {
 .settings-modal {
   display: flex;
   flex-direction: column;
-  width: 720px;
-  height: 78vh;
-  max-height: 640px;
+  width: min(760px, 92vw);
+  height: min(78vh, 640px);
+  max-height: calc(100vh - 60px);
   padding: 0;
+}
+
+.settings-modal .modal-head h1 {
+  font-weight: 600;
 }
 
 .settings-modal .modal-head {
@@ -2118,12 +2133,12 @@ dd {
 }
 
 .settings-nav-item.active {
-  background: rgba(255, 92, 0, 0.14);
-  color: var(--accent-ink);
+  background: var(--surface-hover);
+  color: var(--text-primary);
 }
 
 .settings-nav-item.active svg {
-  color: var(--accent-ink);
+  color: var(--text-primary);
 }
 
 .settings-content {
@@ -2141,8 +2156,10 @@ dd {
 
 .settings-section h2 {
   margin: 0 0 10px;
-  font-size: 13px;
-  font-weight: 700;
+  font-size: 12px;
+  font-weight: 600;
+  letter-spacing: 0.02em;
+  color: var(--text-secondary);
 }
 
 .settings-section-head {
@@ -2173,11 +2190,11 @@ dd {
 
 .settings-row {
   display: grid;
-  grid-template-columns: 16px minmax(0, 1fr) auto;
+  grid-template-columns: 16px minmax(0, 1fr) minmax(0, auto);
   gap: 10px;
   align-items: center;
   min-height: 36px;
-  padding: 4px 8px;
+  padding: 6px 8px;
   border-radius: var(--radius-sm);
   color: var(--text-tertiary);
   font-size: 13px;
@@ -2193,16 +2210,21 @@ dd {
 }
 
 .settings-row strong {
-  overflow: hidden;
+  min-width: 0;
   color: var(--text-primary);
   font-size: 13px;
+  font-weight: 500;
   text-align: right;
-  text-overflow: ellipsis;
-  white-space: nowrap;
+  overflow-wrap: anywhere;
 }
 
+/* Paths stay on one line with an ellipsis; width tracks the viewport so a
+   narrow window doesn't force the row wider than the modal. */
 .settings-value-path {
-  max-width: 260px;
+  max-width: min(260px, 42vw);
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
 }
 
 .settings-row select,
@@ -2228,8 +2250,10 @@ dd {
 
 .settings-subhead {
   margin: 18px 0 10px;
-  font-size: 13px;
-  font-weight: 700;
+  font-size: 12px;
+  font-weight: 600;
+  letter-spacing: 0.02em;
+  color: var(--text-secondary);
 }
 
 .accent-legend {
@@ -2756,7 +2780,7 @@ dd {
   display: flex;
   align-items: center;
   gap: 5px;
-  color: var(--accent);
+  color: var(--text-muted);
 }
 
 .sonic-radar-heading.sonic-radar-root {
@@ -2784,7 +2808,7 @@ dd {
 .sonic-radar-item:hover svg,
 .sidebar-styled-item.active svg,
 .sidebar-styled-item:hover svg {
-  color: var(--accent-ink);
+  color: var(--text-primary);
 }
 
 /* Background Activity modal — the default .modal-card width was sized for

@@ -13,8 +13,8 @@
     "windows": [
       {
         "title": "Darkwave",
-        "width": 1280,
-        "height": 820,
+        "width": 1480,
+        "height": 900,
         "minWidth": 920,
         "minHeight": 640
       }
