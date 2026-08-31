@@ -281,18 +281,21 @@ button.panel-handle-right:active:not(:disabled) {
   padding: 0 10px 4px;
 }
 
+/* Matches .nav-heading-lg so every sidebar section label reads the same. */
 .sidebar .section-header h2 {
-  gap: 6px;
+  gap: 7px;
   color: var(--text-muted);
-  font-size: 13px;
+  font-size: 10.5px;
   font-weight: 700;
-  letter-spacing: 0.03em;
+  letter-spacing: 0.08em;
   text-transform: uppercase;
 }
 
 .sidebar .section-header h2 svg {
   flex: 0 0 auto;
-  color: var(--text-tertiary);
+  width: 13px;
+  height: 13px;
+  color: var(--text-muted);
 }
 
 .sidebar .section-header.accent h2 {
@@ -343,24 +346,30 @@ button.panel-handle-right:active:not(:disabled) {
 .nav-item {
   display: block;
   width: 100%;
-  min-height: 31px;
-  margin-bottom: 3px;
+  min-height: 32px;
+  margin-bottom: 2px;
   padding: 0 10px;
   overflow: hidden;
   border: 0;
   border-radius: var(--radius-sm);
   background: transparent;
-  color: var(--text-primary);
-  font-size: 12px;
+  color: var(--text-secondary);
+  font-size: 13px;
+  font-weight: 450;
   text-align: left;
   text-overflow: ellipsis;
   white-space: nowrap;
 }
 
-.nav-item.active,
 .nav-item:hover {
   background: var(--surface-hover);
   color: var(--text-primary);
+}
+
+.nav-item.active {
+  background: var(--surface-hover);
+  color: var(--text-primary);
+  font-weight: 600;
 }
 
 .nav-item-row {
@@ -489,7 +498,8 @@ button.panel-handle-right:active:not(:disabled) {
   display: flex;
   align-items: center;
   justify-content: space-between;
-  margin: 14px 0 4px;
+  min-height: 24px;
+  margin: 22px 0 4px;
   padding: 0 10px;
 }
 
@@ -498,37 +508,47 @@ button.panel-handle-right:active:not(:disabled) {
   padding: 0;
 }
 
-/* Bigger, icon-led group header — same treatment as the Sonic Radar
-   heading, applied to every other foldable sidebar group (Categories,
-   Projects, Maintenance) so the whole list reads as one system. */
+/* Section label — a quiet uppercase divider (Sonic Radar, Categories,
+   Projects). Deliberately much lighter than the nav rows it groups, so
+   the eye reads "label, then a list of items", not one flat column. */
 .nav-heading-lg {
   display: flex;
   flex: 1;
   align-items: center;
-  gap: 6px;
+  gap: 7px;
   min-width: 0;
-  font-size: 13px;
-  letter-spacing: 0.03em;
+  color: var(--text-muted);
+  font-size: 10.5px;
+  font-weight: 700;
+  letter-spacing: 0.08em;
+  text-transform: uppercase;
   cursor: pointer;
 }
 
 .nav-heading-lg svg {
   flex: 0 0 auto;
-  color: var(--text-tertiary);
+  width: 13px;
+  height: 13px;
+  color: var(--text-muted);
 }
 
 .nav-heading-add {
   display: inline-flex;
   align-items: center;
   justify-content: center;
-  width: 24px;
-  height: 24px;
+  width: 22px;
+  height: 22px;
   flex: 0 0 auto;
   border: none;
   border-radius: 6px;
   background: transparent;
   color: var(--text-muted);
   transition: background-color 140ms var(--ease-soft), color 140ms var(--ease-soft);
+}
+
+.nav-heading-add svg {
+  width: 14px;
+  height: 14px;
 }
 
 .nav-heading-add:hover {
@@ -1974,15 +1994,16 @@ dd {
 .nav-subitem {
   display: block;
   width: 100%;
-  min-height: 26px;
+  min-height: 27px;
   margin-bottom: 2px;
-  padding: 0 10px 0 22px;
+  padding: 0 10px 0 30px;
   overflow: hidden;
   border: 0;
   border-radius: 6px;
   background: transparent;
   color: var(--text-muted);
-  font-size: 11px;
+  font-size: 12px;
+  font-weight: 400;
   text-align: left;
   text-overflow: ellipsis;
   white-space: nowrap;
