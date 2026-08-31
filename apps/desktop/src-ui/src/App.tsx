@@ -3679,8 +3679,8 @@ export function App() {
                 <svg viewBox="0 0 640 148" className="editor-workflow-flow" preserveAspectRatio="xMidYMid meet">
                   <defs>
                     <linearGradient id="editorFlowGradient" x1="0" y1="0" x2="1" y2="0">
-                      <stop offset="0%" stopColor="var(--player-accent-from, #ff7940)" />
-                      <stop offset="100%" stopColor="var(--player-accent-to, #f14800)" />
+                      <stop offset="0%" stopColor="var(--text-muted)" />
+                      <stop offset="100%" stopColor="var(--text-secondary)" />
                     </linearGradient>
                   </defs>
                   <line x1="96" y1="74" x2="544" y2="74" className="ew-flow-track" />
