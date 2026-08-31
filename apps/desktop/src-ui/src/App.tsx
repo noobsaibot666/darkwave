@@ -2817,6 +2817,7 @@ export function App() {
       ]
         .filter(Boolean)
         .join(" ")}
+      style={playerMoodStyle}
     >
       <audio
         ref={audioRef}
@@ -4100,7 +4101,6 @@ export function App() {
       <footer
         className={`transport${sidebarCollapsed ? " sidebar-collapsed" : ""}${inspectorCollapsed ? " inspector-collapsed" : ""}${isPlaying ? " is-playing" : ""}`}
         aria-label="Transport"
-        style={playerMoodStyle}
       >
         <button className="icon-button" aria-label="Previous" onClick={() => playRelative(-1)}>
           <SkipBack size={17} />
