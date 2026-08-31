@@ -606,9 +606,9 @@ type SettingsCategory =
 
 const SETTINGS_CATEGORIES: { id: SettingsCategory; label: string; icon: typeof Database }[] = [
   { id: "general", label: "General", icon: Database },
+  { id: "appearance", label: "Appearance", icon: Palette },
   { id: "playback", label: "Playback", icon: Volume2 },
   { id: "storage", label: "Storage", icon: HardDrive },
-  { id: "appearance", label: "Appearance", icon: Palette },
   { id: "accessibility", label: "Accessibility", icon: Contrast },
   { id: "release", label: "Release Readiness", icon: ShieldCheck },
   { id: "maintenance", label: "Maintenance", icon: FileWarning }
@@ -2796,13 +2796,17 @@ export function App() {
   const drTargetAssetId = playingAssetId ?? selectedAssetId;
   const drTargetProject = collections.find((project) => project.id === lastExportProjectId) ?? null;
   const playerMood = classifyPlayerMood(selectedAsset, appliedTags, selectedAsset?.vocal_ratio ?? null);
-  const playerMoodStyle = playerMood
-    ? ({
-        "--player-accent-from": playerMoodTheme[playerMood].from,
-        "--player-accent-to": playerMoodTheme[playerMood].to,
-        "--player-glow-color": playerMoodTheme[playerMood].glow
-      } as CSSProperties)
-    : undefined;
+  // Default/unclassified mood keeps the brand orange, but with a real glow
+  // value so the playing-state halo matches every other mood (they all set
+  // one) instead of falling back to transparent.
+  const playerTheme = playerMood
+    ? playerMoodTheme[playerMood]
+    : { from: "#ff7d3f", to: "#f24b12", glow: "rgba(255, 92, 0, 0.42)" };
+  const playerMoodStyle = {
+    "--player-accent-from": playerTheme.from,
+    "--player-accent-to": playerTheme.to,
+    "--player-glow-color": playerTheme.glow
+  } as CSSProperties;
 
   return (
     <main
@@ -3423,9 +3427,7 @@ export function App() {
         ) : null}
         <section className="filter-panel" aria-label="Range filters">
           <div className="selection-bar" aria-label="Selection actions">
-            <strong>{selectedAsset ? "1 selected" : "0 selected"}</strong>
-            <span>Click a row to select</span>
-            <span>Click a tag or project to apply it</span>
+            <strong>{(selectedCount || (selectedAsset ? 1 : 0))} selected</strong>
           </div>
           <ListFilter size={13} />
           <label>
@@ -4259,17 +4261,19 @@ export function App() {
                         <div className="settings-row">
                           <Import size={14} />
                           <span>Import folder</span>
-                          <strong className="settings-value-path" title={activeLibrary?.import_root || undefined}>
-                            {activeLibrary?.import_root || "Not set — new sounds aren't auto-imported"}
-                          </strong>
-                          <button type="button" className="text-button" onClick={handleChangeLibraryImportRoot}>
-                            {activeLibrary?.import_root ? "Change" : "Set"}
-                          </button>
-                          {activeLibrary?.import_root ? (
-                            <button type="button" className="text-button" onClick={handleClearLibraryImportRoot}>
-                              Clear
+                          <div className="settings-row-value">
+                            <strong className="settings-value-path" title={activeLibrary?.import_root || undefined}>
+                              {activeLibrary?.import_root || "Not set — new sounds aren't auto-imported"}
+                            </strong>
+                            <button type="button" className="text-button" onClick={handleChangeLibraryImportRoot}>
+                              {activeLibrary?.import_root ? "Change" : "Set"}
                             </button>
-                          ) : null}
+                            {activeLibrary?.import_root ? (
+                              <button type="button" className="text-button" onClick={handleClearLibraryImportRoot}>
+                                Clear
+                              </button>
+                            ) : null}
+                          </div>
                         </div>
                         <div className="settings-row">
                           <Gauge size={14} />

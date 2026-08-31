@@ -1147,33 +1147,13 @@ button:disabled,
   min-height: 0;
   padding: 0 18px 96px;
   overflow: auto;
-  scrollbar-width: thin;
+  scrollbar-width: none;
 }
 
 .browser::-webkit-scrollbar {
-  display: block;
-}
-
-.browser::-webkit-scrollbar:vertical {
   display: none;
   width: 0;
-}
-
-.browser::-webkit-scrollbar:horizontal {
-  height: 6px;
-}
-
-.browser::-webkit-scrollbar-track {
-  background: transparent;
-}
-
-.browser::-webkit-scrollbar-thumb {
-  background: rgba(var(--ink-rgb), 0.18);
-  border-radius: 999px;
-}
-
-.browser::-webkit-scrollbar-thumb:hover {
-  background: rgba(var(--ink-rgb), 0.28);
+  height: 0;
 }
 
 .selection-bar {
@@ -2225,6 +2205,18 @@ dd {
   overflow: hidden;
   text-overflow: ellipsis;
   white-space: nowrap;
+}
+
+/* Rows whose value sits next to one or more action buttons: keep them in
+   the row's third cell and let the buttons wrap under the value on a
+   narrow modal instead of overflowing into a new grid row. */
+.settings-row-value {
+  display: flex;
+  align-items: center;
+  justify-content: flex-end;
+  flex-wrap: wrap;
+  gap: 8px;
+  min-width: 0;
 }
 
 .settings-row select,
