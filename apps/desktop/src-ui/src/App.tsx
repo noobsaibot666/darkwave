@@ -3034,8 +3034,8 @@ export function App() {
           </button>
 
           <div className="nav-heading-row">
-            <span className="nav-heading sonic-radar-heading sonic-radar-root" onClick={() => toggleSection("sidebar-sonic-radar")}>
-              <Activity size={13} />
+            <span className="nav-heading-lg" onClick={() => toggleSection("sidebar-sonic-radar")}>
+              <Activity size={14} />
               Sonic Radar
             </span>
             <button
