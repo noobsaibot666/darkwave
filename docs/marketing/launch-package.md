@@ -7,7 +7,7 @@ Copy is paste-ready. Asset rows give exact filename, pixel size, format. `☐` =
 | Product name | `Darkwave` |
 | App Store listing name (24/30) | `Darkwave — Sound Library` — plain "Darkwave" is taken (App Store names are globally unique) |
 | Bundle ID / category | `dev.darkwave.app` · Music (secondary: Productivity) |
-| Version | `0.2.0` — first App Store submission (launch, not update) |
+| Version | `0.2.1` (build 8) — App Store 0.2.0 was already approved, so this is the next increment |
 | Price | US$49.99 tier (matches storefront €49) · real charge via Stripe `price_1U05EpCsCSs3k4X1fr7x7aER` |
 | Platforms | macOS 12+ (App Store + direct) · Windows (direct only, unsigned) |
 | Storefront | `alan-design.com/#/store` — `web_three/src/data/storeProducts.json`, id `darkwave` (exists, `badge: "NEW"`) |
