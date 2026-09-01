@@ -63,14 +63,22 @@ codesign --verify --deep --strict --verbose=2 "$APP_PATH"
 
 echo "[6/6] Building .pkg for App Store Connect..."
 mkdir -p builds
+# Version-stamped filename so a stale package can't be uploaded by mistake —
+# App Store Connect rejects (409) any upload whose CFBundleShortVersionString
+# isn't higher than the last APPROVED version, and a generic name makes that
+# easy to trip. Read both keys straight out of the app that was just signed.
+SHORT_VER=$(/usr/libexec/PlistBuddy -c "Print :CFBundleShortVersionString" "$APP_PATH/Contents/Info.plist")
+BUILD_VER=$(/usr/libexec/PlistBuddy -c "Print :CFBundleVersion" "$APP_PATH/Contents/Info.plist")
+PKG_OUT="builds/Darkwave_${SHORT_VER}_b${BUILD_VER}.pkg"
+rm -f builds/*.pkg
 COPYFILE_DISABLE=1 productbuild \
   --component "$APP_PATH" /Applications \
   --sign "$INSTALLER_IDENTITY" \
-  "builds/Darkwave_SUBMISSION.pkg"
+  "$PKG_OUT"
 
 echo ""
-echo "✓ builds/Darkwave_SUBMISSION.pkg ready."
+echo "✓ $PKG_OUT ready  (version $SHORT_VER, build $BUILD_VER)"
 echo ""
-echo "Upload with Transporter or:"
-echo "  xcrun altool --upload-app -f builds/Darkwave_SUBMISSION.pkg \\"
-echo "    -t macos -u <apple-id-email> -p <app-specific-password>"
+echo "Upload with Transporter (add this exact file — don't retry a prior delivery) or:"
+echo "  xcrun altool --validate-app -f $PKG_OUT -t macos --apple-id <email> --password <app-specific-pw> --team-id RD7UU4Z3D2"
+echo "  xcrun altool --upload-app   -f $PKG_OUT -t macos --apple-id <email> --password <app-specific-pw> --team-id RD7UU4Z3D2"
