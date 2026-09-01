@@ -16,3 +16,15 @@ The self-served store (`alan-design.com/#/store`) is managed by a separate proje
 5. Follow the deploy checklist Store Manager prints after Publish. See Store Manager's `docs/runbook.md` § "TrueNAS (production)" for known gotchas (git LFS not on the TrueNAS host PATH, the staging clone's `safe.directory` requirement, the real deploy path being `store-manager/app/` not `store-manager/`, and backend deploys to `web_three` being rsync-from-the-Mac via `deploy.sh`, never git-on-TrueNAS).
 
 Windows builds ship unsigned for now (deliberate, already-made call — see `docs/development/release-readiness.md` if that decision is ever revisited). The same Store Manager manifest can carry a `windows` file entry alongside `macos` in one drop if both platforms are ready together — see `docs/manifest-schema.md`.
+
+## Apple release accounts & IDs
+
+Every past "notarization 401" / "Transporter rejected" incident came from using the wrong Apple ID or a stale password. The facts, once:
+
+- **Developer Apple ID: `alan.creative@icloud.com`** — the account for App Store Connect, notarization, and Transporter. **Not** the machine's personal login (`alanxalves@me.com`). The app-specific password for notarization must be generated at appleid.apple.com *while signed in as `alan.creative@icloud.com`*.
+- **Team ID:** `RD7UU4Z3D2` (Nudson Alan Terrinha Alves). **App Store Connect app ID:** `6797313803`.
+- **Bundle IDs:** `dev.darkwave.app` (MAS) · `dev.darkwave.app.direct` (direct-sale).
+- **Notary keychain profile:** `darkwave-notary`. Apple revokes app-specific passwords periodically → `deploy_direct_macos.sh` fails at `[3/5]` with HTTP 401. Fix: regenerate the password, then `xcrun notarytool store-credentials darkwave-notary --apple-id alan.creative@icloud.com --team-id RD7UU4Z3D2` (omit `--password`, let it prompt), and confirm with `xcrun notarytool history --keychain-profile darkwave-notary` before retrying.
+- **Signing certs** (login keychain): Developer ID Application `2FDD1878…` (direct, pinned by SHA-1 in the script) · `3rd Party Mac Developer Application` + `… Installer` (MAS).
+- **Every App Store upload needs a fresh build number** — bump `CFBundleVersion` in `apps/desktop/src-tauri/Info.plist` (marketing version comes from `tauri.conf.json`). App Store Connect 409s a re-used `(CFBundleShortVersionString, CFBundleVersion)` pair, and `CFBundleShortVersionString` must exceed the last *approved* version.
+- **App Store listing name:** `Darkwave — Sound Library` (plain "Darkwave" is taken — App Store names are globally unique).
