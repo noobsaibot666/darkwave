@@ -10,11 +10,16 @@
 #   1. A "Developer ID Application" certificate in your login keychain,
 #      requested via Keychain Access > Certificate Assistant, uploaded to
 #      developer.apple.com, downloaded and double-clicked to install.
-#   2. A notarization keychain profile:
+#   2. A notarization keychain profile. The Apple ID here is the DEVELOPER
+#      account for team RD7UU4Z3D2 — alan.creative@icloud.com — NOT the
+#      personal iCloud login on the machine. The app-specific password must
+#      be generated at appleid.apple.com while signed in as that same Apple
+#      ID; Apple revokes these periodically, so a 401 at [3/5] means re-run
+#      this on ONE line:
 #        xcrun notarytool store-credentials darkwave-notary \
-#          --apple-id <your Apple ID email> \
-#          --team-id RD7UU4Z3D2 \
-#          --password <an app-specific password from appleid.apple.com>
+#          --apple-id alan.creative@icloud.com --team-id RD7UU4Z3D2
+#      (omit --password and let it prompt). Verify with:
+#        xcrun notarytool history --keychain-profile darkwave-notary
 #
 # One dependency to watch during notarization: `ort` (ONNX Runtime, used
 # transitively for Silero VAD voice detection) links a dylib that must
