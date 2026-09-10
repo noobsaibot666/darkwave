@@ -587,9 +587,24 @@ button.panel-handle-right:active:not(:disabled) {
   color: var(--radar-accent);
 }
 
-.nav-heading-add.radar-sync:hover {
+.nav-heading-add.radar-sync:hover:not(:disabled) {
   background: rgba(var(--radar-accent-rgb), 0.14);
   color: var(--radar-accent-strong);
+}
+
+.nav-heading-add.radar-sync:disabled {
+  opacity: 0.55;
+  cursor: default;
+}
+
+.nav-heading-add.radar-sync svg.spin {
+  animation: radar-sync-spin 900ms linear infinite;
+}
+
+@keyframes radar-sync-spin {
+  to {
+    transform: rotate(360deg);
+  }
 }
 
 .library-select-row {

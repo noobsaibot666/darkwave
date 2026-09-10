@@ -42,6 +42,17 @@ isn't a Sonic Radar concern and re-running it could clobber user edits
   rather than automatic, which is the right default: re-analysing a large
   library is minutes of CPU and shouldn't happen unprompted.
 - Re-sync respects the same graceful-degradation contracts: a queued
-  `InstrumentDetection` job with no model installed just waits.
+  `InstrumentDetection` job with no model installed just waits (and the
+  frontend skips draining that kind — see `instrument_detection_available`
+  — so it doesn't flash a 0%-progress bar every tick).
+- Re-running `AudioAnalysis` also re-runs the import-time media-type
+  "first funnel" (`save_audio_analysis_outcome`) for assets still at
+  `media_type = "other"` or an unreviewed `"sound_effect"`. That's
+  intended — re-sync means "re-derive from the signal" — but it means an
+  un-curated library can see a few sounds change category after a re-sync.
+  Anything the user has reviewed or manually typed is untouched.
+- `requeue_analysis_for_library` runs bulk `INSERT…SELECT` over the whole
+  assets table per kind, so `resync_analysis` is `#[tauri::command(async)]`
+  to keep it off the main thread on a large library.
 - Scope is "the analysis trio". If a future pass adds a fourth analysis
   job kind, add it to the `kinds` array in `resync_analysis`.

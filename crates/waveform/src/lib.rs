@@ -33,9 +33,14 @@ impl WaveformCache {
 
     /// Flat per-bucket magnitudes (0.0..=1.0) for the compact transport
     /// strip — `max(|min|, |max|)` of each bucket, derived from the
-    /// already-downsampled `transport` layer so this stays cheap.
+    /// already-downsampled `transport` layer so this stays cheap. Always
+    /// exactly `TRANSPORT_STRIP_BUCKETS` long (zero-padded for a clip too
+    /// short or silent to fill it), so a persisted strip is always the
+    /// authoritative one and the UI never has to recompute for a quiet file.
     pub fn transport_strip(&self) -> Vec<f32> {
-        peak_magnitudes(&self.transport, TRANSPORT_STRIP_BUCKETS)
+        let mut strip = peak_magnitudes(&self.transport, TRANSPORT_STRIP_BUCKETS);
+        strip.resize(TRANSPORT_STRIP_BUCKETS, 0.0);
+        strip
     }
 }
 
@@ -161,6 +166,20 @@ mod tests {
 
         assert_eq!(strip.len(), TRANSPORT_STRIP_BUCKETS);
         assert!(strip.iter().all(|value| (0.0..=1.0).contains(value)));
+    }
+
+    #[test]
+    fn transport_strip_is_full_length_even_for_a_tiny_or_silent_clip() {
+        // Fewer source samples than buckets, and an all-zero clip.
+        assert_eq!(
+            WaveformCache::from_samples(&[0.4, -0.6, 0.1], 44_100)
+                .transport_strip()
+                .len(),
+            TRANSPORT_STRIP_BUCKETS
+        );
+        let silent = WaveformCache::from_samples(&[0.0; 5_000], 44_100).transport_strip();
+        assert_eq!(silent.len(), TRANSPORT_STRIP_BUCKETS);
+        assert!(silent.iter().all(|value| *value == 0.0));
     }
 
     #[test]

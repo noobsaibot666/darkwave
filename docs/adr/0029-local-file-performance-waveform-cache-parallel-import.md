@@ -143,3 +143,8 @@ on the single mutexed connection.
 - BLAKE3 over SHA-256 (faster, effectively I/O-bound) was considered and
   left alone: it's a stored-format change needing migration, and hashing is
   no longer the bottleneck once it's streamed and parallelized.
+- `run_batch_import` buffers all `PreparedImport` structs before committing
+  (so it can commit in stable path order). Each is small (a hash, a path, a
+  few strings), but the peak is O(files) — ~25 MB for a 50k-file import.
+  Acceptable at desktop-library scale; if it ever matters, commit the
+  `buffer_unordered` stream incrementally and give up sorted commit order.

@@ -86,6 +86,18 @@ pub fn load_instrument_model(model_path: &Path, class_map_path: &Path) -> Option
         .position(|output| output.name.to_ascii_lowercase().contains("score"))
         .unwrap_or(0);
 
+    // YAMNet has 521 AudioSet classes; a wildly different count means the
+    // class map and the model don't belong together, which would map raw
+    // scores to the wrong instrument names. Log it rather than fail — a
+    // near miss (an export with a padding class, say) still works.
+    if !(500..=540).contains(&class_names.len()) {
+        eprintln!(
+            "instrument-detection: class map has {} entries (expected ~521 for YAMNet) — \
+             labels may be misaligned; check docs/development/instrument-model.md",
+            class_names.len()
+        );
+    }
+
     Some(InstrumentModel {
         session,
         class_names,

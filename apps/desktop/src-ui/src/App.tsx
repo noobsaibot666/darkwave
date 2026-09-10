@@ -802,10 +802,10 @@ function CollapsibleSection({
 
 type InstrumentFacet = { name: string; count: number };
 
-/// Full-area Instrument Detection view: every detected instrument in the
-/// library as a pill button with its track count. Plain click jumps
-/// straight to that instrument's tracks; shift-click toggles it into a
-/// running multi-selection (OR) that "Show tracks" then applies.
+// Full-area Instrument Detection view: every detected instrument in the
+// library as a pill button with its track count. Plain click jumps
+// straight to that instrument's tracks; shift-click toggles it into a
+// running multi-selection (OR) that "Show tracks" then applies.
 function InstrumentDetectionPage({
   libraryId,
   selected,
@@ -1023,6 +1023,10 @@ export function App() {
   const [jobProgress, setJobProgress] = useState<JobProgress[]>([]);
   const [jobCompletionSummaries, setJobCompletionSummaries] = useState<Record<string, JobCompletionSummary>>({});
   const [audioAnalysisPaused, setAudioAnalysisPaused] = useState(false);
+  // null = not yet checked; false = no model installed, so skip the
+  // instrument-detection drain (its jobs stay pending harmlessly).
+  const [instrumentDetectionAvailable, setInstrumentDetectionAvailable] = useState<boolean | null>(null);
+  const [resyncing, setResyncing] = useState(false);
   const [backgroundActivityOpen, setBackgroundActivityOpen] = useState(false);
   const drainingJobKinds = useRef<Set<string>>(new Set());
   const [offlineControl, setOfflineControl] = useState<OfflineControlState | null>(null);
@@ -1240,7 +1244,11 @@ export function App() {
   // audio analysis, not metadata extraction.
   const runJobDrain = useCallback(
     (libraryId: string, only?: string[]) => {
-      const configs = only ? JOB_KINDS.filter((config) => only.includes(config.kind)) : JOB_KINDS;
+      const configs = (only ? JOB_KINDS.filter((config) => only.includes(config.kind)) : JOB_KINDS)
+        // No instrument model installed: its jobs stay pending harmlessly,
+        // so don't spin process_instrument_jobs (and flash a progress bar)
+        // on every drain trigger.
+        .filter((config) => config.kind !== "instrument_detection" || instrumentDetectionAvailable !== false);
 
       type JobStatus = { kind: string; pending: number; failed: number; completed: number };
 
@@ -1318,7 +1326,7 @@ export function App() {
         })
         .catch(() => {});
     },
-    [refreshAssets, searchQuery, activeFilter, audioAnalysisPaused]
+    [refreshAssets, searchQuery, activeFilter, audioAnalysisPaused, instrumentDetectionAvailable]
   );
 
   const refreshMaintenance = useCallback((libraryId: string) => {
@@ -1407,6 +1415,9 @@ export function App() {
 
   useEffect(() => {
     invoke<boolean>("audio_analysis_paused").then(setAudioAnalysisPaused).catch(() => {});
+    invoke<boolean>("instrument_detection_available")
+      .then(setInstrumentDetectionAvailable)
+      .catch(() => setInstrumentDetectionAvailable(false));
   }, []);
 
   const handleToggleAudioAnalysisPaused = useCallback(() => {
@@ -2458,7 +2469,7 @@ export function App() {
   // when nothing is selected. Backfills assets whose original jobs already
   // finished before a detector existed.
   const handleResyncSonicRadar = useCallback(async () => {
-    if (!activeLibraryId) return;
+    if (!activeLibraryId || resyncing) return;
     const ids = bulkAssetIds;
     if (ids.length === 0) {
       const ok = await confirmDialog(
@@ -2467,6 +2478,7 @@ export function App() {
       );
       if (!ok) return;
     }
+    setResyncing(true);
     setRefreshStatus(
       ids.length === 0
         ? "Queuing re-analysis for the library…"
@@ -2477,10 +2489,17 @@ export function App() {
         setRefreshStatus(
           queued > 0 ? `Re-analysing — ${queued} job${queued === 1 ? "" : "s"} queued` : "Nothing to re-analyse"
         );
-        if (queued > 0) runJobDrain(activeLibraryId);
+        if (queued > 0) {
+          // The backend caches (waveform strips) are about to be
+          // regenerated — drop the session memo so the next play re-fetches
+          // the fresh version rather than showing the pre-resync shape.
+          waveformStripCache.clear();
+          runJobDrain(activeLibraryId);
+        }
       })
-      .catch((error) => setRefreshStatus(`Re-analysis failed: ${String(error)}`));
-  }, [activeLibraryId, bulkAssetIds, runJobDrain]);
+      .catch((error) => setRefreshStatus(`Re-analysis failed: ${String(error)}`))
+      .finally(() => setResyncing(false));
+  }, [activeLibraryId, bulkAssetIds, runJobDrain, resyncing]);
 
   const handleExportSelected = useCallback(
     async (format?: "wav24") => {
@@ -3299,22 +3318,25 @@ export function App() {
             <button
               type="button"
               className="nav-heading-add radar-sync"
+              disabled={resyncing || !activeLibraryId}
               aria-label={
                 bulkAssetIds.length > 0
                   ? `Re-run analysis for ${bulkAssetIds.length} selected sound${bulkAssetIds.length === 1 ? "" : "s"}`
                   : "Re-run analysis for the whole library"
               }
               title={
-                bulkAssetIds.length > 0
-                  ? `Re-run analysis for ${bulkAssetIds.length} selected sound${bulkAssetIds.length === 1 ? "" : "s"}`
-                  : "Re-run analysis for the whole library (nothing selected)"
+                resyncing
+                  ? "Queuing re-analysis…"
+                  : bulkAssetIds.length > 0
+                    ? `Re-run analysis for ${bulkAssetIds.length} selected sound${bulkAssetIds.length === 1 ? "" : "s"}`
+                    : "Re-run analysis for the whole library (nothing selected)"
               }
               onClick={(event) => {
                 event.stopPropagation();
                 handleResyncSonicRadar();
               }}
             >
-              <RefreshCw size={13} />
+              <RefreshCw size={13} className={resyncing ? "spin" : undefined} />
             </button>
             <button
               type="button"

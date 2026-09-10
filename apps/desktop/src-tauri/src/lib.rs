@@ -439,9 +439,14 @@ fn maintenance_report(
         }
     }
 
+    // One finding per pending job, but capped: a whole-library re-sync (ADR
+    // 0032) or a fresh bulk import can leave thousands pending for a few
+    // minutes, and the maintenance panel only shows a count — thousands of
+    // identical finding structs would be a pointless payload.
     let pending_waveforms = catalog
         .pending_job_count(JobKind::WaveformGeneration)
-        .map_err(storage_error_message)?;
+        .map_err(storage_error_message)?
+        .min(100);
     for _ in 0..pending_waveforms {
         findings.push(maintenance::MaintenanceFinding {
             kind: maintenance::MaintenanceFindingKind::StaleWaveformCache,
@@ -1940,12 +1945,20 @@ async fn process_one_instrument_job(
 
     let catalog = state.0.lock().expect("catalog mutex poisoned");
     match detected {
-        Ok(Ok(instruments)) => {
-            if let Err(error) = catalog.set_asset_instruments(job.asset_id, &instruments) {
-                eprintln!("instrument-detection: persist failed for job {}: {error}", job.id);
+        Ok(Ok(instruments)) => match catalog.set_asset_instruments(job.asset_id, &instruments) {
+            Ok(()) => {
+                let _ = catalog.complete_job(job.id);
             }
-            let _ = catalog.complete_job(job.id);
-        }
+            Err(error) => {
+                // Persist failed (transient DB error) — leave it failed so
+                // the standing worker retries, rather than completing a job
+                // that stored nothing.
+                let message = format!("could not persist instruments: {error}");
+                if let Err(fail_error) = catalog.fail_job(job.id, &message) {
+                    eprintln!("instrument-detection: failed to record persist failure: {fail_error:?}");
+                }
+            }
+        },
         Ok(Err(error)) => {
             if let Err(fail_error) = catalog.fail_job(job.id, &error) {
                 eprintln!("instrument-detection: failed to record failure: {fail_error:?}");
@@ -1964,9 +1977,12 @@ async fn process_one_instrument_job(
 /// library when nothing is selected — so assets whose original jobs
 /// already completed pick up newer detection (ADR 0032). Returns the total
 /// number of jobs queued; the frontend then drives the normal drain.
-#[tauri::command]
+// (async): the whole-library form runs bulk INSERT…SELECT over the entire
+// assets table three times; on a large library that's enough work that it
+// must not sit on the main thread (ADR 0024's recurring lesson).
+#[tauri::command(async)]
 fn resync_analysis(
-    state: tauri::State<CatalogState>,
+    state: tauri::State<'_, CatalogState>,
     library_id: String,
     asset_ids: Vec<String>,
 ) -> Result<usize, String> {
@@ -1995,6 +2011,27 @@ fn resync_analysis(
         };
     }
     Ok(queued)
+}
+
+/// Whether instrument detection can actually run — the model is loaded, or
+/// its files are present and will load on the next job. The frontend uses
+/// this to drop `instrument_detection` from the job-drain loop when there's
+/// no model, so a library full of pending detection jobs doesn't flash a
+/// "Detecting instruments 0%" bar on every background tick forever.
+#[tauri::command]
+fn instrument_detection_available(
+    app: tauri::AppHandle,
+    model_state: tauri::State<'_, InstrumentModelState>,
+) -> bool {
+    if model_state
+        .model
+        .lock()
+        .expect("instrument model mutex poisoned")
+        .is_some()
+    {
+        return true;
+    }
+    instrument_model_paths(&app).is_some()
 }
 
 #[derive(serde::Serialize)]
@@ -3568,6 +3605,7 @@ pub fn run() {
             process_audio_analysis_jobs,
             process_waveform_jobs,
             process_instrument_jobs,
+            instrument_detection_available,
             resync_analysis,
             instruments_for_library,
             assets_by_instruments,

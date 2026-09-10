@@ -794,7 +794,8 @@ impl Catalog {
     }
 
     /// Same as `requeue_analysis_for_library` but scoped to an explicit set
-    /// of assets (the Sonic Radar sync button with a selection).
+    /// of assets (the Sonic Radar sync button with a selection). Two bulk
+    /// statements regardless of selection size — not a per-asset loop.
     pub fn requeue_analysis_for_assets(
         &self,
         asset_ids: &[Uuid],
@@ -806,25 +807,40 @@ impl Catalog {
         }
         let kind_db = job_kind_to_db(&kind);
         let now = Utc::now().to_rfc3339();
-        let mut queued = 0usize;
-        for asset_id in asset_ids {
-            let id = asset_id.to_string();
-            self.connection.execute(
-                "DELETE FROM background_jobs
-                 WHERE asset_id = ?1 AND kind = ?2 AND state != 'processing'",
-                params![id, kind_db],
-            )?;
-            queued += self.connection.execute(
-                "INSERT INTO background_jobs (id, asset_id, kind, priority, state, attempts, created_at, updated_at)
-                 SELECT lower(hex(randomblob(16))), ?1, ?2, ?3, 'pending', 0, ?4, ?4
-                 WHERE EXISTS (SELECT 1 FROM assets WHERE id = ?1)
-                   AND NOT EXISTS (
-                     SELECT 1 FROM background_jobs
-                     WHERE asset_id = ?1 AND kind = ?2 AND state = 'processing'
-                   )",
-                params![id, kind_db, priority, now],
-            )?;
-        }
+        let placeholders = vec!["?"; asset_ids.len()].join(", ");
+        let ids: Vec<String> = asset_ids.iter().map(|id| id.to_string()).collect();
+
+        let delete_sql = format!(
+            "DELETE FROM background_jobs
+             WHERE kind = ?1 AND state != 'processing' AND asset_id IN ({placeholders})"
+        );
+        let mut delete_params: Vec<Box<dyn rusqlite::ToSql>> = vec![Box::new(kind_db.to_string())];
+        delete_params.extend(ids.iter().map(|id| Box::new(id.clone()) as Box<dyn rusqlite::ToSql>));
+        self.connection.execute(
+            &delete_sql,
+            params_from_iter(delete_params.iter().map(|p| p.as_ref())),
+        )?;
+
+        let insert_sql = format!(
+            "INSERT INTO background_jobs (id, asset_id, kind, priority, state, attempts, created_at, updated_at)
+             SELECT lower(hex(randomblob(16))), a.id, ?1, ?2, 'pending', 0, ?3, ?3
+             FROM assets a
+             WHERE a.id IN ({placeholders})
+               AND NOT EXISTS (
+                 SELECT 1 FROM background_jobs j
+                 WHERE j.asset_id = a.id AND j.kind = ?1 AND j.state = 'processing'
+               )"
+        );
+        let mut insert_params: Vec<Box<dyn rusqlite::ToSql>> = vec![
+            Box::new(kind_db.to_string()),
+            Box::new(priority),
+            Box::new(now),
+        ];
+        insert_params.extend(ids.iter().map(|id| Box::new(id.clone()) as Box<dyn rusqlite::ToSql>));
+        let queued = self.connection.execute(
+            &insert_sql,
+            params_from_iter(insert_params.iter().map(|p| p.as_ref())),
+        )?;
         Ok(queued)
     }
 
@@ -891,11 +907,20 @@ impl Catalog {
             "UPDATE assets SET waveform_version = waveform_version + 1 WHERE id = ?1",
             params![asset_id.to_string()],
         )?;
-        let version: i64 = self.connection.query_row(
-            "SELECT waveform_version FROM assets WHERE id = ?1",
-            params![asset_id.to_string()],
-            |row| row.get(0),
-        )?;
+        // Asset deleted between decode and persist (a fast trash while a
+        // job or the client fallback was in flight): nothing to cache, and
+        // the FK on waveform_peaks would reject the insert anyway.
+        let Some(version) = self
+            .connection
+            .query_row(
+                "SELECT waveform_version FROM assets WHERE id = ?1",
+                params![asset_id.to_string()],
+                |row| row.get::<_, i64>(0),
+            )
+            .optional()?
+        else {
+            return Ok(());
+        };
         self.connection.execute(
             "INSERT INTO waveform_peaks (asset_id, waveform_version, sample_rate, payload, generated_at)
              VALUES (?1, ?2, ?3, ?4, ?5)
@@ -4095,17 +4120,36 @@ mod tests {
             1
         );
 
-        // Selection-scoped form queues just the named asset.
+        // Selection-scoped form: bulk, queues exactly one job per named
+        // asset, and de-dupes a second call (delete-then-insert).
         let scoped = catalog
-            .requeue_analysis_for_assets(&[done.id], JobKind::InstrumentDetection, 50)
+            .requeue_analysis_for_assets(&[done.id, running.id], JobKind::InstrumentDetection, 50)
             .expect("scoped");
-        assert_eq!(scoped, 1);
+        assert_eq!(scoped, 2);
+        let scoped_again = catalog
+            .requeue_analysis_for_assets(&[done.id, running.id], JobKind::InstrumentDetection, 50)
+            .expect("scoped again");
+        assert_eq!(scoped_again, 2);
         assert_eq!(
             catalog
                 .pending_job_count(JobKind::InstrumentDetection)
                 .expect("count"),
-            1
+            2
         );
+    }
+
+    #[test]
+    fn set_waveform_cache_is_a_no_op_for_a_deleted_asset() {
+        let catalog_path = unique_catalog_path("waveform-cache-missing");
+        let catalog = Catalog::open(&catalog_path).expect("open catalog");
+        let missing = Uuid::new_v4();
+        assert!(catalog
+            .set_waveform_cache(missing, 48_000, "{\"peaks\":[]}")
+            .is_ok());
+        assert!(catalog
+            .get_waveform_cache(missing)
+            .expect("query")
+            .is_none());
     }
 
     #[test]
