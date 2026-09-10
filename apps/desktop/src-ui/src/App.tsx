@@ -385,12 +385,23 @@ function formatMediaRootStatus(status: string | undefined): string {
 // plain language, rather than a generic "N processed" that doesn't say
 // what the work even was or what to do about failures.
 function describeJobCompletion(summary: JobCompletionSummary): { headline: string; detail: string | null } {
-  const noun = summary.kind === "audio_analysis" ? "sound" : "file";
-  const verb = summary.kind === "audio_analysis" ? "analyzing" : "reading";
+  const noun = summary.kind === "metadata_extraction" ? "file" : "sound";
+  const verb =
+    summary.kind === "audio_analysis"
+      ? "analyzing"
+      : summary.kind === "waveform_generation"
+        ? "drawing waveforms for"
+        : "reading";
+  const failedVerb =
+    summary.kind === "audio_analysis"
+      ? "analyze"
+      : summary.kind === "waveform_generation"
+        ? "draw waveforms for"
+        : "read";
   const headline =
     summary.completed > 0
       ? `Finished ${verb} ${summary.completed} ${noun}${summary.completed === 1 ? "" : "s"}`
-      : `Couldn't ${summary.kind === "audio_analysis" ? "analyze" : "read"} ${summary.failed} ${noun}${summary.failed === 1 ? "" : "s"}`;
+      : `Couldn't ${failedVerb} ${summary.failed} ${noun}${summary.failed === 1 ? "" : "s"}`;
   if (summary.failed === 0) {
     return {
       headline,
@@ -414,8 +425,31 @@ function describeJobCompletion(summary: JobCompletionSummary): { headline: strin
 }
 
 const activeBarTrailLength = 10;
+const WAVEFORM_STRIP_BUCKETS = 200;
 
-async function computePeaks(path: string, bucketCount = 200): Promise<number[] | null> {
+// Session cache of transport-strip peaks keyed by asset id. The backend
+// (get_waveform) is the durable cache — this just avoids re-invoking it,
+// or re-running the client fallback, while browsing the same list. Bounded
+// so a long session can't grow it without limit.
+const waveformStripCache = new Map<string, number[]>();
+function rememberWaveformStrip(assetId: string, peaks: number[]): void {
+  waveformStripCache.delete(assetId);
+  waveformStripCache.set(assetId, peaks);
+  if (waveformStripCache.size > 512) {
+    const oldest = waveformStripCache.keys().next().value;
+    if (oldest !== undefined) waveformStripCache.delete(oldest);
+  }
+}
+
+// Fallback used only when the backend has no cached waveform yet (a freshly
+// imported asset whose WaveformGeneration job hasn't run, or a library
+// pre-dating waveform caching). Decodes the whole file once in the WebView;
+// the caller persists the result via store_waveform_peaks so this never
+// runs twice for the same asset.
+async function computePeaks(
+  path: string,
+  bucketCount = WAVEFORM_STRIP_BUCKETS
+): Promise<{ peaks: number[]; sampleRate: number } | null> {
   try {
     const response = await fetch(convertFileSrc(path));
     const arrayBuffer = await response.arrayBuffer();
@@ -435,8 +469,9 @@ async function computePeaks(path: string, bucketCount = 200): Promise<number[] |
       }
       peaks.push(max);
     }
+    const sampleRate = audioBuffer.sampleRate;
     audioContext.close();
-    return peaks;
+    return { peaks, sampleRate };
   } catch {
     return null;
   }
@@ -532,8 +567,13 @@ type JobCompletionSummary = {
   failedExtensions: string[];
 };
 
-const JOB_KINDS: { command: "process_pending_jobs" | "process_audio_analysis_jobs"; kind: string; label: string }[] = [
+const JOB_KINDS: {
+  command: "process_pending_jobs" | "process_waveform_jobs" | "process_audio_analysis_jobs";
+  kind: string;
+  label: string;
+}[] = [
   { command: "process_pending_jobs", kind: "metadata_extraction", label: "Reading metadata" },
+  { command: "process_waveform_jobs", kind: "waveform_generation", label: "Building waveforms" },
   { command: "process_audio_analysis_jobs", kind: "audio_analysis", label: "Analyzing audio" }
 ];
 
@@ -1419,16 +1459,51 @@ export function App() {
 
     audio.src = convertFileSrc(path);
     setPlayingAssetId(asset.id);
-    setPeaks(null);
     if (autoplay) {
       audio.play().catch(() => setIsPlaying(false));
     }
 
     const requestId = ++peakRequestId.current;
-    computePeaks(path).then((computed) => {
-      if (peakRequestId.current === requestId) setPeaks(computed);
-      if (computed) invoke("mark_waveform_ready", { assetId: asset.id }).catch(() => {});
-    });
+    const isCurrent = () => peakRequestId.current === requestId;
+
+    // 1. Session memo — no round-trip at all while browsing the same list.
+    const memoized = waveformStripCache.get(asset.id);
+    if (memoized) {
+      setPeaks(memoized);
+      return;
+    }
+    setPeaks(null);
+
+    // 2. Durable backend cache — a hit means the source file is never read.
+    try {
+      const cached = await invoke<{ peaks: number[]; sample_rate: number } | null>("get_waveform", {
+        assetId: asset.id
+      });
+      if (cached && cached.peaks.length > 0) {
+        rememberWaveformStrip(asset.id, cached.peaks);
+        if (isCurrent()) setPeaks(cached.peaks);
+        return;
+      }
+    } catch {
+      // fall through to the client-side compute
+    }
+    if (!isCurrent()) return;
+
+    // 3. Miss — decode once in the WebView, render it, and hand it back to
+    //    the backend so this asset is a cache hit from here on.
+    const computed = await computePeaks(path);
+    if (!isCurrent()) return;
+    if (computed) {
+      rememberWaveformStrip(asset.id, computed.peaks);
+      setPeaks(computed.peaks);
+      invoke("store_waveform_peaks", {
+        assetId: asset.id,
+        peaks: computed.peaks,
+        sampleRate: Math.round(computed.sampleRate) || 44_100
+      }).catch(() => {});
+    } else {
+      setPeaks(null);
+    }
   }, []);
 
   const togglePlayback = useCallback(() => {
@@ -1501,6 +1576,10 @@ export function App() {
 
       invoke("relink_asset", { assetId: asset.id, newPath })
         .then(() => {
+          // The relinked file is a different file — drop the remembered
+          // strip so the next play loads the new file's shape (the backend
+          // cache was cleared server-side and a fresh job enqueued).
+          waveformStripCache.delete(asset.id);
           if (activeLibraryId) refreshAssets(activeLibraryId, searchQuery, activeFilter);
         })
         .catch(() => {});

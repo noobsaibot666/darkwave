@@ -877,6 +877,7 @@ dependencies = [
  "tokio",
  "trash",
  "uuid",
+ "waveform",
  "workspace-state",
 ]
 
@@ -6279,6 +6280,10 @@ dependencies = [
 [[package]]
 name = "waveform"
 version = "0.1.0"
+dependencies = [
+ "serde",
+ "serde_json",
+]
 
 [[package]]
 name = "wayland-backend"

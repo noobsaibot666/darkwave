@@ -126,6 +126,20 @@ pub enum ReviewState {
     Reviewed,
 }
 
+/// A persisted waveform peak payload for one asset — the output of the
+/// `WaveformGeneration` job, so browsing an asset never has to decode its
+/// source file again just to draw the transport strip. `payload` is an
+/// opaque JSON string owned by the desktop shell (the `waveform` crate's
+/// `WaveformCache` plus a flat transport strip); storage only persists and
+/// returns it verbatim. `waveform_version` mirrors `assets.waveform_version`
+/// at the time the payload was generated, so a stale cache can be detected.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct WaveformCacheRow {
+    pub sample_rate: i64,
+    pub payload: String,
+    pub waveform_version: i64,
+}
+
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub enum JobKind {
     MetadataExtraction,
@@ -299,6 +313,23 @@ impl Catalog {
     pub fn open(path: impl AsRef<Path>) -> Result<Self, StorageError> {
         let connection = Connection::open(path)?;
         connection.pragma_update(None, "foreign_keys", "ON")?;
+        // The whole app funnels every catalog read and write through one
+        // connection behind a single mutex. WAL lets the in-flight
+        // background writes (import registration, analysis results, waveform
+        // payloads) stop blocking the interactive reads queued behind them,
+        // which is the difference between "the UI is sluggish while a big
+        // import runs" and not. `synchronous = NORMAL` is the standard,
+        // safe-under-WAL pairing (a crash can lose the last commit, never
+        // corrupt the file). `busy_timeout` covers the rare moment another
+        // handle touches the file — a backup copy, an external inspector —
+        // instead of erroring straight out. The live catalog always lives
+        // on local app-data storage (see `run()`), so WAL's shared-memory
+        // requirement is never an issue here; a failure to set it (e.g. a
+        // catalog handed a path on an exotic filesystem) is not fatal.
+        let _ = connection.pragma_update(None, "journal_mode", "WAL");
+        let _ = connection.pragma_update(None, "synchronous", "NORMAL");
+        let _ = connection.pragma_update(None, "busy_timeout", 5_000);
+        let _ = connection.pragma_update(None, "temp_store", "MEMORY");
         let catalog = Self { connection };
         catalog.migrate()?;
         Ok(catalog)
@@ -747,6 +778,82 @@ impl Catalog {
                 update.perceptual_fingerprint,
                 asset_id.to_string(),
             ],
+        )?;
+        Ok(())
+    }
+
+    /// Persists (or replaces) the waveform peak payload for an asset and
+    /// bumps `assets.waveform_version` so the stored row's own
+    /// `waveform_version` matches. Called by the `WaveformGeneration` job
+    /// after it decodes the source once, and by the desktop shell's
+    /// client-side fallback so even that path only ever pays the decode
+    /// cost once.
+    pub fn set_waveform_cache(
+        &self,
+        asset_id: Uuid,
+        sample_rate: i64,
+        payload: &str,
+    ) -> Result<(), StorageError> {
+        let now = Utc::now().to_rfc3339();
+        self.connection.execute(
+            "UPDATE assets SET waveform_version = waveform_version + 1 WHERE id = ?1",
+            params![asset_id.to_string()],
+        )?;
+        let version: i64 = self.connection.query_row(
+            "SELECT waveform_version FROM assets WHERE id = ?1",
+            params![asset_id.to_string()],
+            |row| row.get(0),
+        )?;
+        self.connection.execute(
+            "INSERT INTO waveform_peaks (asset_id, waveform_version, sample_rate, payload, generated_at)
+             VALUES (?1, ?2, ?3, ?4, ?5)
+             ON CONFLICT(asset_id) DO UPDATE SET
+               waveform_version = excluded.waveform_version,
+               sample_rate = excluded.sample_rate,
+               payload = excluded.payload,
+               generated_at = excluded.generated_at",
+            params![
+                asset_id.to_string(),
+                version,
+                sample_rate,
+                payload,
+                now,
+            ],
+        )?;
+        Ok(())
+    }
+
+    /// Returns the cached waveform payload for an asset, or `None` if it has
+    /// never been generated (or was invalidated by `clear_waveform_cache`).
+    pub fn get_waveform_cache(
+        &self,
+        asset_id: Uuid,
+    ) -> Result<Option<WaveformCacheRow>, StorageError> {
+        self.connection
+            .query_row(
+                "SELECT sample_rate, payload, waveform_version
+                 FROM waveform_peaks WHERE asset_id = ?1",
+                params![asset_id.to_string()],
+                |row| {
+                    Ok(WaveformCacheRow {
+                        sample_rate: row.get(0)?,
+                        payload: row.get(1)?,
+                        waveform_version: row.get(2)?,
+                    })
+                },
+            )
+            .optional()
+            .map_err(StorageError::from)
+    }
+
+    /// Drops an asset's cached waveform payload — used when the underlying
+    /// file changes out from under the catalog (a relink), so the next
+    /// preview regenerates it from the new source rather than showing the
+    /// old file's shape.
+    pub fn clear_waveform_cache(&self, asset_id: Uuid) -> Result<(), StorageError> {
+        self.connection.execute(
+            "DELETE FROM waveform_peaks WHERE asset_id = ?1",
+            params![asset_id.to_string()],
         )?;
         Ok(())
     }
@@ -1541,6 +1648,11 @@ impl Catalog {
             ],
         )?;
 
+        // The relinked file is a different file on disk — its old waveform
+        // shape no longer describes it. Drop the cache so the next preview
+        // regenerates from the new source.
+        self.clear_waveform_cache(asset_id)?;
+
         Ok(())
     }
 
@@ -1830,7 +1942,7 @@ impl Catalog {
             .query_map(params![library_id.to_string()], |row| {
                 row.get::<_, String>(0)
             })?
-            .map(|result| result.map(|id| parse_uuid(id)))
+            .map(|result| result.map(parse_uuid))
             .collect::<Result<std::collections::HashSet<_>, _>>()
             .map_err(StorageError::from)?;
 
@@ -2033,6 +2145,14 @@ impl Catalog {
               embedded_title TEXT,
               embedded_genre TEXT,
               embedded_comment TEXT
+            );
+
+            CREATE TABLE IF NOT EXISTS waveform_peaks (
+              asset_id TEXT PRIMARY KEY REFERENCES assets(id) ON DELETE CASCADE,
+              waveform_version INTEGER NOT NULL,
+              sample_rate INTEGER NOT NULL,
+              payload TEXT NOT NULL,
+              generated_at TEXT NOT NULL
             );
 
             CREATE TABLE IF NOT EXISTS background_jobs (
@@ -3820,6 +3940,82 @@ mod tests {
             AssetPath::Referenced("/new/location/moved.wav".to_string())
         );
         assert_eq!(loaded.availability_state, AvailabilityState::Local);
+    }
+
+    #[test]
+    fn open_enables_wal_journal_mode() {
+        let catalog_path = unique_catalog_path("wal");
+        let catalog = Catalog::open(&catalog_path).expect("open catalog");
+        let mode: String = catalog
+            .connection
+            .query_row("PRAGMA journal_mode", [], |row| row.get(0))
+            .expect("journal_mode");
+        assert_eq!(mode.to_lowercase(), "wal");
+    }
+
+    #[test]
+    fn waveform_cache_is_stored_retrieved_and_versioned() {
+        let catalog_path = unique_catalog_path("waveform-cache");
+        let catalog = Catalog::open(&catalog_path).expect("open catalog");
+        let library = catalog
+            .create_library("Waves", "/library")
+            .expect("library");
+        let asset = test_asset(&catalog, library.id, "hit.wav", "hash-hit");
+
+        assert!(catalog
+            .get_waveform_cache(asset.id)
+            .expect("query")
+            .is_none());
+
+        catalog
+            .set_waveform_cache(asset.id, 48_000, "{\"peaks\":[0.1,0.9]}")
+            .expect("store");
+        let first = catalog
+            .get_waveform_cache(asset.id)
+            .expect("query")
+            .expect("row");
+        assert_eq!(first.sample_rate, 48_000);
+        assert_eq!(first.payload, "{\"peaks\":[0.1,0.9]}");
+        assert_eq!(first.waveform_version, 1);
+
+        // Regenerating replaces the row in place and advances the version.
+        catalog
+            .set_waveform_cache(asset.id, 44_100, "{\"peaks\":[0.2]}")
+            .expect("restore");
+        let second = catalog
+            .get_waveform_cache(asset.id)
+            .expect("query")
+            .expect("row");
+        assert_eq!(second.sample_rate, 44_100);
+        assert_eq!(second.waveform_version, 2);
+
+        catalog.clear_waveform_cache(asset.id).expect("clear");
+        assert!(catalog
+            .get_waveform_cache(asset.id)
+            .expect("query")
+            .is_none());
+    }
+
+    #[test]
+    fn relink_drops_the_stale_waveform_cache() {
+        let catalog_path = unique_catalog_path("waveform-relink");
+        let catalog = Catalog::open(&catalog_path).expect("open catalog");
+        let library = catalog
+            .create_library("Waves", "/library")
+            .expect("library");
+        let asset = test_asset(&catalog, library.id, "moved.wav", "hash-moved");
+        catalog
+            .set_waveform_cache(asset.id, 48_000, "{\"peaks\":[0.5]}")
+            .expect("store");
+
+        catalog
+            .relink_asset(asset.id, "/new/location/moved.wav")
+            .expect("relink");
+
+        assert!(catalog
+            .get_waveform_cache(asset.id)
+            .expect("query")
+            .is_none());
     }
 
     #[test]
