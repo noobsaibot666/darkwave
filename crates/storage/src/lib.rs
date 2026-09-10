@@ -93,12 +93,20 @@ pub struct AssetRecord {
     pub bpm: Option<f64>,
     pub bpm_confidence: Option<f64>,
     /// Best-effort detected pitch note name (e.g. "A4"), not a musical key —
-    /// see docs/adr/0025-real-audio-analysis.md.
+    /// a monophonic estimate, best on single-source SFX/ambience/drones. See
+    /// docs/adr/0025-real-audio-analysis.md. For the polyphonic musical key
+    /// (e.g. "A minor") use `detected_key`.
     pub musical_key: Option<String>,
     pub key_confidence: Option<f64>,
     /// Fraction of the clip Silero VAD classifies as speech (ADR 0027).
     /// `None` until the analysis job runs, or if it couldn't run at all.
     pub vocal_ratio: Option<f64>,
+    /// Krumhansl-Schmuckler musical key, e.g. "C major" / "A minor" (ADR
+    /// 0030). `None` until analysis runs, or if the material is too atonal
+    /// to call.
+    pub detected_key: Option<String>,
+    /// Chromagram/profile correlation behind `detected_key`, ~0.0..=1.0.
+    pub key_strength: Option<f64>,
 }
 
 /// Fields written by the `AudioAnalysis` background job. `None` leaves the
@@ -118,6 +126,8 @@ pub struct AudioAnalysisUpdate {
     pub musical_key: Option<String>,
     pub key_confidence: Option<f64>,
     pub perceptual_fingerprint: Option<String>,
+    pub detected_key: Option<String>,
+    pub key_strength: Option<f64>,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
@@ -146,6 +156,7 @@ pub enum JobKind {
     Hashing,
     WaveformGeneration,
     AudioAnalysis,
+    InstrumentDetection,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -523,7 +534,7 @@ impl Catalog {
                 storage_mode, content_hash, media_type, file_size, availability_state, review_state, favorite,
                     embedded_title, embedded_genre, embedded_comment,
                     duration_ms, sample_rate, bit_depth, channels, loudness_lufs, peak_db,
-                    bpm, bpm_confidence, musical_key, key_confidence, vocal_ratio
+                    bpm, bpm_confidence, musical_key, key_confidence, vocal_ratio, detected_key, key_strength
              FROM assets
              WHERE library_id = ?1
                AND NOT EXISTS (
@@ -739,6 +750,84 @@ impl Catalog {
         Ok(changed)
     }
 
+    /// User-initiated "re-run this analysis" (the Sonic Radar sync button).
+    /// For every non-trashed asset in `library_id`, drops any of its
+    /// `kind` jobs that isn't already mid-flight and queues one fresh
+    /// pending job, so re-analysis picks up assets whose original job long
+    /// since completed (the backfill path ADRs 0029-0031 left open).
+    /// Returns the number of jobs queued.
+    pub fn requeue_analysis_for_library(
+        &self,
+        library_id: Uuid,
+        kind: JobKind,
+        priority: i64,
+    ) -> Result<usize, StorageError> {
+        let kind_db = job_kind_to_db(&kind);
+        self.connection.execute(
+            "DELETE FROM background_jobs
+             WHERE kind = ?1 AND state != 'processing'
+               AND asset_id IN (
+                 SELECT id FROM assets WHERE library_id = ?2
+                   AND NOT EXISTS (
+                     SELECT 1 FROM trash_items t
+                     WHERE t.asset_id = assets.id AND t.state = 'in_trash'
+                   )
+               )",
+            params![kind_db, library_id.to_string()],
+        )?;
+        let now = Utc::now().to_rfc3339();
+        let queued = self.connection.execute(
+            "INSERT INTO background_jobs (id, asset_id, kind, priority, state, attempts, created_at, updated_at)
+             SELECT lower(hex(randomblob(16))), a.id, ?1, ?2, 'pending', 0, ?3, ?3
+             FROM assets a
+             WHERE a.library_id = ?4
+               AND NOT EXISTS (
+                 SELECT 1 FROM trash_items t WHERE t.asset_id = a.id AND t.state = 'in_trash'
+               )
+               AND NOT EXISTS (
+                 SELECT 1 FROM background_jobs j
+                 WHERE j.asset_id = a.id AND j.kind = ?1 AND j.state = 'processing'
+               )",
+            params![kind_db, priority, now, library_id.to_string()],
+        )?;
+        Ok(queued)
+    }
+
+    /// Same as `requeue_analysis_for_library` but scoped to an explicit set
+    /// of assets (the Sonic Radar sync button with a selection).
+    pub fn requeue_analysis_for_assets(
+        &self,
+        asset_ids: &[Uuid],
+        kind: JobKind,
+        priority: i64,
+    ) -> Result<usize, StorageError> {
+        if asset_ids.is_empty() {
+            return Ok(0);
+        }
+        let kind_db = job_kind_to_db(&kind);
+        let now = Utc::now().to_rfc3339();
+        let mut queued = 0usize;
+        for asset_id in asset_ids {
+            let id = asset_id.to_string();
+            self.connection.execute(
+                "DELETE FROM background_jobs
+                 WHERE asset_id = ?1 AND kind = ?2 AND state != 'processing'",
+                params![id, kind_db],
+            )?;
+            queued += self.connection.execute(
+                "INSERT INTO background_jobs (id, asset_id, kind, priority, state, attempts, created_at, updated_at)
+                 SELECT lower(hex(randomblob(16))), ?1, ?2, ?3, 'pending', 0, ?4, ?4
+                 WHERE EXISTS (SELECT 1 FROM assets WHERE id = ?1)
+                   AND NOT EXISTS (
+                     SELECT 1 FROM background_jobs
+                     WHERE asset_id = ?1 AND kind = ?2 AND state = 'processing'
+                   )",
+                params![id, kind_db, priority, now],
+            )?;
+        }
+        Ok(queued)
+    }
+
     pub fn set_embedded_metadata(
         &self,
         asset_id: Uuid,
@@ -762,7 +851,8 @@ impl Catalog {
             "UPDATE assets SET
                 duration_ms = ?1, sample_rate = ?2, bit_depth = ?3, channels = ?4,
                 loudness_lufs = ?5, peak_db = ?6, bpm = ?7, bpm_confidence = ?8,
-                musical_key = ?9, key_confidence = ?10, perceptual_fingerprint = ?11
+                musical_key = ?9, key_confidence = ?10, perceptual_fingerprint = ?11,
+                detected_key = ?13, key_strength = ?14
              WHERE id = ?12",
             params![
                 update.duration_ms,
@@ -777,6 +867,8 @@ impl Catalog {
                 update.key_confidence,
                 update.perceptual_fingerprint,
                 asset_id.to_string(),
+                update.detected_key,
+                update.key_strength,
             ],
         )?;
         Ok(())
@@ -856,6 +948,114 @@ impl Catalog {
             params![asset_id.to_string()],
         )?;
         Ok(())
+    }
+
+    /// Replaces an asset's detected-instrument list (the output of the
+    /// `InstrumentDetection` job). An empty slice clears it — a valid
+    /// result meaning "the model found nothing", distinct from "not yet
+    /// analysed" (no rows and a still-pending job).
+    pub fn set_asset_instruments(
+        &self,
+        asset_id: Uuid,
+        instruments: &[(String, f64)],
+    ) -> Result<(), StorageError> {
+        self.connection.execute(
+            "DELETE FROM asset_instruments WHERE asset_id = ?1",
+            params![asset_id.to_string()],
+        )?;
+        for (instrument, confidence) in instruments {
+            self.connection.execute(
+                "INSERT OR REPLACE INTO asset_instruments (asset_id, instrument, confidence)
+                 VALUES (?1, ?2, ?3)",
+                params![asset_id.to_string(), instrument, confidence],
+            )?;
+        }
+        Ok(())
+    }
+
+    /// One asset's detected instruments, strongest first.
+    pub fn instruments_for_asset(
+        &self,
+        asset_id: Uuid,
+    ) -> Result<Vec<(String, f64)>, StorageError> {
+        let mut statement = self.connection.prepare(
+            "SELECT instrument, confidence FROM asset_instruments
+             WHERE asset_id = ?1 ORDER BY confidence DESC, instrument ASC",
+        )?;
+        let rows = statement
+            .query_map(params![asset_id.to_string()], |row| {
+                Ok((row.get::<_, String>(0)?, row.get::<_, f64>(1)?))
+            })?
+            .collect::<Result<Vec<_>, _>>()?;
+        Ok(rows)
+    }
+
+    /// Every distinct instrument present in a library with a count of
+    /// non-trashed assets that have it — the facet for the instrument page.
+    /// Ordered by count desc so the common instruments lead.
+    pub fn instrument_counts_for_library(
+        &self,
+        library_id: Uuid,
+    ) -> Result<Vec<(String, i64)>, StorageError> {
+        let mut statement = self.connection.prepare(
+            "SELECT ai.instrument, COUNT(*) AS n
+             FROM asset_instruments ai
+             JOIN assets a ON a.id = ai.asset_id
+             WHERE a.library_id = ?1
+               AND NOT EXISTS (
+                 SELECT 1 FROM trash_items t
+                 WHERE t.asset_id = a.id AND t.state = 'in_trash'
+               )
+             GROUP BY ai.instrument
+             ORDER BY n DESC, ai.instrument ASC",
+        )?;
+        let rows = statement
+            .query_map(params![library_id.to_string()], |row| {
+                Ok((row.get::<_, String>(0)?, row.get::<_, i64>(1)?))
+            })?
+            .collect::<Result<Vec<_>, _>>()?;
+        Ok(rows)
+    }
+
+    /// Non-trashed assets in a library that have ANY of `instruments`
+    /// (OR match). Empty `instruments` returns nothing.
+    pub fn assets_with_any_instrument(
+        &self,
+        library_id: Uuid,
+        instruments: &[String],
+    ) -> Result<Vec<AssetRecord>, StorageError> {
+        if instruments.is_empty() {
+            return Ok(Vec::new());
+        }
+        let placeholders = vec!["?"; instruments.len()].join(", ");
+        let sql = format!(
+            "SELECT DISTINCT assets.id, assets.library_id, assets.original_filename, assets.display_name,
+                assets.relative_path, assets.referenced_path, assets.storage_mode, assets.content_hash,
+                assets.media_type, assets.file_size, assets.availability_state, assets.review_state, assets.favorite,
+                assets.embedded_title, assets.embedded_genre, assets.embedded_comment,
+                assets.duration_ms, assets.sample_rate, assets.bit_depth, assets.channels,
+                assets.loudness_lufs, assets.peak_db, assets.bpm, assets.bpm_confidence,
+                assets.musical_key, assets.key_confidence, assets.vocal_ratio, assets.detected_key, assets.key_strength
+             FROM assets
+             JOIN asset_instruments ai ON ai.asset_id = assets.id
+             WHERE assets.library_id = ?1
+               AND ai.instrument IN ({placeholders})
+               AND NOT EXISTS (
+                 SELECT 1 FROM trash_items t
+                 WHERE t.asset_id = assets.id AND t.state = 'in_trash'
+               )
+             ORDER BY assets.date_added ASC"
+        );
+        let mut statement = self.connection.prepare(&sql)?;
+        let mut params: Vec<Box<dyn rusqlite::ToSql>> = Vec::with_capacity(instruments.len() + 1);
+        params.push(Box::new(library_id.to_string()));
+        for instrument in instruments {
+            params.push(Box::new(instrument.clone()));
+        }
+        let assets = statement
+            .query_map(params_from_iter(params.iter().map(|p| p.as_ref())), asset_from_row)?
+            .collect::<Result<Vec<_>, _>>()?;
+        Ok(assets)
     }
 
     /// (asset_id, perceptual_fingerprint JSON) pairs for every non-trashed
@@ -1277,7 +1477,7 @@ impl Catalog {
                 assets.embedded_title, assets.embedded_genre, assets.embedded_comment,
                 assets.duration_ms, assets.sample_rate, assets.bit_depth, assets.channels,
                 assets.loudness_lufs, assets.peak_db, assets.bpm, assets.bpm_confidence,
-                assets.musical_key, assets.key_confidence, assets.vocal_ratio
+                assets.musical_key, assets.key_confidence, assets.vocal_ratio, assets.detected_key, assets.key_strength
              FROM assets
              INNER JOIN collection_assets ON collection_assets.asset_id = assets.id
              WHERE collection_assets.collection_id = ?1
@@ -1441,7 +1641,7 @@ impl Catalog {
                 assets.embedded_title, assets.embedded_genre, assets.embedded_comment,
                 assets.duration_ms, assets.sample_rate, assets.bit_depth, assets.channels,
                 assets.loudness_lufs, assets.peak_db, assets.bpm, assets.bpm_confidence,
-                assets.musical_key, assets.key_confidence, assets.vocal_ratio
+                assets.musical_key, assets.key_confidence, assets.vocal_ratio, assets.detected_key, assets.key_strength
              FROM assets",
         );
         let mut query_params: Vec<rusqlite::types::Value> = vec![library_id.to_string().into()];
@@ -2155,6 +2355,15 @@ impl Catalog {
               generated_at TEXT NOT NULL
             );
 
+            CREATE TABLE IF NOT EXISTS asset_instruments (
+              asset_id TEXT NOT NULL REFERENCES assets(id) ON DELETE CASCADE,
+              instrument TEXT NOT NULL,
+              confidence REAL NOT NULL DEFAULT 0,
+              PRIMARY KEY (asset_id, instrument)
+            );
+            CREATE INDEX IF NOT EXISTS idx_asset_instruments_instrument
+              ON asset_instruments(instrument);
+
             CREATE TABLE IF NOT EXISTS background_jobs (
               id TEXT PRIMARY KEY,
               asset_id TEXT NOT NULL REFERENCES assets(id) ON DELETE CASCADE,
@@ -2294,6 +2503,8 @@ impl Catalog {
         self.ensure_column("collections", "export_path", "TEXT")?;
         self.ensure_column("collections", "sfx_export_path", "TEXT")?;
         self.ensure_column("assets", "vocal_ratio", "REAL")?;
+        self.ensure_column("assets", "detected_key", "TEXT")?;
+        self.ensure_column("assets", "key_strength", "REAL")?;
         self.ensure_column("libraries", "media_root_bookmark", "TEXT")?;
         self.ensure_column("libraries", "import_root", "TEXT")?;
 
@@ -2330,7 +2541,7 @@ impl Catalog {
                     storage_mode, content_hash, media_type, file_size, availability_state, review_state, favorite,
                     embedded_title, embedded_genre, embedded_comment,
                     duration_ms, sample_rate, bit_depth, channels, loudness_lufs, peak_db,
-                    bpm, bpm_confidence, musical_key, key_confidence, vocal_ratio
+                    bpm, bpm_confidence, musical_key, key_confidence, vocal_ratio, detected_key, key_strength
                  FROM assets WHERE id = ?1",
                 params![id.to_string()],
                 asset_from_row,
@@ -2351,7 +2562,7 @@ impl Catalog {
                     storage_mode, content_hash, media_type, file_size, availability_state, review_state, favorite,
                     embedded_title, embedded_genre, embedded_comment,
                     duration_ms, sample_rate, bit_depth, channels, loudness_lufs, peak_db,
-                    bpm, bpm_confidence, musical_key, key_confidence, vocal_ratio
+                    bpm, bpm_confidence, musical_key, key_confidence, vocal_ratio, detected_key, key_strength
                  FROM assets
                  WHERE library_id = ?1 AND content_hash = ?2 AND file_size = ?3
                  LIMIT 1",
@@ -2408,6 +2619,8 @@ fn asset_from_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<AssetRecord> {
         musical_key: row.get(24)?,
         key_confidence: row.get(25)?,
         vocal_ratio: row.get(26)?,
+        detected_key: row.get(27)?,
+        key_strength: row.get(28)?,
     })
 }
 
@@ -2636,6 +2849,7 @@ fn job_kind_to_db(kind: &JobKind) -> &'static str {
         JobKind::Hashing => "hashing",
         JobKind::WaveformGeneration => "waveform_generation",
         JobKind::AudioAnalysis => "audio_analysis",
+        JobKind::InstrumentDetection => "instrument_detection",
     }
 }
 
@@ -2644,6 +2858,7 @@ fn job_kind_from_db(value: &str) -> JobKind {
         "hashing" => JobKind::Hashing,
         "waveform_generation" => JobKind::WaveformGeneration,
         "audio_analysis" => JobKind::AudioAnalysis,
+        "instrument_detection" => JobKind::InstrumentDetection,
         _ => JobKind::MetadataExtraction,
     }
 }
@@ -3813,6 +4028,137 @@ mod tests {
             .expect("set vocal ratio");
 
         assert_eq!(catalog.get_vocal_ratio(asset.id).expect("get"), Some(0.82));
+    }
+
+    #[test]
+    fn detected_key_round_trips_through_audio_analysis() {
+        let catalog_path = unique_catalog_path("detected-key");
+        let catalog = Catalog::open(&catalog_path).expect("open catalog");
+        let library = catalog.create_library("Keys", "/library").expect("library");
+        let asset = test_asset(&catalog, library.id, "pad.wav", "hash-detected-key");
+
+        let loaded = catalog.get_asset(asset.id).expect("get").expect("exists");
+        assert_eq!(loaded.detected_key, None);
+        assert_eq!(loaded.key_strength, None);
+
+        catalog
+            .set_audio_analysis(
+                asset.id,
+                AudioAnalysisUpdate {
+                    detected_key: Some("A minor".to_string()),
+                    key_strength: Some(0.83),
+                    ..Default::default()
+                },
+            )
+            .expect("analysis");
+
+        let loaded = catalog.get_asset(asset.id).expect("get").expect("exists");
+        assert_eq!(loaded.detected_key.as_deref(), Some("A minor"));
+        assert_eq!(loaded.key_strength, Some(0.83));
+    }
+
+    #[test]
+    fn requeue_analysis_replaces_finished_jobs_but_leaves_in_flight_ones() {
+        let catalog_path = unique_catalog_path("requeue-analysis");
+        let catalog = Catalog::open(&catalog_path).expect("open catalog");
+        let library = catalog.create_library("Lib", "/library").expect("library");
+        let done = test_asset(&catalog, library.id, "done.wav", "hash-done");
+        let running = test_asset(&catalog, library.id, "running.wav", "hash-running");
+
+        // `done` has a completed analysis job; `running` has one mid-flight.
+        catalog
+            .enqueue_job(done.id, JobKind::AudioAnalysis, 40)
+            .expect("enqueue done");
+        let done_jobs = catalog
+            .claim_pending_jobs(JobKind::AudioAnalysis, 10)
+            .expect("claim");
+        for job in &done_jobs {
+            catalog.complete_job(job.id).expect("complete");
+        }
+        catalog
+            .enqueue_job(running.id, JobKind::AudioAnalysis, 40)
+            .expect("enqueue running");
+        catalog
+            .claim_pending_jobs(JobKind::AudioAnalysis, 10)
+            .expect("claim running");
+
+        let queued = catalog
+            .requeue_analysis_for_library(library.id, JobKind::AudioAnalysis, 40)
+            .expect("requeue");
+
+        // Only `done` gets a fresh pending job; `running` is left alone.
+        assert_eq!(queued, 1);
+        assert_eq!(
+            catalog
+                .pending_job_count(JobKind::AudioAnalysis)
+                .expect("count"),
+            1
+        );
+
+        // Selection-scoped form queues just the named asset.
+        let scoped = catalog
+            .requeue_analysis_for_assets(&[done.id], JobKind::InstrumentDetection, 50)
+            .expect("scoped");
+        assert_eq!(scoped, 1);
+        assert_eq!(
+            catalog
+                .pending_job_count(JobKind::InstrumentDetection)
+                .expect("count"),
+            1
+        );
+    }
+
+    #[test]
+    fn asset_instruments_store_facet_counts_and_or_filter() {
+        let catalog_path = unique_catalog_path("asset-instruments");
+        let catalog = Catalog::open(&catalog_path).expect("open catalog");
+        let library = catalog.create_library("Band", "/library").expect("library");
+        let track_a = test_asset(&catalog, library.id, "a.wav", "hash-a");
+        let track_b = test_asset(&catalog, library.id, "b.wav", "hash-b");
+        let track_c = test_asset(&catalog, library.id, "c.wav", "hash-c");
+
+        catalog
+            .set_asset_instruments(track_a.id, &[("Guitar".into(), 0.9), ("Drums".into(), 0.7)])
+            .expect("set a");
+        catalog
+            .set_asset_instruments(track_b.id, &[("Guitar".into(), 0.6), ("Piano".into(), 0.8)])
+            .expect("set b");
+        catalog
+            .set_asset_instruments(track_c.id, &[("Strings".into(), 0.5)])
+            .expect("set c");
+
+        assert_eq!(
+            catalog.instruments_for_asset(track_a.id).expect("a"),
+            vec![("Guitar".to_string(), 0.9), ("Drums".to_string(), 0.7)]
+        );
+
+        let counts = catalog
+            .instrument_counts_for_library(library.id)
+            .expect("counts");
+        assert_eq!(counts[0], ("Guitar".to_string(), 2));
+        assert!(counts.contains(&("Piano".to_string(), 1)));
+        assert!(counts.contains(&("Strings".to_string(), 1)));
+
+        // OR match: Guitar covers a + b, Strings adds c.
+        let mut hits = catalog
+            .assets_with_any_instrument(library.id, &["Guitar".into(), "Strings".into()])
+            .expect("filter")
+            .into_iter()
+            .map(|asset| asset.id)
+            .collect::<Vec<_>>();
+        hits.sort();
+        let mut expected = vec![track_a.id, track_b.id, track_c.id];
+        expected.sort();
+        assert_eq!(hits, expected);
+
+        // Re-running replaces rather than appends.
+        catalog
+            .set_asset_instruments(track_a.id, &[("Bass".into(), 0.95)])
+            .expect("replace a");
+        assert_eq!(
+            catalog.instruments_for_asset(track_a.id).expect("a2"),
+            vec![("Bass".to_string(), 0.95)]
+        );
     }
 
     #[test]

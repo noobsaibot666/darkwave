@@ -1,6 +1,18 @@
 use audio_metadata::DecodedAudioBuffer;
 use pitch_detection::detector::mcleod::McLeodDetector;
 use pitch_detection::detector::PitchDetector;
+use rustfft::{num_complex::Complex, FftPlanner};
+
+mod instruments;
+pub use instruments::{
+    detect_instruments, load_instrument_model, InstrumentModel, InstrumentPrediction,
+};
+
+/// Pitch-class names, index 0 = C. Shared by the pitch-note formatter and
+/// the key detector.
+const PITCH_CLASS_NAMES: [&str; 12] = [
+    "C", "C#", "D", "D#", "E", "F", "F#", "G", "G#", "A", "A#", "B",
+];
 
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub struct AudioMeasurements {
@@ -292,6 +304,176 @@ pub fn estimate_pitch(buffer: &DecodedAudioBuffer) -> Option<PitchEstimate> {
     })
 }
 
+// --- Musical key (Krumhansl-Schmuckler) --------------------------------------
+
+const KEY_FFT_SIZE: usize = 8192;
+const KEY_HOP_SIZE: usize = 4096;
+/// Analyse at most this many frames, taken from the middle of the clip — a
+/// track's key is stable enough that ~60s is plenty, and it bounds the cost
+/// on a 10-minute stem.
+const KEY_MAX_FRAMES: usize = 700;
+const KEY_MIN_SAMPLES: usize = KEY_FFT_SIZE * 3;
+/// Frequency band folded into the chromagram: below ~A1 is mostly rumble,
+/// above ~C7 is mostly harmonics and noise for this purpose.
+const KEY_MIN_HZ: f32 = 55.0;
+const KEY_MAX_HZ: f32 = 2_093.0;
+/// C0 in Hz — the reference for mapping a frequency to a pitch class.
+const KEY_REFERENCE_C0_HZ: f32 = 16.351_6;
+/// Below this correlation the material isn't tonal enough to call a key
+/// (drum loops, atonal SFX, noise beds) — report `None` rather than a guess.
+const KEY_MIN_STRENGTH: f32 = 0.6;
+
+/// Krumhansl-Kessler major/minor key profiles (the canonical published
+/// weights). Index 0 is the tonic.
+const KS_MAJOR_PROFILE: [f32; 12] = [
+    6.35, 2.23, 3.48, 2.33, 4.38, 4.09, 2.52, 5.19, 2.39, 3.66, 2.29, 2.88,
+];
+const KS_MINOR_PROFILE: [f32; 12] = [
+    6.33, 2.68, 3.52, 5.38, 2.60, 3.53, 2.54, 4.75, 3.98, 2.69, 3.34, 3.17,
+];
+
+#[derive(Clone, Debug, PartialEq)]
+pub struct KeyEstimate {
+    /// Full key name, e.g. "C major" or "A minor". A real key from a
+    /// chromagram/profile correlation over the whole clip — distinct from
+    /// `estimate_pitch`, which reports a single monophonic note.
+    pub key: String,
+    /// Tonic pitch class only, e.g. "C", "A#".
+    pub tonic: String,
+    pub is_minor: bool,
+    /// Pearson correlation of the folded chromagram against the winning key
+    /// profile, ~0.0..=1.0. Higher = more strongly tonal.
+    pub strength: f32,
+}
+
+/// Best-effort musical-key detection via the Krumhansl-Schmuckler method:
+/// fold the clip into a 12-bin pitch-class chromagram, then correlate it
+/// against all 24 major/minor key profiles and take the best fit. Returns
+/// `None` for clips too short to analyse or material too atonal to call
+/// (correlation below `KEY_MIN_STRENGTH`). Works on polyphonic music,
+/// unlike `estimate_pitch`.
+pub fn estimate_key(buffer: &DecodedAudioBuffer) -> Option<KeyEstimate> {
+    let mono = mono_samples(buffer);
+    let sample_rate = buffer.sample_rate.max(1) as f32;
+    if mono.len() < KEY_MIN_SAMPLES || sample_rate <= 0.0 {
+        return None;
+    }
+
+    // Centre a bounded analysis window on the middle of the clip.
+    let max_span = KEY_MAX_FRAMES * KEY_HOP_SIZE + KEY_FFT_SIZE;
+    let (window_start, window_end) = if mono.len() > max_span {
+        let start = (mono.len() - max_span) / 2;
+        (start, start + max_span)
+    } else {
+        (0, mono.len())
+    };
+    let region = &mono[window_start..window_end];
+
+    let hann: Vec<f32> = (0..KEY_FFT_SIZE)
+        .map(|n| {
+            0.5 - 0.5 * (2.0 * std::f32::consts::PI * n as f32 / (KEY_FFT_SIZE as f32 - 1.0)).cos()
+        })
+        .collect();
+
+    // Precompute the pitch class each usable FFT bin maps to.
+    let nyquist_bin = KEY_FFT_SIZE / 2;
+    let bin_pitch_class: Vec<Option<usize>> = (0..nyquist_bin)
+        .map(|bin| {
+            let freq = bin as f32 * sample_rate / KEY_FFT_SIZE as f32;
+            if !(KEY_MIN_HZ..=KEY_MAX_HZ).contains(&freq) {
+                return None;
+            }
+            let pc = (12.0 * (freq / KEY_REFERENCE_C0_HZ).log2()).round() as i64;
+            Some(pc.rem_euclid(12) as usize)
+        })
+        .collect();
+
+    let fft = FftPlanner::<f32>::new().plan_fft_forward(KEY_FFT_SIZE);
+    let mut spectrum = vec![Complex::new(0.0_f32, 0.0); KEY_FFT_SIZE];
+    let mut chroma = [0.0_f32; 12];
+    let mut frames = 0usize;
+
+    let mut offset = 0usize;
+    while offset + KEY_FFT_SIZE <= region.len() && frames < KEY_MAX_FRAMES {
+        for (i, slot) in spectrum.iter_mut().enumerate() {
+            *slot = Complex::new(region[offset + i] * hann[i], 0.0);
+        }
+        fft.process(&mut spectrum);
+
+        for (bin, pitch_class) in bin_pitch_class.iter().enumerate() {
+            if let Some(pc) = pitch_class {
+                chroma[*pc] += spectrum[bin].norm();
+            }
+        }
+
+        offset += KEY_HOP_SIZE;
+        frames += 1;
+    }
+
+    if frames == 0 || chroma.iter().sum::<f32>() <= f32::EPSILON {
+        return None;
+    }
+
+    let (tonic, is_minor, strength) = best_key_for_chroma(&chroma)?;
+    if strength < KEY_MIN_STRENGTH {
+        return None;
+    }
+
+    let tonic_name = PITCH_CLASS_NAMES[tonic].to_string();
+    Some(KeyEstimate {
+        key: format!("{} {}", tonic_name, if is_minor { "minor" } else { "major" }),
+        tonic: tonic_name,
+        is_minor,
+        strength,
+    })
+}
+
+/// Correlates `chroma` against every rotation of both KS profiles and
+/// returns `(tonic pitch class, is_minor, correlation)` for the best fit.
+fn best_key_for_chroma(chroma: &[f32; 12]) -> Option<(usize, bool, f32)> {
+    let mut best: Option<(usize, bool, f32)> = None;
+
+    for tonic in 0..12 {
+        for (is_minor, profile) in [(false, &KS_MAJOR_PROFILE), (true, &KS_MINOR_PROFILE)] {
+            let rotated: [f32; 12] = std::array::from_fn(|i| profile[(i + 12 - tonic) % 12]);
+            let correlation = pearson_correlation(chroma, &rotated);
+            let improves = match best {
+                Some((_, _, current)) => correlation > current,
+                None => true,
+            };
+            if improves {
+                best = Some((tonic, is_minor, correlation));
+            }
+        }
+    }
+
+    best.map(|(tonic, is_minor, correlation)| (tonic, is_minor, correlation.clamp(0.0, 1.0)))
+}
+
+fn pearson_correlation(a: &[f32; 12], b: &[f32; 12]) -> f32 {
+    let n = 12.0_f32;
+    let mean_a = a.iter().sum::<f32>() / n;
+    let mean_b = b.iter().sum::<f32>() / n;
+
+    let mut covariance = 0.0_f32;
+    let mut variance_a = 0.0_f32;
+    let mut variance_b = 0.0_f32;
+    for i in 0..12 {
+        let da = a[i] - mean_a;
+        let db = b[i] - mean_b;
+        covariance += da * db;
+        variance_a += da * da;
+        variance_b += db * db;
+    }
+
+    let denominator = (variance_a * variance_b).sqrt();
+    if denominator <= f32::EPSILON {
+        0.0
+    } else {
+        covariance / denominator
+    }
+}
+
 const VAD_SAMPLE_RATE: u32 = 16_000;
 const VAD_CHUNK_SIZE: usize = 512;
 const VAD_SPEECH_PROBABILITY_THRESHOLD: f32 = 0.5;
@@ -344,7 +526,7 @@ pub fn detect_vocal_ratio(buffer: &DecodedAudioBuffer) -> Option<f32> {
 /// Simple linear-interpolation resampler. Not audiophile-grade, but that's
 /// not the goal — it just needs to hand the VAD model a representative
 /// 16kHz signal, not produce audio for playback.
-fn resample_linear(input: &[f32], from_rate: u32, to_rate: u32) -> Vec<f32> {
+pub(crate) fn resample_linear(input: &[f32], from_rate: u32, to_rate: u32) -> Vec<f32> {
     if from_rate == to_rate || input.is_empty() {
         return input.to_vec();
     }
@@ -364,10 +546,6 @@ fn resample_linear(input: &[f32], from_rate: u32, to_rate: u32) -> Vec<f32> {
 }
 
 fn note_name_for_frequency(frequency_hz: f32) -> String {
-    const NOTE_NAMES: [&str; 12] = [
-        "C", "C#", "D", "D#", "E", "F", "F#", "G", "G#", "A", "A#", "B",
-    ];
-
     if frequency_hz <= 0.0 {
         return "?".to_string();
     }
@@ -376,7 +554,7 @@ fn note_name_for_frequency(frequency_hz: f32) -> String {
     let note_index = midi.rem_euclid(12) as usize;
     let octave = midi.div_euclid(12) - 1;
 
-    format!("{}{octave}", NOTE_NAMES[note_index])
+    format!("{}{octave}", PITCH_CLASS_NAMES[note_index])
 }
 
 fn trends_upward(mono: &[f32], sample_rate: u32) -> bool {
@@ -395,7 +573,7 @@ fn trends_upward(mono: &[f32], sample_rate: u32) -> bool {
     last_avg > first_avg * RISE_TREND_RATIO
 }
 
-fn mono_samples(buffer: &DecodedAudioBuffer) -> Vec<f32> {
+pub(crate) fn mono_samples(buffer: &DecodedAudioBuffer) -> Vec<f32> {
     let channels = buffer.channels.max(1) as usize;
     if channels == 1 {
         return buffer.samples.clone();
@@ -760,6 +938,79 @@ mod tests {
     fn note_name_maps_known_frequencies() {
         assert_eq!(note_name_for_frequency(440.0), "A4");
         assert_eq!(note_name_for_frequency(261.63), "C4");
+    }
+
+    /// Sum of sustained sine partials — a crude but tonally-unambiguous
+    /// stand-in for a chord progression in the given key.
+    fn chord_buffer(fundamentals_hz: &[f32], duration_secs: f32, sample_rate: u32) -> DecodedAudioBuffer {
+        let sample_count = (duration_secs * sample_rate as f32) as usize;
+        let samples = (0..sample_count)
+            .map(|i| {
+                let t = i as f32 / sample_rate as f32;
+                fundamentals_hz
+                    .iter()
+                    .map(|freq| 0.2 * (2.0 * std::f32::consts::PI * freq * t).sin())
+                    .sum()
+            })
+            .collect();
+
+        DecodedAudioBuffer { sample_rate, channels: 1, samples }
+    }
+
+    #[test]
+    fn estimates_c_major_from_a_c_major_triad() {
+        // C4 E4 G4 + C5 E5 G5 — all diatonic to C major, tonic strongly present.
+        let buffer = chord_buffer(
+            &[261.63, 329.63, 392.00, 523.25, 659.25, 783.99],
+            6.0,
+            44_100,
+        );
+
+        let key = estimate_key(&buffer).expect("key estimate");
+        assert_eq!(key.key, "C major");
+        assert_eq!(key.tonic, "C");
+        assert!(!key.is_minor);
+        assert!(key.strength >= KEY_MIN_STRENGTH);
+    }
+
+    #[test]
+    fn estimates_a_minor_from_an_a_minor_triad() {
+        // A3 C4 E4 + A4 C5 E5 — diatonic to A minor.
+        let buffer = chord_buffer(
+            &[220.00, 261.63, 329.63, 440.00, 523.25, 659.25],
+            6.0,
+            44_100,
+        );
+
+        let key = estimate_key(&buffer).expect("key estimate");
+        assert_eq!(key.tonic, "A");
+        assert!(key.is_minor);
+        assert_eq!(key.key, "A minor");
+    }
+
+    #[test]
+    fn short_buffer_has_no_key_estimate() {
+        let buffer = sine_wave(440.0, 0.2, 44_100, 0.8);
+        assert_eq!(estimate_key(&buffer), None);
+    }
+
+    #[test]
+    fn white_noise_has_no_confident_key() {
+        // Deterministic pseudo-noise — flat pitch-class content, so no
+        // profile correlates well enough to call a key.
+        let sample_rate = 44_100;
+        let mut state = 0x2545_F491_4F6C_DD1Du64;
+        let samples = (0..sample_rate * 4)
+            .map(|_| {
+                state ^= state << 13;
+                state ^= state >> 7;
+                state ^= state << 17;
+                (state as f32 / u64::MAX as f32) * 2.0 - 1.0
+            })
+            .collect();
+
+        let buffer = DecodedAudioBuffer { sample_rate, channels: 1, samples };
+        assert_eq!(estimate_key(&buffer), None);
     }
 
     #[test]

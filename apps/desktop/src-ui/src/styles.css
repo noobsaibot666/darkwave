@@ -581,6 +581,17 @@ button.panel-handle-right:active:not(:disabled) {
   color: var(--text-primary);
 }
 
+/* Sonic Radar's re-analyse button — tinted with the radar accent so it
+   reads as part of that section, not a generic control. */
+.nav-heading-add.radar-sync {
+  color: var(--radar-accent);
+}
+
+.nav-heading-add.radar-sync:hover {
+  background: rgba(var(--radar-accent-rgb), 0.14);
+  color: var(--radar-accent-strong);
+}
+
 .library-select-row {
   display: flex;
   align-items: center;
@@ -2860,6 +2871,157 @@ dd {
 
 .sonic-radar-item.active {
   background: rgba(var(--radar-accent-rgb), 0.12);
+}
+
+/* --- Instrument Detection ---------------------------------------------- */
+
+/* Full-area pill page, occupies the same slot as .browser. */
+.instrument-page {
+  flex: 1;
+  min-width: 0;
+  min-height: 0;
+  padding: 18px 18px 96px;
+  overflow: auto;
+  scrollbar-width: none;
+}
+
+.instrument-page::-webkit-scrollbar {
+  display: none;
+  width: 0;
+  height: 0;
+}
+
+.instrument-page-head {
+  display: flex;
+  gap: 16px;
+  align-items: flex-start;
+  justify-content: space-between;
+  margin-bottom: 18px;
+}
+
+.instrument-page-head h2 {
+  margin: 0 0 4px;
+  color: var(--text-primary);
+  font-size: 15px;
+  font-weight: 650;
+}
+
+.instrument-page-head p {
+  margin: 0;
+  max-width: 60ch;
+  color: var(--text-muted);
+  font-size: 12.5px;
+  line-height: 1.5;
+}
+
+.instrument-pill-grid {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 8px;
+  align-content: flex-start;
+}
+
+.instrument-pill {
+  display: inline-flex;
+  gap: 8px;
+  align-items: center;
+  padding: 7px 12px;
+  border: 1px solid rgba(var(--ink-rgb), 0.12);
+  border-radius: 999px;
+  background: rgba(var(--ink-rgb), 0.04);
+  color: var(--text-secondary);
+  font-size: 12.5px;
+  cursor: pointer;
+  transition: background 120ms ease, border-color 120ms ease, color 120ms ease;
+}
+
+.instrument-pill:hover {
+  border-color: rgba(var(--radar-accent-rgb), 0.5);
+  color: var(--radar-accent-strong);
+}
+
+.instrument-pill.selected {
+  border-color: var(--radar-accent);
+  background: rgba(var(--radar-accent-rgb), 0.16);
+  color: var(--radar-accent-strong);
+}
+
+.instrument-pill-count {
+  padding: 1px 7px;
+  border-radius: 999px;
+  background: rgba(var(--ink-rgb), 0.1);
+  color: var(--text-muted);
+  font-size: 11px;
+  font-variant-numeric: tabular-nums;
+}
+
+.instrument-pill.selected .instrument-pill-count {
+  background: rgba(var(--radar-accent-rgb), 0.25);
+  color: var(--radar-accent-strong);
+}
+
+/* Slim bar above the filtered track list in results mode. */
+.instrument-filter-bar {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 8px;
+  align-items: center;
+  padding: 12px 0 10px;
+}
+
+.instrument-filter-back,
+.instrument-chip {
+  display: inline-flex;
+  gap: 6px;
+  align-items: center;
+  padding: 5px 10px;
+  border: 1px solid rgba(var(--ink-rgb), 0.12);
+  border-radius: 999px;
+  background: transparent;
+  color: var(--text-secondary);
+  font-size: 12px;
+  cursor: pointer;
+}
+
+.instrument-filter-back:hover {
+  color: var(--radar-accent-strong);
+  border-color: rgba(var(--radar-accent-rgb), 0.5);
+}
+
+.instrument-chip {
+  border-color: var(--radar-accent);
+  background: rgba(var(--radar-accent-rgb), 0.14);
+  color: var(--radar-accent-strong);
+}
+
+.instrument-chip svg {
+  opacity: 0.7;
+}
+
+.instrument-chip:hover svg {
+  opacity: 1;
+}
+
+/* Inspector "Detected Audio Attributes" chip row. */
+.instrument-tag-row {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 6px;
+  margin: 10px 0 4px;
+}
+
+.instrument-tag {
+  padding: 4px 9px;
+  border: 1px solid rgba(var(--radar-accent-rgb), 0.4);
+  border-radius: 999px;
+  background: rgba(var(--radar-accent-rgb), 0.1);
+  color: var(--radar-accent-strong);
+  font-size: 11.5px;
+  cursor: pointer;
+}
+
+.instrument-tag:hover {
+  background: rgba(var(--radar-accent-rgb), 0.2);
 }
 
 /* Background Activity modal — the default .modal-card width was sized for

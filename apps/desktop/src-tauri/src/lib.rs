@@ -43,6 +43,17 @@ struct JobControlState {
     audio_analysis_paused: std::sync::atomic::AtomicBool,
 }
 
+/// The YAMNet instrument-classification model, loaded once on first use of
+/// `process_instrument_jobs`. `Arc<Mutex<…>>` so a blocking inference task
+/// can hold the lock for its whole duration off the async worker threads;
+/// `tried` records that a load was attempted so a missing model isn't
+/// re-probed from disk every background tick. Model absent ⇒ instrument
+/// jobs simply wait (see ADR 0031).
+struct InstrumentModelState {
+    model: std::sync::Arc<Mutex<Option<audio_analysis::InstrumentModel>>>,
+    tried: std::sync::atomic::AtomicBool,
+}
+
 /// A resident similarity-worker subprocess, spawned once and reused across
 /// every analysis job instead of respawning (and re-paying process-start
 /// cost) per file. See `run_similarity_worker` for the request/response
@@ -1796,6 +1807,256 @@ async fn process_one_waveform_job(
     true
 }
 
+/// Where the instrument model may live: the app-data `models/` dir (a
+/// drop-in that needs no rebuild) takes priority over the bundled
+/// `resources/models/`. Returns the pair only if BOTH files are present.
+fn instrument_model_paths(app: &tauri::AppHandle) -> Option<(PathBuf, PathBuf)> {
+    let dirs = [
+        app.path().app_data_dir().ok().map(|dir| dir.join("models")),
+        app.path().resource_dir().ok().map(|dir| dir.join("models")),
+    ];
+    for dir in dirs.into_iter().flatten() {
+        let model = dir.join("yamnet.onnx");
+        let class_map = dir.join("yamnet_class_map.csv");
+        if model.is_file() && class_map.is_file() {
+            return Some((model, class_map));
+        }
+    }
+    None
+}
+
+/// Drains pending `InstrumentDetection` jobs: decode each asset once and run
+/// the YAMNet model over it, persisting the folded instrument labels. If no
+/// model is installed this claims nothing and returns 0 — the jobs stay
+/// pending and start processing once a model is dropped in and the app
+/// restarts. Inference is serialised on the model mutex (the ONNX session
+/// isn't `Sync`, and it already parallelises internally), so unlike the
+/// waveform/analysis workers this runs one job at a time.
+#[tauri::command(async)]
+async fn process_instrument_jobs(
+    app: tauri::AppHandle,
+    state: tauri::State<'_, CatalogState>,
+    model_state: tauri::State<'_, InstrumentModelState>,
+) -> Result<usize, String> {
+    use std::sync::atomic::Ordering;
+
+    if !model_state.tried.swap(true, Ordering::SeqCst) {
+        match instrument_model_paths(&app) {
+            Some((model_path, class_map_path)) => {
+                let loaded = tauri::async_runtime::spawn_blocking(move || {
+                    audio_analysis::load_instrument_model(&model_path, &class_map_path)
+                })
+                .await
+                .ok()
+                .flatten();
+                if loaded.is_some() {
+                    *model_state.model.lock().expect("instrument model mutex poisoned") = loaded;
+                } else {
+                    eprintln!("instrument-detection: model files found but failed to load");
+                }
+            }
+            None => eprintln!(
+                "instrument-detection: no model installed (models/yamnet.onnx + \
+                 yamnet_class_map.csv) — instrument jobs will wait"
+            ),
+        }
+    }
+    if model_state
+        .model
+        .lock()
+        .expect("instrument model mutex poisoned")
+        .is_none()
+    {
+        return Ok(0);
+    }
+
+    let jobs = {
+        let catalog = state.0.lock().expect("catalog mutex poisoned");
+        catalog
+            .reset_stuck_processing_jobs(JobKind::InstrumentDetection)
+            .map_err(storage_error_message)?;
+        catalog
+            .claim_pending_jobs(JobKind::InstrumentDetection, 12)
+            .map_err(storage_error_message)?
+    };
+
+    let mut processed = 0usize;
+    for job in jobs {
+        if process_one_instrument_job(&app, &state, &model_state, job).await {
+            processed += 1;
+        }
+    }
+    Ok(processed)
+}
+
+async fn process_one_instrument_job(
+    app: &tauri::AppHandle,
+    state: &tauri::State<'_, CatalogState>,
+    model_state: &tauri::State<'_, InstrumentModelState>,
+    job: storage::JobRecord,
+) -> bool {
+    let asset = {
+        let catalog = state.0.lock().expect("catalog mutex poisoned");
+        catalog.get_asset(job.asset_id)
+    };
+    let asset = match asset {
+        Ok(Some(asset)) => asset,
+        Ok(None) => {
+            let catalog = state.0.lock().expect("catalog mutex poisoned");
+            let _ = catalog.fail_job(job.id, "asset not found");
+            return true;
+        }
+        Err(error) => {
+            eprintln!("instrument-detection: failed to load asset {}: {error:?}", job.asset_id);
+            return false;
+        }
+    };
+
+    let local_path = {
+        let catalog = state.0.lock().expect("catalog mutex poisoned");
+        local_asset_path(app, &catalog, &asset)
+    };
+    let Ok(local_path) = local_path else {
+        return true;
+    };
+    if !std::path::Path::new(&local_path).exists() {
+        return true;
+    }
+
+    let model = model_state.model.clone();
+    let detected = tauri::async_runtime::spawn_blocking(move || -> Result<Vec<(String, f64)>, String> {
+        let buffer = audio_metadata::decode_any_supported_audio(&local_path)
+            .map_err(|error| format!("{error:?}"))?;
+        let mut guard = model.lock().expect("instrument model mutex poisoned");
+        let Some(model) = guard.as_mut() else {
+            return Err("instrument model unloaded".to_string());
+        };
+        Ok(audio_analysis::detect_instruments(model, &buffer)
+            .into_iter()
+            .map(|prediction| (prediction.instrument, prediction.confidence as f64))
+            .collect())
+    })
+    .await;
+
+    let catalog = state.0.lock().expect("catalog mutex poisoned");
+    match detected {
+        Ok(Ok(instruments)) => {
+            if let Err(error) = catalog.set_asset_instruments(job.asset_id, &instruments) {
+                eprintln!("instrument-detection: persist failed for job {}: {error}", job.id);
+            }
+            let _ = catalog.complete_job(job.id);
+        }
+        Ok(Err(error)) => {
+            if let Err(fail_error) = catalog.fail_job(job.id, &error) {
+                eprintln!("instrument-detection: failed to record failure: {fail_error:?}");
+            }
+        }
+        Err(join_error) => {
+            eprintln!("instrument-detection: task panicked: {join_error}");
+            return false;
+        }
+    }
+    true
+}
+
+/// The Sonic Radar "sync" button: re-queue every analysis pass
+/// (waveform, tempo/key/vocal, instruments) for a selection — or the whole
+/// library when nothing is selected — so assets whose original jobs
+/// already completed pick up newer detection (ADR 0032). Returns the total
+/// number of jobs queued; the frontend then drives the normal drain.
+#[tauri::command]
+fn resync_analysis(
+    state: tauri::State<CatalogState>,
+    library_id: String,
+    asset_ids: Vec<String>,
+) -> Result<usize, String> {
+    let library_id = parse_uuid_field(&library_id, "library id")?;
+    let asset_ids = asset_ids
+        .iter()
+        .map(|id| parse_uuid_field(id, "asset id"))
+        .collect::<Result<Vec<_>, _>>()?;
+
+    let catalog = state.0.lock().expect("catalog mutex poisoned");
+    let kinds = [
+        (JobKind::WaveformGeneration, 30_i64),
+        (JobKind::AudioAnalysis, 40),
+        (JobKind::InstrumentDetection, 50),
+    ];
+    let mut queued = 0usize;
+    for (kind, priority) in kinds {
+        queued += if asset_ids.is_empty() {
+            catalog
+                .requeue_analysis_for_library(library_id, kind, priority)
+                .map_err(storage_error_message)?
+        } else {
+            catalog
+                .requeue_analysis_for_assets(&asset_ids, kind, priority)
+                .map_err(storage_error_message)?
+        };
+    }
+    Ok(queued)
+}
+
+#[derive(serde::Serialize)]
+struct InstrumentFacet {
+    name: String,
+    count: i64,
+}
+
+/// Every distinct detected instrument in a library with its asset count —
+/// the data behind the Instrument Detection page's pill grid.
+#[tauri::command]
+fn instruments_for_library(
+    state: tauri::State<CatalogState>,
+    library_id: String,
+) -> Result<Vec<InstrumentFacet>, String> {
+    let library_id = parse_uuid_field(&library_id, "library id")?;
+    let catalog = state.0.lock().expect("catalog mutex poisoned");
+    Ok(catalog
+        .instrument_counts_for_library(library_id)
+        .map_err(storage_error_message)?
+        .into_iter()
+        .map(|(name, count)| InstrumentFacet { name, count })
+        .collect())
+}
+
+/// Assets that have ANY of the given instruments (OR match) — the filtered
+/// list once one or more instrument pills are selected.
+#[tauri::command]
+fn assets_by_instruments(
+    state: tauri::State<CatalogState>,
+    library_id: String,
+    instruments: Vec<String>,
+) -> Result<Vec<AssetRecord>, String> {
+    let library_id = parse_uuid_field(&library_id, "library id")?;
+    let catalog = state.0.lock().expect("catalog mutex poisoned");
+    catalog
+        .assets_with_any_instrument(library_id, &instruments)
+        .map_err(storage_error_message)
+}
+
+#[derive(serde::Serialize)]
+struct InstrumentTag {
+    name: String,
+    confidence: f64,
+}
+
+/// One asset's detected instruments (for the inspector), strongest first.
+#[tauri::command]
+fn asset_instruments(
+    state: tauri::State<CatalogState>,
+    asset_id: String,
+) -> Result<Vec<InstrumentTag>, String> {
+    let asset_id = parse_uuid_field(&asset_id, "asset id")?;
+    let catalog = state.0.lock().expect("catalog mutex poisoned");
+    Ok(catalog
+        .instruments_for_asset(asset_id)
+        .map_err(storage_error_message)?
+        .into_iter()
+        .map(|(name, confidence)| InstrumentTag { name, confidence })
+        .collect())
+}
+
 // (async): reads embedded metadata from each pending asset's file (ADR
 // 0021) — real file I/O, run on every app launch and every background
 // tick, so it shouldn't be on the main thread by default.
@@ -1862,6 +2123,7 @@ fn job_status(
     [
         (JobKind::MetadataExtraction, "metadata_extraction"),
         (JobKind::WaveformGeneration, "waveform_generation"),
+        (JobKind::InstrumentDetection, "instrument_detection"),
         (JobKind::AudioAnalysis, "audio_analysis"),
     ]
     .into_iter()
@@ -1883,6 +2145,7 @@ fn parse_job_kind_field(kind: &str) -> Result<JobKind, String> {
     match kind {
         "metadata_extraction" => Ok(JobKind::MetadataExtraction),
         "waveform_generation" => Ok(JobKind::WaveformGeneration),
+        "instrument_detection" => Ok(JobKind::InstrumentDetection),
         "audio_analysis" => Ok(JobKind::AudioAnalysis),
         other => Err(format!("unknown job kind: {other}")),
     }
@@ -2212,6 +2475,7 @@ async fn analyze_asset_audio(
                 .collect::<Vec<_>>();
             let tempo = audio_analysis::estimate_tempo(&buffer);
             let pitch = audio_analysis::estimate_pitch(&buffer);
+            let key = audio_analysis::estimate_key(&buffer);
             let vocal_ratio = audio_analysis::detect_vocal_ratio(&buffer);
 
             let channels = buffer.channels.max(1) as u64;
@@ -2233,6 +2497,8 @@ async fn analyze_asset_audio(
                 musical_key: pitch.as_ref().map(|estimate| estimate.note_name.clone()),
                 key_confidence: pitch.as_ref().map(|estimate| estimate.clarity as f64),
                 perceptual_fingerprint: None,
+                detected_key: key.as_ref().map(|estimate| estimate.key.clone()),
+                key_strength: key.as_ref().map(|estimate| estimate.strength as f64),
             };
 
             Ok((needs_review, suggested_tags, vocal_ratio, update, waveform))
@@ -2588,6 +2854,10 @@ fn relink_asset(
     // generation pass for the new file so the strip repopulates without
     // waiting for the next preview.
     let _ = catalog.enqueue_job(asset_id, JobKind::WaveformGeneration, 30);
+    // The old file's instruments no longer describe the new one — clear
+    // them and queue a re-detect.
+    let _ = catalog.set_asset_instruments(asset_id, &[]);
+    let _ = catalog.enqueue_job(asset_id, JobKind::InstrumentDetection, 50);
     Ok(())
 }
 
@@ -3062,6 +3332,10 @@ pub fn run() {
                 audio_analysis_paused: std::sync::atomic::AtomicBool::new(false),
             });
             app.manage(SimilarityWorkerState(tokio::sync::Mutex::new(None)));
+            app.manage(InstrumentModelState {
+                model: std::sync::Arc::new(Mutex::new(None)),
+                tried: std::sync::atomic::AtomicBool::new(false),
+            });
             #[cfg(all(target_os = "macos", not(feature = "direct-dist")))]
             app.manage(BookmarkAccessState(Mutex::new(std::collections::HashMap::new())));
 
@@ -3293,6 +3567,11 @@ pub fn run() {
             process_pending_jobs,
             process_audio_analysis_jobs,
             process_waveform_jobs,
+            process_instrument_jobs,
+            resync_analysis,
+            instruments_for_library,
+            assets_by_instruments,
+            asset_instruments,
             set_audio_analysis_paused,
             audio_analysis_paused,
             job_status,

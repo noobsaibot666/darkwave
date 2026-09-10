@@ -260,7 +260,9 @@ name = "audio-analysis"
 version = "0.1.0"
 dependencies = [
  "audio-metadata",
+ "ort",
  "pitch-detection",
+ "rustfft",
  "voice_activity_detector",
 ]
 

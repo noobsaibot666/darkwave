@@ -391,6 +391,9 @@ pub fn commit_prepared_import(
         // process_waveform_jobs command (decode once, cache the peaks) — see ADR 0029.
         catalog.enqueue_job(asset.id, JobKind::WaveformGeneration, 30)?;
         catalog.enqueue_job(asset.id, JobKind::AudioAnalysis, 40)?;
+        // Instrument detection (ADR 0031) is its own job — it runs a
+        // separate ONNX model and is drained by process_instrument_jobs.
+        catalog.enqueue_job(asset.id, JobKind::InstrumentDetection, 50)?;
         suggest_import_tags(catalog, &asset, &tag_suggestions)?;
         if let Some(source_context) = source_context {
             catalog.set_source_record(SourceRecordDraft {
