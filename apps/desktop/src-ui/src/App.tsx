@@ -3113,8 +3113,10 @@ export function App() {
             Needs Review
           </button>
 
+          <div className="nav-divider" role="separator" />
+
           <div className="nav-heading-row">
-            <span className="nav-heading-lg" onClick={() => toggleSection("sidebar-sonic-radar")}>
+            <span className="nav-heading-lg radar-heading" onClick={() => toggleSection("sidebar-sonic-radar")}>
               <Activity size={14} />
               Sonic Radar
             </span>

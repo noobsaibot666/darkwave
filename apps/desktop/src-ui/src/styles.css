@@ -53,6 +53,14 @@
   --accent-rgb: 255, 92, 0;
   --accent-to-rgb: 241, 72, 0;
 
+  /* Sonic Radar's own accent — a scan/signal cyan, kept well clear of the
+     player orange (which stays reserved for playback state) and the gold
+     SFX hue. Used for the Sonic Radar section header and every filter row
+     under it, so that block reads as one instrument. */
+  --radar-accent: #22d3ee;
+  --radar-accent-strong: #67e8f9;
+  --radar-accent-rgb: 34, 211, 238;
+
   /* SFX mood/icon color (see playerMoodTheme in App.tsx and rowIconMeta) —
      a token rather than a hardcoded hex so it can go darker in light mode;
      the bright gold that reads fine on the near-black default background
@@ -96,6 +104,11 @@
   --sfx-to: #7a5600;
   --sfx-ink: #9c6b02;
   --sfx-glow: rgba(154, 107, 2, 0.35);
+
+  /* Deeper cyan so it holds contrast on the light silver background. */
+  --radar-accent: #0e7490;
+  --radar-accent-strong: #0891b2;
+  --radar-accent-rgb: 14, 116, 144;
 }
 
 * {
@@ -501,6 +514,18 @@ button.panel-handle-right:active:not(:disabled) {
   min-height: 24px;
   margin: 22px 0 4px;
   padding: 0 10px;
+}
+
+/* Hairline between the flat top filters (All … Needs Review) and the
+   grouped sections below, so the two read as separate blocks. */
+.nav-divider {
+  height: 1px;
+  margin: 14px 10px 0;
+  background: rgba(var(--ink-rgb), 0.08);
+}
+
+.nav-divider + .nav-heading-row {
+  margin-top: 12px;
 }
 
 .nav-heading-row .nav-heading {
@@ -2793,9 +2818,9 @@ dd {
 }
 
 /* Sonic Radar — sidebar quick filters over the app's own real analysis
-   results (vocal detection, tempo, pitch). Uses the exact same .nav-heading-lg
-   header and .sidebar-styled-item rows as Categories / Projects so the whole
-   list reads as one system. */
+   results (vocal detection, tempo, pitch). Same layout as the Categories /
+   Projects rows, but carries its own cyan radar accent (--radar-accent) on
+   the header and every row so the block reads as one instrument. */
 .sonic-radar-item,
 .sidebar-styled-item {
   display: flex;
@@ -2809,11 +2834,32 @@ dd {
   color: var(--text-secondary);
 }
 
-.sonic-radar-item.active svg,
-.sonic-radar-item:hover svg,
 .sidebar-styled-item.active svg,
 .sidebar-styled-item:hover svg {
   color: var(--text-primary);
+}
+
+/* Radar accent: the section header icon + label, and every filter row's
+   icon and label, all in the same cyan. */
+.radar-heading,
+.radar-heading svg {
+  color: var(--radar-accent);
+}
+
+.sonic-radar-item,
+.sonic-radar-item svg {
+  color: var(--radar-accent);
+}
+
+.sonic-radar-item:hover,
+.sonic-radar-item:hover svg,
+.sonic-radar-item.active,
+.sonic-radar-item.active svg {
+  color: var(--radar-accent-strong);
+}
+
+.sonic-radar-item.active {
+  background: rgba(var(--radar-accent-rgb), 0.12);
 }
 
 /* Background Activity modal — the default .modal-card width was sized for
