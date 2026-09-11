@@ -2404,10 +2404,18 @@ async fn process_audio_analysis_jobs(
 /// Processes a single already-claimed audio-analysis job: resolves the
 /// asset, analyzes it (or defers it if it isn't cached locally yet),
 /// persists the result, and emits a progress event. Returns `false` only
-/// when the queue was paused before this job's turn came up — the job is
-/// left `'processing'` and picked back up by `reset_stuck_processing_jobs`
-/// next time, the same "leave it for later, don't lose it" behavior the
-/// pre-concurrency version had when it broke out of its loop early on pause.
+/// when the queue was paused before this job's turn came up.
+///
+/// That pause case explicitly requeues the job back to `'pending'` rather
+/// than leaving it `'processing'` for `reset_stuck_processing_jobs` to find
+/// later — this used to rely on that reset, back when it ran unconditionally
+/// on every claim cycle and so recovered an abandoned claim almost
+/// instantly. Once reset gained an age floor (so it stops yanking back
+/// claims that are still genuinely in flight — see its doc comment), a job
+/// abandoned here by a pause toggled mid-batch would otherwise sit
+/// `'processing'` and invisible to `claim_pending_jobs` for however long is
+/// left of that floor before it's claimable again. An explicit requeue on
+/// the *known* reason (paused, not abandoned) needs no such wait.
 ///
 /// A per-job storage error is logged and treated as a skip rather than
 /// aborting the whole batch (the previous sequential version's `?` would
@@ -2426,6 +2434,10 @@ async fn process_one_audio_analysis_job(
     use tauri::Emitter;
 
     if job_control.audio_analysis_paused.load(Ordering::SeqCst) {
+        let catalog = state.0.lock().expect("catalog mutex poisoned");
+        if let Err(error) = catalog.requeue_job_as_pending(job.id) {
+            eprintln!("audio-analysis: failed to requeue paused job {}: {error:?}", job.id);
+        }
         return false;
     }
 
@@ -2694,14 +2706,20 @@ async fn analyze_asset_audio(
 /// one at a time, in the order it receives them (see
 /// `crates/similarity-worker`'s `--stdin-loop` mode), so whoever holds the
 /// lock is guaranteed to read back its own response, never someone else's.
+///
 /// This does mean concurrent analysis jobs take turns at the fingerprint
 /// step specifically, even though their much heavier decode/DSP/VAD work
-/// (see `analyze_asset_audio`) runs fully in parallel — a small pool of
-/// resident workers instead of one would remove that serialization point
-/// too, but isn't implemented here; the fixed per-file spawn/model-start
-/// cost this replaces was the actually-measured problem, not fingerprint
-/// throughput itself, so this is deliberately the simpler fix until
-/// real-world measurement says otherwise.
+/// (see `analyze_asset_audio`) runs fully in parallel — real-world
+/// measurement (a batch that should take seconds sitting at 0% for
+/// minutes, CPU busy the whole time on other jobs' decode work) is what
+/// this doc comment used to say would justify revisiting that trade-off:
+/// a handful of files in one real library reliably made the sidecar hang
+/// or crawl, and because every *other* in-flight job's `analyze_asset_audio`
+/// call blocks on this same lock at its very last line, one bad file
+/// stalled the throughput of the whole concurrent batch, not just its own
+/// job. The timeout below is what actually bounds that now; a small pool
+/// of resident workers would remove the serialization point entirely, but
+/// isn't implemented here.
 async fn run_similarity_worker(
     app: &tauri::AppHandle,
     worker_state: &SimilarityWorkerState,
@@ -2729,12 +2747,17 @@ async fn run_similarity_worker(
     }
 
     let worker = guard.as_mut().expect("just ensured it's Some");
-    // Deliberately generous — a debug build of the sidecar (unoptimized)
-    // has been observed taking 20-40s for an ordinary file even before
-    // this change, so this is headroom for that, not a tight production
-    // budget. Without any bound at all, one pathological file hangs this
-    // job's slot forever with nothing to recover it.
-    let response = tokio::time::timeout(std::time::Duration::from_secs(90), async {
+    // This used to be 90s — "generous headroom" for a slow debug-build
+    // sidecar. In practice that generosity is what let a handful of
+    // pathological files (real library content the resident bliss-audio
+    // worker chokes or hangs on) turn into multi-minute stalls: this lock
+    // is held for the whole wait, so every *other* concurrently-decoding
+    // job's completion is serialized behind it too (see the fn doc
+    // comment). 20s is still well above the ordinary case this was sized
+    // for, but caps how much one bad file can cost the jobs waiting
+    // behind it — fingerprinting is explicitly a nice-to-have, not worth
+    // trading a whole batch's throughput for.
+    let response = tokio::time::timeout(std::time::Duration::from_secs(20), async {
         loop {
             match worker.events.recv().await {
                 Some(CommandEvent::Stdout(bytes)) => return Some(bytes),

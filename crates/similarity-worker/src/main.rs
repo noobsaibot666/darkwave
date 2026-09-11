@@ -52,9 +52,19 @@ fn run_stdin_loop() {
             continue;
         }
 
-        let response = match analyze(path) {
-            Ok(analysis) => json!({ "analysis": analysis }),
-            Err(error) => json!({ "error": error }),
+        // bliss-audio (a third-party decoder/feature-extractor) is known to
+        // panic on some real-world pathological files rather than return an
+        // Err — catch_unwind turns that into one bad response for this one
+        // path instead of taking the whole resident process down with it.
+        // Without this, a single bad file in a batch loses the entire
+        // "stay resident, skip the per-file process-start cost" optimization
+        // this mode exists for — the parent (see `run_similarity_worker`)
+        // would have to notice the crash and pay a full respawn, and every
+        // file still queued behind the crashed one waits through that too.
+        let response = match std::panic::catch_unwind(|| analyze(path)) {
+            Ok(Ok(analysis)) => json!({ "analysis": analysis }),
+            Ok(Err(error)) => json!({ "error": error }),
+            Err(_) => json!({ "error": "analyze panicked" }),
         };
 
         // The parent reads responses split on newlines from a pipe that
