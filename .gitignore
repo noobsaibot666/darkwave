@@ -12,5 +12,8 @@ target/
 apps/desktop/src-tauri/gen/
 apps/desktop/src-tauri/binaries/
 apps/desktop/builds/
+# Instrument-detection model artifacts — fetched per docs/development/instrument-model.md
+apps/desktop/src-tauri/models/*.onnx
+apps/desktop/src-tauri/models/*.csv
 .claude/settings.local.json
 secrets/

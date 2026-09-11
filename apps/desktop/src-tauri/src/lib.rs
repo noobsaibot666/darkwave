@@ -43,6 +43,17 @@ struct JobControlState {
     audio_analysis_paused: std::sync::atomic::AtomicBool,
 }
 
+/// The YAMNet instrument-classification model, loaded once on first use of
+/// `process_instrument_jobs`. `Arc<Mutex<…>>` so a blocking inference task
+/// can hold the lock for its whole duration off the async worker threads;
+/// `tried` records that a load was attempted so a missing model isn't
+/// re-probed from disk every background tick. Model absent ⇒ instrument
+/// jobs simply wait (see ADR 0031).
+struct InstrumentModelState {
+    model: std::sync::Arc<Mutex<Option<audio_analysis::InstrumentModel>>>,
+    tried: std::sync::atomic::AtomicBool,
+}
+
 /// A resident similarity-worker subprocess, spawned once and reused across
 /// every analysis job instead of respawning (and re-paying process-start
 /// cost) per file. See `run_similarity_worker` for the request/response
@@ -428,9 +439,14 @@ fn maintenance_report(
         }
     }
 
+    // One finding per pending job, but capped: a whole-library re-sync (ADR
+    // 0032) or a fresh bulk import can leave thousands pending for a few
+    // minutes, and the maintenance panel only shows a count — thousands of
+    // identical finding structs would be a pointless payload.
     let pending_waveforms = catalog
         .pending_job_count(JobKind::WaveformGeneration)
-        .map_err(storage_error_message)?;
+        .map_err(storage_error_message)?
+        .min(100);
     for _ in 0..pending_waveforms {
         findings.push(maintenance::MaintenanceFinding {
             kind: maintenance::MaintenanceFindingKind::StaleWaveformCache,
@@ -1124,9 +1140,9 @@ fn apply_browser_command(
 // beachball) for however long the import takes, same class of bug already
 // fixed for list_assets/warm_library_cache/etc. above.
 #[tauri::command(async)]
-fn import_folder(
+async fn import_folder(
     app: tauri::AppHandle,
-    state: tauri::State<CatalogState>,
+    state: tauri::State<'_, CatalogState>,
     library_id: String,
     folder_path: String,
     mode: String,
@@ -1167,33 +1183,10 @@ fn import_folder(
         }
     }
 
-    let mut paths = collect_audio_files(std::path::Path::new(&folder_path))
+    let paths = collect_audio_files(std::path::Path::new(&folder_path))
         .map_err(|error| format!("could not read folder {folder_path}: {error}"))?;
-    paths.sort();
 
-    let mut imported = Vec::new();
-    let mut failed = Vec::new();
-
-    // Lock per file rather than once for the whole scan: hashing each file (and, over a
-    // NAS mount, the network read behind it) can take a while, and holding the catalog
-    // mutex for the entire loop would block every other command — playback, browsing,
-    // tagging — until the whole folder finished importing.
-    for path in paths {
-        let filename = path
-            .file_name()
-            .map(|name| name.to_string_lossy().to_string())
-            .unwrap_or_default();
-
-        let catalog = state.0.lock().expect("catalog mutex poisoned");
-        match import_pipeline::import_file(&catalog, library_id, &path, import_mode) {
-            Ok(asset) => imported.push(asset),
-            Err(ImportError::UnsupportedFormat(_)) => {}
-            Err(error) => failed.push(ImportFailure {
-                filename,
-                reason: error.to_string(),
-            }),
-        }
-    }
+    let (imported, failed) = run_batch_import(&state, library_id, import_mode, paths).await;
 
     Ok(ImportFolderResult { imported, failed })
 }
@@ -1235,6 +1228,83 @@ fn collect_audio_files(root: &std::path::Path) -> std::io::Result<Vec<PathBuf>> 
     Ok(files)
 }
 
+/// Shared import driver for `import_folder` / `refresh_library` /
+/// `scan_import_folder`. Runs the metadata-probe + streamed-hash stage
+/// (`import_pipeline::prepare_import`) across `paths` with bounded
+/// parallelism and no catalog lock — the slow disk/NAS-bound part of an
+/// import — then commits the results one file at a time, taking the catalog
+/// lock per file so browsing/playback/tagging stay responsive while a big
+/// library imports (ADR 0024's mutex lesson) and a first import of an
+/// SSD/NVMe library isn't bottlenecked on hashing one file per core (ADR
+/// 0029). `UnsupportedFormat` is a silent skip in both stages, exactly as
+/// the old per-file `import_file` path treated it.
+async fn run_batch_import(
+    state: &tauri::State<'_, CatalogState>,
+    library_id: Uuid,
+    mode: ImportMode,
+    paths: Vec<PathBuf>,
+) -> (Vec<AssetRecord>, Vec<ImportFailure>) {
+    use futures::stream::{self, StreamExt};
+
+    // Matches AUDIO_ANALYSIS_CONCURRENCY: enough to use several cores on
+    // local storage, not so much that it fires a swarm of simultaneous
+    // whole-file reads at a single NAS mount or spinning disk.
+    const IMPORT_PREPARE_CONCURRENCY: usize = 4;
+
+    let mut prepared: Vec<(PathBuf, Result<import_pipeline::PreparedImport, ImportError>)> =
+        stream::iter(paths)
+            .map(|path| async move {
+                let probe_path = path.clone();
+                let result = tauri::async_runtime::spawn_blocking(move || {
+                    import_pipeline::prepare_import(&probe_path, mode)
+                })
+                .await
+                .unwrap_or_else(|join_error| {
+                    Err(ImportError::Io(std::io::Error::other(join_error.to_string())))
+                });
+                (path, result)
+            })
+            .buffer_unordered(IMPORT_PREPARE_CONCURRENCY)
+            .collect()
+            .await;
+
+    // Commit in stable path order regardless of which prepares finished first.
+    prepared.sort_by(|(a, _), (b, _)| a.cmp(b));
+
+    let mut imported = Vec::new();
+    let mut failed = Vec::new();
+    for (path, result) in prepared {
+        let filename = path
+            .file_name()
+            .map(|name| name.to_string_lossy().to_string())
+            .unwrap_or_default();
+
+        let prepared = match result {
+            Ok(prepared) => prepared,
+            Err(ImportError::UnsupportedFormat(_)) => continue,
+            Err(error) => {
+                failed.push(ImportFailure {
+                    filename,
+                    reason: error.to_string(),
+                });
+                continue;
+            }
+        };
+
+        let catalog = state.0.lock().expect("catalog mutex poisoned");
+        match import_pipeline::commit_prepared_import(&catalog, library_id, prepared, None) {
+            Ok(asset) => imported.push(asset),
+            Err(ImportError::UnsupportedFormat(_)) => {}
+            Err(error) => failed.push(ImportFailure {
+                filename,
+                reason: error.to_string(),
+            }),
+        }
+    }
+
+    (imported, failed)
+}
+
 /// Re-scans a library's media root for audio files not yet in the catalog (e.g. dropped
 /// into a watched NAS folder outside the app) and imports them as referenced assets.
 /// Registration is naturally idempotent: `register_asset` matches on content hash and
@@ -1244,8 +1314,8 @@ fn collect_audio_files(root: &std::path::Path) -> std::io::Result<Vec<PathBuf>> 
 // block the UI (the "sync button" freeze) for however long that scan
 // takes, which grows with library size and NAS latency.
 #[tauri::command(async)]
-fn refresh_library(
-    state: tauri::State<CatalogState>,
+async fn refresh_library(
+    state: tauri::State<'_, CatalogState>,
     library_id: String,
 ) -> Result<ImportFolderResult, String> {
     let library_id = parse_uuid_field(&library_id, "library id")?;
@@ -1275,33 +1345,16 @@ fn refresh_library(
         return Err("This library has no media root yet — import a folder first.".to_string());
     }
 
-    let mut paths = collect_audio_files(std::path::Path::new(&media_root))
-        .map_err(|error| format!("could not read {media_root}: {error}"))?;
-    paths.sort();
+    // Filter out already-catalogued files before the prepare stage so a
+    // rescan never re-hashes what it already knows.
+    let paths: Vec<PathBuf> = collect_audio_files(std::path::Path::new(&media_root))
+        .map_err(|error| format!("could not read {media_root}: {error}"))?
+        .into_iter()
+        .filter(|path| !known_paths.contains(&path.to_string_lossy().to_string()))
+        .collect();
 
-    let mut imported = Vec::new();
-    let mut failed = Vec::new();
-
-    for path in paths {
-        if known_paths.contains(&path.to_string_lossy().to_string()) {
-            continue;
-        }
-
-        let filename = path
-            .file_name()
-            .map(|name| name.to_string_lossy().to_string())
-            .unwrap_or_default();
-
-        let catalog = state.0.lock().expect("catalog mutex poisoned");
-        match import_pipeline::import_file(&catalog, library_id, &path, ImportMode::Referenced) {
-            Ok(asset) => imported.push(asset),
-            Err(ImportError::UnsupportedFormat(_)) => {}
-            Err(error) => failed.push(ImportFailure {
-                filename,
-                reason: error.to_string(),
-            }),
-        }
-    }
+    let (imported, failed) =
+        run_batch_import(&state, library_id, ImportMode::Referenced, paths).await;
 
     Ok(ImportFolderResult { imported, failed })
 }
@@ -1319,8 +1372,8 @@ fn refresh_library(
 // (async): same reasoning as import_folder/refresh_library above — a
 // directory walk plus per-file hashing must not block the main thread.
 #[tauri::command(async)]
-fn scan_import_folder(
-    state: tauri::State<CatalogState>,
+async fn scan_import_folder(
+    state: tauri::State<'_, CatalogState>,
     library_id: String,
 ) -> Result<ImportFolderResult, String> {
     let library_id = parse_uuid_field(&library_id, "library id")?;
@@ -1340,29 +1393,10 @@ fn scan_import_folder(
         });
     };
 
-    let mut paths = collect_audio_files(std::path::Path::new(&import_root))
+    let paths = collect_audio_files(std::path::Path::new(&import_root))
         .map_err(|error| format!("could not read {import_root}: {error}"))?;
-    paths.sort();
 
-    let mut imported = Vec::new();
-    let mut failed = Vec::new();
-
-    for path in paths {
-        let filename = path
-            .file_name()
-            .map(|name| name.to_string_lossy().to_string())
-            .unwrap_or_default();
-
-        let catalog = state.0.lock().expect("catalog mutex poisoned");
-        match import_pipeline::import_file(&catalog, library_id, &path, ImportMode::Managed) {
-            Ok(asset) => imported.push(asset),
-            Err(ImportError::UnsupportedFormat(_)) => {}
-            Err(error) => failed.push(ImportFailure {
-                filename,
-                reason: error.to_string(),
-            }),
-        }
-    }
+    let (imported, failed) = run_batch_import(&state, library_id, ImportMode::Managed, paths).await;
 
     Ok(ImportFolderResult { imported, failed })
 }
@@ -1563,13 +1597,530 @@ fn purge_preview_cache(app: tauri::AppHandle) -> Result<(), String> {
     Ok(())
 }
 
-#[tauri::command]
-fn mark_waveform_ready(state: tauri::State<CatalogState>, asset_id: String) -> Result<usize, String> {
-    let asset_id = parse_uuid_field(&asset_id, "asset id")?;
-    let catalog = state.0.lock().expect("catalog mutex poisoned");
+/// One asset's persisted waveform: the flat transport-strip magnitudes the
+/// UI draws plus the multi-resolution min/max peaks (ADR 0004) kept for
+/// richer future renderers. Stored as JSON in the `waveform_peaks` table by
+/// either the `WaveformGeneration` job or the analysis job (whichever
+/// decodes the file first), or by the client fallback below.
+#[derive(Clone, serde::Serialize, serde::Deserialize)]
+struct StoredWaveform {
+    peaks: Vec<f32>,
+    sample_rate: u32,
+    cache: waveform::WaveformCache,
+}
+
+/// What `get_waveform` hands the frontend — just what it renders.
+#[derive(Clone, serde::Serialize)]
+struct WaveformResponse {
+    peaks: Vec<f32>,
+    sample_rate: u32,
+}
+
+fn build_waveform_payload(buffer: &audio_metadata::DecodedAudioBuffer) -> StoredWaveform {
+    let cache = waveform::WaveformCache::from_samples(&buffer.samples, buffer.sample_rate);
+    StoredWaveform {
+        peaks: cache.transport_strip(),
+        sample_rate: buffer.sample_rate,
+        cache,
+    }
+}
+
+fn persist_waveform_payload(
+    catalog: &Catalog,
+    asset_id: Uuid,
+    payload: &StoredWaveform,
+) -> Result<(), String> {
+    let json = serde_json::to_string(payload).map_err(|error| error.to_string())?;
+    catalog
+        .set_waveform_cache(asset_id, i64::from(payload.sample_rate), &json)
+        .map_err(storage_error_message)?;
     catalog
         .complete_pending_jobs_for_asset(asset_id, JobKind::WaveformGeneration)
+        .map_err(storage_error_message)?;
+    Ok(())
+}
+
+/// Returns an asset's cached waveform, or `None` if it hasn't been
+/// generated yet (the frontend then computes one itself and calls
+/// `store_waveform_peaks` so the miss only happens once). A corrupt stored
+/// payload is treated as a miss rather than an error, for the same reason.
+#[tauri::command]
+fn get_waveform(
+    state: tauri::State<CatalogState>,
+    asset_id: String,
+) -> Result<Option<WaveformResponse>, String> {
+    let asset_id = parse_uuid_field(&asset_id, "asset id")?;
+    let catalog = state.0.lock().expect("catalog mutex poisoned");
+    let Some(row) = catalog
+        .get_waveform_cache(asset_id)
+        .map_err(storage_error_message)?
+    else {
+        return Ok(None);
+    };
+    match serde_json::from_str::<StoredWaveform>(&row.payload) {
+        Ok(stored) => Ok(Some(WaveformResponse {
+            peaks: stored.peaks,
+            sample_rate: stored.sample_rate,
+        })),
+        Err(error) => {
+            eprintln!("waveform: discarding corrupt payload for {asset_id}: {error}");
+            Ok(None)
+        }
+    }
+}
+
+/// Persists a waveform the frontend computed itself (the fallback path when
+/// `get_waveform` missed) so no asset is ever decoded in the WebView more
+/// than once. The array is clamped and length-capped so a bad client value
+/// can't poison the cache; the multi-resolution layers are left empty since
+/// the client only produces the flat strip.
+#[tauri::command]
+fn store_waveform_peaks(
+    state: tauri::State<CatalogState>,
+    asset_id: String,
+    peaks: Vec<f32>,
+    sample_rate: u32,
+) -> Result<(), String> {
+    let asset_id = parse_uuid_field(&asset_id, "asset id")?;
+    let peaks: Vec<f32> = peaks
+        .into_iter()
+        .take(4096)
+        .map(|value| if value.is_finite() { value.clamp(0.0, 1.0) } else { 0.0 })
+        .collect();
+    let payload = StoredWaveform {
+        peaks,
+        sample_rate,
+        cache: waveform::WaveformCache {
+            sample_rate,
+            row: Vec::new(),
+            inspector: Vec::new(),
+            transport: Vec::new(),
+        },
+    };
+    let catalog = state.0.lock().expect("catalog mutex poisoned");
+    persist_waveform_payload(&catalog, asset_id, &payload)
+}
+
+/// Drains pending `WaveformGeneration` jobs: decode each asset's source
+/// file once on a blocking thread, reduce it to a peak payload, and persist
+/// it so browsing that asset never re-reads the file. Mirrors
+/// `process_audio_analysis_jobs` — bounded batch, self-healing stuck
+/// claims, bounded concurrency, catalog mutex held only for the short
+/// reads/writes around the decode. An asset that isn't available locally
+/// yet is left pending (picked back up by `reset_stuck_processing_jobs`),
+/// not failed. The common case during import is that the analysis job
+/// decodes first and fills this cache as a side effect, so this usually
+/// finds nothing to do — it's the path for relinks, an analysis-paused
+/// queue, and libraries catalogued before waveform caching existed.
+#[tauri::command(async)]
+async fn process_waveform_jobs(
+    app: tauri::AppHandle,
+    state: tauri::State<'_, CatalogState>,
+) -> Result<usize, String> {
+    use futures::stream::{self, StreamExt};
+
+    let jobs = {
+        let catalog = state.0.lock().expect("catalog mutex poisoned");
+        catalog
+            .reset_stuck_processing_jobs(JobKind::WaveformGeneration)
+            .map_err(storage_error_message)?;
+        catalog
+            .claim_pending_jobs(JobKind::WaveformGeneration, 24)
+            .map_err(storage_error_message)?
+    };
+
+    // Same reasoning as AUDIO_ANALYSIS_CONCURRENCY: enough to use several
+    // cores on local storage, not so much that it fires a swarm of
+    // simultaneous whole-file reads at one NAS mount.
+    const WAVEFORM_CONCURRENCY: usize = 4;
+
+    let mut results = stream::iter(jobs)
+        .map(|job| process_one_waveform_job(&app, &state, job))
+        .buffer_unordered(WAVEFORM_CONCURRENCY);
+
+    let mut processed = 0usize;
+    while let Some(counted) = results.next().await {
+        if counted {
+            processed += 1;
+        }
+    }
+
+    Ok(processed)
+}
+
+async fn process_one_waveform_job(
+    app: &tauri::AppHandle,
+    state: &tauri::State<'_, CatalogState>,
+    job: storage::JobRecord,
+) -> bool {
+    let asset = {
+        let catalog = state.0.lock().expect("catalog mutex poisoned");
+        catalog.get_asset(job.asset_id)
+    };
+    let asset = match asset {
+        Ok(Some(asset)) => asset,
+        Ok(None) => {
+            let catalog = state.0.lock().expect("catalog mutex poisoned");
+            if let Err(error) = catalog.fail_job(job.id, "asset not found") {
+                eprintln!("waveform: failed to record missing-asset failure: {error:?}");
+            }
+            return true;
+        }
+        Err(error) => {
+            eprintln!("waveform: failed to load asset {}: {error:?}", job.asset_id);
+            return false;
+        }
+    };
+
+    let local_path = {
+        let catalog = state.0.lock().expect("catalog mutex poisoned");
+        local_asset_path(app, &catalog, &asset)
+    };
+    // Not warmed into the local cache yet — leave the job pending, same as
+    // analysis does, so a later warm+retry picks it up.
+    let Ok(local_path) = local_path else {
+        return true;
+    };
+    if !std::path::Path::new(&local_path).exists() {
+        return true;
+    }
+
+    let decode_path = local_path.clone();
+    let decoded = tauri::async_runtime::spawn_blocking(move || {
+        audio_metadata::decode_any_supported_audio(&decode_path).map_err(|error| format!("{error:?}"))
+    })
+    .await;
+
+    let catalog = state.0.lock().expect("catalog mutex poisoned");
+    match decoded {
+        Ok(Ok(buffer)) => {
+            let payload = build_waveform_payload(&buffer);
+            if let Err(error) = persist_waveform_payload(&catalog, job.asset_id, &payload) {
+                eprintln!("waveform: failed to persist payload for job {}: {error}", job.id);
+            }
+        }
+        Ok(Err(error)) => {
+            if let Err(fail_error) = catalog.fail_job(job.id, &error) {
+                eprintln!("waveform: failed to record decode failure: {fail_error:?}");
+            }
+        }
+        Err(join_error) => {
+            eprintln!("waveform: decode task panicked: {join_error}");
+            return false;
+        }
+    }
+    true
+}
+
+/// Where the instrument model may live: the app-data `models/` dir (a
+/// drop-in that needs no rebuild) takes priority over the bundled
+/// `resources/models/`. Returns the pair only if BOTH files are present.
+fn instrument_model_paths(app: &tauri::AppHandle) -> Option<(PathBuf, PathBuf)> {
+    let dirs = [
+        app.path().app_data_dir().ok().map(|dir| dir.join("models")),
+        app.path().resource_dir().ok().map(|dir| dir.join("models")),
+    ];
+    for dir in dirs.into_iter().flatten() {
+        let model = dir.join("yamnet.onnx");
+        let class_map = dir.join("yamnet_class_map.csv");
+        if model.is_file() && class_map.is_file() {
+            return Some((model, class_map));
+        }
+    }
+    None
+}
+
+/// Drains pending `InstrumentDetection` jobs: decode each asset once and run
+/// the YAMNet model over it, persisting the folded instrument labels. If no
+/// model is installed this claims nothing and returns 0 — the jobs stay
+/// pending and start processing once a model is dropped in and the app
+/// restarts. Inference is serialised on the model mutex (the ONNX session
+/// isn't `Sync`, and it already parallelises internally), so unlike the
+/// waveform/analysis workers this runs one job at a time.
+#[tauri::command(async)]
+async fn process_instrument_jobs(
+    app: tauri::AppHandle,
+    state: tauri::State<'_, CatalogState>,
+    model_state: tauri::State<'_, InstrumentModelState>,
+) -> Result<usize, String> {
+    use std::sync::atomic::Ordering;
+
+    if !model_state.tried.swap(true, Ordering::SeqCst) {
+        match instrument_model_paths(&app) {
+            Some((model_path, class_map_path)) => {
+                let loaded = tauri::async_runtime::spawn_blocking(move || {
+                    audio_analysis::load_instrument_model(&model_path, &class_map_path)
+                })
+                .await
+                .ok()
+                .flatten();
+                if loaded.is_some() {
+                    *model_state.model.lock().expect("instrument model mutex poisoned") = loaded;
+                } else {
+                    eprintln!("instrument-detection: model files found but failed to load");
+                }
+            }
+            None => eprintln!(
+                "instrument-detection: no model installed (models/yamnet.onnx + \
+                 yamnet_class_map.csv) — instrument jobs will wait"
+            ),
+        }
+    }
+    if model_state
+        .model
+        .lock()
+        .expect("instrument model mutex poisoned")
+        .is_none()
+    {
+        return Ok(0);
+    }
+
+    let jobs = {
+        let catalog = state.0.lock().expect("catalog mutex poisoned");
+        catalog
+            .reset_stuck_processing_jobs(JobKind::InstrumentDetection)
+            .map_err(storage_error_message)?;
+        catalog
+            .claim_pending_jobs(JobKind::InstrumentDetection, 12)
+            .map_err(storage_error_message)?
+    };
+
+    let mut processed = 0usize;
+    for job in jobs {
+        if process_one_instrument_job(&app, &state, &model_state, job).await {
+            processed += 1;
+        }
+    }
+    Ok(processed)
+}
+
+async fn process_one_instrument_job(
+    app: &tauri::AppHandle,
+    state: &tauri::State<'_, CatalogState>,
+    model_state: &tauri::State<'_, InstrumentModelState>,
+    job: storage::JobRecord,
+) -> bool {
+    let asset = {
+        let catalog = state.0.lock().expect("catalog mutex poisoned");
+        catalog.get_asset(job.asset_id)
+    };
+    let asset = match asset {
+        Ok(Some(asset)) => asset,
+        Ok(None) => {
+            let catalog = state.0.lock().expect("catalog mutex poisoned");
+            let _ = catalog.fail_job(job.id, "asset not found");
+            return true;
+        }
+        Err(error) => {
+            eprintln!("instrument-detection: failed to load asset {}: {error:?}", job.asset_id);
+            return false;
+        }
+    };
+
+    let local_path = {
+        let catalog = state.0.lock().expect("catalog mutex poisoned");
+        local_asset_path(app, &catalog, &asset)
+    };
+    let Ok(local_path) = local_path else {
+        return true;
+    };
+    if !std::path::Path::new(&local_path).exists() {
+        return true;
+    }
+
+    let model = model_state.model.clone();
+    let detected = tauri::async_runtime::spawn_blocking(move || -> Result<Vec<(String, f64)>, String> {
+        let buffer = audio_metadata::decode_any_supported_audio(&local_path)
+            .map_err(|error| format!("{error:?}"))?;
+        let mut guard = model.lock().expect("instrument model mutex poisoned");
+        let Some(model) = guard.as_mut() else {
+            return Err("instrument model unloaded".to_string());
+        };
+        Ok(audio_analysis::detect_instruments(model, &buffer)
+            .into_iter()
+            .map(|prediction| (prediction.instrument, prediction.confidence as f64))
+            .collect())
+    })
+    .await;
+
+    let catalog = state.0.lock().expect("catalog mutex poisoned");
+    match detected {
+        Ok(Ok(instruments)) => match catalog.set_asset_instruments(job.asset_id, &instruments) {
+            Ok(()) => {
+                let _ = catalog.complete_job(job.id);
+            }
+            Err(error) => {
+                // Persist failed (transient DB error) — leave it failed so
+                // the standing worker retries, rather than completing a job
+                // that stored nothing.
+                let message = format!("could not persist instruments: {error}");
+                if let Err(fail_error) = catalog.fail_job(job.id, &message) {
+                    eprintln!("instrument-detection: failed to record persist failure: {fail_error:?}");
+                }
+            }
+        },
+        Ok(Err(error)) => {
+            if let Err(fail_error) = catalog.fail_job(job.id, &error) {
+                eprintln!("instrument-detection: failed to record failure: {fail_error:?}");
+            }
+        }
+        Err(join_error) => {
+            eprintln!("instrument-detection: task panicked: {join_error}");
+            return false;
+        }
+    }
+    true
+}
+
+/// Job priority resync_analysis queues at for each kind — kept alongside
+/// resync_analysis rather than in `JobKind` itself since it's a UI-driven
+/// "how urgent is a manual re-analysis" choice, not an intrinsic property of
+/// the kind.
+fn resync_priority_for_job_kind(kind: &JobKind) -> i64 {
+    match kind {
+        JobKind::MetadataExtraction => 10,
+        JobKind::Hashing => 20,
+        JobKind::WaveformGeneration => 30,
+        JobKind::AudioAnalysis => 40,
+        JobKind::InstrumentDetection => 50,
+    }
+}
+
+/// The Sonic Radar "sync" button, and the inspector's per-track Analyze
+/// buttons: re-queue analysis for a selection — or the whole library when
+/// nothing is selected — so assets whose original jobs already completed
+/// pick up newer detection (ADR 0032). Returns the total number of jobs
+/// queued; the frontend then drives the normal drain.
+///
+/// `kinds` (job-kind strings, e.g. "audio_analysis", "instrument_detection")
+/// lets a caller target just one pass — the inspector's Sonic Radar section
+/// uses this so re-analyzing one asset doesn't also re-run every other pass
+/// on it. Omitted or empty defaults to all three passes (waveform, audio
+/// analysis, instrument detection), which is what the sidebar's whole-
+/// selection sync button relies on. Note tempo/key/pitch/vocals are *not*
+/// independently selectable: `analyze_asset_audio` decodes the file once and
+/// fills all four from that single pass, so every one of them maps to the
+/// same "audio_analysis" kind.
+// (async): the whole-library form runs bulk INSERT…SELECT over the entire
+// assets table up to three times; on a large library that's enough work
+// that it must not sit on the main thread (ADR 0024's recurring lesson).
+#[tauri::command(async)]
+fn resync_analysis(
+    state: tauri::State<'_, CatalogState>,
+    library_id: String,
+    asset_ids: Vec<String>,
+    kinds: Option<Vec<String>>,
+) -> Result<usize, String> {
+    let library_id = parse_uuid_field(&library_id, "library id")?;
+    let asset_ids = asset_ids
+        .iter()
+        .map(|id| parse_uuid_field(id, "asset id"))
+        .collect::<Result<Vec<_>, _>>()?;
+
+    let selected_kinds = match kinds {
+        Some(names) if !names.is_empty() => names
+            .iter()
+            .map(|name| parse_job_kind_field(name))
+            .collect::<Result<Vec<_>, _>>()?,
+        _ => vec![JobKind::WaveformGeneration, JobKind::AudioAnalysis, JobKind::InstrumentDetection],
+    };
+
+    let catalog = state.0.lock().expect("catalog mutex poisoned");
+    let mut queued = 0usize;
+    for kind in selected_kinds {
+        let priority = resync_priority_for_job_kind(&kind);
+        queued += if asset_ids.is_empty() {
+            catalog
+                .requeue_analysis_for_library(library_id, kind, priority)
+                .map_err(storage_error_message)?
+        } else {
+            catalog
+                .requeue_analysis_for_assets(&asset_ids, kind, priority)
+                .map_err(storage_error_message)?
+        };
+    }
+    Ok(queued)
+}
+
+/// Whether instrument detection can actually run — the model is loaded, or
+/// its files are present and will load on the next job. The frontend uses
+/// this to drop `instrument_detection` from the job-drain loop when there's
+/// no model, so a library full of pending detection jobs doesn't flash a
+/// "Detecting instruments 0%" bar on every background tick forever.
+#[tauri::command]
+fn instrument_detection_available(
+    app: tauri::AppHandle,
+    model_state: tauri::State<'_, InstrumentModelState>,
+) -> bool {
+    if model_state
+        .model
+        .lock()
+        .expect("instrument model mutex poisoned")
+        .is_some()
+    {
+        return true;
+    }
+    instrument_model_paths(&app).is_some()
+}
+
+#[derive(serde::Serialize)]
+struct InstrumentFacet {
+    name: String,
+    count: i64,
+}
+
+/// Every distinct detected instrument in a library with its asset count —
+/// the data behind the Instrument Detection page's pill grid.
+#[tauri::command]
+fn instruments_for_library(
+    state: tauri::State<CatalogState>,
+    library_id: String,
+) -> Result<Vec<InstrumentFacet>, String> {
+    let library_id = parse_uuid_field(&library_id, "library id")?;
+    let catalog = state.0.lock().expect("catalog mutex poisoned");
+    Ok(catalog
+        .instrument_counts_for_library(library_id)
+        .map_err(storage_error_message)?
+        .into_iter()
+        .map(|(name, count)| InstrumentFacet { name, count })
+        .collect())
+}
+
+/// Assets that have ANY of the given instruments (OR match) — the filtered
+/// list once one or more instrument pills are selected.
+#[tauri::command]
+fn assets_by_instruments(
+    state: tauri::State<CatalogState>,
+    library_id: String,
+    instruments: Vec<String>,
+) -> Result<Vec<AssetRecord>, String> {
+    let library_id = parse_uuid_field(&library_id, "library id")?;
+    let catalog = state.0.lock().expect("catalog mutex poisoned");
+    catalog
+        .assets_with_any_instrument(library_id, &instruments)
         .map_err(storage_error_message)
+}
+
+#[derive(serde::Serialize)]
+struct InstrumentTag {
+    name: String,
+    confidence: f64,
+}
+
+/// One asset's detected instruments (for the inspector), strongest first.
+#[tauri::command]
+fn asset_instruments(
+    state: tauri::State<CatalogState>,
+    asset_id: String,
+) -> Result<Vec<InstrumentTag>, String> {
+    let asset_id = parse_uuid_field(&asset_id, "asset id")?;
+    let catalog = state.0.lock().expect("catalog mutex poisoned");
+    Ok(catalog
+        .instruments_for_asset(asset_id)
+        .map_err(storage_error_message)?
+        .into_iter()
+        .map(|(name, confidence)| InstrumentTag { name, confidence })
+        .collect())
 }
 
 // (async): reads embedded metadata from each pending asset's file (ADR
@@ -1619,11 +2170,12 @@ struct JobStatusEntry {
     completed: usize,
 }
 
-/// Library-scoped pending/failed/completed counts for the two job kinds the
-/// frontend can actually drive to completion (`process_pending_jobs`,
-/// `process_audio_analysis_jobs`). WaveformGeneration is deliberately
-/// excluded — it completes per-asset when the frontend previews a sound,
-/// not via any batch command, so there's no queue to report progress on.
+/// Library-scoped pending/failed/completed counts for the three job kinds
+/// the frontend drives to completion: `process_pending_jobs`
+/// (metadata_extraction), `process_waveform_jobs` (waveform_generation),
+/// and `process_audio_analysis_jobs` (audio_analysis). WaveformGeneration
+/// used to complete only when the frontend previewed a sound; it is now a
+/// real backend queue (ADR 0029), so it reports progress like the others.
 /// failed/completed exist so a finished batch can report what actually
 /// happened (and how many failed) instead of just disappearing silently.
 #[tauri::command]
@@ -1636,6 +2188,8 @@ fn job_status(
 
     [
         (JobKind::MetadataExtraction, "metadata_extraction"),
+        (JobKind::WaveformGeneration, "waveform_generation"),
+        (JobKind::InstrumentDetection, "instrument_detection"),
         (JobKind::AudioAnalysis, "audio_analysis"),
     ]
     .into_iter()
@@ -1656,6 +2210,8 @@ fn job_status(
 fn parse_job_kind_field(kind: &str) -> Result<JobKind, String> {
     match kind {
         "metadata_extraction" => Ok(JobKind::MetadataExtraction),
+        "waveform_generation" => Ok(JobKind::WaveformGeneration),
+        "instrument_detection" => Ok(JobKind::InstrumentDetection),
         "audio_analysis" => Ok(JobKind::AudioAnalysis),
         other => Err(format!("unknown job kind: {other}")),
     }
@@ -1878,6 +2434,14 @@ fn save_audio_analysis_outcome(
     catalog
         .set_audio_analysis(asset_id, outcome.update)
         .map_err(storage_error_message)?;
+    // The decode this analysis just did is also everything the waveform
+    // cache needs — fill it now and mark the WaveformGeneration job done,
+    // so process_waveform_jobs won't decode the same file again. A failure
+    // here is logged, not fatal: the standalone job is still pending and
+    // will regenerate it.
+    if let Err(error) = persist_waveform_payload(catalog, asset_id, &outcome.waveform) {
+        eprintln!("waveform: failed to persist alongside analysis for {asset_id}: {error}");
+    }
     catalog
         .set_vocal_ratio(asset_id, vocal_ratio)
         .map_err(storage_error_message)?;
@@ -1941,6 +2505,11 @@ struct AudioAnalysisOutcome {
     suggested_tags: Vec<&'static str>,
     vocal_ratio: Option<f32>,
     update: storage::AudioAnalysisUpdate,
+    /// Built from the same decoded buffer as the analysis, so the common
+    /// import path decodes each file once and fills the waveform cache as a
+    /// side effect rather than making `process_waveform_jobs` decode it a
+    /// second time.
+    waveform: StoredWaveform,
 }
 
 async fn analyze_asset_audio(
@@ -1958,11 +2527,12 @@ async fn analyze_asset_audio(
     // spawn_blocking moves it onto Tokio's separate blocking-thread pool,
     // where it can run at full CPU cost without starving the UI thread.
     let path_owned = path.to_string();
-    let (needs_review, suggested_tags, vocal_ratio, mut update) =
+    let (needs_review, suggested_tags, vocal_ratio, mut update, waveform) =
         tauri::async_runtime::spawn_blocking(move || -> Result<_, String> {
             let buffer = audio_metadata::decode_any_supported_audio(&path_owned)
                 .map_err(|error| format!("{error:?}"))?;
 
+            let waveform = build_waveform_payload(&buffer);
             let needs_review = audio_analysis::is_likely_silent_or_corrupt(&buffer);
             let measurements = audio_analysis::measure(&buffer);
             let suggested_tags = audio_analysis::suggest_action_tags(&buffer, measurements)
@@ -1971,6 +2541,7 @@ async fn analyze_asset_audio(
                 .collect::<Vec<_>>();
             let tempo = audio_analysis::estimate_tempo(&buffer);
             let pitch = audio_analysis::estimate_pitch(&buffer);
+            let key = audio_analysis::estimate_key(&buffer);
             let vocal_ratio = audio_analysis::detect_vocal_ratio(&buffer);
 
             let channels = buffer.channels.max(1) as u64;
@@ -1992,9 +2563,11 @@ async fn analyze_asset_audio(
                 musical_key: pitch.as_ref().map(|estimate| estimate.note_name.clone()),
                 key_confidence: pitch.as_ref().map(|estimate| estimate.clarity as f64),
                 perceptual_fingerprint: None,
+                detected_key: key.as_ref().map(|estimate| estimate.key.clone()),
+                key_strength: key.as_ref().map(|estimate| estimate.strength as f64),
             };
 
-            Ok((needs_review, suggested_tags, vocal_ratio, update))
+            Ok((needs_review, suggested_tags, vocal_ratio, update, waveform))
         })
         .await
         .map_err(|error| format!("audio analysis task panicked: {error}"))??;
@@ -2006,6 +2579,7 @@ async fn analyze_asset_audio(
         suggested_tags,
         vocal_ratio,
         update,
+        waveform,
     })
 }
 
@@ -2341,7 +2915,16 @@ fn relink_asset(
     let catalog = state.0.lock().expect("catalog mutex poisoned");
     catalog
         .relink_asset(asset_id, new_path)
-        .map_err(storage_error_message)
+        .map_err(storage_error_message)?;
+    // relink_asset drops the now-wrong waveform cache; queue a fresh
+    // generation pass for the new file so the strip repopulates without
+    // waiting for the next preview.
+    let _ = catalog.enqueue_job(asset_id, JobKind::WaveformGeneration, 30);
+    // The old file's instruments no longer describe the new one — clear
+    // them and queue a re-detect.
+    let _ = catalog.set_asset_instruments(asset_id, &[]);
+    let _ = catalog.enqueue_job(asset_id, JobKind::InstrumentDetection, 50);
+    Ok(())
 }
 
 #[tauri::command]
@@ -2815,6 +3398,10 @@ pub fn run() {
                 audio_analysis_paused: std::sync::atomic::AtomicBool::new(false),
             });
             app.manage(SimilarityWorkerState(tokio::sync::Mutex::new(None)));
+            app.manage(InstrumentModelState {
+                model: std::sync::Arc::new(Mutex::new(None)),
+                tried: std::sync::atomic::AtomicBool::new(false),
+            });
             #[cfg(all(target_os = "macos", not(feature = "direct-dist")))]
             app.manage(BookmarkAccessState(Mutex::new(std::collections::HashMap::new())));
 
@@ -3045,13 +3632,21 @@ pub fn run() {
             restore_library,
             process_pending_jobs,
             process_audio_analysis_jobs,
+            process_waveform_jobs,
+            process_instrument_jobs,
+            instrument_detection_available,
+            resync_analysis,
+            instruments_for_library,
+            assets_by_instruments,
+            asset_instruments,
             set_audio_analysis_paused,
             audio_analysis_paused,
             job_status,
             retry_failed_jobs,
             failed_job_extensions,
             similar_assets,
-            mark_waveform_ready,
+            get_waveform,
+            store_waveform_peaks,
             trash_duplicate_group,
             explain_search_query,
             create_browser_state,
@@ -3084,6 +3679,34 @@ mod tests {
     fn parse_uuid_field_accepts_uuid_input() {
         let id = uuid::Uuid::new_v4();
         assert_eq!(super::parse_uuid_field(&id.to_string(), "library id"), Ok(id));
+    }
+
+    #[test]
+    fn parse_job_kind_field_round_trips_waveform_generation() {
+        assert_eq!(
+            super::parse_job_kind_field("waveform_generation"),
+            Ok(storage::JobKind::WaveformGeneration)
+        );
+    }
+
+    #[test]
+    fn build_waveform_payload_produces_a_bounded_strip_and_serializes() {
+        let buffer = audio_metadata::DecodedAudioBuffer {
+            sample_rate: 48_000,
+            channels: 2,
+            samples: (0..20_000)
+                .map(|i| if i % 2 == 0 { -0.8 } else { 0.6 })
+                .collect(),
+        };
+
+        let payload = super::build_waveform_payload(&buffer);
+        assert_eq!(payload.sample_rate, 48_000);
+        assert_eq!(payload.peaks.len(), waveform::TRANSPORT_STRIP_BUCKETS);
+        assert!(payload.peaks.iter().all(|value| (0.0..=1.0).contains(value)));
+
+        let json = serde_json::to_string(&payload).expect("serialize");
+        let restored: super::StoredWaveform = serde_json::from_str(&json).expect("deserialize");
+        assert_eq!(restored.peaks, payload.peaks);
     }
 
     #[test]

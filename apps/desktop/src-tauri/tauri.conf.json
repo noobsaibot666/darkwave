@@ -39,6 +39,7 @@
       "icons/icon.ico"
     ],
     "externalBin": ["binaries/similarity-worker"],
+    "resources": ["models/*"],
     "macOS": {
       "entitlements": "entitlements.mas.plist",
       "hardenedRuntime": true,

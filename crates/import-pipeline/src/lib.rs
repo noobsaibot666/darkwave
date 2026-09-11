@@ -6,6 +6,7 @@ use sha2::{Digest, Sha256};
 use shared_types::{AvailabilityState, StorageMode};
 use std::collections::BTreeMap;
 use std::fs;
+use std::io::Read;
 use std::path::{Path, PathBuf};
 use storage::{
     AssetPath, AssetRecord, Catalog, JobKind, NewAssetRecord, SourceRecordDraft, StorageError,
@@ -238,7 +239,8 @@ pub fn import_file(
     path: impl AsRef<Path>,
     mode: ImportMode,
 ) -> Result<AssetRecord, ImportError> {
-    import_file_internal(catalog, library_id, path.as_ref(), mode, None)
+    let prepared = prepare_import(path, mode)?;
+    commit_prepared_import(catalog, library_id, prepared, None)
 }
 
 pub fn import_file_with_source_context(
@@ -248,22 +250,49 @@ pub fn import_file_with_source_context(
     mode: ImportMode,
     source_context: ImportSourceContext,
 ) -> Result<AssetRecord, ImportError> {
-    import_file_internal(
-        catalog,
-        library_id,
-        path.as_ref(),
-        mode,
-        Some(source_context),
-    )
+    let prepared = prepare_import(path, mode)?;
+    commit_prepared_import(catalog, library_id, prepared, Some(source_context))
 }
 
-fn import_file_internal(
-    catalog: &Catalog,
-    library_id: Uuid,
-    path: &Path,
+/// Everything `import_file` computes about a candidate file *before* it
+/// touches the catalog: the extension check, the streamed content hash, and
+/// the filename/metadata-derived tag suggestions. All of it is filesystem
+/// work — the slow, disk- or NAS-bound part of an import — and none of it
+/// needs the catalog lock, so a batch importer can run this stage across
+/// many files in parallel and then commit them one at a time. Produced by
+/// [`prepare_import`], consumed by [`commit_prepared_import`].
+#[derive(Clone, Debug)]
+pub struct PreparedImport {
+    source_path: PathBuf,
     mode: ImportMode,
-    source_context: Option<ImportSourceContext>,
-) -> Result<AssetRecord, ImportError> {
+    original_filename: String,
+    display_name: String,
+    content_hash: String,
+    storage_mode: StorageMode,
+    asset_path: AssetPath,
+    media_type: String,
+    file_size: u64,
+    tag_suggestions: Vec<search::TagSuggestion>,
+}
+
+impl PreparedImport {
+    /// The file this was prepared from — handy for a caller reporting a
+    /// per-file failure without re-deriving the name.
+    pub fn source_path(&self) -> &Path {
+        &self.source_path
+    }
+
+    pub fn original_filename(&self) -> &str {
+        &self.original_filename
+    }
+}
+
+/// Reads and fingerprints one candidate file without any catalog access.
+/// Returns [`ImportError::UnsupportedFormat`] for anything whose extension
+/// isn't a recognized audio type, exactly as `import_file` does, so callers
+/// can keep treating that as a silent skip.
+pub fn prepare_import(path: impl AsRef<Path>, mode: ImportMode) -> Result<PreparedImport, ImportError> {
+    let path = path.as_ref();
     let metadata = extract_immediate_metadata(path)?;
 
     if !is_recognized_audio_extension(&metadata.extension) {
@@ -280,7 +309,7 @@ fn import_file_internal(
         .and_then(|file_stem| file_stem.to_str())
         .unwrap_or(&original_filename)
         .replace(['_', '-'], " ");
-    let content_hash = lightweight_content_hash(path)?;
+    let content_hash = stream_content_hash(path)?;
     let storage_mode = match mode {
         ImportMode::Managed => StorageMode::Managed,
         ImportMode::Referenced => StorageMode::Referenced,
@@ -296,6 +325,43 @@ fn import_file_internal(
         metadata.file_size,
     );
 
+    Ok(PreparedImport {
+        source_path: path.to_path_buf(),
+        mode,
+        original_filename,
+        display_name,
+        content_hash,
+        storage_mode,
+        asset_path,
+        media_type,
+        file_size: metadata.file_size,
+        tag_suggestions,
+    })
+}
+
+/// Registers a [`PreparedImport`] in the catalog and, for a genuinely new
+/// asset, enqueues its background jobs, seeds tag suggestions, records
+/// source context, and (Managed mode) copies the file into the library.
+/// This is the only stage that needs the catalog lock.
+pub fn commit_prepared_import(
+    catalog: &Catalog,
+    library_id: Uuid,
+    prepared: PreparedImport,
+    source_context: Option<ImportSourceContext>,
+) -> Result<AssetRecord, ImportError> {
+    let PreparedImport {
+        source_path,
+        mode,
+        original_filename,
+        display_name,
+        content_hash,
+        storage_mode,
+        asset_path,
+        media_type,
+        file_size,
+        tag_suggestions,
+    } = prepared;
+
     let (asset, is_new) = catalog.register_asset(NewAssetRecord {
         library_id,
         original_filename,
@@ -304,7 +370,7 @@ fn import_file_internal(
         storage_mode,
         content_hash: Some(content_hash),
         media_type,
-        file_size: metadata.file_size,
+        file_size,
         availability_state: AvailabilityState::Local,
     })?;
 
@@ -319,10 +385,15 @@ fn import_file_internal(
     // already made) on every rescan. Skip all of it for an existing asset.
     if is_new {
         catalog.enqueue_job(asset.id, JobKind::MetadataExtraction, 10)?;
-        // No Hashing job: content_hash above is already a full-file SHA-256, not a partial
-        // sample, so there is no further hashing work for a background job to do.
+        // No Hashing job: stream_content_hash above is already a full-file SHA-256, not a
+        // partial sample, so there is no further hashing work for a background job to do.
+        // The WaveformGeneration job below is drained by the desktop shell's
+        // process_waveform_jobs command (decode once, cache the peaks) — see ADR 0029.
         catalog.enqueue_job(asset.id, JobKind::WaveformGeneration, 30)?;
         catalog.enqueue_job(asset.id, JobKind::AudioAnalysis, 40)?;
+        // Instrument detection (ADR 0031) is its own job — it runs a
+        // separate ONNX model and is drained by process_instrument_jobs.
+        catalog.enqueue_job(asset.id, JobKind::InstrumentDetection, 50)?;
         suggest_import_tags(catalog, &asset, &tag_suggestions)?;
         if let Some(source_context) = source_context {
             catalog.set_source_record(SourceRecordDraft {
@@ -338,7 +409,7 @@ fn import_file_internal(
         }
 
         if mode == ImportMode::Managed {
-            copy_managed_source(catalog, library_id, path, &asset)?;
+            copy_managed_source(catalog, library_id, &source_path, &asset)?;
         }
     }
 
@@ -359,10 +430,26 @@ fn snapshot_file_sizes(folder: &Path) -> Result<BTreeMap<PathBuf, u64>, ImportEr
     Ok(sizes)
 }
 
-fn lightweight_content_hash(path: &Path) -> Result<String, ImportError> {
-    let bytes = fs::read(path)?;
-    let digest = Sha256::digest(bytes);
-    Ok(format!("{digest:x}"))
+/// Full-file SHA-256, read in bounded chunks rather than slurped into one
+/// `Vec` the size of the file — a multi-GB stem no longer spikes memory by
+/// its whole length just to be fingerprinted. The digest is unchanged
+/// (still every byte of the file), so this is drop-in with existing
+/// `content_hash` values.
+fn stream_content_hash(path: &Path) -> Result<String, ImportError> {
+    let file = fs::File::open(path)?;
+    let mut reader = std::io::BufReader::with_capacity(1 << 16, file);
+    let mut hasher = Sha256::new();
+    let mut buffer = [0u8; 1 << 16];
+
+    loop {
+        let read = reader.read(&mut buffer)?;
+        if read == 0 {
+            break;
+        }
+        hasher.update(&buffer[..read]);
+    }
+
+    Ok(format!("{:x}", hasher.finalize()))
 }
 
 fn infer_media_type_from_suggestions(suggestions: &[search::TagSuggestion]) -> String {
@@ -653,6 +740,57 @@ mod tests {
         assert_eq!(imported.storage_mode, StorageMode::Referenced);
         assert_eq!(catalog.list_assets(library.id).expect("assets").len(), 1);
         assert!(catalog.next_pending_job().expect("job query").is_some());
+    }
+
+    #[test]
+    fn stream_content_hash_matches_a_whole_file_digest() {
+        let audio_path = unique_audio_path("hash-stream.wav");
+        // Larger than the 64 KiB read buffer, so the chunked loop runs more
+        // than once — the case a single fs::read would never exercise.
+        let payload: Vec<u8> = (0..200_000u32).map(|i| (i % 251) as u8).collect();
+        fs::write(&audio_path, &payload).expect("fixture");
+
+        let streamed = stream_content_hash(&audio_path).expect("hash");
+        let one_shot = format!("{:x}", Sha256::digest(&payload));
+
+        assert_eq!(streamed, one_shot);
+    }
+
+    #[test]
+    fn prepare_import_does_no_catalog_work_and_commit_finishes_it() {
+        let catalog_path = unique_catalog_path("prepare-commit");
+        let audio_path = unique_audio_path("prepare-commit-impact.wav");
+        fs::write(&audio_path, b"prepare then commit").expect("fixture");
+
+        let prepared = prepare_import(&audio_path, ImportMode::Referenced).expect("prepare");
+        assert_eq!(prepared.original_filename(), "prepare-commit-impact.wav");
+        assert_eq!(prepared.source_path(), audio_path.as_path());
+
+        let catalog = Catalog::open(&catalog_path).expect("catalog");
+        let library = catalog
+            .create_library("Split", "/library")
+            .expect("library");
+        let asset = commit_prepared_import(&catalog, library.id, prepared, None).expect("commit");
+
+        assert_eq!(asset.original_filename, "prepare-commit-impact.wav");
+        assert_eq!(catalog.list_assets(library.id).expect("assets").len(), 1);
+        assert_eq!(
+            catalog
+                .pending_job_count(JobKind::WaveformGeneration)
+                .expect("job count"),
+            1
+        );
+    }
+
+    #[test]
+    fn prepare_import_rejects_unrecognized_extensions() {
+        let path = unique_audio_path("notes.txt");
+        fs::write(&path, b"not audio").expect("fixture");
+
+        assert!(matches!(
+            prepare_import(&path, ImportMode::Referenced),
+            Err(ImportError::UnsupportedFormat(_))
+        ));
     }
 
     #[test]

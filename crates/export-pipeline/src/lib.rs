@@ -720,6 +720,22 @@ mod tests {
     use super::*;
     use std::path::PathBuf;
 
+    /// Mirrors plan_editorial_export's own `Path::join`-based destination
+    /// building, so these assertions check the right segments landed in the
+    /// right order/hierarchy without hardcoding a forward-slash-only string
+    /// `Path::join` never promised — on Windows it only inserts `\` between
+    /// components, it doesn't rewrite the `/` already present in a base
+    /// fixture like "/projects/trailer/audio", so a literal string here
+    /// failed CI's `windows-latest` job for every test that joined a path
+    /// while comparing against a POSIX-only expectation.
+    fn expected_destination(base: &str, parts: &[&str]) -> String {
+        let mut path = PathBuf::from(base);
+        for part in parts {
+            path = path.join(part);
+        }
+        path.to_string_lossy().to_string()
+    }
+
     #[test]
     fn file_url_for_path_handles_windows_drive_paths() {
         assert_eq!(
@@ -759,7 +775,7 @@ mod tests {
         assert_eq!(plan.source_path, "/library/Media/00/impact.wav");
         assert_eq!(
             plan.destination_path,
-            "/projects/trailer/audio/Dark Impact.wav"
+            expected_destination("/projects/trailer/audio", &["Dark Impact.wav"])
         );
         assert!(plan.preserve_original);
         assert!(plan.include_license_record);
@@ -782,7 +798,10 @@ mod tests {
         })
         .expect("plan");
 
-        assert_eq!(plan.destination_path, "/projects/trailer/audio/Theme.wav");
+        assert_eq!(
+            plan.destination_path,
+            expected_destination("/projects/trailer/audio", &["Theme.wav"])
+        );
         assert_eq!(
             plan.range,
             Some(ExportRangeMs {
@@ -815,7 +834,7 @@ mod tests {
 
         assert_eq!(
             plan.destination_path,
-            "/projects/trailer/audio/04_FOLEY/door/Door Open.wav"
+            expected_destination("/projects/trailer/audio", &["04_FOLEY/door", "Door Open.wav"])
         );
     }
 
@@ -834,7 +853,7 @@ mod tests {
 
         assert_eq!(
             plan.destination_path,
-            "/projects/trailer/audio/Room Tone.wav"
+            expected_destination("/projects/trailer/audio", &["Room Tone.wav"])
         );
     }
 

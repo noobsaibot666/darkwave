@@ -583,11 +583,24 @@ mod tests {
 
         assert_eq!(job.library_id, library_id);
         assert_eq!(job.manifest_revision, 9);
+        // Built with the same Path::join plan_reconnect_validation uses,
+        // rather than a hardcoded forward-slash literal — Path::join only
+        // inserts the platform separator (\ on Windows) between the base and
+        // the newly-joined component, it doesn't rewrite the '/' already in
+        // "/Volumes/TrueNAS/SFX", so a literal string here failed CI's
+        // windows-latest job (".../SFX\Media/..." vs the expected
+        // ".../SFX/Media/...").
         assert_eq!(
             job.paths_to_validate,
             vec![
-                "/Volumes/TrueNAS/SFX/Media/00/impact.wav".to_string(),
-                "/Volumes/TrueNAS/SFX/Media/00/riser.wav".to_string(),
+                Path::new("/Volumes/TrueNAS/SFX")
+                    .join("Media/00/impact.wav")
+                    .to_string_lossy()
+                    .to_string(),
+                Path::new("/Volumes/TrueNAS/SFX")
+                    .join("Media/00/riser.wav")
+                    .to_string_lossy()
+                    .to_string(),
             ]
         );
     }

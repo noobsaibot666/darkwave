@@ -28,3 +28,30 @@ Every past "notarization 401" / "Transporter rejected" incident came from using 
 - **Signing certs** (login keychain): Developer ID Application `2FDD1878…` (direct, pinned by SHA-1 in the script) · `3rd Party Mac Developer Application` + `… Installer` (MAS).
 - **Every App Store upload needs a fresh build number** — bump `CFBundleVersion` in `apps/desktop/src-tauri/Info.plist` (marketing version comes from `tauri.conf.json`). App Store Connect 409s a re-used `(CFBundleShortVersionString, CFBundleVersion)` pair, and `CFBundleShortVersionString` must exceed the last *approved* version.
 - **App Store listing name:** `Darkwave — Sound Library` (plain "Darkwave" is taken — App Store names are globally unique).
+
+## Keep every dev machine on the same version — branch hygiene
+
+Development happens on more than one machine (this Mac, and a Windows machine — see
+`docs/src/content/docs/development/windows-setup.md`, which already assumes `git pull origin main`
+is how Windows picks up changes). That only works if `main` on GitHub is actually kept current and
+every machine's local branches are pushed, not left sitting locally.
+
+- **`main` is the single source of truth.** Every machine pulls from it; nothing should be "ahead"
+  of GitHub for more than a session. If a local branch exists (feature work, a Windows-specific
+  build fix, anything), **push it the same session it's created** — an unpushed branch on one
+  machine is invisible to every other machine and to Claude sessions running elsewhere, which is
+  exactly the kind of drift that causes "why doesn't this build on Windows" surprises later.
+- **Machine-specific fixes still go through a real branch + PR, not a local-only branch.** If the
+  Windows machine needs changes just to build there (a `Cargo.lock` platform quirk, a path-handling
+  fix, a toolchain workaround), make them on a short-lived branch off `main`, push it, open a PR,
+  and merge it back into `main` promptly — don't let it live only as an unpushed local branch. A
+  fix that isn't merged doesn't exist as far as any other machine is concerned.
+- **Merge and delete branches once their work lands — don't let them linger.** A long-lived branch
+  that's diverged from `main` for days/weeks (commits piling up on one side with no PR) is the
+  streamlining problem, not a feature. If a branch is meant to ship, open the PR as soon as there's
+  something reviewable, not after it's accumulated a pile of unrelated follow-on work.
+- **Before doing git work in a session** (committing, branching, or being asked to "streamline" /
+  "verify the repo"), run `git fetch --all --prune` and check `git branch -vv` / `gh api
+  repos/{owner}/{repo}/branches` against what's expected — a branch a human mentions (e.g. "the
+  Windows branch") but that doesn't show up on GitHub means it's still local-only somewhere and
+  needs pushing before it can be reviewed, merged, or even inspected from another machine.

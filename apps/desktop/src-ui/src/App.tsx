@@ -8,9 +8,11 @@ import {
   Activity,
   Archive,
   Bell,
+  CheckCircle2,
   ChevronDown,
   ChevronLeft,
   ChevronRight,
+  Circle,
   Clapperboard,
   Contrast,
   Copy,
@@ -25,6 +27,7 @@ import {
   HardDrive,
   HelpCircle,
   Import,
+  KeyRound,
   Library,
   Link2,
   ListFilter,
@@ -34,6 +37,7 @@ import {
   Music2,
   Palette,
   Pause,
+  Piano,
   Play,
   Plus,
   RefreshCw,
@@ -89,11 +93,14 @@ type AssetRecord = {
   peak_db: number | null;
   bpm: number | null;
   bpm_confidence: number | null;
-  /** Best-effort detected pitch note name (e.g. "A4"), not a musical key. */
+  /** Best-effort monophonic pitch note (e.g. "A4") — not a musical key. */
   musical_key: string | null;
   key_confidence: number | null;
   /** Fraction of the clip classified as speech (Silero VAD). */
   vocal_ratio: number | null;
+  /** Krumhansl-Schmuckler musical key, e.g. "C major" / "A minor". */
+  detected_key: string | null;
+  key_strength: number | null;
 };
 
 type ImportFailure = {
@@ -262,11 +269,16 @@ type ActiveFilter =
   | "has_vocals"
   | "instrumental"
   | "has_tempo"
+  | "has_key"
   | "has_pitch"
   | { favoritesCategory: SoundCategory }
   | { unreviewedCategory: SoundCategory }
   | { project: string; smart?: boolean }
-  | { tag: string };
+  | { tag: string }
+  // Instrument Detection. `page: true` shows the pill grid (with
+  // `instruments` as the running multi-selection); `page: false` shows the
+  // track list filtered to any of `instruments` (OR).
+  | { instrumentPage: boolean; instruments: string[] };
 
 function matchesSoundCategory(asset: AssetRecord, category: SoundCategory): boolean {
   switch (category) {
@@ -385,12 +397,27 @@ function formatMediaRootStatus(status: string | undefined): string {
 // plain language, rather than a generic "N processed" that doesn't say
 // what the work even was or what to do about failures.
 function describeJobCompletion(summary: JobCompletionSummary): { headline: string; detail: string | null } {
-  const noun = summary.kind === "audio_analysis" ? "sound" : "file";
-  const verb = summary.kind === "audio_analysis" ? "analyzing" : "reading";
+  const noun = summary.kind === "metadata_extraction" ? "file" : "sound";
+  const verb =
+    summary.kind === "audio_analysis"
+      ? "analyzing"
+      : summary.kind === "waveform_generation"
+        ? "drawing waveforms for"
+        : summary.kind === "instrument_detection"
+          ? "detecting instruments in"
+          : "reading";
+  const failedVerb =
+    summary.kind === "audio_analysis"
+      ? "analyze"
+      : summary.kind === "waveform_generation"
+        ? "draw waveforms for"
+        : summary.kind === "instrument_detection"
+          ? "detect instruments in"
+          : "read";
   const headline =
     summary.completed > 0
       ? `Finished ${verb} ${summary.completed} ${noun}${summary.completed === 1 ? "" : "s"}`
-      : `Couldn't ${summary.kind === "audio_analysis" ? "analyze" : "read"} ${summary.failed} ${noun}${summary.failed === 1 ? "" : "s"}`;
+      : `Couldn't ${failedVerb} ${summary.failed} ${noun}${summary.failed === 1 ? "" : "s"}`;
   if (summary.failed === 0) {
     return {
       headline,
@@ -414,8 +441,31 @@ function describeJobCompletion(summary: JobCompletionSummary): { headline: strin
 }
 
 const activeBarTrailLength = 10;
+const WAVEFORM_STRIP_BUCKETS = 200;
 
-async function computePeaks(path: string, bucketCount = 200): Promise<number[] | null> {
+// Session cache of transport-strip peaks keyed by asset id. The backend
+// (get_waveform) is the durable cache — this just avoids re-invoking it,
+// or re-running the client fallback, while browsing the same list. Bounded
+// so a long session can't grow it without limit.
+const waveformStripCache = new Map<string, number[]>();
+function rememberWaveformStrip(assetId: string, peaks: number[]): void {
+  waveformStripCache.delete(assetId);
+  waveformStripCache.set(assetId, peaks);
+  if (waveformStripCache.size > 512) {
+    const oldest = waveformStripCache.keys().next().value;
+    if (oldest !== undefined) waveformStripCache.delete(oldest);
+  }
+}
+
+// Fallback used only when the backend has no cached waveform yet (a freshly
+// imported asset whose WaveformGeneration job hasn't run, or a library
+// pre-dating waveform caching). Decodes the whole file once in the WebView;
+// the caller persists the result via store_waveform_peaks so this never
+// runs twice for the same asset.
+async function computePeaks(
+  path: string,
+  bucketCount = WAVEFORM_STRIP_BUCKETS
+): Promise<{ peaks: number[]; sampleRate: number } | null> {
   try {
     const response = await fetch(convertFileSrc(path));
     const arrayBuffer = await response.arrayBuffer();
@@ -435,8 +485,9 @@ async function computePeaks(path: string, bucketCount = 200): Promise<number[] |
       }
       peaks.push(max);
     }
+    const sampleRate = audioBuffer.sampleRate;
     audioContext.close();
-    return peaks;
+    return { peaks, sampleRate };
   } catch {
     return null;
   }
@@ -532,8 +583,18 @@ type JobCompletionSummary = {
   failedExtensions: string[];
 };
 
-const JOB_KINDS: { command: "process_pending_jobs" | "process_audio_analysis_jobs"; kind: string; label: string }[] = [
+const JOB_KINDS: {
+  command:
+    | "process_pending_jobs"
+    | "process_waveform_jobs"
+    | "process_instrument_jobs"
+    | "process_audio_analysis_jobs";
+  kind: string;
+  label: string;
+}[] = [
   { command: "process_pending_jobs", kind: "metadata_extraction", label: "Reading metadata" },
+  { command: "process_waveform_jobs", kind: "waveform_generation", label: "Building waveforms" },
+  { command: "process_instrument_jobs", kind: "instrument_detection", label: "Detecting instruments" },
   { command: "process_audio_analysis_jobs", kind: "audio_analysis", label: "Analyzing audio" }
 ];
 
@@ -741,6 +802,95 @@ function CollapsibleSection({
   );
 }
 
+type InstrumentFacet = { name: string; count: number };
+
+// Full-area Instrument Detection view: every detected instrument in the
+// library as a pill button with its track count. Plain click jumps
+// straight to that instrument's tracks; shift-click toggles it into a
+// running multi-selection (OR) that "Show tracks" then applies.
+function InstrumentDetectionPage({
+  libraryId,
+  selected,
+  onPick,
+  onToggle,
+  onApply
+}: {
+  libraryId: string | null;
+  selected: string[];
+  onPick: (name: string) => void;
+  onToggle: (name: string) => void;
+  onApply: () => void;
+}) {
+  const [facets, setFacets] = useState<InstrumentFacet[] | null>(null);
+
+  useEffect(() => {
+    if (!libraryId) {
+      setFacets([]);
+      return;
+    }
+    let live = true;
+    const load = () =>
+      invoke<InstrumentFacet[]>("instruments_for_library", { libraryId })
+        .then((rows) => {
+          if (live) setFacets(rows);
+        })
+        .catch(() => {
+          if (live) setFacets([]);
+        });
+    load();
+    // Counts grow as InstrumentDetection jobs finish — refresh on the
+    // background tick that also drives job draining.
+    const unlisten = listen("background-tick", load);
+    return () => {
+      live = false;
+      unlisten.then((off) => off());
+    };
+  }, [libraryId]);
+
+  const selectedCount = selected.length;
+
+  return (
+    <section className="instrument-page" aria-label="Instrument detection">
+      <div className="instrument-page-head">
+        <div>
+          <h2>Instrument Detection</h2>
+          <p>
+            {facets === null
+              ? "Scanning the library…"
+              : facets.length === 0
+                ? "No instruments detected yet — they appear here as analysis runs. If nothing ever shows, the detection model isn't installed (see docs)."
+                : "Click an instrument to see its tracks. Shift-click to combine several (matches any)."}
+          </p>
+        </div>
+        {selectedCount > 0 ? (
+          <button type="button" className="primary-action" onClick={onApply}>
+            Show tracks · {selectedCount} instrument{selectedCount === 1 ? "" : "s"}
+          </button>
+        ) : null}
+      </div>
+      {facets && facets.length > 0 ? (
+        <div className="instrument-pill-grid">
+          {facets.map((facet) => {
+            const isSelected = selected.includes(facet.name);
+            return (
+              <button
+                key={facet.name}
+                type="button"
+                className={isSelected ? "instrument-pill selected" : "instrument-pill"}
+                aria-pressed={isSelected}
+                onClick={(event) => (event.shiftKey ? onToggle(facet.name) : onPick(facet.name))}
+              >
+                <span className="instrument-pill-name">{facet.name}</span>
+                <span className="instrument-pill-count">{facet.count}</span>
+              </button>
+            );
+          })}
+        </div>
+      ) : null}
+    </section>
+  );
+}
+
 export function App() {
   const [releaseItems, setReleaseItems] = useState(fallbackReleaseItems);
   const updateChannelState = releaseItems.find((item) => item.blocker === "update_system")?.state ?? "Planned";
@@ -842,6 +992,7 @@ export function App() {
   const [tags, setTags] = useState<TagRecord[]>([]);
   const [appliedTags, setAppliedTags] = useState<TagRecord[]>([]);
   const [suggestedTags, setSuggestedTags] = useState<TagRecord[]>([]);
+  const [assetInstruments, setAssetInstruments] = useState<{ name: string; confidence: number }[]>([]);
   const [newTagName, setNewTagName] = useState("");
   const [newTagFacet, setNewTagFacet] = useState("action");
 
@@ -874,6 +1025,27 @@ export function App() {
   const [jobProgress, setJobProgress] = useState<JobProgress[]>([]);
   const [jobCompletionSummaries, setJobCompletionSummaries] = useState<Record<string, JobCompletionSummary>>({});
   const [audioAnalysisPaused, setAudioAnalysisPaused] = useState(false);
+  // null = not yet checked; false = no model installed, so skip the
+  // instrument-detection drain (its jobs stay pending harmlessly).
+  const [instrumentDetectionAvailable, setInstrumentDetectionAvailable] = useState<boolean | null>(null);
+  const [resyncing, setResyncing] = useState(false);
+  // Sonic Radar inspector panel: which per-asset analysis kind is currently
+  // queued/running (drives the row's progress bar/disabled state) and the
+  // last status line shown under the row list. Both reset when selection
+  // changes. sonicRadarBusyKind only clears once jobProgress/
+  // jobCompletionSummaries confirm the drain actually finished — not right
+  // after the queue call returns — so the UI never claims "analyzed" ahead
+  // of the backend actually having run it.
+  const [sonicRadarBusyKind, setSonicRadarBusyKind] = useState<"audio_analysis" | "instrument_detection" | null>(
+    null
+  );
+  const [sonicRadarStatus, setSonicRadarStatus] = useState<string | null>(null);
+  // True once jobProgress has shown sonicRadarBusyKind's entry at least
+  // once — distinguishes "the drain hasn't picked our job up yet" from
+  // "the drain finished" when jobProgress reports zero pending for a kind
+  // in both cases.
+  const sonicRadarSeenPendingRef = useRef(false);
+  const sonicRadarTimeoutRef = useRef<ReturnType<typeof setTimeout> | null>(null);
   const [backgroundActivityOpen, setBackgroundActivityOpen] = useState(false);
   const drainingJobKinds = useRef<Set<string>>(new Set());
   const [offlineControl, setOfflineControl] = useState<OfflineControlState | null>(null);
@@ -940,6 +1112,8 @@ export function App() {
       base = assets.filter((asset) => asset.vocal_ratio != null && asset.vocal_ratio < VOCAL_RATIO_THRESHOLD);
     } else if (activeFilter === "has_tempo") {
       base = assets.filter((asset) => asset.bpm != null);
+    } else if (activeFilter === "has_key") {
+      base = assets.filter((asset) => asset.detected_key != null);
     } else if (activeFilter === "has_pitch") {
       base = assets.filter((asset) => asset.musical_key != null);
     } else if (typeof activeFilter === "object" && "favoritesCategory" in activeFilter) {
@@ -953,6 +1127,26 @@ export function App() {
     }
     return formatFilter ? base.filter((asset) => detectAudioFormat(asset) === formatFilter) : base;
   }, [assets, activeFilter, formatFilter]);
+
+  const instrumentFilter =
+    typeof activeFilter === "object" && "instrumentPage" in activeFilter ? activeFilter : null;
+
+  const pickInstrument = useCallback((name: string) => {
+    setActiveFilter({ instrumentPage: false, instruments: [name] });
+  }, []);
+
+  const toggleInstrument = useCallback((name: string) => {
+    setActiveFilter((current) => {
+      const base =
+        typeof current === "object" && "instrumentPage" in current ? current.instruments : [];
+      const next = base.includes(name) ? base.filter((entry) => entry !== name) : [...base, name];
+      // Removing the last one in results mode drops back to the pill page.
+      const page =
+        (typeof current === "object" && "instrumentPage" in current ? current.instrumentPage : true) ||
+        next.length === 0;
+      return { instrumentPage: page, instruments: next };
+    });
+  }, []);
 
   const browserScrollRef = useRef<HTMLElement | null>(null);
   const [browserScrollTop, setBrowserScrollTop] = useState(0);
@@ -1029,6 +1223,18 @@ export function App() {
           .catch(() => setAssets([]));
         return;
       }
+      if (typeof filter === "object" && "instrumentPage" in filter) {
+        // On the pill page the list isn't shown; in results mode fetch the
+        // OR-match set. Empty selection => nothing.
+        if (filter.instrumentPage || filter.instruments.length === 0) {
+          setAssets([]);
+          return;
+        }
+        invoke<AssetRecord[]>("assets_by_instruments", { libraryId, instruments: filter.instruments })
+          .then(setAssets)
+          .catch(() => setAssets([]));
+        return;
+      }
 
       const request = hasActiveRangeFilters(rangeFilters)
         ? invoke<AssetRecord[]>("search_assets_advanced", {
@@ -1057,7 +1263,11 @@ export function App() {
   // audio analysis, not metadata extraction.
   const runJobDrain = useCallback(
     (libraryId: string, only?: string[]) => {
-      const configs = only ? JOB_KINDS.filter((config) => only.includes(config.kind)) : JOB_KINDS;
+      const configs = (only ? JOB_KINDS.filter((config) => only.includes(config.kind)) : JOB_KINDS)
+        // No instrument model installed: its jobs stay pending harmlessly,
+        // so don't spin process_instrument_jobs (and flash a progress bar)
+        // on every drain trigger.
+        .filter((config) => config.kind !== "instrument_detection" || instrumentDetectionAvailable !== false);
 
       type JobStatus = { kind: string; pending: number; failed: number; completed: number };
 
@@ -1135,7 +1345,7 @@ export function App() {
         })
         .catch(() => {});
     },
-    [refreshAssets, searchQuery, activeFilter, audioAnalysisPaused]
+    [refreshAssets, searchQuery, activeFilter, audioAnalysisPaused, instrumentDetectionAvailable]
   );
 
   const refreshMaintenance = useCallback((libraryId: string) => {
@@ -1224,6 +1434,9 @@ export function App() {
 
   useEffect(() => {
     invoke<boolean>("audio_analysis_paused").then(setAudioAnalysisPaused).catch(() => {});
+    invoke<boolean>("instrument_detection_available")
+      .then(setInstrumentDetectionAvailable)
+      .catch(() => setInstrumentDetectionAvailable(false));
   }, []);
 
   const handleToggleAudioAnalysisPaused = useCallback(() => {
@@ -1403,13 +1616,24 @@ export function App() {
   }, [selectedAssetId, visibleAssets, browserRowHeightPx]);
 
   useEffect(() => {
+    setSonicRadarStatus(null);
+    setSonicRadarBusyKind(null);
+    sonicRadarSeenPendingRef.current = false;
+    if (sonicRadarTimeoutRef.current) {
+      clearTimeout(sonicRadarTimeoutRef.current);
+      sonicRadarTimeoutRef.current = null;
+    }
     if (!selectedAssetId) {
       setAppliedTags([]);
       setSuggestedTags([]);
       setSourceDraft(null);
+      setAssetInstruments([]);
       return;
     }
     refreshAssetTags(selectedAssetId);
+    invoke<{ name: string; confidence: number }[]>("asset_instruments", { assetId: selectedAssetId })
+      .then(setAssetInstruments)
+      .catch(() => setAssetInstruments([]));
   }, [selectedAssetId, refreshAssetTags]);
 
   const loadAssetForPlayback = useCallback(async (asset: AssetRecord, autoplay: boolean) => {
@@ -1419,16 +1643,51 @@ export function App() {
 
     audio.src = convertFileSrc(path);
     setPlayingAssetId(asset.id);
-    setPeaks(null);
     if (autoplay) {
       audio.play().catch(() => setIsPlaying(false));
     }
 
     const requestId = ++peakRequestId.current;
-    computePeaks(path).then((computed) => {
-      if (peakRequestId.current === requestId) setPeaks(computed);
-      if (computed) invoke("mark_waveform_ready", { assetId: asset.id }).catch(() => {});
-    });
+    const isCurrent = () => peakRequestId.current === requestId;
+
+    // 1. Session memo — no round-trip at all while browsing the same list.
+    const memoized = waveformStripCache.get(asset.id);
+    if (memoized) {
+      setPeaks(memoized);
+      return;
+    }
+    setPeaks(null);
+
+    // 2. Durable backend cache — a hit means the source file is never read.
+    try {
+      const cached = await invoke<{ peaks: number[]; sample_rate: number } | null>("get_waveform", {
+        assetId: asset.id
+      });
+      if (cached && cached.peaks.length > 0) {
+        rememberWaveformStrip(asset.id, cached.peaks);
+        if (isCurrent()) setPeaks(cached.peaks);
+        return;
+      }
+    } catch {
+      // fall through to the client-side compute
+    }
+    if (!isCurrent()) return;
+
+    // 3. Miss — decode once in the WebView, render it, and hand it back to
+    //    the backend so this asset is a cache hit from here on.
+    const computed = await computePeaks(path);
+    if (!isCurrent()) return;
+    if (computed) {
+      rememberWaveformStrip(asset.id, computed.peaks);
+      setPeaks(computed.peaks);
+      invoke("store_waveform_peaks", {
+        assetId: asset.id,
+        peaks: computed.peaks,
+        sampleRate: Math.round(computed.sampleRate) || 44_100
+      }).catch(() => {});
+    } else {
+      setPeaks(null);
+    }
   }, []);
 
   const togglePlayback = useCallback(() => {
@@ -1501,6 +1760,10 @@ export function App() {
 
       invoke("relink_asset", { assetId: asset.id, newPath })
         .then(() => {
+          // The relinked file is a different file — drop the remembered
+          // strip so the next play loads the new file's shape (the backend
+          // cache was cleared server-side and a fresh job enqueued).
+          waveformStripCache.delete(asset.id);
           if (activeLibraryId) refreshAssets(activeLibraryId, searchQuery, activeFilter);
         })
         .catch(() => {});
@@ -2226,6 +2489,132 @@ export function App() {
       refreshMaintenance(activeLibraryId);
     });
   }, [activeLibraryId, searchQuery, activeFilter, refreshAssets, refreshMaintenance, runJobDrain]);
+
+  // Sonic Radar "sync": re-run every analysis pass (waveform, tempo/key/
+  // vocal, instruments) for the current selection, or the whole library
+  // when nothing is selected. Backfills assets whose original jobs already
+  // finished before a detector existed.
+  const handleResyncSonicRadar = useCallback(async () => {
+    if (!activeLibraryId || resyncing) return;
+    const ids = bulkAssetIds;
+    if (ids.length === 0) {
+      const ok = await confirmDialog(
+        "Re-run Sonic Radar analysis for the whole library? Every sound is re-analysed — this can take a while on a large library.",
+        { title: "Re-analyse library", kind: "warning" }
+      );
+      if (!ok) return;
+    }
+    setResyncing(true);
+    setRefreshStatus(
+      ids.length === 0
+        ? "Queuing re-analysis for the library…"
+        : `Queuing re-analysis for ${ids.length} sound${ids.length === 1 ? "" : "s"}…`
+    );
+    invoke<number>("resync_analysis", { libraryId: activeLibraryId, assetIds: ids })
+      .then((queued) => {
+        setRefreshStatus(
+          queued > 0 ? `Re-analysing — ${queued} job${queued === 1 ? "" : "s"} queued` : "Nothing to re-analyse"
+        );
+        if (queued > 0) {
+          // The backend caches (waveform strips) are about to be
+          // regenerated — drop the session memo so the next play re-fetches
+          // the fresh version rather than showing the pre-resync shape.
+          waveformStripCache.clear();
+          runJobDrain(activeLibraryId);
+        }
+      })
+      .catch((error) => setRefreshStatus(`Re-analysis failed: ${String(error)}`))
+      .finally(() => setResyncing(false));
+  }, [activeLibraryId, bulkAssetIds, runJobDrain, resyncing]);
+
+  // Sonic Radar inspector panel: analyze just the selected sound, and only
+  // the one job kind its missing row asked for. Tempo/key/pitch/vocals all
+  // come out of the same decode+DSP pass (analyze_asset_audio decodes the
+  // file once and fills every one of those fields together), so there's no
+  // "just tempo" job to run — every row in that group queues the same
+  // "audio_analysis" kind. Instrument detection is a genuinely separate
+  // model/pass, so it gets its own kind.
+  //
+  // sonicRadarBusyKind is deliberately NOT cleared here once the queue call
+  // resolves — that would just mean the job was *inserted*, not that it ran.
+  // The effect below watching jobProgress/jobCompletionSummaries is what
+  // actually clears it, once the drain reports the job finished (and,
+  // separately, whether it succeeded or failed).
+  const handleAnalyzeAssetKind = useCallback(
+    (kind: "audio_analysis" | "instrument_detection") => {
+      if (!activeLibraryId || !selectedAssetId || sonicRadarBusyKind) return;
+      sonicRadarSeenPendingRef.current = false;
+      if (sonicRadarTimeoutRef.current) {
+        clearTimeout(sonicRadarTimeoutRef.current);
+        sonicRadarTimeoutRef.current = null;
+      }
+      setSonicRadarBusyKind(kind);
+      setSonicRadarStatus(
+        kind === "audio_analysis" ? "Queuing tempo/key/pitch/vocal analysis…" : "Queuing instrument detection…"
+      );
+      invoke<number>("resync_analysis", { libraryId: activeLibraryId, assetIds: [selectedAssetId], kinds: [kind] })
+        .then((queued) => {
+          if (kind === "audio_analysis" && audioAnalysisPaused) {
+            // Queued, but nothing will drive it until the user resumes audio
+            // analysis (Maintenance) — don't sit here "Analyzing…" forever
+            // waiting for a drain that isn't going to run.
+            setSonicRadarStatus(
+              queued > 0
+                ? "Queued — audio analysis is paused; resume it in Maintenance to run this"
+                : "Nothing new to queue"
+            );
+            setSonicRadarBusyKind(null);
+            return;
+          }
+          setSonicRadarStatus("Analyzing…");
+          runJobDrain(activeLibraryId, [kind]);
+          // Safety net: if the drain never reports back (e.g. it was
+          // deduped against an already-running drain whose progress we
+          // never observed), don't leave the row spinning forever.
+          sonicRadarTimeoutRef.current = setTimeout(() => {
+            setSonicRadarBusyKind((current) => (current === kind ? null : current));
+            setSonicRadarStatus("Still running — check Background Activity for status");
+          }, 45000);
+        })
+        .catch((error) => {
+          setSonicRadarStatus(`Couldn't queue analysis: ${String(error)}`);
+          setSonicRadarBusyKind(null);
+        });
+    },
+    [activeLibraryId, selectedAssetId, runJobDrain, audioAnalysisPaused, sonicRadarBusyKind]
+  );
+
+  // Confirms the queued job actually finished (completed OR failed) before
+  // clearing the busy state, using the same ground-truth job_status diff
+  // runJobDrain already computes for the global completion toasts — not an
+  // optimistic timer. jobProgress no longer listing the kind means the
+  // backend drained it to zero pending; jobCompletionSummaries (when
+  // present) says whether that drain actually succeeded.
+  useEffect(() => {
+    if (!sonicRadarBusyKind) return;
+    const stillPending = jobProgress.some((job) => job.kind === sonicRadarBusyKind);
+    if (stillPending) {
+      sonicRadarSeenPendingRef.current = true;
+      return;
+    }
+    if (!sonicRadarSeenPendingRef.current) return; // drain hasn't picked it up yet
+    if (sonicRadarTimeoutRef.current) {
+      clearTimeout(sonicRadarTimeoutRef.current);
+      sonicRadarTimeoutRef.current = null;
+    }
+    const summary = jobCompletionSummaries[sonicRadarBusyKind];
+    setSonicRadarStatus(summary ? describeJobCompletion(summary).headline : "Done");
+    // Instrument detections live in a separate table (asset_instruments),
+    // not on the asset record refreshAssets already re-fetches — refetch it
+    // explicitly so the Instruments row's checkmark reflects the real
+    // result instead of the stale pre-analysis list.
+    if (sonicRadarBusyKind === "instrument_detection" && selectedAssetId) {
+      invoke<{ name: string; confidence: number }[]>("asset_instruments", { assetId: selectedAssetId })
+        .then(setAssetInstruments)
+        .catch(() => {});
+    }
+    setSonicRadarBusyKind(null);
+  }, [jobProgress, jobCompletionSummaries, sonicRadarBusyKind, selectedAssetId]);
 
   const handleExportSelected = useCallback(
     async (format?: "wav24") => {
@@ -3034,11 +3423,36 @@ export function App() {
             Needs Review
           </button>
 
+          <div className="nav-divider" role="separator" />
+
           <div className="nav-heading-row">
-            <span className="nav-heading-lg" onClick={() => toggleSection("sidebar-sonic-radar")}>
+            <span className="nav-heading-lg radar-heading" onClick={() => toggleSection("sidebar-sonic-radar")}>
               <Activity size={14} />
               Sonic Radar
             </span>
+            <button
+              type="button"
+              className="nav-heading-add radar-sync"
+              disabled={resyncing || !activeLibraryId}
+              aria-label={
+                bulkAssetIds.length > 0
+                  ? `Re-run analysis for ${bulkAssetIds.length} selected sound${bulkAssetIds.length === 1 ? "" : "s"}`
+                  : "Re-run analysis for the whole library"
+              }
+              title={
+                resyncing
+                  ? "Queuing re-analysis…"
+                  : bulkAssetIds.length > 0
+                    ? `Re-run analysis for ${bulkAssetIds.length} selected sound${bulkAssetIds.length === 1 ? "" : "s"}`
+                    : "Re-run analysis for the whole library (nothing selected)"
+              }
+              onClick={(event) => {
+                event.stopPropagation();
+                handleResyncSonicRadar();
+              }}
+            >
+              <RefreshCw size={13} className={resyncing ? "spin" : undefined} />
+            </button>
             <button
               type="button"
               className="nav-heading-add"
@@ -3067,16 +3481,34 @@ export function App() {
               <button
                 className={activeFilter === "has_tempo" ? "nav-item sonic-radar-item active" : "nav-item sonic-radar-item"}
                 onClick={() => setActiveFilter("has_tempo")}
+                title="Sounds with an estimated tempo (BPM)"
               >
                 <Gauge size={13} />
                 Detected Tempo
               </button>
               <button
+                className={activeFilter === "has_key" ? "nav-item sonic-radar-item active" : "nav-item sonic-radar-item"}
+                onClick={() => setActiveFilter("has_key")}
+                title="Sounds with a detected musical key (e.g. A minor) — Krumhansl-Schmuckler analysis over the whole clip, works on polyphonic music"
+              >
+                <KeyRound size={13} />
+                Detected Key
+              </button>
+              <button
                 className={activeFilter === "has_pitch" ? "nav-item sonic-radar-item active" : "nav-item sonic-radar-item"}
                 onClick={() => setActiveFilter("has_pitch")}
+                title="Sounds with a detected monophonic pitch — best for single-source SFX, ambience, and drones, not full mixes"
               >
                 <Music size={13} />
                 Detected Pitch
+              </button>
+              <button
+                className={instrumentFilter ? "nav-item sonic-radar-item active" : "nav-item sonic-radar-item"}
+                onClick={() => setActiveFilter({ instrumentPage: true, instruments: [] })}
+                title="Detected instruments — browse the library by instrument (piano, guitar, drums, strings…), pick one or combine several"
+              >
+                <Piano size={13} />
+                Instrument Detection
               </button>
             </>
           )}
@@ -3521,6 +3953,17 @@ export function App() {
             </>
           ) : null}
         </section>
+        {instrumentFilter?.instrumentPage ? (
+          <InstrumentDetectionPage
+            libraryId={activeLibraryId}
+            selected={instrumentFilter.instruments}
+            onPick={pickInstrument}
+            onToggle={toggleInstrument}
+            onApply={() =>
+              setActiveFilter({ instrumentPage: false, instruments: instrumentFilter.instruments })
+            }
+          />
+        ) : (
         <section
           className="browser"
           aria-label="Sound browser"
@@ -3528,6 +3971,32 @@ export function App() {
           ref={browserScrollRef}
           onScroll={(event) => setBrowserScrollTop(event.currentTarget.scrollTop)}
         >
+          {instrumentFilter ? (
+            <div className="instrument-filter-bar">
+              <button
+                type="button"
+                className="instrument-filter-back"
+                onClick={() =>
+                  setActiveFilter({ instrumentPage: true, instruments: instrumentFilter.instruments })
+                }
+              >
+                <ChevronLeft size={13} />
+                Instruments
+              </button>
+              {instrumentFilter.instruments.map((name) => (
+                <button
+                  key={name}
+                  type="button"
+                  className="instrument-chip"
+                  onClick={() => toggleInstrument(name)}
+                  aria-label={`Remove ${name} filter`}
+                >
+                  {name}
+                  <X size={11} />
+                </button>
+              ))}
+            </div>
+          ) : null}
           <div className="browser-header">
             <span aria-hidden="true" />
             <span aria-hidden="true" />
@@ -3642,6 +4111,7 @@ export function App() {
             </>
           )}
         </section>
+        )}
         <AnimatePresence>
           {editorWorkflowOpen ? (
             <motion.section
@@ -3940,6 +4410,127 @@ export function App() {
               ))}
           </div>
         </CollapsibleSection>
+        <CollapsibleSection
+          id="sonic-radar-track"
+          title="Sonic Radar"
+          icon={<Activity size={14} />}
+          className="sonic-radar-track-section"
+          collapsed={collapsedSections.has("sonic-radar-track")}
+          onToggle={toggleSection}
+        >
+          {selectedAsset ? (
+            <>
+              <div className="radar-status-list">
+                {[
+                  {
+                    key: "tempo",
+                    label: "Tempo",
+                    detected: selectedAsset.bpm != null,
+                    value: selectedAsset.bpm != null ? `~${Math.round(selectedAsset.bpm)} BPM` : null,
+                    kind: "audio_analysis" as const,
+                    hint: "Runs the full audio analysis pass (tempo, key, pitch, and vocals are detected together in one decode)"
+                  },
+                  {
+                    key: "key",
+                    label: "Key",
+                    detected: selectedAsset.detected_key != null,
+                    value: selectedAsset.detected_key,
+                    kind: "audio_analysis" as const,
+                    hint: "Runs the full audio analysis pass (tempo, key, pitch, and vocals are detected together in one decode)"
+                  },
+                  {
+                    key: "pitch",
+                    label: "Pitch",
+                    detected: selectedAsset.musical_key != null,
+                    value: selectedAsset.musical_key,
+                    kind: "audio_analysis" as const,
+                    hint: "Runs the full audio analysis pass (tempo, key, pitch, and vocals are detected together in one decode)"
+                  },
+                  {
+                    key: "vocals",
+                    label: "Vocals",
+                    detected: selectedAsset.vocal_ratio != null,
+                    value:
+                      selectedAsset.vocal_ratio != null
+                        ? `${(selectedAsset.vocal_ratio ?? 0) >= VOCAL_RATIO_THRESHOLD ? "Vocal" : "Instrumental"} · ${Math.round(
+                            (selectedAsset.vocal_ratio ?? 0) * 100
+                          )}%`
+                        : null,
+                    kind: "audio_analysis" as const,
+                    hint: "Runs the full audio analysis pass (tempo, key, pitch, and vocals are detected together in one decode)"
+                  },
+                  {
+                    key: "instruments",
+                    label: "Instruments",
+                    detected: assetInstruments.length > 0,
+                    value: assetInstruments.length > 0 ? `${assetInstruments.length} detected` : null,
+                    kind: "instrument_detection" as const,
+                    hint: "Runs instrument detection separately — it's its own model/pass, not part of the audio analysis above"
+                  }
+                ].map((row) => {
+                  const busyHere = sonicRadarBusyKind === row.kind;
+                  const modelMissing = row.kind === "instrument_detection" && instrumentDetectionAvailable === false;
+                  return (
+                    <div className="radar-status-row" key={row.key}>
+                      <span className={row.detected ? "radar-status-icon detected" : "radar-status-icon"}>
+                        {row.detected ? <CheckCircle2 size={15} /> : <Circle size={15} />}
+                      </span>
+                      <span className="radar-status-name">{row.label}</span>
+                      {row.detected ? (
+                        <span className="radar-status-value">{row.value}</span>
+                      ) : modelMissing ? (
+                        <span className="radar-status-hint" title="Detection model isn't installed — see docs">
+                          Model not installed
+                        </span>
+                      ) : (
+                        <button
+                          type="button"
+                          className="radar-analyze-btn"
+                          // Only one analysis runs from this panel at a time — a
+                          // second click here would just requeue the same job
+                          // (or the other kind's job) on top of one already
+                          // in flight, with no way to show two progress bars
+                          // at once, so every not-yet-detected row disables
+                          // while any kind is busy, not just its own.
+                          disabled={sonicRadarBusyKind !== null}
+                          title={row.hint}
+                          onClick={() => handleAnalyzeAssetKind(row.kind)}
+                        >
+                          {busyHere ? "Analyzing…" : "Analyze"}
+                        </button>
+                      )}
+                    </div>
+                  );
+                })}
+              </div>
+              {sonicRadarBusyKind ? (
+                (() => {
+                  const job = jobProgress.find((entry) => entry.kind === sonicRadarBusyKind);
+                  const done = job ? job.total - job.pending : 0;
+                  const percent = job && job.total > 0 ? Math.round((done / job.total) * 100) : null;
+                  return (
+                    <div className="radar-progress" aria-label="Analysis progress" role="status">
+                      <span className="radar-progress-track">
+                        <span
+                          className={percent == null ? "radar-progress-fill indeterminate" : "radar-progress-fill"}
+                          style={{ width: `${percent ?? 30}%` }}
+                        />
+                      </span>
+                      <span className="radar-progress-label">
+                        {sonicRadarStatus ?? "Analyzing…"}
+                        {job ? ` (${done}/${job.total})` : ""}
+                      </span>
+                    </div>
+                  );
+                })()
+              ) : sonicRadarStatus ? (
+                <div className="status-line">{sonicRadarStatus}</div>
+              ) : null}
+            </>
+          ) : (
+            <span className="empty-hint">Select a sound to see its Sonic Radar status</span>
+          )}
+        </CollapsibleSection>
         {selectedAsset && (selectedAsset.embedded_title || selectedAsset.embedded_genre || selectedAsset.embedded_comment) ? (
           <CollapsibleSection
             id="embedded"
@@ -3954,8 +4545,10 @@ export function App() {
         ) : null}
         {selectedAsset &&
         (selectedAsset.bpm != null ||
+          selectedAsset.detected_key != null ||
           selectedAsset.musical_key != null ||
-          selectedAsset.duration_ms != null) ? (
+          selectedAsset.duration_ms != null ||
+          assetInstruments.length > 0) ? (
           <CollapsibleSection
             id="detected"
             title="Detected Audio Attributes"
@@ -3984,13 +4577,34 @@ export function App() {
                   <strong className="attribute-value">~{Math.round(selectedAsset.bpm)} BPM</strong>
                 </div>
               ) : null}
+              {selectedAsset.detected_key != null ? (
+                <div className="attribute-pill" title="Best-effort musical key (Krumhansl-Schmuckler)">
+                  <span className="attribute-label">Key</span>
+                  <strong className="attribute-value">{selectedAsset.detected_key}</strong>
+                </div>
+              ) : null}
               {selectedAsset.musical_key != null ? (
-                <div className="attribute-pill" title="Best-effort estimate, not a musical key">
+                <div className="attribute-pill" title="Monophonic pitch estimate — best for single-source SFX, not full mixes">
                   <span className="attribute-label">Pitch</span>
                   <strong className="attribute-value">{selectedAsset.musical_key}</strong>
                 </div>
               ) : null}
             </div>
+            {assetInstruments.length > 0 ? (
+              <div className="instrument-tag-row" aria-label="Detected instruments">
+                {assetInstruments.map((entry) => (
+                  <button
+                    key={entry.name}
+                    type="button"
+                    className="instrument-tag"
+                    title={`Detected instrument (${Math.round(entry.confidence * 100)}% confidence) — click to browse`}
+                    onClick={() => setActiveFilter({ instrumentPage: false, instruments: [entry.name] })}
+                  >
+                    {entry.name}
+                  </button>
+                ))}
+              </div>
+            ) : null}
             <button type="button" className="primary-action" onClick={handleFindSimilar}>
               Find Similar Sounds
             </button>
