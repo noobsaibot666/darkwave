@@ -2430,18 +2430,19 @@ dd {
    described options, instead of two bare icon buttons that only a hover
    tooltip told apart. */
 .radar-sync-menu {
-  width: 250px;
+  width: 340px;
+  padding: 10px;
   display: flex;
   flex-direction: column;
-  gap: 2px;
+  gap: 4px;
 }
 
 .radar-sync-menu-item {
   display: flex;
   align-items: flex-start;
-  gap: 10px;
+  gap: 12px;
   width: 100%;
-  padding: 8px;
+  padding: 12px;
   border: 0;
   border-radius: var(--radius-sm);
   background: transparent;
@@ -2464,26 +2465,26 @@ dd {
   flex: 0 0 auto;
   align-items: center;
   justify-content: center;
-  width: 26px;
-  height: 26px;
+  width: 30px;
+  height: 30px;
   margin-top: 1px;
-  border-radius: 8px;
+  border-radius: 9px;
   background: rgba(var(--radar-accent-rgb), 0.14);
   color: var(--radar-accent-strong);
 }
 
 .radar-sync-menu-item-title {
   display: block;
-  font-size: 13px;
+  font-size: 13.5px;
   font-weight: 600;
   color: var(--text-primary);
 }
 
 .radar-sync-menu-item-desc {
   display: block;
-  margin-top: 2px;
-  font-size: 11px;
-  line-height: 1.35;
+  margin-top: 4px;
+  font-size: 11.5px;
+  line-height: 1.5;
   color: var(--text-secondary);
 }
 
