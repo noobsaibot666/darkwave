@@ -994,6 +994,14 @@ export function App() {
   const [filterMenuOpen, setFilterMenuOpen] = useState(false);
   const [filterMenuPosition, setFilterMenuPosition] = useState<{ top: number; left: number } | null>(null);
   const filterButtonRef = useRef<HTMLButtonElement | null>(null);
+  // Sonic Radar's re-analyse options — one button, one menu, instead of two
+  // unlabeled icons that looked like the same action twice ("Re-analyse
+  // everything" vs "Backfill Tempo/Key/Pitch/Vocals only" were previously
+  // both bare icon buttons with nothing but a hover tooltip telling them
+  // apart).
+  const [radarSyncMenuOpen, setRadarSyncMenuOpen] = useState(false);
+  const [radarSyncMenuPosition, setRadarSyncMenuPosition] = useState<{ top: number; left: number } | null>(null);
+  const radarSyncButtonRef = useRef<HTMLButtonElement | null>(null);
   const [sfxSubcategoriesOpen, setSfxSubcategoriesOpen] = useState(false);
   const [favoritesCategoriesOpen, setFavoritesCategoriesOpen] = useState(false);
   const [unreviewedCategoriesOpen, setUnreviewedCategoriesOpen] = useState(false);
@@ -3784,53 +3792,89 @@ export function App() {
               <Activity size={14} />
               Sonic Radar
             </span>
-            <button
-              type="button"
-              className="nav-heading-add radar-sync"
-              disabled={resyncing || !activeLibraryId}
-              aria-label={
-                bulkAssetIds.length > 0
-                  ? `Re-run analysis for ${bulkAssetIds.length} selected sound${bulkAssetIds.length === 1 ? "" : "s"}`
-                  : "Re-run analysis for the whole library"
-              }
-              title={
-                resyncing
-                  ? "Queuing re-analysis…"
-                  : bulkAssetIds.length > 0
-                    ? `Re-run analysis for ${bulkAssetIds.length} selected sound${bulkAssetIds.length === 1 ? "" : "s"}`
-                    : "Re-run analysis for the whole library (nothing selected)"
-              }
-              onClick={(event) => {
-                event.stopPropagation();
-                handleResyncSonicRadar();
-              }}
-            >
-              <RefreshCw size={13} className={resyncing ? "spin" : undefined} />
-            </button>
-            {/* A track's audio-analysis job can show "completed" and still
-                have no Key/Pitch on record — that pass was added after a
-                lot of this catalog was already analysed, so most existing
-                "completed" jobs never actually ran the newer detection.
-                This backfills just that (Tempo/Key/Pitch/Vocals) for the
-                whole library without re-touching instrument detection or
-                waveform generation, unlike the full re-analyse above. */}
-            <button
-              type="button"
-              className="nav-heading-add radar-sync"
-              disabled={resyncing || !activeLibraryId || bulkAssetIds.length > 0}
-              aria-label="Backfill Tempo/Key/Pitch/Vocals for the whole library"
-              title={
-                bulkAssetIds.length > 0
-                  ? "Clear the selection to backfill the whole library (use the inspector's Analyze buttons for a single track)"
-                  : "Backfill Tempo/Key/Pitch/Vocals for the whole library — catches tracks analysed before this detection existed"
-              }
-              onClick={(event) => {
-                event.stopPropagation();
-                handleBackfillAudioAnalysis();
-              }}
-            >
-              <Sparkles size={13} />
-            </button>
+            <div style={{ position: "relative" }}>
+              <button
+                ref={radarSyncButtonRef}
+                type="button"
+                className="nav-heading-add radar-sync"
+                disabled={resyncing || !activeLibraryId}
+                aria-label="Re-analyse options"
+                title={resyncing ? "Queuing re-analysis…" : "Re-analyse options"}
+                onClick={(event) => {
+                  event.stopPropagation();
+                  if (!radarSyncMenuOpen && radarSyncButtonRef.current) {
+                    const rect = radarSyncButtonRef.current.getBoundingClientRect();
+                    setRadarSyncMenuPosition({ top: rect.bottom + 6, left: rect.left });
+                  }
+                  setRadarSyncMenuOpen((previous) => !previous);
+                }}
+              >
+                <RefreshCw size={13} className={resyncing ? "spin" : undefined} />
+              </button>
+              <AnimatePresence>
+                {radarSyncMenuOpen && radarSyncMenuPosition ? (
+                  <motion.div
+                    className="modal-card filter-menu radar-sync-menu"
+                    style={{ top: radarSyncMenuPosition.top, left: radarSyncMenuPosition.left }}
+                    initial={{ opacity: 0, scale: 0.95, y: -6 }}
+                    animate={{ opacity: 1, scale: 1, y: 0 }}
+                    exit={{ opacity: 0, scale: 0.95, y: -6 }}
+                    transition={{ duration: 0.16, ease: [0.4, 0, 0.2, 1] }}
+                  >
+                    <button
+                      type="button"
+                      className="radar-sync-menu-item"
+                      disabled={resyncing || !activeLibraryId}
+                      onClick={() => {
+                        setRadarSyncMenuOpen(false);
+                        handleResyncSonicRadar();
+                      }}
+                    >
+                      <span className="radar-sync-menu-item-icon">
+                        <RefreshCw size={14} />
+                      </span>
+                      <span>
+                        <span className="radar-sync-menu-item-title">Re-analyse everything</span>
+                        <span className="radar-sync-menu-item-desc">
+                          {bulkAssetIds.length > 0
+                            ? `Waveform, audio analysis, and instrument detection for ${bulkAssetIds.length} selected sound${bulkAssetIds.length === 1 ? "" : "s"}.`
+                            : "Waveform, audio analysis, and instrument detection, whole library. Can take a while."}
+                        </span>
+                      </span>
+                    </button>
+                    {/* A track's audio-analysis job can show "completed" and
+                        still have no Key/Pitch on record — that pass was
+                        added after a lot of this catalog was already
+                        analysed, so most existing "completed" jobs never
+                        actually ran the newer detection. This backfills
+                        just that (Tempo/Key/Pitch/Vocals) for the whole
+                        library without re-touching instrument detection or
+                        waveform generation, unlike the option above. */}
+                    <button
+                      type="button"
+                      className="radar-sync-menu-item"
+                      disabled={resyncing || !activeLibraryId || bulkAssetIds.length > 0}
+                      title={bulkAssetIds.length > 0 ? "Clear the selection first — this one is whole-library only" : undefined}
+                      onClick={() => {
+                        setRadarSyncMenuOpen(false);
+                        handleBackfillAudioAnalysis();
+                      }}
+                    >
+                      <span className="radar-sync-menu-item-icon">
+                        <Sparkles size={14} />
+                      </span>
+                      <span>
+                        <span className="radar-sync-menu-item-title">Backfill Tempo/Key/Pitch/Vocals</span>
+                        <span className="radar-sync-menu-item-desc">
+                          Whole library only. Catches tracks analysed before key/pitch detection existed — skips
+                          instrument detection and waveforms.
+                        </span>
+                      </span>
+                    </button>
+                  </motion.div>
+                ) : null}
+              </AnimatePresence>
+            </div>
             <button
               type="button"
               className="nav-heading-add"
