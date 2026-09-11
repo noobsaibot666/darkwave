@@ -37,3 +37,19 @@ serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 thiserror = "2"
 uuid = { version = "1", features = ["v4", "serde"] }
+
+# There was no [profile.release] at all — every shipped build (the app
+# itself, and similarity-worker's separately-built sidecar binary, see
+# scripts/build-similarity-worker-sidecar.sh) was running on Cargo's
+# defaults (codegen-units = 16, no LTO), which favors fast incremental
+# *compiles* over runtime speed. That trade-off makes sense for `cargo
+# check`/dev builds, never for something built once and then run by every
+# user — this is the CPU-bound DSP/decode/FFT/VAD code path this session
+# spent a long stretch hardening, so it's worth actually optimizing.
+# `panic` is deliberately left at its default ("unwind"): several of
+# today's fixes specifically rely on a panic inside spawn_blocking being
+# caught as a JoinError rather than aborting the whole process.
+[profile.release]
+lto = "thin"
+codegen-units = 1
+strip = true
