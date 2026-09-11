@@ -1,3 +1,4 @@
+import { createPortal } from "react-dom";
 import { convertFileSrc, invoke } from "@tauri-apps/api/core";
 import { listen } from "@tauri-apps/api/event";
 import { getCurrentWebview } from "@tauri-apps/api/webview";
@@ -4052,69 +4053,82 @@ export function App() {
               >
                 <RefreshCw size={13} className={resyncing ? "spin" : undefined} />
               </button>
-              <AnimatePresence>
-                {radarSyncMenuOpen && radarSyncMenuPosition ? (
-                  <motion.div
-                    className="modal-card filter-menu radar-sync-menu"
-                    style={{ top: radarSyncMenuPosition.top, left: radarSyncMenuPosition.left }}
-                    initial={{ opacity: 0, scale: 0.95, y: -6 }}
-                    animate={{ opacity: 1, scale: 1, y: 0 }}
-                    exit={{ opacity: 0, scale: 0.95, y: -6 }}
-                    transition={{ duration: 0.16, ease: [0.4, 0, 0.2, 1] }}
-                  >
-                    <button
-                      type="button"
-                      className="radar-sync-menu-item"
-                      disabled={resyncing || !activeLibraryId}
-                      onClick={() => {
-                        setRadarSyncMenuOpen(false);
-                        handleResyncSonicRadar();
-                      }}
+              {/* Portaled to document.body rather than left in place like
+                  .filter-menu's own position:fixed trick: that trick only
+                  escapes an ancestor's overflow-x-via-overflow-y-auto
+                  inheritance, not this one — .sidebar has its own
+                  backdrop-filter (the glass panel look), and *any* filter
+                  or transform on an ancestor makes it the containing block
+                  for position:fixed descendants too, right back inside
+                  .sidebar's overflow:hidden. That's what was cropping this
+                  menu down to a sliver. A real portal has no such
+                  ancestor at all. */}
+              {createPortal(
+                <AnimatePresence>
+                  {radarSyncMenuOpen && radarSyncMenuPosition ? (
+                    <motion.div
+                      className="modal-card filter-menu radar-sync-menu"
+                      style={{ top: radarSyncMenuPosition.top, left: radarSyncMenuPosition.left }}
+                      initial={{ opacity: 0, scale: 0.95, y: -6 }}
+                      animate={{ opacity: 1, scale: 1, y: 0 }}
+                      exit={{ opacity: 0, scale: 0.95, y: -6 }}
+                      transition={{ duration: 0.16, ease: [0.4, 0, 0.2, 1] }}
                     >
-                      <span className="radar-sync-menu-item-icon">
-                        <RefreshCw size={14} />
-                      </span>
-                      <span>
-                        <span className="radar-sync-menu-item-title">Re-analyse everything</span>
-                        <span className="radar-sync-menu-item-desc">
-                          {bulkAssetIds.length > 0
-                            ? `Waveform, audio analysis, and instrument detection for ${bulkAssetIds.length} selected sound${bulkAssetIds.length === 1 ? "" : "s"}.`
-                            : "Waveform, audio analysis, and instrument detection, whole library. Can take a while."}
+                      <button
+                        type="button"
+                        className="radar-sync-menu-item"
+                        disabled={resyncing || !activeLibraryId}
+                        onClick={() => {
+                          setRadarSyncMenuOpen(false);
+                          handleResyncSonicRadar();
+                        }}
+                      >
+                        <span className="radar-sync-menu-item-icon">
+                          <RefreshCw size={14} />
                         </span>
-                      </span>
-                    </button>
-                    {/* A track's audio-analysis job can show "completed" and
-                        still have no Key/Pitch on record — that pass was
-                        added after a lot of this catalog was already
-                        analysed, so most existing "completed" jobs never
-                        actually ran the newer detection. This backfills
-                        just that (Tempo/Key/Pitch/Vocals) for the whole
-                        library without re-touching instrument detection or
-                        waveform generation, unlike the option above. */}
-                    <button
-                      type="button"
-                      className="radar-sync-menu-item"
-                      disabled={resyncing || !activeLibraryId || bulkAssetIds.length > 0}
-                      title={bulkAssetIds.length > 0 ? "Clear the selection first — this one is whole-library only" : undefined}
-                      onClick={() => {
-                        setRadarSyncMenuOpen(false);
-                        handleBackfillAudioAnalysis();
-                      }}
-                    >
-                      <span className="radar-sync-menu-item-icon">
-                        <Sparkles size={14} />
-                      </span>
-                      <span>
-                        <span className="radar-sync-menu-item-title">Backfill Tempo/Key/Pitch/Vocals</span>
-                        <span className="radar-sync-menu-item-desc">
-                          Whole library only. Catches tracks analysed before key/pitch detection existed — skips
-                          instrument detection and waveforms.
+                        <span>
+                          <span className="radar-sync-menu-item-title">Re-analyse everything</span>
+                          <span className="radar-sync-menu-item-desc">
+                            {bulkAssetIds.length > 0
+                              ? `Waveform, audio analysis, and instrument detection for ${bulkAssetIds.length} selected sound${bulkAssetIds.length === 1 ? "" : "s"}.`
+                              : "Waveform, audio analysis, and instrument detection, whole library. Can take a while."}
+                          </span>
                         </span>
-                      </span>
-                    </button>
-                  </motion.div>
-                ) : null}
-              </AnimatePresence>
+                      </button>
+                      {/* A track's audio-analysis job can show "completed" and
+                          still have no Key/Pitch on record — that pass was
+                          added after a lot of this catalog was already
+                          analysed, so most existing "completed" jobs never
+                          actually ran the newer detection. This backfills
+                          just that (Tempo/Key/Pitch/Vocals) for the whole
+                          library without re-touching instrument detection or
+                          waveform generation, unlike the option above. */}
+                      <button
+                        type="button"
+                        className="radar-sync-menu-item"
+                        disabled={resyncing || !activeLibraryId || bulkAssetIds.length > 0}
+                        title={bulkAssetIds.length > 0 ? "Clear the selection first — this one is whole-library only" : undefined}
+                        onClick={() => {
+                          setRadarSyncMenuOpen(false);
+                          handleBackfillAudioAnalysis();
+                        }}
+                      >
+                        <span className="radar-sync-menu-item-icon">
+                          <Sparkles size={14} />
+                        </span>
+                        <span>
+                          <span className="radar-sync-menu-item-title">Backfill Tempo/Key/Pitch/Vocals</span>
+                          <span className="radar-sync-menu-item-desc">
+                            Whole library only. Catches tracks analysed before key/pitch detection existed — skips
+                            instrument detection and waveforms.
+                          </span>
+                        </span>
+                      </button>
+                    </motion.div>
+                  ) : null}
+                </AnimatePresence>,
+                document.body
+              )}
             </div>
             <button
               type="button"
