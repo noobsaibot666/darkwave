@@ -1,6 +1,6 @@
 import { convertFileSrc, invoke } from "@tauri-apps/api/core";
 import { listen } from "@tauri-apps/api/event";
-import { AnimatePresence, motion } from "motion/react";
+import { AnimatePresence, motion, useMotionValue, useTransform } from "motion/react";
 import { open as openDialog, save as saveDialog, confirm as confirmDialog } from "@tauri-apps/plugin-dialog";
 import { revealItemInDir } from "@tauri-apps/plugin-opener";
 import { writeText as writeClipboardText } from "@tauri-apps/plugin-clipboard-manager";
@@ -37,6 +37,7 @@ import {
   Music2,
   Palette,
   Pause,
+  Pencil,
   Piano,
   Play,
   Plus,
@@ -58,7 +59,17 @@ import {
   X,
   Zap
 } from "lucide-react";
-import { useCallback, useEffect, useMemo, useRef, useState, type CSSProperties, type MouseEvent, type ReactNode } from "react";
+import {
+  useCallback,
+  useEffect,
+  useMemo,
+  useRef,
+  useState,
+  type CSSProperties,
+  type MouseEvent,
+  type PointerEvent as ReactPointerEvent,
+  type ReactNode
+} from "react";
 
 type LibraryRecord = {
   id: string;
@@ -638,6 +649,18 @@ const PLAYER_ACCENT_LEGEND: { mood: PlayerMood | "default"; label: string; descr
 // frames on a transient shouldn't flip a whole SFX into "has voice").
 const VOCAL_RATIO_THRESHOLD = 0.15;
 
+// How far the pointer has to move past an asset row's pointerdown before
+// it counts as a drag rather than a click — small enough to feel
+// immediate, large enough that an ordinary click's few pixels of jitter
+// never gets misread as one.
+const DRAG_ACTIVATE_DISTANCE_PX = 6;
+
+// How many recently-used projects the in-flight drag dock offers as
+// one-hop drop targets, and where that short list is persisted so it
+// survives a restart instead of resetting every session.
+const DRAG_DOCK_PROJECT_COUNT = 3;
+const RECENT_PROJECT_IDS_STORAGE_KEY = "darkwave.recentProjectIds";
+
 // Cosmetic only (labels, shortcut glyphs). Every actual keyboard/modifier
 // check in this file uses `event.metaKey || event.ctrlKey` so behavior is
 // correct on both platforms regardless of what this detects.
@@ -973,11 +996,46 @@ export function App() {
   const [sfxSubcategoriesOpen, setSfxSubcategoriesOpen] = useState(false);
   const [favoritesCategoriesOpen, setFavoritesCategoriesOpen] = useState(false);
   const [unreviewedCategoriesOpen, setUnreviewedCategoriesOpen] = useState(false);
+  // "projects" is deliberately absent here — the inspector's Projects
+  // section (id="projects") is a drag-and-drop target, so it needs to be
+  // visible by default or a fresh session hides it and dropping a track
+  // there looks broken until the user notices and expands it manually.
   const [collapsedSections, setCollapsedSections] = useState<Set<string>>(
-    () => new Set(["projects", "embedded", "detected", "source", "maintenance", "nas", "backup"])
+    () => new Set(["embedded", "detected", "source", "maintenance", "nas", "backup"])
   );
   const [refreshStatus, setRefreshStatus] = useState<string | null>(null);
   const [newProjectModalOpen, setNewProjectModalOpen] = useState(false);
+  // Drag-and-drop a track onto a project name (sidebar or inspector) to add
+  // it there — tracks which project row is currently a valid drop target,
+  // for the hover highlight. dragPreview (+ the motion values tracking the
+  // cursor) drives the floating, morphing drag-preview card; null means no
+  // drag is in progress. See the pointermove/pointerup effect further down.
+  const [dragOverProjectId, setDragOverProjectId] = useState<string | null>(null);
+  const [dragPreview, setDragPreview] = useState<{ label: string; count: number } | null>(null);
+  // The last few projects a track was actually dropped/added into, most
+  // recent first — persisted so the drag dock below has something useful
+  // to show even on a fresh launch's first drag. Purely a convenience
+  // ranking; add_to_collection is the source of truth, this never is.
+  const [recentProjectIds, setRecentProjectIds] = useState<string[]>(() => {
+    try {
+      const raw = localStorage.getItem(RECENT_PROJECT_IDS_STORAGE_KEY);
+      const parsed = raw ? JSON.parse(raw) : [];
+      return Array.isArray(parsed) ? parsed.filter((entry): entry is string => typeof entry === "string") : [];
+    } catch {
+      return [];
+    }
+  });
+  const dragPreviewX = useMotionValue(0);
+  const dragPreviewY = useMotionValue(0);
+  // Offset a little past the cursor rather than centered under it, so the
+  // card doesn't itself hide the drop target it's hovering over. Derived
+  // values (not a static CSS transform) so they keep composing with
+  // whileDrag/animate's own transform instead of fighting it.
+  const dragPreviewLeft = useTransform(dragPreviewX, (value) => value + 14);
+  const dragPreviewTop = useTransform(dragPreviewY, (value) => value + 18);
+  const dragStartRef = useRef<{ x: number; y: number; asset: AssetRecord } | null>(null);
+  const dragActiveRef = useRef(false);
+  const suppressNextRowClickRef = useRef(false);
   const [createLibraryModalOpen, setCreateLibraryModalOpen] = useState(false);
   const [shortcutsOpen, setShortcutsOpen] = useState(false);
   const toggleSection = useCallback((id: string) => {
@@ -1001,6 +1059,12 @@ export function App() {
   const [newProjectName, setNewProjectName] = useState("");
   const [newProjectExportPath, setNewProjectExportPath] = useState("");
   const [newProjectSfxExportPath, setNewProjectSfxExportPath] = useState("");
+  // The sidebar's hover-to-reveal edit icon on a project row opens this —
+  // editProjectId doubles as "is the modal open".
+  const [editProjectId, setEditProjectId] = useState<string | null>(null);
+  const [editProjectName, setEditProjectName] = useState("");
+  const [editProjectExportPath, setEditProjectExportPath] = useState("");
+  const [editProjectSfxExportPath, setEditProjectSfxExportPath] = useState("");
   const [lastExportProjectId, setLastExportProjectId] = useState<string | null>(null);
   const [drExportStatus, setDrExportStatus] = useState<string | null>(null);
   const [projectAddToast, setProjectAddToast] = useState<{ projectId: string; message: string } | null>(null);
@@ -1025,6 +1089,7 @@ export function App() {
   const [jobProgress, setJobProgress] = useState<JobProgress[]>([]);
   const [jobCompletionSummaries, setJobCompletionSummaries] = useState<Record<string, JobCompletionSummary>>({});
   const [audioAnalysisPaused, setAudioAnalysisPaused] = useState(false);
+  const [waveformGenerationPaused, setWaveformGenerationPaused] = useState(false);
   // null = not yet checked; false = no model installed, so skip the
   // instrument-detection drain (its jobs stay pending harmlessly).
   const [instrumentDetectionAvailable, setInstrumentDetectionAvailable] = useState<boolean | null>(null);
@@ -1032,20 +1097,19 @@ export function App() {
   // Sonic Radar inspector panel: which per-asset analysis kind is currently
   // queued/running (drives the row's progress bar/disabled state) and the
   // last status line shown under the row list. Both reset when selection
-  // changes. sonicRadarBusyKind only clears once jobProgress/
-  // jobCompletionSummaries confirm the drain actually finished — not right
-  // after the queue call returns — so the UI never claims "analyzed" ahead
-  // of the backend actually having run it.
+  // changes. sonicRadarBusyKind only clears once handleAnalyzeAssetKind's
+  // own poll of asset_job_state confirms the job reached a terminal state
+  // (completed or failed) — never optimistically, and never silently.
   const [sonicRadarBusyKind, setSonicRadarBusyKind] = useState<"audio_analysis" | "instrument_detection" | null>(
     null
   );
   const [sonicRadarStatus, setSonicRadarStatus] = useState<string | null>(null);
-  // True once jobProgress has shown sonicRadarBusyKind's entry at least
-  // once — distinguishes "the drain hasn't picked our job up yet" from
-  // "the drain finished" when jobProgress reports zero pending for a kind
-  // in both cases.
-  const sonicRadarSeenPendingRef = useRef(false);
-  const sonicRadarTimeoutRef = useRef<ReturnType<typeof setTimeout> | null>(null);
+  // Bumped on every new Analyze click and every selection change; a poll
+  // loop checks its own captured id against this before acting, so an
+  // in-flight poll for a superseded click (user switched tracks, or
+  // clicked Analyze again) quietly stops touching state instead of racing
+  // a newer one.
+  const sonicRadarRequestIdRef = useRef(0);
   const [backgroundActivityOpen, setBackgroundActivityOpen] = useState(false);
   const drainingJobKinds = useRef<Set<string>>(new Set());
   const [offlineControl, setOfflineControl] = useState<OfflineControlState | null>(null);
@@ -1288,6 +1352,7 @@ export function App() {
             // which is exactly what was driving CPU/memory usage far past
             // what a single drain needs.
             if (config.kind === "audio_analysis" && audioAnalysisPaused) return;
+            if (config.kind === "waveform_generation" && waveformGenerationPaused) return;
             if (startPending === 0 || drainingJobKinds.current.has(config.kind)) return;
             drainingJobKinds.current.add(config.kind);
 
@@ -1345,7 +1410,7 @@ export function App() {
         })
         .catch(() => {});
     },
-    [refreshAssets, searchQuery, activeFilter, audioAnalysisPaused, instrumentDetectionAvailable]
+    [refreshAssets, searchQuery, activeFilter, audioAnalysisPaused, waveformGenerationPaused, instrumentDetectionAvailable]
   );
 
   const refreshMaintenance = useCallback((libraryId: string) => {
@@ -1434,6 +1499,7 @@ export function App() {
 
   useEffect(() => {
     invoke<boolean>("audio_analysis_paused").then(setAudioAnalysisPaused).catch(() => {});
+    invoke<boolean>("waveform_generation_paused").then(setWaveformGenerationPaused).catch(() => {});
     invoke<boolean>("instrument_detection_available")
       .then(setInstrumentDetectionAvailable)
       .catch(() => setInstrumentDetectionAvailable(false));
@@ -1445,6 +1511,18 @@ export function App() {
     invoke("set_audio_analysis_paused", { paused: next }).catch(() => {});
     if (!next && activeLibraryId) runJobDrain(activeLibraryId, ["audio_analysis"]);
   }, [audioAnalysisPaused, activeLibraryId, runJobDrain]);
+
+  // A library catalogued before waveform caching existed (or one with a lot
+  // of Referenced/NAS assets) can carry a backlog thousands deep — decoding
+  // through that at WAVEFORM_CONCURRENCY in a debug build pins CPU for a
+  // long time and makes everything else (including just selecting a track)
+  // feel slow. This is the pause valve for that specifically.
+  const handleToggleWaveformGenerationPaused = useCallback(() => {
+    const next = !waveformGenerationPaused;
+    setWaveformGenerationPaused(next);
+    invoke("set_waveform_generation_paused", { paused: next }).catch(() => {});
+    if (!next && activeLibraryId) runJobDrain(activeLibraryId, ["waveform_generation"]);
+  }, [waveformGenerationPaused, activeLibraryId, runJobDrain]);
 
   const handleRetryFailedJobs = useCallback(
     (kind: string) => {
@@ -1618,11 +1696,7 @@ export function App() {
   useEffect(() => {
     setSonicRadarStatus(null);
     setSonicRadarBusyKind(null);
-    sonicRadarSeenPendingRef.current = false;
-    if (sonicRadarTimeoutRef.current) {
-      clearTimeout(sonicRadarTimeoutRef.current);
-      sonicRadarTimeoutRef.current = null;
-    }
+    sonicRadarRequestIdRef.current += 1; // cancel any in-flight poll for the previous asset
     if (!selectedAssetId) {
       setAppliedTags([]);
       setSuggestedTags([]);
@@ -1855,6 +1929,31 @@ export function App() {
       .catch(() => {});
   }, [newTagName, newTagFacet, selectedAssetId, handleApplyTag]);
 
+  // One-click tagging straight from what Sonic Radar already detected
+  // (instrument names, vocal presence) — reuses the existing tag if the
+  // library already has one with this name, otherwise creates it under a
+  // sensible facet first. Same apply path as the manual "Apply Tag" grid.
+  const handleQuickTag = useCallback(
+    (name: string, facet: string) => {
+      if (bulkAssetIds.length === 0) return;
+      const normalized = name.trim().toLowerCase();
+      const existing = tags.find(
+        (tag) => tag.normalized_name.toLowerCase() === normalized || tag.name.toLowerCase() === normalized
+      );
+      if (existing) {
+        handleApplyTag(existing);
+        return;
+      }
+      invoke<TagRecord>("create_tag", { name: name.trim(), facet })
+        .then((tag) => {
+          setTags((previous) => (previous.some((existing2) => existing2.id === tag.id) ? previous : [...previous, tag]));
+          return handleApplyTag(tag);
+        })
+        .catch(() => {});
+    },
+    [bulkAssetIds, tags, handleApplyTag]
+  );
+
   const handleAcceptSuggestion = useCallback(
     (tag: TagRecord) => {
       if (!selectedAssetId) return;
@@ -1940,6 +2039,71 @@ export function App() {
     });
     if (typeof selected === "string") setNewProjectSfxExportPath(selected);
   }, []);
+
+  const handleOpenEditProject = useCallback((project: CollectionRecord) => {
+    setEditProjectId(project.id);
+    setEditProjectName(project.name);
+    setEditProjectExportPath(project.export_path ?? "");
+    setEditProjectSfxExportPath(project.sfx_export_path ?? "");
+  }, []);
+
+  const handleChooseEditProjectExportPath = useCallback(async () => {
+    const selected = await openDialog({ directory: true, multiple: false, title: "Choose a sound folder" });
+    if (typeof selected === "string") setEditProjectExportPath(selected);
+  }, []);
+
+  const handleChooseEditProjectSfxExportPath = useCallback(async () => {
+    const selected = await openDialog({ directory: true, multiple: false, title: "Choose a sound effects folder" });
+    if (typeof selected === "string") setEditProjectSfxExportPath(selected);
+  }, []);
+
+  // Saves whichever of name/export paths actually changed — each field has
+  // its own backend command (rename_project, set_project_export_path,
+  // set_project_sfx_export_path), so this only calls the ones it needs to
+  // rather than always writing all three.
+  const handleSaveProjectEdits = useCallback(() => {
+    if (!editProjectId) return;
+    const project = collections.find((entry) => entry.id === editProjectId);
+    if (!project) return;
+    const projectId = editProjectId;
+    const trimmedName = editProjectName.trim();
+    const trimmedExportPath = editProjectExportPath.trim();
+    const trimmedSfxExportPath = editProjectSfxExportPath.trim();
+
+    const updates: Promise<CollectionRecord>[] = [];
+    if (trimmedName && trimmedName !== project.name) {
+      updates.push(invoke<CollectionRecord>("rename_project", { projectId, name: trimmedName }));
+    }
+    if (trimmedExportPath !== (project.export_path ?? "")) {
+      updates.push(
+        invoke<CollectionRecord>("set_project_export_path", {
+          projectId,
+          exportPath: trimmedExportPath || null
+        })
+      );
+    }
+    if (trimmedSfxExportPath !== (project.sfx_export_path ?? "")) {
+      updates.push(
+        invoke<CollectionRecord>("set_project_sfx_export_path", {
+          projectId,
+          sfxExportPath: trimmedSfxExportPath || null
+        })
+      );
+    }
+    if (updates.length === 0) {
+      setEditProjectId(null);
+      return;
+    }
+    // Each call returns the full row post-update; the last one to resolve
+    // reflects every field that changed, so just take the last result.
+    Promise.all(updates)
+      .then((results) => {
+        const updated = results[results.length - 1];
+        setCollections((previous) => previous.map((entry) => (entry.id === updated.id ? updated : entry)));
+        setEditProjectId(null);
+      })
+      .catch(() => {});
+  }, [editProjectId, editProjectName, editProjectExportPath, editProjectSfxExportPath, collections]);
 
   const handleExportToProject = useCallback(
     (project: CollectionRecord, assetIds: string[]) => {
@@ -2038,6 +2202,13 @@ export function App() {
 
   const handleRowClick = useCallback(
     (asset: AssetRecord, index: number, event: MouseEvent) => {
+      // A drag-to-project gesture that just released can still trigger a
+      // trailing click on whatever the pointer started on — ignore it once,
+      // so dropping a track onto a project doesn't also reselect/replay it.
+      if (suppressNextRowClickRef.current) {
+        suppressNextRowClickRef.current = false;
+        return;
+      }
       setSelectedAssetId(asset.id);
       const mode: SelectionMode = event.shiftKey ? "Range" : event.metaKey || event.ctrlKey ? "Toggle" : "Replace";
       if (mode === "Replace" && playingAssetId !== asset.id) {
@@ -2061,6 +2232,22 @@ export function App() {
     [browserState, playingAssetId, loadAssetForPlayback]
   );
 
+  // Bumps a project to the front of recentProjectIds (used to rank the
+  // drag dock and, incidentally, nothing else — the DB membership itself
+  // is never derived from this).
+  const markProjectUsed = useCallback((projectId: string) => {
+    setRecentProjectIds((previous) => {
+      const next = [projectId, ...previous.filter((id) => id !== projectId)].slice(0, DRAG_DOCK_PROJECT_COUNT);
+      try {
+        localStorage.setItem(RECENT_PROJECT_IDS_STORAGE_KEY, JSON.stringify(next));
+      } catch {
+        // Best-effort — a private window or full storage just means the
+        // drag dock falls back to the plain project list next launch.
+      }
+      return next;
+    });
+  }, []);
+
   const handleAddSelectedToProject = useCallback(
     (project: CollectionRecord) => {
       if (bulkAssetIds.length === 0) return;
@@ -2069,11 +2256,94 @@ export function App() {
           setUndoStack((previous) => [...previous, { id: undoId, label: `Add to "${project.name}"` }]);
           setRedoStack([]);
           if (activeLibraryId) refreshProjectMemberships(activeLibraryId);
+          markProjectUsed(project.id);
         })
         .catch(() => {});
     },
-    [bulkAssetIds, activeLibraryId, refreshProjectMemberships]
+    [bulkAssetIds, activeLibraryId, refreshProjectMemberships, markProjectUsed]
   );
+
+  // Drag a track (or, if the dragged row is part of the current selection,
+  // every selected track) and drop it on a project name — in the left
+  // sidebar's Projects list or the inspector's Projects chips — to add it
+  // there. Picking up an unselected row only moves that one row, matching
+  // ordinary file-manager drag conventions.
+  //
+  // This is a hand-rolled pointer drag, not native HTML5 DnD: native drag's
+  // only customizable visual is `setDragImage`, a single frozen snapshot
+  // taken at drag start — it can't animate. Tracking the pointer ourselves
+  // lets dragPreview (rendered below with `motion`) morph and follow the
+  // cursor smoothly for the whole gesture instead.
+  const handleAssetPointerDown = useCallback((event: ReactPointerEvent<HTMLElement>, asset: AssetRecord) => {
+    if (event.button !== 0) return; // left button / primary touch only
+    // Without this, the browser reads the mousedown+move as a text-selection
+    // drag (Chromium/WebKit's default for a mousedown-then-move over
+    // non-form content) and highlights everything the cursor crosses —
+    // rows, sidebar labels, project names — for the whole gesture. This is
+    // the actual custom drag, so it owns the gesture from the first pixel.
+    event.preventDefault();
+    dragStartRef.current = { x: event.clientX, y: event.clientY, asset };
+  }, []);
+
+  useEffect(() => {
+    let draggedIds: string[] = [];
+
+    const handlePointerMove = (event: PointerEvent) => {
+      const start = dragStartRef.current;
+      if (!start) return;
+      if (!dragActiveRef.current) {
+        if (Math.hypot(event.clientX - start.x, event.clientY - start.y) < DRAG_ACTIVATE_DISTANCE_PX) return;
+        dragActiveRef.current = true;
+        draggedIds = bulkAssetIds.includes(start.asset.id) ? bulkAssetIds : [start.asset.id];
+        setDragPreview({ label: start.asset.display_name, count: draggedIds.length });
+      }
+      dragPreviewX.set(event.clientX);
+      dragPreviewY.set(event.clientY);
+      const hovered = (event.target as HTMLElement | null)
+        ?.ownerDocument?.elementFromPoint(event.clientX, event.clientY)
+        ?.closest<HTMLElement>("[data-drop-project-id]");
+      setDragOverProjectId(hovered?.dataset.dropProjectId ?? null);
+    };
+
+    const handlePointerUp = (event: PointerEvent) => {
+      const wasDragging = dragActiveRef.current;
+      dragStartRef.current = null;
+      dragActiveRef.current = false;
+      setDragPreview(null);
+      setDragOverProjectId(null);
+      if (!wasDragging) return;
+      suppressNextRowClickRef.current = true;
+      const hovered = document.elementFromPoint(event.clientX, event.clientY)?.closest<HTMLElement>("[data-drop-project-id]");
+      const projectId = hovered?.dataset.dropProjectId;
+      const ids = draggedIds;
+      draggedIds = [];
+      if (!projectId || ids.length === 0) return;
+      const project = collections.find((entry) => entry.id === projectId);
+      if (!project || project.collection_type !== "Project") return;
+      invoke<string>("add_to_collection", { collectionId: project.id, assetIds: ids })
+        .then((undoId) => {
+          setUndoStack((previous) => [...previous, { id: undoId, label: `Add to "${project.name}"` }]);
+          setRedoStack([]);
+          if (activeLibraryId) refreshProjectMemberships(activeLibraryId);
+          setProjectAddToast({
+            projectId: project.id,
+            message: ids.length === 1 ? "Added" : `${ids.length} added`
+          });
+          window.setTimeout(() => {
+            setProjectAddToast((current) => (current?.projectId === project.id ? null : current));
+          }, 2000);
+          markProjectUsed(project.id);
+        })
+        .catch(() => {});
+    };
+
+    window.addEventListener("pointermove", handlePointerMove);
+    window.addEventListener("pointerup", handlePointerUp);
+    return () => {
+      window.removeEventListener("pointermove", handlePointerMove);
+      window.removeEventListener("pointerup", handlePointerUp);
+    };
+  }, [bulkAssetIds, collections, activeLibraryId, refreshProjectMemberships, dragPreviewX, dragPreviewY, markProjectUsed]);
 
   // The sidebar's per-project "+" — a one-click way to add whatever's
   // currently playing to a project without first selecting it in the
@@ -2090,11 +2360,32 @@ export function App() {
           window.setTimeout(() => {
             setProjectAddToast((current) => (current?.projectId === project.id ? null : current));
           }, 2000);
+          markProjectUsed(project.id);
         })
         .catch(() => {});
     },
-    [playingAssetId, activeLibraryId, refreshProjectMemberships]
+    [playingAssetId, activeLibraryId, refreshProjectMemberships, markProjectUsed]
   );
+
+  // Recent projects (most-recently-used first, backfilled from the plain
+  // project list so there's always something to show) for the drag dock —
+  // a fast-access shortcut that pops up during a drag so dropping a track
+  // into a project never depends on either sidebar's Projects section
+  // happening to be expanded/scrolled into view.
+  const dragDockProjects = useMemo(() => {
+    const projectCollections = collections.filter((entry) => entry.collection_type === "Project");
+    const byId = new Map(projectCollections.map((entry) => [entry.id, entry] as const));
+    const ranked: CollectionRecord[] = [];
+    for (const id of recentProjectIds) {
+      const match = byId.get(id);
+      if (match) ranked.push(match);
+    }
+    for (const entry of projectCollections) {
+      if (ranked.length >= DRAG_DOCK_PROJECT_COUNT) break;
+      if (!ranked.includes(entry)) ranked.push(entry);
+    }
+    return ranked.slice(0, DRAG_DOCK_PROJECT_COUNT);
+  }, [collections, recentProjectIds]);
 
   const handleSaveSource = useCallback(() => {
     if (!sourceDraft) return;
@@ -2535,86 +2826,127 @@ export function App() {
   // "audio_analysis" kind. Instrument detection is a genuinely separate
   // model/pass, so it gets its own kind.
   //
-  // sonicRadarBusyKind is deliberately NOT cleared here once the queue call
-  // resolves — that would just mean the job was *inserted*, not that it ran.
-  // The effect below watching jobProgress/jobCompletionSummaries is what
-  // actually clears it, once the drain reports the job finished (and,
-  // separately, whether it succeeded or failed).
+  // Outcome tracking polls asset_job_state directly — this asset's own job
+  // row — rather than the shared, per-kind job_status/jobProgress counters
+  // used earlier: those are library-wide, so a *different* in-flight job of
+  // the same kind (another asset, a background drain) could leave this
+  // asset's own completion (or failure) unreported. That was the bug behind
+  // Pitch/Instruments silently reverting to "Analyze" with no error and no
+  // result — the shared tracker sometimes never saw this job at all.
   const handleAnalyzeAssetKind = useCallback(
-    (kind: "audio_analysis" | "instrument_detection") => {
+    async (kind: "audio_analysis" | "instrument_detection") => {
       if (!activeLibraryId || !selectedAssetId || sonicRadarBusyKind) return;
-      sonicRadarSeenPendingRef.current = false;
-      if (sonicRadarTimeoutRef.current) {
-        clearTimeout(sonicRadarTimeoutRef.current);
-        sonicRadarTimeoutRef.current = null;
-      }
+      const assetId = selectedAssetId;
+      const requestId = (sonicRadarRequestIdRef.current += 1);
+      const stillCurrent = () => sonicRadarRequestIdRef.current === requestId;
+
       setSonicRadarBusyKind(kind);
       setSonicRadarStatus(
         kind === "audio_analysis" ? "Queuing tempo/key/pitch/vocal analysis…" : "Queuing instrument detection…"
       );
-      invoke<number>("resync_analysis", { libraryId: activeLibraryId, assetIds: [selectedAssetId], kinds: [kind] })
-        .then((queued) => {
-          if (kind === "audio_analysis" && audioAnalysisPaused) {
-            // Queued, but nothing will drive it until the user resumes audio
-            // analysis (Maintenance) — don't sit here "Analyzing…" forever
-            // waiting for a drain that isn't going to run.
-            setSonicRadarStatus(
-              queued > 0
-                ? "Queued — audio analysis is paused; resume it in Maintenance to run this"
-                : "Nothing new to queue"
-            );
-            setSonicRadarBusyKind(null);
-            return;
-          }
-          setSonicRadarStatus("Analyzing…");
-          runJobDrain(activeLibraryId, [kind]);
-          // Safety net: if the drain never reports back (e.g. it was
-          // deduped against an already-running drain whose progress we
-          // never observed), don't leave the row spinning forever.
-          sonicRadarTimeoutRef.current = setTimeout(() => {
-            setSonicRadarBusyKind((current) => (current === kind ? null : current));
-            setSonicRadarStatus("Still running — check Background Activity for status");
-          }, 45000);
-        })
-        .catch((error) => {
+
+      let queued = 0;
+      try {
+        queued = await invoke<number>("resync_analysis", {
+          libraryId: activeLibraryId,
+          assetIds: [assetId],
+          kinds: [kind]
+        });
+      } catch (error) {
+        if (stillCurrent()) {
           setSonicRadarStatus(`Couldn't queue analysis: ${String(error)}`);
           setSonicRadarBusyKind(null);
-        });
-    },
-    [activeLibraryId, selectedAssetId, runJobDrain, audioAnalysisPaused, sonicRadarBusyKind]
-  );
+        }
+        return;
+      }
+      if (!stillCurrent()) return;
 
-  // Confirms the queued job actually finished (completed OR failed) before
-  // clearing the busy state, using the same ground-truth job_status diff
-  // runJobDrain already computes for the global completion toasts — not an
-  // optimistic timer. jobProgress no longer listing the kind means the
-  // backend drained it to zero pending; jobCompletionSummaries (when
-  // present) says whether that drain actually succeeded.
-  useEffect(() => {
-    if (!sonicRadarBusyKind) return;
-    const stillPending = jobProgress.some((job) => job.kind === sonicRadarBusyKind);
-    if (stillPending) {
-      sonicRadarSeenPendingRef.current = true;
-      return;
-    }
-    if (!sonicRadarSeenPendingRef.current) return; // drain hasn't picked it up yet
-    if (sonicRadarTimeoutRef.current) {
-      clearTimeout(sonicRadarTimeoutRef.current);
-      sonicRadarTimeoutRef.current = null;
-    }
-    const summary = jobCompletionSummaries[sonicRadarBusyKind];
-    setSonicRadarStatus(summary ? describeJobCompletion(summary).headline : "Done");
-    // Instrument detections live in a separate table (asset_instruments),
-    // not on the asset record refreshAssets already re-fetches — refetch it
-    // explicitly so the Instruments row's checkmark reflects the real
-    // result instead of the stale pre-analysis list.
-    if (sonicRadarBusyKind === "instrument_detection" && selectedAssetId) {
-      invoke<{ name: string; confidence: number }[]>("asset_instruments", { assetId: selectedAssetId })
-        .then(setAssetInstruments)
-        .catch(() => {});
-    }
-    setSonicRadarBusyKind(null);
-  }, [jobProgress, jobCompletionSummaries, sonicRadarBusyKind, selectedAssetId]);
+      if (kind === "audio_analysis" && audioAnalysisPaused) {
+        // Queued, but nothing will drive it until the user resumes audio
+        // analysis (Maintenance) — don't sit here "Analyzing…" forever
+        // waiting for a drain that isn't going to run.
+        setSonicRadarStatus(
+          queued > 0
+            ? "Queued — audio analysis is paused; resume it in Maintenance to run this"
+            : "Nothing new to queue"
+        );
+        setSonicRadarBusyKind(null);
+        return;
+      }
+
+      setSonicRadarStatus("Analyzing…");
+      runJobDrain(activeLibraryId, [kind]); // best-effort kick — harmless no-op if a drain for this kind is already running, since that one will pick our job up too
+
+      type AssetJobState = { state: string; error: string | null };
+      let finalState: AssetJobState | null = null;
+      // Instrument detection decodes+resamples the whole source file before
+      // it ever gets to inference, and this panel processes one asset at a
+      // time behind whatever else is already draining (waveform
+      // generation's own backlog, in particular) — a multi-minute track
+      // under real background load can legitimately take longer than a
+      // minute. 120s gives that real headroom without masking an actually
+      // stuck job forever.
+      const deadline = Date.now() + 120_000;
+      while (Date.now() < deadline) {
+        await new Promise((resolve) => setTimeout(resolve, 800));
+        if (!stillCurrent()) return;
+        try {
+          const jobState = await invoke<AssetJobState | null>("asset_job_state", { assetId, kind });
+          if (jobState && (jobState.state === "completed" || jobState.state === "failed")) {
+            finalState = jobState;
+            break;
+          }
+        } catch {
+          // transient — keep polling until the deadline
+        }
+        if (!stillCurrent()) return;
+      }
+      if (!stillCurrent()) return;
+
+      if (!finalState) {
+        setSonicRadarStatus("Still taking a while — it'll keep running; check back or try again shortly");
+        setSonicRadarBusyKind(null);
+        return;
+      }
+
+      if (finalState.state === "failed") {
+        setSonicRadarStatus(`Analysis failed: ${finalState.error ?? "unknown error"}`);
+        setSonicRadarBusyKind(null);
+        return;
+      }
+
+      // Completed — pull the fresh result before declaring success, so the
+      // checkmark reflects what the database actually has, never an
+      // assumption. Instrument detections live in a separate table
+      // (asset_instruments), not on the asset record refreshAssets
+      // re-fetches, so that needs its own explicit refetch.
+      refreshAssets(activeLibraryId, searchQuery, activeFilter);
+      if (kind === "instrument_detection") {
+        try {
+          const instruments = await invoke<{ name: string; confidence: number }[]>("asset_instruments", {
+            assetId
+          });
+          if (stillCurrent()) setAssetInstruments(instruments);
+        } catch {
+          // leave whatever's already showing — refreshAssets still ran
+        }
+      }
+      if (stillCurrent()) {
+        setSonicRadarStatus("Done — results updated below");
+        setSonicRadarBusyKind(null);
+      }
+    },
+    [
+      activeLibraryId,
+      selectedAssetId,
+      runJobDrain,
+      audioAnalysisPaused,
+      sonicRadarBusyKind,
+      refreshAssets,
+      searchQuery,
+      activeFilter
+    ]
+  );
 
   const handleExportSelected = useCallback(
     async (format?: "wav24") => {
@@ -3203,6 +3535,7 @@ export function App() {
         "shell",
         sidebarCollapsed ? "sidebar-collapsed" : "",
         inspectorCollapsed ? "inspector-collapsed" : "",
+        dragPreview ? "dragging-asset" : "",
       ]
         .filter(Boolean)
         .join(" ")}
@@ -3618,7 +3951,11 @@ export function App() {
           {collapsedSections.has("sidebar-projects")
             ? null
             : collections.map((project) => (
-                <div className="nav-item-row" key={project.id}>
+                <div
+                  className={dragOverProjectId === project.id ? "nav-item-row drag-over" : "nav-item-row"}
+                  key={project.id}
+                  data-drop-project-id={project.collection_type === "Project" ? project.id : undefined}
+                >
                   {project.collection_type === "Project" ? (
                     <button
                       type="button"
@@ -3656,6 +3993,20 @@ export function App() {
                     {project.collection_type === "Smart" ? <Zap size={14} /> : null}
                     {project.name}
                   </button>
+                  {project.collection_type === "Project" ? (
+                    <button
+                      type="button"
+                      className="project-edit-button"
+                      aria-label={`Edit ${project.name}`}
+                      title={`Edit ${project.name}`}
+                      onClick={(event) => {
+                        event.stopPropagation();
+                        handleOpenEditProject(project);
+                      }}
+                    >
+                      <Pencil size={13} />
+                    </button>
+                  ) : null}
                   {project.collection_type === "Project" ? (
                     <button
                       type="button"
@@ -4026,6 +4377,7 @@ export function App() {
                 key={asset.id}
                 data-asset-id={asset.id}
                 onClick={(event) => handleRowClick(asset, index, event)}
+                onPointerDown={(event) => handleAssetPointerDown(event, asset)}
               >
                 <button
                   className="play-cell"
@@ -4364,13 +4716,62 @@ export function App() {
               ))
             )}
           </div>
+          {(() => {
+            // Quick-tag chips built straight from what Sonic Radar has
+            // already detected for this sound (instruments, vocal
+            // presence) — the tag recommendations the user actually has
+            // real signal for, not just guesses from the filename. Skips
+            // anything already applied.
+            const quickTagCandidates: { key: string; label: string; facet: string }[] = [];
+            for (const entry of assetInstruments) {
+              if (!appliedTags.some((tag) => tag.name.toLowerCase() === entry.name.toLowerCase())) {
+                quickTagCandidates.push({ key: `instrument-${entry.name}`, label: entry.name, facet: "instrument" });
+              }
+            }
+            if (selectedAsset?.vocal_ratio != null) {
+              const label = selectedAsset.vocal_ratio >= VOCAL_RATIO_THRESHOLD ? "Vocal" : "Instrumental";
+              if (!appliedTags.some((tag) => tag.name.toLowerCase() === label.toLowerCase())) {
+                quickTagCandidates.push({ key: `vocal-${label}`, label, facet: "vocal" });
+              }
+            }
+            return quickTagCandidates.length > 0 ? (
+              <>
+                <h2>From Analysis</h2>
+                <div className="chip-row" aria-label="Tag suggestions from Sonic Radar analysis">
+                  {quickTagCandidates.map((candidate) => (
+                    <button
+                      key={candidate.key}
+                      type="button"
+                      className="quick-tag-chip"
+                      title={`Add "${candidate.label}" as a tag`}
+                      onClick={() => handleQuickTag(candidate.label, candidate.facet)}
+                    >
+                      + {candidate.label}
+                    </button>
+                  ))}
+                </div>
+              </>
+            ) : null;
+          })()}
           <h2>Apply Tag</h2>
           <div className="tag-grid">
-            {tags.map((tag) => (
-              <button key={tag.id} onClick={() => handleApplyTag(tag)} disabled={bulkAssetIds.length === 0}>
-                {tag.name}
-              </button>
-            ))}
+            {tags
+              .filter((tag) => {
+                // Action-shape tags (Impact/Whoosh/Rise, and anything else
+                // under the same facet) describe a transient hit's shape —
+                // only meaningful for a short SFX/Foley hit, not a
+                // Soundtrack/Voiceover/Ambience track. Keeps the grid from
+                // offering tags that can't actually apply to what's
+                // selected — e.g. a Soundtrack shouldn't be cluttered with
+                // SFX-only tags.
+                if (tag.facet !== "action") return true;
+                return selectedAsset?.media_type === "sound_effect" || selectedAsset?.media_type === "foley";
+              })
+              .map((tag) => (
+                <button key={tag.id} onClick={() => handleApplyTag(tag)} disabled={bulkAssetIds.length === 0}>
+                  {tag.name}
+                </button>
+              ))}
           </div>
           <div className="setup-field-row">
             <input
@@ -4396,11 +4797,21 @@ export function App() {
               .map((project) => (
                 <button
                   key={project.id}
-                  className="project-chip"
-                  title={`Add selected to ${project.name}`}
+                  className={
+                    (dragOverProjectId === project.id ? "project-chip drag-over" : "project-chip") +
+                    (bulkAssetIds.length === 0 ? " no-selection" : "")
+                  }
+                  title={`Add selected to ${project.name} (or drag a track here)`}
                   aria-label={`Add selected to ${project.name}`}
                   onClick={() => handleAddSelectedToProject(project)}
-                  disabled={bulkAssetIds.length === 0}
+                  // Not a native `disabled` button: dragging an unselected
+                  // row here (nothing in bulkAssetIds) is exactly the case
+                  // this exists for, and a disabled control is invisible to
+                  // elementFromPoint's drop hit-testing. The click path
+                  // already no-ops on an empty selection; `.no-selection`
+                  // above just dims it to match.
+                  aria-disabled={bulkAssetIds.length === 0}
+                  data-drop-project-id={project.id}
                 >
                   <span className="project-thumb">
                     <Music size={12} />
@@ -5309,6 +5720,7 @@ export function App() {
             !refreshStatus &&
             !importStatus &&
             !audioAnalysisPaused &&
+            !waveformGenerationPaused &&
             Object.keys(jobCompletionSummaries).length === 0 ? (
               <p className="empty-hint activity-empty-hint">All caught up — nothing running right now.</p>
             ) : (
@@ -5368,6 +5780,16 @@ export function App() {
                         >
                           <Pause size={15} />
                         </button>
+                      ) : job.kind === "waveform_generation" ? (
+                        <button
+                          type="button"
+                          className="icon-button"
+                          aria-label="Pause waveform generation"
+                          title="Pause waveform generation — queued work stays queued, nothing is lost"
+                          onClick={handleToggleWaveformGenerationPaused}
+                        >
+                          <Pause size={15} />
+                        </button>
                       ) : null}
                     </div>
                   );
@@ -5389,6 +5811,28 @@ export function App() {
                       aria-label="Resume audio analysis"
                       title="Resume audio analysis"
                       onClick={handleToggleAudioAnalysisPaused}
+                    >
+                      <Play size={15} />
+                    </button>
+                  </div>
+                ) : null}
+                {waveformGenerationPaused ? (
+                  <div className="job-progress-row">
+                    <span className="job-progress-icon">
+                      <Pause size={15} />
+                    </span>
+                    <div className="job-progress-body">
+                      <div className="job-progress-head">
+                        <span className="job-progress-label">Waveform generation paused</span>
+                      </div>
+                      <div className="status-line">Queued files stay queued — nothing is lost, just deferred.</div>
+                    </div>
+                    <button
+                      type="button"
+                      className="icon-button"
+                      aria-label="Resume waveform generation"
+                      title="Resume waveform generation"
+                      onClick={handleToggleWaveformGenerationPaused}
                     >
                       <Play size={15} />
                     </button>
@@ -5500,6 +5944,82 @@ export function App() {
                 }}
               >
                 Create Project
+              </button>
+            </div>
+          </motion.div>
+        </motion.div>
+      ) : null}
+      </AnimatePresence>
+      <AnimatePresence>
+      {editProjectId ? (
+        <motion.div
+          className="modal-overlay"
+          onClick={() => setEditProjectId(null)}
+          initial={{ opacity: 0 }}
+          animate={{ opacity: 1 }}
+          exit={{ opacity: 0 }}
+          transition={{ duration: 0.18 }}
+        >
+          <motion.div
+            className="modal-card"
+            onClick={(event) => event.stopPropagation()}
+            aria-label="Edit project"
+            initial={{ opacity: 0, scale: 0.96, y: 10 }}
+            animate={{ opacity: 1, scale: 1, y: 0 }}
+            exit={{ opacity: 0, scale: 0.96, y: 10 }}
+            transition={{ duration: 0.2, ease: [0.4, 0, 0.2, 1] }}
+          >
+            <div className="modal-head">
+              <h1>Edit Project</h1>
+              <button type="button" className="icon-button" aria-label="Close" onClick={() => setEditProjectId(null)}>
+                <X size={16} />
+              </button>
+            </div>
+            <div className="settings-stack">
+              <input
+                autoFocus
+                placeholder="Project name"
+                value={editProjectName}
+                onChange={(event) => setEditProjectName(event.target.value)}
+                onKeyDown={(event) => {
+                  if (event.key === "Enter" && editProjectName.trim()) handleSaveProjectEdits();
+                }}
+              />
+              <label className="setup-field">
+                <span>Sound folder</span>
+                <div className="setup-field-row">
+                  <input
+                    placeholder="/Volumes/Edit/MyFilm/Sounds"
+                    value={editProjectExportPath}
+                    onChange={(event) => setEditProjectExportPath(event.target.value)}
+                  />
+                  <button type="button" onClick={handleChooseEditProjectExportPath}>
+                    Browse
+                  </button>
+                </div>
+                <p className="settings-hint">For music.</p>
+              </label>
+              <label className="setup-field">
+                <span>Sound effects folder</span>
+                <div className="setup-field-row">
+                  <input
+                    placeholder="/Volumes/Edit/MyFilm/SFX"
+                    value={editProjectSfxExportPath}
+                    onChange={(event) => setEditProjectSfxExportPath(event.target.value)}
+                  />
+                  <button type="button" onClick={handleChooseEditProjectSfxExportPath}>
+                    Browse
+                  </button>
+                </div>
+                <p className="settings-hint">Everything else — auto-sorted into subfolders.</p>
+              </label>
+              <button
+                type="button"
+                className="primary-action"
+                disabled={!editProjectName.trim()}
+                onClick={handleSaveProjectEdits}
+              >
+                Save Changes
               </button>
             </div>
           </motion.div>
@@ -5790,6 +6310,72 @@ export function App() {
           </motion.div>
         </motion.div>
       ) : null}
+      </AnimatePresence>
+      <AnimatePresence>
+        {dragPreview ? (
+          <motion.div
+            className="drag-preview"
+            style={{ left: dragPreviewLeft, top: dragPreviewTop }}
+            initial={{ opacity: 0, scale: 0.3, borderRadius: 10 }}
+            animate={{ opacity: 1, scale: 1, borderRadius: 18 }}
+            exit={{ opacity: 0, scale: 0.4 }}
+            transition={{ type: "spring", stiffness: 520, damping: 30, mass: 0.6 }}
+            aria-hidden="true"
+          >
+            <Music2 size={20} />
+            {dragPreview.count > 1 ? <span className="drag-preview-count">{dragPreview.count}</span> : null}
+          </motion.div>
+        ) : null}
+      </AnimatePresence>
+      {/* Drag dock — pops up the moment a drag activates, fanning out the
+          up-to-3 most recently used projects as big one-hop drop targets.
+          It's positioned independently of either Projects list, so a track
+          can always be dropped even when the sidebar's section is
+          collapsed, scrolled away, or the inspector is closed. The anchor
+          strip spans the full width so the dock can stay centered without
+          a static CSS transform (which motion's own x/y/scale animation on
+          the card below would otherwise clobber); pointer-events are off
+          on the strip and back on for the card itself so it doesn't
+          swallow drop hit-testing in the empty margins beside it. */}
+      <AnimatePresence>
+        {dragPreview && dragDockProjects.length > 0 ? (
+          <div className="drag-dock-anchor" aria-hidden="true">
+            <motion.div
+              className="drag-dock"
+              initial={{ opacity: 0, y: 26, scale: 0.92 }}
+              animate={{ opacity: 1, y: 0, scale: 1 }}
+              exit={{ opacity: 0, y: 18, scale: 0.92 }}
+              transition={{ type: "spring", stiffness: 360, damping: 30, mass: 0.7 }}
+            >
+              <span className="drag-dock-label">Drop into</span>
+              <div className="drag-dock-cards">
+                {dragDockProjects.map((project, index) => {
+                  const isOver = dragOverProjectId === project.id;
+                  return (
+                    <motion.div
+                      key={project.id}
+                      className={isOver ? "drag-dock-card drag-over" : "drag-dock-card"}
+                      data-drop-project-id={project.id}
+                      initial={{ opacity: 0, y: 16, scale: 0.8 }}
+                      animate={{ opacity: 1, y: 0, scale: isOver ? 1.08 : 1 }}
+                      transition={{
+                        type: "spring",
+                        stiffness: 460,
+                        damping: 24,
+                        delay: index * 0.05
+                      }}
+                    >
+                      <span className="drag-dock-card-icon">
+                        <Clapperboard size={18} />
+                      </span>
+                      <span className="drag-dock-card-label">{project.name}</span>
+                    </motion.div>
+                  );
+                })}
+              </div>
+            </motion.div>
+          </div>
+        ) : null}
       </AnimatePresence>
     </main>
   );

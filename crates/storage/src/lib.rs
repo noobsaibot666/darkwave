@@ -20,6 +20,8 @@ pub enum StorageError {
     NotASmartCollection,
     #[error("smart collection query is invalid: {0}")]
     InvalidSmartCollectionQuery(String),
+    #[error("invalid input: {0}")]
+    InvalidInput(String),
 }
 
 pub fn is_network_tolerant_catalog_path(path: &str) -> Result<bool, StorageError> {
@@ -616,6 +618,53 @@ impl Catalog {
             params![error, Utc::now().to_rfc3339(), job_id.to_string()],
         )?;
         Ok(())
+    }
+
+    /// Puts a claimed (`processing`) job back to `pending` without counting
+    /// it as a failure — for "not actually wrong, just not ready yet" cases
+    /// like a Referenced/NAS asset whose file isn't reachable this attempt.
+    /// Several process_one_*_job functions used to just `return` here with
+    /// no DB write at all, leaving the row silently stuck at `processing`
+    /// (comments claimed "left pending" but nothing made that true) — which
+    /// starved job_state_counts_for_library's `pending` count, which starved
+    /// the frontend's "is there work to do" check, which is the only thing
+    /// that ever calls back in to let reset_stuck_processing_jobs self-heal
+    /// it. A kind whose entire remaining queue hit this path could get
+    /// stuck forever with no error and no result — this closes that loop
+    /// explicitly instead of hoping something else resets it later.
+    pub fn requeue_job_as_pending(&self, job_id: Uuid) -> Result<(), StorageError> {
+        self.connection.execute(
+            "UPDATE background_jobs SET state = 'pending', updated_at = ?1 WHERE id = ?2",
+            params![Utc::now().to_rfc3339(), job_id.to_string()],
+        )?;
+        Ok(())
+    }
+
+    /// The single most recent job of `kind` for one asset — `(state,
+    /// error)`, or `None` if no such job has ever been queued. Used by the
+    /// inspector's per-track Analyze buttons to poll *this asset's own*
+    /// outcome directly, instead of the shared, per-kind `job_status`
+    /// counters those buttons used to rely on: that library-wide view can't
+    /// distinguish "my job" from someone else's already-in-flight drain of
+    /// the same kind, which is what let a real completion (or failure) go
+    /// unreported. `resync_analysis` deletes any prior non-processing job
+    /// for this (asset, kind) before inserting a fresh one, so at most one
+    /// row ever matches — "most recent" is unambiguous, not a guess.
+    pub fn latest_job_state_for_asset(
+        &self,
+        asset_id: Uuid,
+        kind: JobKind,
+    ) -> Result<Option<(String, Option<String>)>, StorageError> {
+        self.connection
+            .query_row(
+                "SELECT state, error FROM background_jobs
+                 WHERE asset_id = ?1 AND kind = ?2
+                 ORDER BY updated_at DESC LIMIT 1",
+                params![asset_id.to_string(), job_kind_to_db(&kind)],
+                |row| Ok((row.get::<_, String>(0)?, row.get::<_, Option<String>>(1)?)),
+            )
+            .optional()
+            .map_err(StorageError::from)
     }
 
     pub fn complete_pending_jobs_for_asset(
@@ -1356,6 +1405,22 @@ impl Catalog {
         Ok(())
     }
 
+    /// Renames a project (or any collection) — the hover edit icon on the
+    /// sidebar's Projects list. Trims and refuses a blank name rather than
+    /// silently writing empty string, same intent as create_collection's
+    /// own name handling.
+    pub fn rename_collection(&self, collection_id: Uuid, name: &str) -> Result<(), StorageError> {
+        let name = name.trim();
+        if name.is_empty() {
+            return Err(StorageError::InvalidInput("project name cannot be empty".to_string()));
+        }
+        self.connection.execute(
+            "UPDATE collections SET name = ?1 WHERE id = ?2",
+            params![name, collection_id.to_string()],
+        )?;
+        Ok(())
+    }
+
     pub fn pending_job_count(&self, kind: JobKind) -> Result<usize, StorageError> {
         let count: i64 = self.connection.query_row(
             "SELECT COUNT(*) FROM background_jobs WHERE kind = ?1 AND state = 'pending'",
@@ -1411,7 +1476,18 @@ impl Catalog {
         for (state, count) in rows {
             let count = count as usize;
             match state.as_str() {
-                "pending" => counts.pending = count,
+                // "processing" folds into `pending` (every consumer of this
+                // struct only ever treats `pending` as "work not done yet",
+                // for a progress-bar's total-minus-pending math) — NOT
+                // dropped, which was a real bug: a kind whose only
+                // outstanding jobs were stuck `processing` (e.g. abandoned
+                // by a killed process) reported pending=0, so the frontend's
+                // `startPending === 0` drain gate never called the
+                // processing command again — and reset_stuck_processing_jobs
+                // only ever runs at the start of that same command, so a
+                // kind in this state could never self-heal. `+=` because
+                // both states can be present in the same grouped result.
+                "pending" | "processing" => counts.pending += count,
                 "failed" => counts.failed = count,
                 "completed" => counts.completed = count,
                 _ => {}

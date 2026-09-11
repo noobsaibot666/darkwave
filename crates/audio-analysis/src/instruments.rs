@@ -113,8 +113,17 @@ pub fn detect_instruments(
     model: &mut InstrumentModel,
     buffer: &DecodedAudioBuffer,
 ) -> Vec<InstrumentPrediction> {
-    let mono = mono_samples(buffer);
-    let resampled = resample_linear(&mono, buffer.sample_rate.max(1), YAMNET_SAMPLE_RATE);
+    // Trim to (about) the middle window this function ends up using *before*
+    // mono-mixing and resampling, not after. Both of those scale with the
+    // whole file's length, not the ~90s MAX_SAMPLES_FOR_DETECTION actually
+    // keeps — mono-mixing and resampling a full multi-minute track only to
+    // throw away everything outside the last window was wasted CPU
+    // proportional to (duration / 90s), and on a library with many
+    // multi-minute tracks that was the largest single cost in this
+    // function, well past decode and past the model's own inference time.
+    let windowed = trim_to_detection_window(buffer);
+    let mono = mono_samples(&windowed);
+    let resampled = resample_linear(&mono, windowed.sample_rate.max(1), YAMNET_SAMPLE_RATE);
     if resampled.len() < MIN_SAMPLES_FOR_DETECTION {
         return Vec::new();
     }
@@ -130,6 +139,37 @@ pub fn detect_instruments(
         return Vec::new();
     };
     aggregate_predictions(&model.class_names, &class_means)
+}
+
+/// Slices `buffer` down to (approximately) the middle
+/// `MAX_SAMPLES_FOR_DETECTION` post-resample window, measured in the
+/// buffer's *own* sample rate and frame-aligned across all channels —
+/// cheap to slightly over-estimate (resampling still trims exactly to
+/// MAX_SAMPLES_FOR_DETECTION afterward), so this only needs to be in the
+/// right ballpark, not exact. A short clip (nothing to trim) is returned
+/// untouched, borrowing nothing extra.
+fn trim_to_detection_window(buffer: &DecodedAudioBuffer) -> DecodedAudioBuffer {
+    let channels = buffer.channels.max(1) as usize;
+    let total_frames = buffer.samples.len() / channels;
+    let window_frames =
+        ((MAX_SAMPLES_FOR_DETECTION as u64 * buffer.sample_rate.max(1) as u64) / YAMNET_SAMPLE_RATE as u64) as usize;
+
+    if window_frames == 0 || total_frames <= window_frames {
+        return DecodedAudioBuffer {
+            sample_rate: buffer.sample_rate,
+            channels: buffer.channels,
+            samples: buffer.samples.clone(),
+        };
+    }
+
+    let start_frame = (total_frames - window_frames) / 2;
+    let start = start_frame * channels;
+    let end = ((start_frame + window_frames) * channels).min(buffer.samples.len());
+    DecodedAudioBuffer {
+        sample_rate: buffer.sample_rate,
+        channels: buffer.channels,
+        samples: buffer.samples[start..end].to_vec(),
+    }
 }
 
 /// Feeds the waveform to the model and returns the per-class mean score
@@ -347,6 +387,45 @@ mod tests {
         let names = parse_class_map(csv);
 
         assert_eq!(names, vec!["Speech", "Musical instrument", "Guitar", "Violin, fiddle"]);
+    }
+
+    #[test]
+    fn trim_to_detection_window_leaves_a_short_clip_untouched() {
+        let buffer = DecodedAudioBuffer {
+            sample_rate: 44_100,
+            channels: 2,
+            samples: vec![0.0; 44_100 * 2 * 5], // 5s, well under the ~90s window
+        };
+
+        let trimmed = trim_to_detection_window(&buffer);
+
+        assert_eq!(trimmed.samples.len(), buffer.samples.len());
+    }
+
+    #[test]
+    fn trim_to_detection_window_shrinks_a_long_clip_to_about_90_seconds() {
+        // The bug this guards against: mono-mixing and resampling a whole
+        // multi-minute track before detect_instruments trims to its ~90s
+        // window scaled CPU cost with the entire file, not the window it
+        // actually uses — the dominant cost for a long library track.
+        let sample_rate = 44_100u32;
+        let channels = 2u16;
+        let total_seconds = 200;
+        let buffer = DecodedAudioBuffer {
+            sample_rate,
+            channels,
+            samples: vec![0.0; sample_rate as usize * channels as usize * total_seconds],
+        };
+
+        let trimmed = trim_to_detection_window(&buffer);
+        let trimmed_seconds = (trimmed.samples.len() / channels as usize) as f64 / sample_rate as f64;
+
+        assert!(
+            trimmed_seconds < total_seconds as f64 / 2.0,
+            "expected real shrinkage, got {trimmed_seconds}s of {total_seconds}s"
+        );
+        assert!((trimmed_seconds - 90.0).abs() < 1.0, "expected ~90s, got {trimmed_seconds}s");
+        assert_eq!(trimmed.samples.len() % channels as usize, 0, "must stay frame-aligned");
     }
 
     #[test]

@@ -171,6 +171,16 @@ input:focus-visible {
   grid-template-columns: 0px minmax(460px, 1fr) 0px;
 }
 
+/* While a track is mid-drag toward a project, the cursor can cross the
+   sidebar, inspector, or anywhere else — blanket-disable selection app-wide
+   for the gesture's duration rather than only on the row it started from. */
+.shell.dragging-asset,
+.shell.dragging-asset * {
+  -webkit-user-select: none;
+  user-select: none;
+  cursor: grabbing !important;
+}
+
 .panel-handle {
   position: absolute;
   top: 50%;
@@ -463,6 +473,35 @@ button.panel-handle-right:active:not(:disabled) {
   flex: 0 0 auto;
   justify-content: center;
   border-radius: 8px;
+}
+
+/* Hover-to-reveal edit icon on a project row — hidden until the row (or the
+   button itself, for keyboard focus) is hovered/focused, so the row isn't
+   cluttered at rest. */
+.project-edit-button {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  width: 26px;
+  height: 26px;
+  padding: 0;
+  flex: 0 0 auto;
+  border: none;
+  border-radius: 6px;
+  background: transparent;
+  color: var(--text-muted);
+  opacity: 0;
+  transition: opacity 120ms ease, background-color 140ms var(--ease-soft), color 140ms var(--ease-soft);
+}
+
+.nav-item-row:hover .project-edit-button,
+.project-edit-button:focus-visible {
+  opacity: 1;
+}
+
+.project-edit-button:hover {
+  background: var(--surface-hover);
+  color: var(--text-primary);
 }
 
 .dr-button {
@@ -1322,6 +1361,11 @@ button:disabled,
   color: var(--text-secondary);
   cursor: pointer;
   transition: background-color 140ms var(--ease-soft), border-color 140ms var(--ease-soft);
+  /* Rows are drag handles (pointer-tracked, not native HTML5 DnD) — without
+     this, dragging reads to the browser as a text-selection gesture and
+     highlights row content as the cursor moves. */
+  -webkit-user-select: none;
+  user-select: none;
 }
 
 .asset-row:hover {
@@ -1493,6 +1537,159 @@ h2 {
   align-items: center;
   gap: 8px;
   text-align: left;
+  transition: background 120ms ease, border-color 120ms ease;
+}
+
+/* Visual stand-in for :disabled — kept a real (non-disabled) button so it
+   still receives drag/drop events when nothing is click-selected. */
+.project-chip.no-selection {
+  opacity: 0.4;
+}
+
+.project-chip.no-selection:hover {
+  opacity: 0.7;
+}
+
+/* Drag-over highlight, sidebar Projects rows and inspector project chips
+   alike — dropping a dragged track here adds it to that project. */
+.nav-item-row.drag-over,
+.project-chip.drag-over {
+  border-radius: 8px;
+  background: rgba(var(--radar-accent-rgb), 0.16);
+  outline: 1.5px dashed var(--radar-accent);
+  outline-offset: -1.5px;
+}
+
+/* The floating drag preview — a track (or the current selection) being
+   dragged onto a project morphs into this small 4:3 card and follows the
+   cursor. Fixed + pointer-events:none so it never itself becomes the
+   elementFromPoint hit under the cursor during drop hit-testing. */
+.drag-preview {
+  position: fixed;
+  top: 0;
+  left: 0;
+  z-index: 500;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  width: 88px;
+  aspect-ratio: 4 / 3;
+  pointer-events: none;
+  background: var(--surface-solid);
+  border: 1px solid var(--radar-accent);
+  box-shadow: 0 10px 28px rgba(0, 0, 0, 0.28), 0 0 0 1px rgba(var(--radar-accent-rgb), 0.25);
+  color: var(--radar-accent-strong);
+}
+
+.drag-preview-count {
+  position: absolute;
+  top: -7px;
+  right: -7px;
+  min-width: 18px;
+  height: 18px;
+  padding: 0 5px;
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  border-radius: 999px;
+  background: var(--radar-accent);
+  color: #06202a;
+  font-size: 10.5px;
+  font-weight: 800;
+}
+
+/* Drag dock — fixed bottom-center strip that fans out the most recently
+   used projects as big drop targets the instant a drag activates. The
+   anchor spans the full width (invisible except where the dock itself
+   renders) purely so flexbox can center the dock without a static CSS
+   transform, which would otherwise fight motion's own animated
+   transform on `.drag-dock`. */
+.drag-dock-anchor {
+  position: fixed;
+  left: 0;
+  right: 0;
+  bottom: 30px;
+  z-index: 490;
+  display: flex;
+  justify-content: center;
+  pointer-events: none;
+}
+
+.drag-dock {
+  pointer-events: auto;
+  display: flex;
+  align-items: center;
+  gap: 12px;
+  padding: 10px 16px;
+  border-radius: 16px;
+  background: var(--surface-solid);
+  border: 1px solid rgba(var(--radar-accent-rgb), 0.35);
+  box-shadow: 0 18px 46px rgba(0, 0, 0, 0.38), 0 0 0 1px rgba(var(--radar-accent-rgb), 0.12);
+  backdrop-filter: blur(16px);
+}
+
+.drag-dock-label {
+  flex: 0 0 auto;
+  padding-right: 2px;
+  color: var(--text-secondary);
+  font-size: 11px;
+  font-weight: 700;
+  letter-spacing: 0.04em;
+  text-transform: uppercase;
+  white-space: nowrap;
+}
+
+.drag-dock-cards {
+  display: flex;
+  align-items: stretch;
+  gap: 8px;
+}
+
+.drag-dock-card {
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  justify-content: center;
+  gap: 6px;
+  width: 92px;
+  padding: 12px 8px;
+  border-radius: 12px;
+  background: var(--control-bg);
+  border: 1px solid var(--control-border);
+  color: var(--text-primary);
+  transition: background 120ms ease, border-color 120ms ease;
+}
+
+.drag-dock-card-icon {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  width: 30px;
+  height: 30px;
+  border-radius: 9px;
+  background: rgba(var(--radar-accent-rgb), 0.14);
+  color: var(--radar-accent-strong);
+}
+
+.drag-dock-card-label {
+  max-width: 100%;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  font-size: 11px;
+  font-weight: 600;
+  text-align: center;
+}
+
+.drag-dock-card.drag-over {
+  background: rgba(var(--radar-accent-rgb), 0.2);
+  border-color: var(--radar-accent);
+  box-shadow: 0 0 0 3px rgba(var(--radar-accent-rgb), 0.18);
+}
+
+.drag-dock-card.drag-over .drag-dock-card-icon {
+  background: var(--radar-accent);
+  color: #06202a;
 }
 
 .project-thumb {
@@ -3161,6 +3358,26 @@ dd {
 .radar-progress-label {
   color: var(--text-muted);
   font-size: 11.5px;
+}
+
+/* "From Analysis" quick-tag chips (Tags section) — cyan radar accent ties
+   them visually to the Sonic Radar data they're built from. */
+.quick-tag-chip {
+  display: inline-flex;
+  align-items: center;
+  gap: 3px;
+  padding: 4px 10px;
+  border: 1px dashed rgba(var(--radar-accent-rgb), 0.5);
+  border-radius: 999px;
+  background: rgba(var(--radar-accent-rgb), 0.08);
+  color: var(--radar-accent-strong);
+  font-size: 11px;
+  cursor: pointer;
+}
+
+.quick-tag-chip:hover {
+  border-style: solid;
+  background: rgba(var(--radar-accent-rgb), 0.18);
 }
 
 /* Background Activity modal — the default .modal-card width was sized for

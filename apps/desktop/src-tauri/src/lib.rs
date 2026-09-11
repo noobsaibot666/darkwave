@@ -41,6 +41,14 @@ struct BookmarkAccessState(Mutex<std::collections::HashMap<Uuid, security_scoped
 /// through claim/reset cycles every background tick.
 struct JobControlState {
     audio_analysis_paused: std::sync::atomic::AtomicBool,
+    /// Same idea as audio_analysis_paused, for WaveformGeneration. Split
+    /// out separately (not folded into one job-analysis pause) because a
+    /// library catalogued before waveform caching existed can carry a huge
+    /// one-time backlog (thousands of Referenced/NAS assets) that pins CPU
+    /// for a long time in a debug build — letting the user pause *that*
+    /// specifically, without also losing tempo/key/vocal detection, is what
+    /// actually gets the UI responsive again.
+    waveform_generation_paused: std::sync::atomic::AtomicBool,
 }
 
 /// The YAMNet instrument-classification model, loaded once on first use of
@@ -1716,8 +1724,14 @@ fn store_waveform_peaks(
 async fn process_waveform_jobs(
     app: tauri::AppHandle,
     state: tauri::State<'_, CatalogState>,
+    job_control: tauri::State<'_, JobControlState>,
 ) -> Result<usize, String> {
     use futures::stream::{self, StreamExt};
+    use std::sync::atomic::Ordering;
+
+    if job_control.waveform_generation_paused.load(Ordering::SeqCst) {
+        return Ok(0);
+    }
 
     let jobs = {
         let catalog = state.0.lock().expect("catalog mutex poisoned");
@@ -1729,10 +1743,17 @@ async fn process_waveform_jobs(
             .map_err(storage_error_message)?
     };
 
-    // Same reasoning as AUDIO_ANALYSIS_CONCURRENCY: enough to use several
-    // cores on local storage, not so much that it fires a swarm of
-    // simultaneous whole-file reads at one NAS mount.
-    const WAVEFORM_CONCURRENCY: usize = 4;
+    // Lower than AUDIO_ANALYSIS_CONCURRENCY on purpose: a library catalogued
+    // before waveform caching existed can carry a backlog thousands deep
+    // (every pre-existing Referenced/NAS asset needs one), so this is the
+    // kind most likely to be mid-backlog for a long stretch. At 4-way it
+    // was pinning CPU hard enough to starve interactive work (a manual
+    // Sonic Radar Analyze click, even simple track selection) of any real
+    // scheduling turn for a long time — not hung, just never getting a
+    // chance to run. 2-way still makes real progress without dominating
+    // every core; pause it entirely (waveform_generation_paused) for
+    // latency-sensitive work like a focused instrument-detection pass.
+    const WAVEFORM_CONCURRENCY: usize = 2;
 
     let mut results = stream::iter(jobs)
         .map(|job| process_one_waveform_job(&app, &state, job))
@@ -1776,12 +1797,27 @@ async fn process_one_waveform_job(
         let catalog = state.0.lock().expect("catalog mutex poisoned");
         local_asset_path(app, &catalog, &asset)
     };
-    // Not warmed into the local cache yet — leave the job pending, same as
-    // analysis does, so a later warm+retry picks it up.
+    // Not warmed into the local cache yet — put it back to pending, same as
+    // analysis does, so a later warm+retry picks it up. This must be an
+    // explicit write, not just returning without touching the row: it was
+    // claimed (state='processing') before this function ran, and leaving
+    // it there un-reset drops it out of the pending count entirely
+    // (job_state_counts_for_library only reports 'pending'/'processing'
+    // combined as of the fix for this exact bug) — which starves the
+    // frontend's "is there work to do" check that's the only thing that
+    // ever calls back in here to retry it.
     let Ok(local_path) = local_path else {
+        let catalog = state.0.lock().expect("catalog mutex poisoned");
+        if let Err(error) = catalog.requeue_job_as_pending(job.id) {
+            eprintln!("waveform: failed to requeue unavailable-file job {}: {error:?}", job.id);
+        }
         return true;
     };
     if !std::path::Path::new(&local_path).exists() {
+        let catalog = state.0.lock().expect("catalog mutex poisoned");
+        if let Err(error) = catalog.requeue_job_as_pending(job.id) {
+            eprintln!("waveform: failed to requeue missing-file job {}: {error:?}", job.id);
+        }
         return true;
     }
 
@@ -1922,9 +1958,17 @@ async fn process_one_instrument_job(
         local_asset_path(app, &catalog, &asset)
     };
     let Ok(local_path) = local_path else {
+        let catalog = state.0.lock().expect("catalog mutex poisoned");
+        if let Err(error) = catalog.requeue_job_as_pending(job.id) {
+            eprintln!("instrument-detection: failed to requeue unavailable-file job {}: {error:?}", job.id);
+        }
         return true;
     };
     if !std::path::Path::new(&local_path).exists() {
+        let catalog = state.0.lock().expect("catalog mutex poisoned");
+        if let Err(error) = catalog.requeue_job_as_pending(job.id) {
+            eprintln!("instrument-detection: failed to requeue missing-file job {}: {error:?}", job.id);
+        }
         return true;
     }
 
@@ -2040,6 +2084,34 @@ fn resync_analysis(
         };
     }
     Ok(queued)
+}
+
+#[derive(serde::Serialize)]
+struct AssetJobStateResponse {
+    state: String,
+    error: Option<String>,
+}
+
+/// The Sonic Radar inspector's per-track Analyze buttons poll this
+/// directly after queuing (see resync_analysis) instead of the shared,
+/// library-wide `job_status` counters — this is scoped to one asset's own
+/// job row, so it can't be confused by some *other* in-flight job of the
+/// same kind, which was the actual bug behind an Analyze click sometimes
+/// reverting with no error and no result: the shared tracker occasionally
+/// never even saw this asset's job.
+#[tauri::command]
+fn asset_job_state(
+    state: tauri::State<CatalogState>,
+    asset_id: String,
+    kind: String,
+) -> Result<Option<AssetJobStateResponse>, String> {
+    let asset_id = parse_uuid_field(&asset_id, "asset id")?;
+    let kind = parse_job_kind_field(&kind)?;
+    let catalog = state.0.lock().expect("catalog mutex poisoned");
+    catalog
+        .latest_job_state_for_asset(asset_id, kind)
+        .map(|maybe| maybe.map(|(state, error)| AssetJobStateResponse { state, error }))
+        .map_err(storage_error_message)
 }
 
 /// Whether instrument detection can actually run — the model is loaded, or
@@ -2387,10 +2459,18 @@ async fn process_one_audio_analysis_job(
     // as "succeeded" to the UI since this isn't a real failure —
     // reset_stuck_processing_jobs makes it claimable again next round.
     let Ok(local_path) = local_path else {
+        let catalog = state.0.lock().expect("catalog mutex poisoned");
+        if let Err(error) = catalog.requeue_job_as_pending(job.id) {
+            eprintln!("audio-analysis: failed to requeue unavailable-file job {}: {error:?}", job.id);
+        }
         let _ = app.emit("audio-analysis-progress", AudioAnalysisProgressEvent { succeeded: true });
         return true;
     };
     if !std::path::Path::new(&local_path).exists() {
+        let catalog = state.0.lock().expect("catalog mutex poisoned");
+        if let Err(error) = catalog.requeue_job_as_pending(job.id) {
+            eprintln!("audio-analysis: failed to requeue missing-file job {}: {error:?}", job.id);
+        }
         let _ = app.emit("audio-analysis-progress", AudioAnalysisProgressEvent { succeeded: true });
         return true;
     }
@@ -2498,6 +2578,21 @@ fn set_audio_analysis_paused(job_control: tauri::State<JobControlState>, paused:
 #[tauri::command]
 fn audio_analysis_paused(job_control: tauri::State<JobControlState>) -> bool {
     job_control.audio_analysis_paused.load(std::sync::atomic::Ordering::SeqCst)
+}
+
+/// Same contract as set_audio_analysis_paused, for WaveformGeneration.
+#[tauri::command]
+fn set_waveform_generation_paused(job_control: tauri::State<JobControlState>, paused: bool) {
+    job_control
+        .waveform_generation_paused
+        .store(paused, std::sync::atomic::Ordering::SeqCst);
+}
+
+#[tauri::command]
+fn waveform_generation_paused(job_control: tauri::State<JobControlState>) -> bool {
+    job_control
+        .waveform_generation_paused
+        .load(std::sync::atomic::Ordering::SeqCst)
 }
 
 struct AudioAnalysisOutcome {
@@ -3032,6 +3127,24 @@ fn set_project_sfx_export_path(
         .ok_or_else(|| "project not found".to_string())
 }
 
+/// The sidebar's hover-to-reveal edit icon: renames a project.
+#[tauri::command]
+fn rename_project(
+    state: tauri::State<CatalogState>,
+    project_id: String,
+    name: String,
+) -> Result<CollectionRecord, String> {
+    let project_id = parse_uuid_field(&project_id, "project id")?;
+    let catalog = state.0.lock().expect("catalog mutex poisoned");
+    catalog
+        .rename_collection(project_id, &name)
+        .map_err(storage_error_message)?;
+    catalog
+        .get_collection(project_id)
+        .map_err(storage_error_message)?
+        .ok_or_else(|| "project not found".to_string())
+}
+
 /// The "editor's dream" button: copies one sound straight into a project's
 /// configured folder (e.g. an editing app's watch folder) so it can be
 /// dragged into a timeline immediately, without an export-destination
@@ -3396,6 +3509,7 @@ pub fn run() {
             app.manage(CatalogState(Mutex::new(catalog)));
             app.manage(JobControlState {
                 audio_analysis_paused: std::sync::atomic::AtomicBool::new(false),
+                waveform_generation_paused: std::sync::atomic::AtomicBool::new(false),
             });
             app.manage(SimilarityWorkerState(tokio::sync::Mutex::new(None)));
             app.manage(InstrumentModelState {
@@ -3611,6 +3725,7 @@ pub fn run() {
             create_project,
             set_project_export_path,
             set_project_sfx_export_path,
+            rename_project,
             export_asset_to_project,
             add_to_collection,
             assets_in_collection,
@@ -3636,11 +3751,14 @@ pub fn run() {
             process_instrument_jobs,
             instrument_detection_available,
             resync_analysis,
+            asset_job_state,
             instruments_for_library,
             assets_by_instruments,
             asset_instruments,
             set_audio_analysis_paused,
             audio_analysis_paused,
+            set_waveform_generation_paused,
+            waveform_generation_paused,
             job_status,
             retry_failed_jobs,
             failed_job_extensions,
