@@ -4046,7 +4046,13 @@ export function App() {
                   event.stopPropagation();
                   if (!radarSyncMenuOpen && radarSyncButtonRef.current) {
                     const rect = radarSyncButtonRef.current.getBoundingClientRect();
-                    setRadarSyncMenuPosition({ top: rect.bottom + 6, left: rect.left });
+                    // Clamped so the menu (up to 340px, see .radar-sync-menu)
+                    // can't be positioned partway off the right edge of a
+                    // narrow window — the button sits near the sidebar's
+                    // own right edge, so left-aligning on it unclamped runs
+                    // out of room on anything but a wide window.
+                    const left = Math.min(rect.left, window.innerWidth - 340 - 16);
+                    setRadarSyncMenuPosition({ top: rect.bottom + 6, left: Math.max(16, left) });
                   }
                   setRadarSyncMenuOpen((previous) => !previous);
                 }}
@@ -4090,8 +4096,8 @@ export function App() {
                           <span className="radar-sync-menu-item-title">Re-analyse everything</span>
                           <span className="radar-sync-menu-item-desc">
                             {bulkAssetIds.length > 0
-                              ? `Waveform, audio analysis, and instrument detection for ${bulkAssetIds.length} selected sound${bulkAssetIds.length === 1 ? "" : "s"}.`
-                              : "Waveform, audio analysis, and instrument detection, whole library. Can take a while."}
+                              ? `Waveform, analysis, and instruments for ${bulkAssetIds.length} selected sound${bulkAssetIds.length === 1 ? "" : "s"}.`
+                              : "Waveform, analysis, and instruments for the whole library."}
                           </span>
                         </span>
                       </button>
@@ -4119,8 +4125,7 @@ export function App() {
                         <span className="radar-sync-menu-item-body">
                           <span className="radar-sync-menu-item-title">Backfill Tempo/Key/Pitch/Vocals</span>
                           <span className="radar-sync-menu-item-desc">
-                            Whole library only. Catches tracks analysed before key/pitch detection existed — skips
-                            instrument detection and waveforms.
+                            Whole library only. Backfills tracks analysed before key/pitch detection existed.
                           </span>
                         </span>
                       </button>

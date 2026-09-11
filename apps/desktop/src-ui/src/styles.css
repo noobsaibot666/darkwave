@@ -2430,7 +2430,10 @@ dd {
    described options, instead of two bare icon buttons that only a hover
    tooltip told apart. */
 .radar-sync-menu {
-  width: 340px;
+  /* Responsive: never wider than 340px, but shrinks on a narrow window
+     instead of running off the edge — the trigger's position is already
+     clamped in App.tsx, this is the width half of the same fix. */
+  width: min(340px, calc(100vw - 32px));
   padding: 10px;
   display: flex;
   flex-direction: column;
@@ -2449,6 +2452,14 @@ dd {
   color: var(--text-primary);
   text-align: left;
   cursor: pointer;
+  /* button, input, select are reset to white-space: nowrap globally (so
+     small icon/label buttons never wrap awkwardly) — inherited, so it
+     was also forcing this button's title/description onto one line no
+     matter how the flex sizing underneath was set up. That's the actual
+     reason the description text was still getting cut off after the
+     min-width: 0 fix below: wrapping was never allowed to happen at
+     all. */
+  white-space: normal;
 }
 
 .radar-sync-menu-item:hover:not(:disabled) {
