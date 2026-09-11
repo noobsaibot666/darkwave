@@ -747,19 +747,40 @@ impl Catalog {
         Ok(jobs)
     }
 
-    /// Resets any job of `kind` left in `'processing'` back to `'pending'` —
-    /// `claim_pending_jobs` marks a job `'processing'` before doing the real
-    /// work, so a job whose claiming call never reaches `complete_job` or
-    /// `fail_job` (a cancelled batch, a dev-rebuild restart, a crash) is
-    /// permanently stuck: `claim_pending_jobs` only ever selects `'pending'`
-    /// rows, and `requeue_failed_jobs` only ever selects `'failed'` ones, so
-    /// nothing else would ever pick it back up. Meant to run at the start of
-    /// a claim cycle, before the next `claim_pending_jobs` for the same kind.
+    /// Resets any job of `kind` left in `'processing'` for at least
+    /// `STUCK_PROCESSING_THRESHOLD` back to `'pending'` — `claim_pending_jobs`
+    /// marks a job `'processing'` before doing the real work, so a job whose
+    /// claiming call never reaches `complete_job` or `fail_job` (a cancelled
+    /// batch, a dev-rebuild restart, a crash) is permanently stuck:
+    /// `claim_pending_jobs` only ever selects `'pending'` rows, and
+    /// `requeue_failed_jobs` only ever selects `'failed'` ones, so nothing
+    /// else would ever pick it back up. Meant to run at the start of a claim
+    /// cycle, before the next `claim_pending_jobs` for the same kind.
+    ///
+    /// The age floor matters: this used to reset *every* `'processing'` row
+    /// unconditionally, on every call. Each `process_*_jobs` command already
+    /// awaits its whole claimed batch before returning, so in the ordinary
+    /// case there's nothing of its own left in `'processing'` to catch — but
+    /// a single slow file (a large decode under heavy concurrent load, which
+    /// this app has seen run to several minutes) sitting right at the
+    /// boundary between one claim cycle and the next got its row yanked back
+    /// to `'pending'` and immediately re-claimed by the very next cycle,
+    /// before the original attempt had a chance to finish and record
+    /// completion. Since a reset keeps the job's original `created_at`, it
+    /// sorts right back to the front of `claim_pending_jobs`'s queue too —
+    /// so the same handful of slow jobs could get interrupted and restarted
+    /// indefinitely without ever completing, which is exactly the "stuck
+    /// instrument detection" symptom this was chasing. Giving a claim a real
+    /// window to finish before treating it as abandoned fixes that; a
+    /// genuinely orphaned claim (dead process, crash) still gets reclaimed,
+    /// just on the next cycle at or past the threshold rather than instantly.
     pub fn reset_stuck_processing_jobs(&self, kind: JobKind) -> Result<usize, StorageError> {
+        const STUCK_PROCESSING_THRESHOLD: chrono::Duration = chrono::Duration::minutes(3);
+        let cutoff = (Utc::now() - STUCK_PROCESSING_THRESHOLD).to_rfc3339();
         let changed = self.connection.execute(
             "UPDATE background_jobs SET state = 'pending', updated_at = ?1
-             WHERE state = 'processing' AND kind = ?2",
-            params![Utc::now().to_rfc3339(), job_kind_to_db(&kind)],
+             WHERE state = 'processing' AND kind = ?2 AND updated_at < ?3",
+            params![Utc::now().to_rfc3339(), job_kind_to_db(&kind), cutoff],
         )?;
         Ok(changed)
     }
@@ -3331,6 +3352,16 @@ mod tests {
         catalog
             .claim_pending_jobs(JobKind::AudioAnalysis, 10)
             .expect("claim");
+        // Simulate a claim genuinely abandoned a while ago (dead process,
+        // crash) rather than one still legitimately in flight — see the age
+        // floor on reset_stuck_processing_jobs itself.
+        catalog
+            .connection
+            .execute(
+                "UPDATE background_jobs SET updated_at = ?1 WHERE kind = 'audio_analysis'",
+                params![(Utc::now() - chrono::Duration::minutes(10)).to_rfc3339()],
+            )
+            .expect("backdate claim");
 
         let reset = catalog
             .reset_stuck_processing_jobs(JobKind::AudioAnalysis)
@@ -3345,6 +3376,32 @@ mod tests {
             1,
             "a job left 'processing' by an abandoned claim must become claimable again after reset"
         );
+    }
+
+    #[test]
+    fn reset_stuck_processing_jobs_leaves_a_freshly_claimed_job_alone() {
+        // A claim that's only seconds old is most likely still legitimately
+        // in flight (a slow decode under load, not an abandoned process) —
+        // resetting it out from under the worker still holding it would let
+        // the very next claim cycle re-claim (and start over on) the same
+        // job before the original attempt ever got a chance to finish. See
+        // the reset_stuck_processing_jobs doc comment for the full story
+        // (this was a real, observed cause of jobs that never completed).
+        let catalog_path = unique_catalog_path("job-reset-stuck-fresh");
+        let catalog = Catalog::open(&catalog_path).expect("open catalog");
+        let library = catalog.create_library("Jobs", "/library").expect("library");
+        let asset = test_asset(&catalog, library.id, "tone.wav", "hash-job-reset-stuck-fresh");
+        catalog
+            .enqueue_job(asset.id, JobKind::AudioAnalysis, 40)
+            .expect("enqueue");
+        catalog
+            .claim_pending_jobs(JobKind::AudioAnalysis, 10)
+            .expect("claim");
+
+        let reset = catalog
+            .reset_stuck_processing_jobs(JobKind::AudioAnalysis)
+            .expect("reset stuck jobs");
+        assert_eq!(reset, 0, "a claim only seconds old must not be treated as abandoned");
     }
 
     #[test]
