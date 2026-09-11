@@ -2965,7 +2965,7 @@ fn asset_from_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<AssetRecord> {
         vocal_ratio: row.get(26)?,
         detected_key: row.get(27)?,
         key_strength: row.get(28)?,
-        stem_group_id: row.get::<_, Option<String>>(29)?.map(|id| parse_uuid(id)),
+        stem_group_id: row.get::<_, Option<String>>(29)?.map(parse_uuid),
         stem_label: row.get(30)?,
         stem_is_primary: row.get::<_, i64>(31)? != 0,
     })

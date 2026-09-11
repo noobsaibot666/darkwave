@@ -1223,6 +1223,11 @@ async fn import_folder(
 
     let (imported, failed) = run_batch_import(&state, library_id, import_mode, paths).await;
 
+    {
+        let catalog = state.0.lock().expect("catalog mutex poisoned");
+        let _ = detect_and_persist_stem_groups(&catalog, library_id);
+    }
+
     Ok(ImportFolderResult { imported, failed })
 }
 
@@ -1340,6 +1345,186 @@ async fn run_batch_import(
     (imported, failed)
 }
 
+#[derive(Debug, serde::Serialize)]
+struct DroppedImportResult {
+    imported: Vec<AssetRecord>,
+    failed: Vec<ImportFailure>,
+    /// How many stem groups (this drop's own STEMS-pattern files, plus any
+    /// previously-ungrouped ones elsewhere in the library) got linked as a
+    /// side effect — surfaced so the frontend can say something like "3
+    /// tracks, 1 with stems" instead of staying silent about it.
+    stem_groups_detected: usize,
+}
+
+/// Handles files/folders dropped onto the app window from outside it (see
+/// the frontend's `onDragDropEvent` listener). Unlike `import_folder`/
+/// `import_file` — which catalog a file wherever it already lives, in
+/// Managed or Referenced mode — a drop's whole point is "make this the
+/// library's own copy": each path is copied into `media_root` (or one of
+/// its configured `import_subfolders`, when `target_subfolder` is
+/// `Some`) *before* being cataloged as Referenced at that new, permanent
+/// location. The original — typically sitting in Downloads — is never
+/// touched and never becomes the canonical file.
+///
+/// `paths` can mix individual files and whole folders (a dropped "Song
+/// Stems" folder, say) — folders are expanded recursively the same way
+/// `import_folder`'s own folder argument already is.
+// (async): copies real file bytes (possibly many, possibly large) and
+// then runs the same disk/hash-bound prepare stage import_folder does —
+// exactly the kind of work ADR 0024 says can't run on the main thread.
+#[tauri::command(async)]
+async fn import_dropped_paths(
+    state: tauri::State<'_, CatalogState>,
+    library_id: String,
+    paths: Vec<String>,
+    target_subfolder: Option<String>,
+) -> Result<DroppedImportResult, String> {
+    let library_id = parse_uuid_field(&library_id, "library id")?;
+
+    let media_root = {
+        let catalog = state.0.lock().expect("catalog mutex poisoned");
+        catalog
+            .get_library(library_id)
+            .map_err(storage_error_message)?
+            .ok_or_else(|| "library not found".to_string())?
+            .media_root
+    };
+    if media_root.trim().is_empty() {
+        return Err("this library has no media root set yet — import a folder first".to_string());
+    }
+
+    let mut destination_dir = PathBuf::from(&media_root);
+    if let Some(subfolder) = target_subfolder.as_deref().map(str::trim).filter(|name| !name.is_empty()) {
+        destination_dir.push(subfolder);
+    }
+    std::fs::create_dir_all(&destination_dir)
+        .map_err(|error| format!("could not create {}: {error}", destination_dir.display()))?;
+
+    // Expand any dropped folders to the audio files inside them, exactly
+    // like import_folder's own folder argument.
+    let mut source_files: Vec<PathBuf> = Vec::new();
+    for path_str in &paths {
+        let path = std::path::Path::new(&path_str);
+        if path.is_dir() {
+            let mut nested = collect_audio_files(path)
+                .map_err(|error| format!("could not read folder {path_str}: {error}"))?;
+            source_files.append(&mut nested);
+        } else {
+            let extension = path.extension().and_then(|ext| ext.to_str()).unwrap_or_default();
+            if import_pipeline::is_recognized_audio_extension(extension) {
+                source_files.push(path.to_path_buf());
+            }
+        }
+    }
+
+    // Copy each into the library's own folder before cataloging anything
+    // — a copy failure for one file just drops it from the batch (it
+    // never reaches run_batch_import, so it won't appear in `imported`
+    // either) rather than sinking the whole drop.
+    let mut copied_paths = Vec::with_capacity(source_files.len());
+    for source in &source_files {
+        let Some(file_name) = source.file_name() else { continue };
+        let destination = unique_destination_path(&destination_dir, file_name);
+        if std::fs::copy(source, &destination).is_ok() {
+            copied_paths.push(destination);
+        }
+    }
+
+    let (imported, failed) = run_batch_import(&state, library_id, ImportMode::Referenced, copied_paths).await;
+
+    let stem_groups_detected = {
+        let catalog = state.0.lock().expect("catalog mutex poisoned");
+        detect_and_persist_stem_groups(&catalog, library_id).unwrap_or(0)
+    };
+
+    Ok(DroppedImportResult { imported, failed, stem_groups_detected })
+}
+
+/// Appends " (2)", " (3)"... before the extension until the result doesn't
+/// already exist under `dir` — the same collision convention Finder/
+/// Explorer use, so a file dropped twice (or one that happens to share a
+/// name with something already in the library's folder) never silently
+/// overwrites or gets skipped.
+fn unique_destination_path(dir: &std::path::Path, file_name: &std::ffi::OsStr) -> PathBuf {
+    let candidate = dir.join(file_name);
+    if !candidate.exists() {
+        return candidate;
+    }
+
+    let name_path = std::path::Path::new(file_name);
+    let stem = name_path.file_stem().and_then(|s| s.to_str()).unwrap_or("file");
+    let extension = name_path.extension().and_then(|ext| ext.to_str());
+    let mut attempt = 2u32;
+    loop {
+        let numbered = match extension {
+            Some(ext) => format!("{stem} ({attempt}).{ext}"),
+            None => format!("{stem} ({attempt})"),
+        };
+        let candidate = dir.join(numbered);
+        if !candidate.exists() {
+            return candidate;
+        }
+        attempt += 1;
+    }
+}
+
+/// Runs stem-group detection (`import_pipeline::detect_stem_groups`) over
+/// every currently un-grouped asset in a library and persists whatever it
+/// finds. Called automatically after any import — a regular folder
+/// import, and a drop's own `import_dropped_paths` — so a real stem set
+/// gets organized without the user ever having to ask, and separately
+/// exposed as the `detect_stem_groups` command for an explicit
+/// retroactive scan over a library that already has scattered,
+/// never-grouped stems from before this feature existed.
+fn detect_and_persist_stem_groups(catalog: &Catalog, library_id: Uuid) -> Result<usize, String> {
+    let candidates = catalog
+        .asset_filenames_for_library(library_id)
+        .map_err(storage_error_message)?;
+    let groups = import_pipeline::detect_stem_groups(&candidates);
+    for members in &groups {
+        let group_id = Uuid::new_v4();
+        catalog.set_stem_group(group_id, members).map_err(storage_error_message)?;
+    }
+    Ok(groups.len())
+}
+
+/// Explicit "go organize whatever's already scattered" action — for a
+/// library that had stem sets imported before this feature existed (or
+/// one where the automatic post-import pass, for whatever reason, missed
+/// something). Returns how many new groups it formed.
+#[tauri::command]
+fn detect_stem_groups(state: tauri::State<CatalogState>, library_id: String) -> Result<usize, String> {
+    let library_id = parse_uuid_field(&library_id, "library id")?;
+    let catalog = state.0.lock().expect("catalog mutex poisoned");
+    detect_and_persist_stem_groups(&catalog, library_id)
+}
+
+/// One stem group's full member list (primary/full-mix first) — what the
+/// inspector's Stems panel shows for a selected asset that has
+/// `stem_group_id` set.
+#[tauri::command]
+fn stem_group_members(state: tauri::State<CatalogState>, group_id: String) -> Result<Vec<AssetRecord>, String> {
+    let group_id = parse_uuid_field(&group_id, "group id")?;
+    let catalog = state.0.lock().expect("catalog mutex poisoned");
+    catalog.stem_group_members(group_id).map_err(storage_error_message)
+}
+
+/// Sets (or, with an empty list, clears) the named subfolders under a
+/// library's `media_root` a dropped file can be routed into — see
+/// `LibraryRecord::import_subfolders`.
+#[tauri::command]
+fn set_library_import_subfolders(
+    state: tauri::State<CatalogState>,
+    library_id: String,
+    names: Vec<String>,
+) -> Result<(), String> {
+    let library_id = parse_uuid_field(&library_id, "library id")?;
+    let catalog = state.0.lock().expect("catalog mutex poisoned");
+    catalog
+        .set_library_import_subfolders(library_id, &names)
+        .map_err(storage_error_message)
+}
+
 /// Re-scans a library's media root for audio files not yet in the catalog (e.g. dropped
 /// into a watched NAS folder outside the app) and imports them as referenced assets.
 /// Registration is naturally idempotent: `register_asset` matches on content hash and
@@ -1391,6 +1576,11 @@ async fn refresh_library(
     let (imported, failed) =
         run_batch_import(&state, library_id, ImportMode::Referenced, paths).await;
 
+    {
+        let catalog = state.0.lock().expect("catalog mutex poisoned");
+        let _ = detect_and_persist_stem_groups(&catalog, library_id);
+    }
+
     Ok(ImportFolderResult { imported, failed })
 }
 
@@ -1432,6 +1622,11 @@ async fn scan_import_folder(
         .map_err(|error| format!("could not read {import_root}: {error}"))?;
 
     let (imported, failed) = run_batch_import(&state, library_id, ImportMode::Managed, paths).await;
+
+    {
+        let catalog = state.0.lock().expect("catalog mutex poisoned");
+        let _ = detect_and_persist_stem_groups(&catalog, library_id);
+    }
 
     Ok(ImportFolderResult { imported, failed })
 }
@@ -3798,6 +3993,10 @@ pub fn run() {
             create_library,
             set_library_media_root,
             set_library_import_root,
+            set_library_import_subfolders,
+            import_dropped_paths,
+            detect_stem_groups,
+            stem_group_members,
             purge_library_cache,
             empty_library_trash,
             delete_library,
