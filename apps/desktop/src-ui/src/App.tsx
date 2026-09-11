@@ -50,6 +50,7 @@ import {
   SkipBack,
   SkipForward,
   SlidersHorizontal,
+  Sparkles,
   Star,
   Trash2,
   Volume2,
@@ -2785,38 +2786,58 @@ export function App() {
   // vocal, instruments) for the current selection, or the whole library
   // when nothing is selected. Backfills assets whose original jobs already
   // finished before a detector existed.
-  const handleResyncSonicRadar = useCallback(async () => {
-    if (!activeLibraryId || resyncing) return;
-    const ids = bulkAssetIds;
-    if (ids.length === 0) {
-      const ok = await confirmDialog(
-        "Re-run Sonic Radar analysis for the whole library? Every sound is re-analysed — this can take a while on a large library.",
-        { title: "Re-analyse library", kind: "warning" }
-      );
-      if (!ok) return;
-    }
-    setResyncing(true);
-    setRefreshStatus(
-      ids.length === 0
-        ? "Queuing re-analysis for the library…"
-        : `Queuing re-analysis for ${ids.length} sound${ids.length === 1 ? "" : "s"}…`
-    );
-    invoke<number>("resync_analysis", { libraryId: activeLibraryId, assetIds: ids })
-      .then((queued) => {
-        setRefreshStatus(
-          queued > 0 ? `Re-analysing — ${queued} job${queued === 1 ? "" : "s"} queued` : "Nothing to re-analyse"
+  // `kinds` omitted re-runs all three passes (waveform, audio analysis,
+  // instrument detection) — the blunt "re-analyse everything" hammer.
+  // Passing just ["audio_analysis"] (see handleBackfillAudioAnalysis
+  // below) re-runs only the Tempo/Key/Pitch/Vocals pass, without also
+  // re-queuing every instrument-detection job (an expensive ML pass) or
+  // every waveform job just to pick up newer tempo/key/pitch logic.
+  const handleResyncSonicRadar = useCallback(
+    async (kinds?: string[]) => {
+      if (!activeLibraryId || resyncing) return;
+      const ids = bulkAssetIds;
+      const scopeLabel = kinds ? "audio analysis (Tempo/Key/Pitch/Vocals)" : "every analysis pass";
+      if (ids.length === 0) {
+        const ok = await confirmDialog(
+          `Re-run ${scopeLabel} for the whole library? Every matching sound is re-analysed — this can take a while on a large library.`,
+          { title: "Re-analyse library", kind: "warning" }
         );
-        if (queued > 0) {
-          // The backend caches (waveform strips) are about to be
-          // regenerated — drop the session memo so the next play re-fetches
-          // the fresh version rather than showing the pre-resync shape.
-          waveformStripCache.clear();
-          runJobDrain(activeLibraryId);
-        }
-      })
-      .catch((error) => setRefreshStatus(`Re-analysis failed: ${String(error)}`))
-      .finally(() => setResyncing(false));
-  }, [activeLibraryId, bulkAssetIds, runJobDrain, resyncing]);
+        if (!ok) return;
+      }
+      setResyncing(true);
+      setRefreshStatus(
+        ids.length === 0
+          ? "Queuing re-analysis for the library…"
+          : `Queuing re-analysis for ${ids.length} sound${ids.length === 1 ? "" : "s"}…`
+      );
+      invoke<number>("resync_analysis", { libraryId: activeLibraryId, assetIds: ids, kinds })
+        .then((queued) => {
+          setRefreshStatus(
+            queued > 0 ? `Re-analysing — ${queued} job${queued === 1 ? "" : "s"} queued` : "Nothing to re-analyse"
+          );
+          if (queued > 0) {
+            // The backend caches (waveform strips) are about to be
+            // regenerated — drop the session memo so the next play re-fetches
+            // the fresh version rather than showing the pre-resync shape.
+            waveformStripCache.clear();
+            runJobDrain(activeLibraryId);
+          }
+        })
+        .catch((error) => setRefreshStatus(`Re-analysis failed: ${String(error)}`))
+        .finally(() => setResyncing(false));
+    },
+    [activeLibraryId, bulkAssetIds, runJobDrain, resyncing]
+  );
+
+  // A track can complete its audio-analysis job and still have no key/
+  // pitch on record if it was analysed by an older build of the app —
+  // key and pitch detection landed after audio analysis did, so most of
+  // an existing catalog's "completed" jobs never actually ran that code.
+  // This re-runs just that one pass, library-wide, without touching
+  // instrument detection or waveform generation.
+  const handleBackfillAudioAnalysis = useCallback(() => {
+    handleResyncSonicRadar(["audio_analysis"]);
+  }, [handleResyncSonicRadar]);
 
   // Sonic Radar inspector panel: analyze just the selected sound, and only
   // the one job kind its missing row asked for. Tempo/key/pitch/vocals all
@@ -3785,6 +3806,30 @@ export function App() {
               }}
             >
               <RefreshCw size={13} className={resyncing ? "spin" : undefined} />
+            </button>
+            {/* A track's audio-analysis job can show "completed" and still
+                have no Key/Pitch on record — that pass was added after a
+                lot of this catalog was already analysed, so most existing
+                "completed" jobs never actually ran the newer detection.
+                This backfills just that (Tempo/Key/Pitch/Vocals) for the
+                whole library without re-touching instrument detection or
+                waveform generation, unlike the full re-analyse above. */}
+            <button
+              type="button"
+              className="nav-heading-add radar-sync"
+              disabled={resyncing || !activeLibraryId || bulkAssetIds.length > 0}
+              aria-label="Backfill Tempo/Key/Pitch/Vocals for the whole library"
+              title={
+                bulkAssetIds.length > 0
+                  ? "Clear the selection to backfill the whole library (use the inspector's Analyze buttons for a single track)"
+                  : "Backfill Tempo/Key/Pitch/Vocals for the whole library — catches tracks analysed before this detection existed"
+              }
+              onClick={(event) => {
+                event.stopPropagation();
+                handleBackfillAudioAnalysis();
+              }}
+            >
+              <Sparkles size={13} />
             </button>
             <button
               type="button"

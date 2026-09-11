@@ -265,6 +265,16 @@ const PITCH_WINDOW_SIZE: usize = 2048;
 const PITCH_POWER_THRESHOLD: f32 = 5.0;
 const PITCH_CLARITY_THRESHOLD: f32 = 0.6;
 const MIN_SAMPLES_FOR_PITCH: usize = 1024;
+/// How many candidate windows to sample across the clip. A single ~46ms
+/// window (2048 samples @ 44.1kHz) landing on a transient, a rest, or a
+/// noisy patch was the difference between a real, sustained pitch and
+/// "no result" for an otherwise perfectly tonal clip — most of this
+/// library's tracks were coming back with no pitch at all for exactly
+/// that reason. Sampling several spots and keeping the clearest hit costs
+/// a few more windows' worth of FFT work but doesn't relax the actual
+/// bar (PITCH_CLARITY_THRESHOLD still applies per window) — it just gives
+/// a real pitch more chances to be the one caught.
+const PITCH_SCAN_WINDOWS: usize = 9;
 
 #[derive(Clone, Debug, PartialEq)]
 pub struct PitchEstimate {
@@ -276,8 +286,10 @@ pub struct PitchEstimate {
     pub clarity: f32,
 }
 
-/// Best-effort dominant-pitch detection over a representative window taken
-/// from the middle of the clip (avoids likely silence at the very start/end).
+/// Best-effort dominant-pitch detection: scans several candidate windows
+/// spread across the clip (avoiding the very edges, where silence/fades
+/// are likely) and keeps the clearest hit rather than betting everything
+/// on a single window from dead-center.
 pub fn estimate_pitch(buffer: &DecodedAudioBuffer) -> Option<PitchEstimate> {
     let mono = mono_samples(buffer);
     if mono.len() < MIN_SAMPLES_FOR_PITCH {
@@ -285,23 +297,53 @@ pub fn estimate_pitch(buffer: &DecodedAudioBuffer) -> Option<PitchEstimate> {
     }
 
     let window_size = PITCH_WINDOW_SIZE.min(mono.len());
-    let start = (mono.len() - window_size) / 2;
-    let window = &mono[start..start + window_size];
     let padding = window_size / 2;
+    let usable_span = mono.len() - window_size;
 
     let mut detector = McLeodDetector::new(window_size, padding);
-    let pitch = detector.get_pitch(
-        window,
-        buffer.sample_rate as usize,
-        PITCH_POWER_THRESHOLD,
-        PITCH_CLARITY_THRESHOLD,
-    )?;
+    let mut best: Option<pitch_detection::Pitch<f32>> = None;
 
+    for start in pitch_scan_window_starts(usable_span) {
+        let window = &mono[start..start + window_size];
+        if let Some(pitch) = detector.get_pitch(
+            window,
+            buffer.sample_rate as usize,
+            PITCH_POWER_THRESHOLD,
+            PITCH_CLARITY_THRESHOLD,
+        ) {
+            if best.as_ref().map_or(true, |current| pitch.clarity > current.clarity) {
+                best = Some(pitch);
+            }
+        }
+    }
+
+    let pitch = best?;
     Some(PitchEstimate {
         note_name: note_name_for_frequency(pitch.frequency),
         frequency_hz: pitch.frequency,
         clarity: pitch.clarity,
     })
+}
+
+/// Start offsets for `PITCH_SCAN_WINDOWS` windows spread across the middle
+/// 90% of the clip (`usable_span` = clip length minus one window, i.e. the
+/// range of valid start offsets). A clip too short to offset at all (span
+/// 0) just gets the single dead-center window as before.
+fn pitch_scan_window_starts(usable_span: usize) -> Vec<usize> {
+    if usable_span == 0 {
+        return vec![0];
+    }
+    let lo = (usable_span as f64 * 0.05) as usize;
+    let hi = (usable_span as f64 * 0.95) as usize;
+    if PITCH_SCAN_WINDOWS <= 1 || hi <= lo {
+        return vec![usable_span / 2];
+    }
+    (0..PITCH_SCAN_WINDOWS)
+        .map(|i| {
+            let t = i as f64 / (PITCH_SCAN_WINDOWS - 1) as f64;
+            lo + ((hi - lo) as f64 * t) as usize
+        })
+        .collect()
 }
 
 // --- Musical key (Krumhansl-Schmuckler) --------------------------------------
@@ -321,7 +363,13 @@ const KEY_MAX_HZ: f32 = 2_093.0;
 const KEY_REFERENCE_C0_HZ: f32 = 16.351_6;
 /// Below this correlation the material isn't tonal enough to call a key
 /// (drum loops, atonal SFX, noise beds) — report `None` rather than a guess.
-const KEY_MIN_STRENGTH: f32 = 0.6;
+///
+/// Calibrated against real catalog tracks rather than picked cold: at 0.6,
+/// clearly tonal full mixes ("2050 - The Other Girl", 0.57; a legitimate
+/// song, not noise) were being rejected right alongside genuinely atonal
+/// material, while an isolated drum stem sat at 0.45. 0.5 keeps the drum
+/// stem out while letting real, if less clean, tonal material through.
+const KEY_MIN_STRENGTH: f32 = 0.5;
 
 /// Krumhansl-Kessler major/minor key profiles (the canonical published
 /// weights). Index 0 is the tonic.
@@ -353,6 +401,18 @@ pub struct KeyEstimate {
 /// (correlation below `KEY_MIN_STRENGTH`). Works on polyphonic music,
 /// unlike `estimate_pitch`.
 pub fn estimate_key(buffer: &DecodedAudioBuffer) -> Option<KeyEstimate> {
+    let estimate = estimate_key_unfiltered(buffer)?;
+    if estimate.strength < KEY_MIN_STRENGTH {
+        return None;
+    }
+    Some(estimate)
+}
+
+/// Same chromagram/correlation as `estimate_key`, but returns the best
+/// profile match regardless of `KEY_MIN_STRENGTH` — the caller decides
+/// (or, for calibration/diagnostics, doesn't) whether the correlation is
+/// strong enough to call. `estimate_key` is just this plus that one cut.
+pub fn estimate_key_unfiltered(buffer: &DecodedAudioBuffer) -> Option<KeyEstimate> {
     let mono = mono_samples(buffer);
     let sample_rate = buffer.sample_rate.max(1) as f32;
     if mono.len() < KEY_MIN_SAMPLES || sample_rate <= 0.0 {
@@ -415,9 +475,6 @@ pub fn estimate_key(buffer: &DecodedAudioBuffer) -> Option<KeyEstimate> {
     }
 
     let (tonic, is_minor, strength) = best_key_for_chroma(&chroma)?;
-    if strength < KEY_MIN_STRENGTH {
-        return None;
-    }
 
     let tonic_name = PITCH_CLASS_NAMES[tonic].to_string();
     Some(KeyEstimate {
