@@ -765,6 +765,51 @@ button.panel-handle-right:active:not(:disabled) {
   flex-direction: column;
 }
 
+/* Shown for as long as a file is hovering over the window during a real
+   OS-level drag (Finder, Downloads...) — see the onDragDropEvent effect.
+   Covers just the canvas (workspace), not the sidebar/inspector either
+   side of it, since those aren't a drop target. */
+.external-drop-overlay {
+  position: absolute;
+  inset: 0;
+  z-index: 40;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  background: rgba(var(--ink-rgb), 0.55);
+  backdrop-filter: blur(3px);
+  pointer-events: none;
+}
+
+.external-drop-overlay-frame {
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  gap: 10px;
+  padding: 36px 52px;
+  border: 2px dashed rgba(var(--accent-rgb), 0.6);
+  border-radius: var(--radius-lg);
+  background: rgba(var(--accent-rgb), 0.1);
+  color: var(--accent);
+  animation: external-drop-pulse 1.4s ease-in-out infinite;
+}
+
+.external-drop-overlay-frame p {
+  margin: 0;
+  font-size: 15px;
+  font-weight: 600;
+}
+
+@keyframes external-drop-pulse {
+  0%,
+  100% {
+    border-color: rgba(var(--accent-rgb), 0.4);
+  }
+  50% {
+    border-color: rgba(var(--accent-rgb), 0.85);
+  }
+}
+
 .topbar {
   display: flex;
   gap: 10px;

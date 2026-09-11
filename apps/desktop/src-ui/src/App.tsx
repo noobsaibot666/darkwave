@@ -1013,6 +1013,11 @@ export function App() {
   // choice" means "for the rest of this run", not forever; the prompt
   // comes back on the next launch even if this was checked last time.
   const rememberedDropSubfolderRef = useRef<{ libraryId: string; subfolder: string | null } | null>(null);
+  // True for the whole time a file is hovering over the window during an
+  // OS-level drag (Tauri's 'enter'/'over'), false again on 'drop' or
+  // 'leave' — purely the canvas overlay's visibility, no import logic of
+  // its own (that's handleExternalFileDrop, on 'drop').
+  const [isExternalDragActive, setIsExternalDragActive] = useState(false);
   const [activeFilter, setActiveFilter] = useState<ActiveFilter>("all");
   const [sidebarCollapsed, setSidebarCollapsed] = useState(false);
   const [inspectorCollapsed, setInspectorCollapsed] = useState(false);
@@ -2947,8 +2952,13 @@ export function App() {
     let cancelled = false;
     getCurrentWebview()
       .onDragDropEvent((event) => {
-        if (event.payload.type === "drop") {
+        if (event.payload.type === "enter" || event.payload.type === "over") {
+          setIsExternalDragActive(true);
+        } else if (event.payload.type === "drop") {
+          setIsExternalDragActive(false);
           handleExternalFileDrop(event.payload.paths);
+        } else if (event.payload.type === "leave") {
+          setIsExternalDragActive(false);
         }
       })
       .then((off) => {
@@ -4341,6 +4351,28 @@ export function App() {
         </div>
       </aside>
       <section className="workspace">
+        <AnimatePresence>
+          {isExternalDragActive ? (
+            <motion.div
+              className="external-drop-overlay"
+              initial={{ opacity: 0 }}
+              animate={{ opacity: 1 }}
+              exit={{ opacity: 0 }}
+              transition={{ duration: 0.15 }}
+            >
+              <motion.div
+                className="external-drop-overlay-frame"
+                initial={{ scale: 0.96 }}
+                animate={{ scale: 1 }}
+                exit={{ scale: 0.96 }}
+                transition={{ duration: 0.15 }}
+              >
+                <Import size={30} />
+                <p>Drop to import &amp; analyze</p>
+              </motion.div>
+            </motion.div>
+          ) : null}
+        </AnimatePresence>
         <header className="topbar">
           <button
             type="button"
