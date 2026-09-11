@@ -1427,9 +1427,22 @@ export function App() {
             if (startPending === 0 || drainingJobKinds.current.has(config.kind)) return;
             drainingJobKinds.current.add(config.kind);
 
+            // total is the *whole* library's job count for this kind
+            // (pending + failed + completed already done, possibly across
+            // earlier sessions) — not just what's left to do right now.
+            // Using startPending alone here used to make every fresh drain
+            // (in particular the one right after launch) render as "0 of a
+            // small number", indistinguishable from a job that had never
+            // made any progress at all: the bar always looked like it was
+            // starting over, even though the already-completed work was
+            // never touched again and every session really does pick up
+            // exactly where the last one left off (claim_pending_jobs only
+            // ever selects 'pending' rows — nothing re-does 'completed'
+            // ones). done = total - pending below now reflects that.
+            const total = startPending + failedBefore + completedBefore;
             setJobProgress((previous) => [
               ...previous.filter((entry) => entry.kind !== config.kind),
-              { kind: config.kind, label: config.label, pending: startPending, total: startPending, failed: 0 }
+              { kind: config.kind, label: config.label, pending: startPending, total, failed: failedBefore }
             ]);
             setJobCompletionSummaries((previous) => {
               if (!(config.kind in previous)) return previous;
