@@ -1599,16 +1599,19 @@ h2 {
 }
 
 /* Drag dock — fixed bottom-center strip that fans out the most recently
-   used projects as big drop targets the instant a drag activates. The
-   anchor spans the full width (invisible except where the dock itself
-   renders) purely so flexbox can center the dock without a static CSS
-   transform, which would otherwise fight motion's own animated
-   transform on `.drag-dock`. */
+   used projects as big icon-only drop targets the instant a drag
+   activates. The anchor spans the full width (invisible except where the
+   dock itself renders) purely so flexbox can center the dock without a
+   static CSS transform, which would otherwise fight motion's own animated
+   transform on `.drag-dock` — this is also what keeps it centered no
+   matter how many project cards actually fit (1-4). Sits well above the
+   transport bar (fixed, bottom:16px, 64px tall — see `.transport`) so the
+   two never overlap. */
 .drag-dock-anchor {
   position: fixed;
   left: 0;
   right: 0;
-  bottom: 30px;
+  bottom: 104px;
   z-index: 490;
   display: flex;
   justify-content: center;
@@ -1619,24 +1622,13 @@ h2 {
   pointer-events: auto;
   display: flex;
   align-items: center;
-  gap: 12px;
-  padding: 10px 16px;
-  border-radius: 16px;
+  gap: 10px;
+  padding: 10px;
+  border-radius: 18px;
   background: var(--surface-solid);
   border: 1px solid rgba(var(--radar-accent-rgb), 0.35);
   box-shadow: 0 18px 46px rgba(0, 0, 0, 0.38), 0 0 0 1px rgba(var(--radar-accent-rgb), 0.12);
   backdrop-filter: blur(16px);
-}
-
-.drag-dock-label {
-  flex: 0 0 auto;
-  padding-right: 2px;
-  color: var(--text-secondary);
-  font-size: 11px;
-  font-weight: 700;
-  letter-spacing: 0.04em;
-  text-transform: uppercase;
-  white-space: nowrap;
 }
 
 .drag-dock-cards {
@@ -1645,15 +1637,15 @@ h2 {
   gap: 8px;
 }
 
+/* Icon-only — no name label. Dropping the label is what buys room for a
+   4th recent project without the dock outgrowing a comfortable width. */
 .drag-dock-card {
   display: flex;
-  flex-direction: column;
   align-items: center;
   justify-content: center;
-  gap: 6px;
-  width: 92px;
-  padding: 12px 8px;
-  border-radius: 12px;
+  width: 56px;
+  height: 56px;
+  border-radius: 14px;
   background: var(--control-bg);
   border: 1px solid var(--control-border);
   color: var(--text-primary);
@@ -1664,21 +1656,11 @@ h2 {
   display: inline-flex;
   align-items: center;
   justify-content: center;
-  width: 30px;
-  height: 30px;
-  border-radius: 9px;
+  width: 38px;
+  height: 38px;
+  border-radius: 10px;
   background: rgba(var(--radar-accent-rgb), 0.14);
   color: var(--radar-accent-strong);
-}
-
-.drag-dock-card-label {
-  max-width: 100%;
-  overflow: hidden;
-  text-overflow: ellipsis;
-  white-space: nowrap;
-  font-size: 11px;
-  font-weight: 600;
-  text-align: center;
 }
 
 .drag-dock-card.drag-over {

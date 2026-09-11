@@ -658,7 +658,7 @@ const DRAG_ACTIVATE_DISTANCE_PX = 6;
 // How many recently-used projects the in-flight drag dock offers as
 // one-hop drop targets, and where that short list is persisted so it
 // survives a restart instead of resetting every session.
-const DRAG_DOCK_PROJECT_COUNT = 3;
+const DRAG_DOCK_PROJECT_COUNT = 4;
 const RECENT_PROJECT_IDS_STORAGE_KEY = "darkwave.recentProjectIds";
 
 // Cosmetic only (labels, shortcut glyphs). Every actual keyboard/modifier
@@ -6328,7 +6328,7 @@ export function App() {
         ) : null}
       </AnimatePresence>
       {/* Drag dock — pops up the moment a drag activates, fanning out the
-          up-to-3 most recently used projects as big one-hop drop targets.
+          up-to-4 most recently used projects as big one-hop drop targets.
           It's positioned independently of either Projects list, so a track
           can always be dropped even when the sidebar's section is
           collapsed, scrolled away, or the inspector is closed. The anchor
@@ -6347,7 +6347,6 @@ export function App() {
               exit={{ opacity: 0, y: 18, scale: 0.92 }}
               transition={{ type: "spring", stiffness: 360, damping: 30, mass: 0.7 }}
             >
-              <span className="drag-dock-label">Drop into</span>
               <div className="drag-dock-cards">
                 {dragDockProjects.map((project, index) => {
                   const isOver = dragOverProjectId === project.id;
@@ -6356,6 +6355,7 @@ export function App() {
                       key={project.id}
                       className={isOver ? "drag-dock-card drag-over" : "drag-dock-card"}
                       data-drop-project-id={project.id}
+                      title={project.name}
                       initial={{ opacity: 0, y: 16, scale: 0.8 }}
                       animate={{ opacity: 1, y: 0, scale: isOver ? 1.08 : 1 }}
                       transition={{
@@ -6366,9 +6366,8 @@ export function App() {
                       }}
                     >
                       <span className="drag-dock-card-icon">
-                        <Clapperboard size={18} />
+                        <Clapperboard size={20} />
                       </span>
-                      <span className="drag-dock-card-label">{project.name}</span>
                     </motion.div>
                   );
                 })}
