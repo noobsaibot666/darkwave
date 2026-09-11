@@ -1018,6 +1018,19 @@ export function App() {
   // 'leave' — purely the canvas overlay's visibility, no import logic of
   // its own (that's handleExternalFileDrop, on 'drop').
   const [isExternalDragActive, setIsExternalDragActive] = useState(false);
+  // A brief, auto-dismissing confirmation once a drop finishes importing —
+  // separate from importStatus (which only ever shows up inside the
+  // Background Activity panel a click away). `id` keys the AnimatePresence
+  // node so two imports finishing with the same message back-to-back still
+  // each get their own enter animation rather than looking like one that
+  // never left.
+  const [importToast, setImportToast] = useState<{ id: number; message: string } | null>(null);
+  const importToastTimeoutRef = useRef<number | null>(null);
+  const showImportToast = useCallback((message: string) => {
+    if (importToastTimeoutRef.current !== null) window.clearTimeout(importToastTimeoutRef.current);
+    setImportToast({ id: Date.now(), message });
+    importToastTimeoutRef.current = window.setTimeout(() => setImportToast(null), 3600);
+  }, []);
   const [activeFilter, setActiveFilter] = useState<ActiveFilter>("all");
   const [sidebarCollapsed, setSidebarCollapsed] = useState(false);
   const [inspectorCollapsed, setInspectorCollapsed] = useState(false);
@@ -2898,11 +2911,12 @@ export function App() {
             result.stem_groups_detected > 0
               ? ` · ${result.stem_groups_detected} stem group${result.stem_groups_detected === 1 ? "" : "s"} organized`
               : "";
-          setImportStatus(
+          const summary =
             result.failed.length > 0
               ? `Imported ${result.imported.length}, ${result.failed.length} failed${stemsNote}`
-              : `Imported ${result.imported.length} sound${result.imported.length === 1 ? "" : "s"}${stemsNote}`
-          );
+              : `Imported ${result.imported.length} sound${result.imported.length === 1 ? "" : "s"}${stemsNote}`;
+          setImportStatus(summary);
+          showImportToast(summary);
           if (libraryId === activeLibraryId) {
             refreshAssets(libraryId, searchQuery, activeFilter);
             refreshMaintenance(libraryId);
@@ -2911,7 +2925,7 @@ export function App() {
         })
         .catch((error) => setImportStatus(`Import failed: ${String(error)}`));
     },
-    [activeLibraryId, searchQuery, activeFilter, refreshAssets, refreshMaintenance, runJobDrain]
+    [activeLibraryId, searchQuery, activeFilter, refreshAssets, refreshMaintenance, runJobDrain, showImportToast]
   );
 
   // Entry point for a real OS-level drop (see the onDragDropEvent effect
@@ -3824,6 +3838,21 @@ export function App() {
       >
         {inspectorCollapsed ? <ChevronLeft size={13} /> : <ChevronRight size={13} />}
       </button>
+      <AnimatePresence>
+        {importToast ? (
+          <motion.div
+            className="import-toast"
+            key={importToast.id}
+            initial={{ opacity: 0, y: 10, scale: 0.98 }}
+            animate={{ opacity: 1, y: 0, scale: 1 }}
+            exit={{ opacity: 0, y: 6, scale: 0.98 }}
+            transition={{ duration: 0.22, ease: [0.4, 0, 0.2, 1] }}
+          >
+            <CheckCircle2 size={15} />
+            <span>{importToast.message}</span>
+          </motion.div>
+        ) : null}
+      </AnimatePresence>
       <aside className={sidebarCollapsed ? "sidebar collapsed" : "sidebar"} aria-label="Library">
         <div className="panel-body">
           <div className="library-select-row">
@@ -4358,17 +4387,17 @@ export function App() {
               initial={{ opacity: 0 }}
               animate={{ opacity: 1 }}
               exit={{ opacity: 0 }}
-              transition={{ duration: 0.15 }}
+              transition={{ duration: 0.12 }}
             >
               <motion.div
                 className="external-drop-overlay-frame"
-                initial={{ scale: 0.96 }}
-                animate={{ scale: 1 }}
-                exit={{ scale: 0.96 }}
-                transition={{ duration: 0.15 }}
+                initial={{ opacity: 0, scale: 0.9, y: 6 }}
+                animate={{ opacity: 1, scale: 1, y: 0 }}
+                exit={{ opacity: 0, scale: 0.92, y: 4 }}
+                transition={{ duration: 0.16, ease: [0.4, 0, 0.2, 1] }}
               >
-                <Import size={30} />
-                <p>Drop to import &amp; analyze</p>
+                <Import size={22} />
+                <p>Drop to import</p>
               </motion.div>
             </motion.div>
           ) : null}
