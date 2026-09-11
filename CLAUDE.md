@@ -55,3 +55,16 @@ every machine's local branches are pushed, not left sitting locally.
   repos/{owner}/{repo}/branches` against what's expected — a branch a human mentions (e.g. "the
   Windows branch") but that doesn't show up on GitHub means it's still local-only somewhere and
   needs pushing before it can be reviewed, merged, or even inspected from another machine.
+
+## Cross-machine dev notes
+
+Two files carry short messages between the macOS and Windows devs — no live channel needed:
+
+- `docs/development/windows-developer-notes.md` — macOS writes, Windows reads/acts.
+- `docs/development/macos-developer-notes.md` — Windows writes, macOS reads.
+
+Newest entry on top. Don't edit old entries — append. Keep entries short: what changed, what to
+do, nothing else. After a session that lands a sync-worthy change (new deps, new required files,
+a Windows-only ask), add an entry to the Windows doc **and commit + push it with the rest of the
+work**, same as any other branch-hygiene change above — an unpushed note is as useless as an
+unpushed branch.
