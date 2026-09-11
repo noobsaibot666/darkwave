@@ -534,6 +534,7 @@ fn purge_from_trash(state: tauri::State<CatalogState>, asset_id: String) -> Resu
 /// no file left on disk — already holds.
 #[tauri::command]
 fn delete_trash_item_permanently(
+    app: tauri::AppHandle,
     state: tauri::State<CatalogState>,
     asset_id: String,
 ) -> Result<(), String> {
@@ -550,6 +551,15 @@ fn delete_trash_item_permanently(
         Ok(()) => {}
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
         Err(error) => return Err(format!("failed to delete file: {error}")),
+    }
+
+    // The asset's disposable local preview-cache copy (see cached_file_path)
+    // is never coming back into use once this row is gone — this was
+    // previously left behind on every single-item permanent delete, an
+    // orphan with no future cleanup path short of "Clear Cache" nuking
+    // every asset's cache, not just this one.
+    if let Ok(cache_dir) = preview_cache_dir(&app) {
+        let _ = std::fs::remove_file(cached_file_path(&cache_dir, &asset));
     }
 
     catalog
@@ -894,15 +904,32 @@ fn purge_library_cache(
 
 /// Permanently removes every currently-trashed asset in this library from
 /// the catalog, bypassing the normal retention wait. Same guarantee as the
-/// rest of the trash system: only ever deletes catalog rows, never a real
-/// file (see `storage::Catalog::empty_trash_for_library`).
+/// rest of the trash system for the *real* file: only ever deletes catalog
+/// rows, never a real file (see `storage::Catalog::empty_trash_for_library`).
+/// The app's own disposable local preview-cache copy (see
+/// `cached_file_path`) is a different story — nothing else was ever going
+/// to clean those up once these rows are gone, so this does that too.
 #[tauri::command]
-fn empty_library_trash(state: tauri::State<CatalogState>, library_id: String) -> Result<usize, String> {
+fn empty_library_trash(
+    app: tauri::AppHandle,
+    state: tauri::State<CatalogState>,
+    library_id: String,
+) -> Result<usize, String> {
     let library_id = parse_uuid_field(&library_id, "library id")?;
     let catalog = state.0.lock().expect("catalog mutex poisoned");
-    catalog
+
+    let trashed = catalog.list_trash_items(library_id).map_err(storage_error_message)?;
+    let removed = catalog
         .empty_trash_for_library(library_id)
-        .map_err(storage_error_message)
+        .map_err(storage_error_message)?;
+
+    if let Ok(cache_dir) = preview_cache_dir(&app) {
+        for item in trashed {
+            let _ = std::fs::remove_file(cached_file_path_for(&cache_dir, item.asset_id, &item.original_path));
+        }
+    }
+
+    Ok(removed)
 }
 
 /// Counts returned to the UI so "library deleted" can say what it actually
@@ -1503,11 +1530,20 @@ fn preview_cache_dir(app: &tauri::AppHandle) -> Result<PathBuf, String> {
 }
 
 fn cached_file_path(cache_dir: &std::path::Path, asset: &AssetRecord) -> PathBuf {
-    let extension = std::path::Path::new(&asset.original_filename)
+    cached_file_path_for(cache_dir, asset.id, &asset.original_filename)
+}
+
+/// Shared by `cached_file_path` (has a full `AssetRecord` on hand) and
+/// callers that only have a trashed item's id + its original path/filename
+/// (a `TrashItem` doesn't carry a whole `AssetRecord`) — same naming scheme
+/// either way, so a cache entry written under one path is always found
+/// under the other.
+fn cached_file_path_for(cache_dir: &std::path::Path, asset_id: Uuid, filename_or_path: &str) -> PathBuf {
+    let extension = std::path::Path::new(filename_or_path)
         .extension()
         .and_then(|extension| extension.to_str())
         .unwrap_or("bin");
-    cache_dir.join(format!("{}.{}", asset.id, extension))
+    cache_dir.join(format!("{asset_id}.{extension}"))
 }
 
 /// Copies referenced (typically NAS-backed) assets into a local cache directory for fast
