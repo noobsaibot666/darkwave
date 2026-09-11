@@ -17,3 +17,7 @@ apps/desktop/src-tauri/models/*.onnx
 apps/desktop/src-tauri/models/*.csv
 .claude/settings.local.json
 secrets/
+
+# Local test fixtures for the stems-detection feature — real sample audio,
+# not something to ship in the repo.
+docs/samples/

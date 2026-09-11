@@ -48,6 +48,13 @@ pub struct LibraryRecord {
     /// `media_root` where the organized library actually lives. `None`
     /// until the user sets one, e.g. in the first-run wizard.
     pub import_root: Option<String>,
+    /// Named subfolders under `media_root` a file dropped onto the app
+    /// window can be filed into (e.g. `["Soundtrack", "SFX"]`) — see
+    /// `set_library_import_subfolders`. `None` or empty means there's only
+    /// one destination (`media_root` itself), so a drop never needs to ask
+    /// "which folder"; 2+ names means it does, unless the user's chosen to
+    /// remember an answer for this session.
+    pub import_subfolders: Vec<String>,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
@@ -109,6 +116,18 @@ pub struct AssetRecord {
     pub detected_key: Option<String>,
     /// Chromagram/profile correlation behind `detected_key`, ~0.0..=1.0.
     pub key_strength: Option<f64>,
+    /// Shared by every member of a detected stem group (the full mix plus
+    /// its separated-instrument siblings — see `import_pipeline::stems`).
+    /// `None` for an asset that isn't part of one.
+    pub stem_group_id: Option<Uuid>,
+    /// This member's part within its stem group, e.g. "Full Mix", "Drums",
+    /// "Melody". `None` when `stem_group_id` is `None`.
+    pub stem_label: Option<String>,
+    /// Exactly one member per `stem_group_id` has this set — the one shown
+    /// as the browsable row in the main list; the rest are only reachable
+    /// through that row's Stems panel. Meaningless when `stem_group_id` is
+    /// `None`.
+    pub stem_is_primary: bool,
 }
 
 /// Fields written by the `AudioAnalysis` background job. `None` leaves the
@@ -359,6 +378,7 @@ impl Catalog {
             media_root: media_root.as_ref().to_string(),
             media_root_bookmark: None,
             import_root: None,
+            import_subfolders: Vec::new(),
         };
         let now = Utc::now().to_rfc3339();
 
@@ -377,7 +397,8 @@ impl Catalog {
 
     pub fn list_libraries(&self) -> Result<Vec<LibraryRecord>, StorageError> {
         let mut statement = self.connection.prepare(
-            "SELECT id, name, media_root, media_root_bookmark, import_root FROM libraries ORDER BY created_at ASC",
+            "SELECT id, name, media_root, media_root_bookmark, import_root, import_subfolders
+             FROM libraries ORDER BY created_at ASC",
         )?;
         let libraries = statement
             .query_map([], |row| {
@@ -387,6 +408,7 @@ impl Catalog {
                     media_root: row.get(2)?,
                     media_root_bookmark: row.get(3)?,
                     import_root: row.get(4)?,
+                    import_subfolders: parse_import_subfolders(row.get(5)?),
                 })
             })?
             .collect::<Result<Vec<_>, _>>()?;
@@ -397,7 +419,8 @@ impl Catalog {
     pub fn get_library(&self, id: Uuid) -> Result<Option<LibraryRecord>, StorageError> {
         self.connection
             .query_row(
-                "SELECT id, name, media_root, media_root_bookmark, import_root FROM libraries WHERE id = ?1",
+                "SELECT id, name, media_root, media_root_bookmark, import_root, import_subfolders
+                 FROM libraries WHERE id = ?1",
                 params![id.to_string()],
                 |row| {
                     Ok(LibraryRecord {
@@ -406,6 +429,7 @@ impl Catalog {
                         media_root: row.get(2)?,
                         media_root_bookmark: row.get(3)?,
                         import_root: row.get(4)?,
+                        import_subfolders: parse_import_subfolders(row.get(5)?),
                     })
                 },
             )
@@ -457,6 +481,38 @@ impl Catalog {
         self.connection.execute(
             "UPDATE libraries SET import_root = ?1 WHERE id = ?2",
             params![import_root, library_id.to_string()],
+        )?;
+        Ok(())
+    }
+
+    /// Sets (or clears, with an empty slice) the named subfolders under
+    /// this library's `media_root` a dropped file can be routed into —
+    /// see `LibraryRecord::import_subfolders`. Blank names are dropped;
+    /// duplicates (case-insensitive) are collapsed to the first spelling,
+    /// since two entries that resolve to the same folder would make the
+    /// "which one" prompt nonsensical.
+    pub fn set_library_import_subfolders(
+        &self,
+        library_id: Uuid,
+        names: &[String],
+    ) -> Result<(), StorageError> {
+        let mut seen = std::collections::HashSet::new();
+        let cleaned: Vec<String> = names
+            .iter()
+            .map(|name| name.trim().to_string())
+            .filter(|name| !name.is_empty())
+            .filter(|name| seen.insert(name.to_lowercase()))
+            .collect();
+        let json = if cleaned.is_empty() {
+            None
+        } else {
+            Some(serde_json::to_string(&cleaned).map_err(|error| {
+                StorageError::InvalidInput(format!("could not encode import subfolders: {error}"))
+            })?)
+        };
+        self.connection.execute(
+            "UPDATE libraries SET import_subfolders = ?1 WHERE id = ?2",
+            params![json, library_id.to_string()],
         )?;
         Ok(())
     }
@@ -536,7 +592,8 @@ impl Catalog {
                 storage_mode, content_hash, media_type, file_size, availability_state, review_state, favorite,
                     embedded_title, embedded_genre, embedded_comment,
                     duration_ms, sample_rate, bit_depth, channels, loudness_lufs, peak_db,
-                    bpm, bpm_confidence, musical_key, key_confidence, vocal_ratio, detected_key, key_strength
+                    bpm, bpm_confidence, musical_key, key_confidence, vocal_ratio, detected_key, key_strength,
+                    stem_group_id, stem_label, stem_is_primary
              FROM assets
              WHERE library_id = ?1
                AND NOT EXISTS (
@@ -1065,6 +1122,97 @@ impl Catalog {
         Ok(())
     }
 
+    /// Bulk-assigns a stem group: every `(asset_id, label, is_primary)` in
+    /// `members` gets the same `group_id`. Exactly one member should have
+    /// `is_primary = true` — the row shown in the main asset list; callers
+    /// (see `import_pipeline::stems::detect_stem_groups`) already
+    /// guarantee that, this just persists whatever it's given. Wrapped in
+    /// a transaction for the same reason `set_asset_instruments` is: a
+    /// mid-loop failure shouldn't leave a group half-assigned.
+    pub fn set_stem_group(
+        &self,
+        group_id: Uuid,
+        members: &[(Uuid, String, bool)],
+    ) -> Result<(), StorageError> {
+        self.connection.execute_batch("BEGIN IMMEDIATE")?;
+        let result = (|| -> Result<(), StorageError> {
+            for (asset_id, label, is_primary) in members {
+                self.connection.execute(
+                    "UPDATE assets SET stem_group_id = ?1, stem_label = ?2, stem_is_primary = ?3 WHERE id = ?4",
+                    params![group_id.to_string(), label, *is_primary as i64, asset_id.to_string()],
+                )?;
+            }
+            Ok(())
+        })();
+        match result {
+            Ok(()) => {
+                self.connection.execute_batch("COMMIT")?;
+                Ok(())
+            }
+            Err(error) => {
+                let _ = self.connection.execute_batch("ROLLBACK");
+                Err(error)
+            }
+        }
+    }
+
+    /// Removes `asset_id` from whatever stem group it's in (a no-op if it
+    /// isn't in one). Doesn't touch the other members — if that leaves the
+    /// group with fewer than 2, it's still technically "a group" in the
+    /// DB, just with nothing interesting for the UI to expand.
+    pub fn clear_stem_group_for_asset(&self, asset_id: Uuid) -> Result<(), StorageError> {
+        self.connection.execute(
+            "UPDATE assets SET stem_group_id = NULL, stem_label = NULL, stem_is_primary = 0 WHERE id = ?1",
+            params![asset_id.to_string()],
+        )?;
+        Ok(())
+    }
+
+    /// Every member of one stem group (the primary/full-mix row first,
+    /// then the rest alphabetically by label) — what the inspector's Stems
+    /// panel shows for a selected asset.
+    pub fn stem_group_members(&self, group_id: Uuid) -> Result<Vec<AssetRecord>, StorageError> {
+        let mut statement = self.connection.prepare(
+            "SELECT id, library_id, original_filename, display_name, relative_path, referenced_path,
+                storage_mode, content_hash, media_type, file_size, availability_state, review_state, favorite,
+                embedded_title, embedded_genre, embedded_comment,
+                duration_ms, sample_rate, bit_depth, channels, loudness_lufs, peak_db,
+                bpm, bpm_confidence, musical_key, key_confidence, vocal_ratio, detected_key, key_strength,
+                stem_group_id, stem_label, stem_is_primary
+             FROM assets
+             WHERE stem_group_id = ?1
+               AND NOT EXISTS (
+                 SELECT 1 FROM trash_items WHERE trash_items.asset_id = assets.id AND trash_items.state = 'in_trash'
+               )
+             ORDER BY stem_is_primary DESC, stem_label ASC",
+        )?;
+        let members = statement
+            .query_map(params![group_id.to_string()], asset_from_row)?
+            .collect::<Result<Vec<_>, _>>()?;
+        Ok(members)
+    }
+
+    /// `(asset id, original filename)` for every non-trashed, not-already-
+    /// grouped asset in a library — the input a retroactive whole-library
+    /// stem-detection pass scans (see the `detect_stem_groups` Tauri
+    /// command). A freshly-imported batch passes its own file list
+    /// directly instead of calling this.
+    pub fn asset_filenames_for_library(&self, library_id: Uuid) -> Result<Vec<(Uuid, String)>, StorageError> {
+        let mut statement = self.connection.prepare(
+            "SELECT id, original_filename FROM assets
+             WHERE library_id = ?1 AND stem_group_id IS NULL
+               AND NOT EXISTS (
+                 SELECT 1 FROM trash_items WHERE trash_items.asset_id = assets.id AND trash_items.state = 'in_trash'
+               )",
+        )?;
+        let rows = statement
+            .query_map(params![library_id.to_string()], |row| {
+                Ok((parse_uuid(row.get::<_, String>(0)?), row.get::<_, String>(1)?))
+            })?
+            .collect::<Result<Vec<_>, _>>()?;
+        Ok(rows)
+    }
+
     /// Replaces an asset's detected-instrument list (the output of the
     /// `InstrumentDetection` job). An empty slice clears it — a valid
     /// result meaning "the model found nothing", distinct from "not yet
@@ -1175,7 +1323,8 @@ impl Catalog {
                 assets.embedded_title, assets.embedded_genre, assets.embedded_comment,
                 assets.duration_ms, assets.sample_rate, assets.bit_depth, assets.channels,
                 assets.loudness_lufs, assets.peak_db, assets.bpm, assets.bpm_confidence,
-                assets.musical_key, assets.key_confidence, assets.vocal_ratio, assets.detected_key, assets.key_strength
+                assets.musical_key, assets.key_confidence, assets.vocal_ratio, assets.detected_key, assets.key_strength,
+                assets.stem_group_id, assets.stem_label, assets.stem_is_primary
              FROM assets
              JOIN asset_instruments ai ON ai.asset_id = assets.id
              WHERE assets.library_id = ?1
@@ -1644,7 +1793,8 @@ impl Catalog {
                 assets.embedded_title, assets.embedded_genre, assets.embedded_comment,
                 assets.duration_ms, assets.sample_rate, assets.bit_depth, assets.channels,
                 assets.loudness_lufs, assets.peak_db, assets.bpm, assets.bpm_confidence,
-                assets.musical_key, assets.key_confidence, assets.vocal_ratio, assets.detected_key, assets.key_strength
+                assets.musical_key, assets.key_confidence, assets.vocal_ratio, assets.detected_key, assets.key_strength,
+                assets.stem_group_id, assets.stem_label, assets.stem_is_primary
              FROM assets
              INNER JOIN collection_assets ON collection_assets.asset_id = assets.id
              WHERE collection_assets.collection_id = ?1
@@ -1808,7 +1958,8 @@ impl Catalog {
                 assets.embedded_title, assets.embedded_genre, assets.embedded_comment,
                 assets.duration_ms, assets.sample_rate, assets.bit_depth, assets.channels,
                 assets.loudness_lufs, assets.peak_db, assets.bpm, assets.bpm_confidence,
-                assets.musical_key, assets.key_confidence, assets.vocal_ratio, assets.detected_key, assets.key_strength
+                assets.musical_key, assets.key_confidence, assets.vocal_ratio, assets.detected_key, assets.key_strength,
+                assets.stem_group_id, assets.stem_label, assets.stem_is_primary
              FROM assets",
         );
         let mut query_params: Vec<rusqlite::types::Value> = vec![library_id.to_string().into()];
@@ -2682,6 +2833,14 @@ impl Catalog {
         self.ensure_column("assets", "key_strength", "REAL")?;
         self.ensure_column("libraries", "media_root_bookmark", "TEXT")?;
         self.ensure_column("libraries", "import_root", "TEXT")?;
+        self.ensure_column("assets", "stem_group_id", "TEXT")?;
+        self.ensure_column("assets", "stem_label", "TEXT")?;
+        self.ensure_column("assets", "stem_is_primary", "INTEGER NOT NULL DEFAULT 0")?;
+        // JSON array of subfolder names under media_root a dropped file can
+        // be routed into (e.g. ["Soundtrack", "SFX"]) — see
+        // set_library_import_subfolders. `None`/absent means "just one
+        // destination, media_root itself" — no prompt needed on drop.
+        self.ensure_column("libraries", "import_subfolders", "TEXT")?;
 
         Ok(())
     }
@@ -2716,7 +2875,8 @@ impl Catalog {
                     storage_mode, content_hash, media_type, file_size, availability_state, review_state, favorite,
                     embedded_title, embedded_genre, embedded_comment,
                     duration_ms, sample_rate, bit_depth, channels, loudness_lufs, peak_db,
-                    bpm, bpm_confidence, musical_key, key_confidence, vocal_ratio, detected_key, key_strength
+                    bpm, bpm_confidence, musical_key, key_confidence, vocal_ratio, detected_key, key_strength,
+                    stem_group_id, stem_label, stem_is_primary
                  FROM assets WHERE id = ?1",
                 params![id.to_string()],
                 asset_from_row,
@@ -2737,7 +2897,8 @@ impl Catalog {
                     storage_mode, content_hash, media_type, file_size, availability_state, review_state, favorite,
                     embedded_title, embedded_genre, embedded_comment,
                     duration_ms, sample_rate, bit_depth, channels, loudness_lufs, peak_db,
-                    bpm, bpm_confidence, musical_key, key_confidence, vocal_ratio, detected_key, key_strength
+                    bpm, bpm_confidence, musical_key, key_confidence, vocal_ratio, detected_key, key_strength,
+                    stem_group_id, stem_label, stem_is_primary
                  FROM assets
                  WHERE library_id = ?1 AND content_hash = ?2 AND file_size = ?3
                  LIMIT 1",
@@ -2756,6 +2917,14 @@ impl Catalog {
         )?;
         Ok(id)
     }
+}
+
+/// A malformed stored value (shouldn't happen — only `set_library_import_subfolders`
+/// ever writes this column) is treated the same as absent: no subfolders,
+/// no prompt, rather than an error surfacing on every library load.
+fn parse_import_subfolders(raw: Option<String>) -> Vec<String> {
+    raw.and_then(|json| serde_json::from_str::<Vec<String>>(&json).ok())
+        .unwrap_or_default()
 }
 
 fn asset_from_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<AssetRecord> {
@@ -2796,6 +2965,9 @@ fn asset_from_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<AssetRecord> {
         vocal_ratio: row.get(26)?,
         detected_key: row.get(27)?,
         key_strength: row.get(28)?,
+        stem_group_id: row.get::<_, Option<String>>(29)?.map(|id| parse_uuid(id)),
+        stem_label: row.get(30)?,
+        stem_is_primary: row.get::<_, i64>(31)? != 0,
     })
 }
 
@@ -4429,6 +4601,82 @@ mod tests {
             catalog.instruments_for_asset(track_a.id).expect("a2"),
             vec![("Bass".to_string(), 0.95)]
         );
+    }
+
+    #[test]
+    fn stem_group_links_members_and_marks_exactly_one_primary() {
+        let catalog_path = unique_catalog_path("stem-group");
+        let catalog = Catalog::open(&catalog_path).expect("open catalog");
+        let library = catalog.create_library("Songs", "/library").expect("library");
+        let full_mix = test_asset(&catalog, library.id, "Song - Artist.mp3", "hash-full");
+        let drums = test_asset(&catalog, library.id, "Song STEMS DRUMS - Artist.mp3", "hash-drums");
+        let melody = test_asset(&catalog, library.id, "Song STEMS MELODY - Artist.mp3", "hash-melody");
+        let unrelated = test_asset(&catalog, library.id, "Other Song.mp3", "hash-other");
+
+        let group_id = Uuid::new_v4();
+        catalog
+            .set_stem_group(
+                group_id,
+                &[
+                    (full_mix.id, "Full Mix".to_string(), true),
+                    (drums.id, "Drums".to_string(), false),
+                    (melody.id, "Melody".to_string(), false),
+                ],
+            )
+            .expect("set stem group");
+
+        let members = catalog.stem_group_members(group_id).expect("members");
+        assert_eq!(members.len(), 3);
+        assert_eq!(members[0].id, full_mix.id, "the primary member sorts first");
+        assert!(members[0].stem_is_primary);
+        assert_eq!(members[0].stem_label.as_deref(), Some("Full Mix"));
+        assert!(members.iter().any(|member| member.id == drums.id && !member.stem_is_primary));
+        assert!(members.iter().any(|member| member.id == melody.id && !member.stem_is_primary));
+        assert!(members.iter().all(|member| member.stem_group_id == Some(group_id)));
+
+        // asset_filenames_for_library only returns un-grouped assets — the
+        // input a retroactive scan should re-scan, not the ones a previous
+        // pass already resolved.
+        let ungrouped = catalog
+            .asset_filenames_for_library(library.id)
+            .expect("ungrouped");
+        assert_eq!(ungrouped, vec![(unrelated.id, "Other Song.mp3".to_string())]);
+
+        catalog.clear_stem_group_for_asset(drums.id).expect("clear");
+        let loaded = catalog.get_asset(drums.id).expect("get").expect("exists");
+        assert_eq!(loaded.stem_group_id, None);
+        assert_eq!(loaded.stem_label, None);
+        assert!(!loaded.stem_is_primary);
+        // Untouched siblings stay grouped.
+        assert_eq!(
+            catalog.stem_group_members(group_id).expect("members after clear").len(),
+            2
+        );
+    }
+
+    #[test]
+    fn library_import_subfolders_default_empty_dedupe_and_can_be_cleared() {
+        let catalog_path = unique_catalog_path("import-subfolders");
+        let catalog = Catalog::open(&catalog_path).expect("open catalog");
+        let library = catalog.create_library("One", "/library").expect("library");
+        assert_eq!(library.import_subfolders, Vec::<String>::new());
+
+        catalog
+            .set_library_import_subfolders(
+                library.id,
+                &["Soundtrack".to_string(), " SFX ".to_string(), "soundtrack".to_string(), "".to_string()],
+            )
+            .expect("set subfolders");
+        let loaded = catalog.get_library(library.id).expect("get").expect("exists");
+        // Blank entries dropped, whitespace trimmed, case-insensitive dupes
+        // collapsed to the first spelling.
+        assert_eq!(loaded.import_subfolders, vec!["Soundtrack".to_string(), "SFX".to_string()]);
+
+        catalog
+            .set_library_import_subfolders(library.id, &[])
+            .expect("clear subfolders");
+        let cleared = catalog.get_library(library.id).expect("get").expect("exists");
+        assert_eq!(cleared.import_subfolders, Vec::<String>::new());
     }
 
     #[test]

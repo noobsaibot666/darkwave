@@ -15,6 +15,9 @@ use storage::{
 use thiserror::Error;
 use uuid::Uuid;
 
+pub mod stems;
+pub use stems::{detect_stem_groups, StemCandidate, StemGroup};
+
 /// Extensions eligible for import/cataloging. Deliberately broader than
 /// `audio_metadata::supported_mvp_format`, which gates native decode/playback support:
 /// a file can be cataloged, tagged, and organized before this app can play it natively.
