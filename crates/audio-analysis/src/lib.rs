@@ -535,6 +535,18 @@ const VAD_SAMPLE_RATE: u32 = 16_000;
 const VAD_CHUNK_SIZE: usize = 512;
 const VAD_SPEECH_PROBABILITY_THRESHOLD: f32 = 0.5;
 const MIN_SECONDS_FOR_VOCAL_DETECTION: f32 = 1.0;
+/// Every other analysis pass in this file caps the material it actually
+/// scans to a bounded, representative window — `estimate_key`'s ~65s,
+/// `detect_instruments`'s ~90s, `estimate_pitch`'s handful of windows.
+/// This one didn't: a VAD inference call per VAD_CHUNK_SIZE-sample chunk
+/// over the *entire* clip means a real multi-minute song runs several
+/// thousand sequential forward passes, one per ~32ms of audio — measured
+/// as a genuine, large share of why a batch containing a few full-length
+/// songs could sit far longer than expected despite nothing being stuck.
+/// A voice presence ratio doesn't need every chunk in a five-minute
+/// track to be a good estimate; capping to a window this size keeps that
+/// accuracy while bounding the cost the same way the other passes do.
+const MAX_SECONDS_FOR_VOCAL_DETECTION: f32 = 90.0;
 
 // `VoiceActivityDetector::builder().build()` loads and initializes a Silero
 // ONNX inference session — real, measurable setup cost, not just a struct
@@ -549,6 +561,20 @@ const MIN_SECONDS_FOR_VOCAL_DETECTION: f32 = 1.0;
 thread_local! {
     static VAD_DETECTOR: std::cell::RefCell<Option<voice_activity_detector::VoiceActivityDetector>> =
         const { std::cell::RefCell::new(None) };
+}
+
+/// Caps VAD scanning to a centered window of at most
+/// `MAX_SECONDS_FOR_VOCAL_DETECTION`, at the already-resampled 16kHz rate —
+/// a borrowed slice, no copy, since the caller only ever iterates it in
+/// chunks. Short clips (the common case — most of a sound library) are
+/// returned untouched.
+fn trim_to_vocal_detection_window(resampled: &[f32]) -> &[f32] {
+    let window_samples = (MAX_SECONDS_FOR_VOCAL_DETECTION * VAD_SAMPLE_RATE as f32) as usize;
+    if resampled.len() <= window_samples {
+        return resampled;
+    }
+    let start = (resampled.len() - window_samples) / 2;
+    &resampled[start..start + window_samples]
 }
 
 /// Fraction of the clip Silero VAD classifies as speech (0.0-1.0), or `None`
@@ -566,6 +592,7 @@ pub fn detect_vocal_ratio(buffer: &DecodedAudioBuffer) -> Option<f32> {
     if resampled.len() < VAD_CHUNK_SIZE {
         return None;
     }
+    let resampled = trim_to_vocal_detection_window(&resampled);
 
     VAD_DETECTOR.with(|cell| {
         let mut slot = cell.borrow_mut();
@@ -925,6 +952,20 @@ mod tests {
         let input = vec![0.1, 0.2, 0.3];
 
         assert_eq!(resample_linear(&input, 16_000, 16_000), input);
+    }
+
+    #[test]
+    fn trim_to_vocal_detection_window_leaves_a_short_clip_untouched() {
+        let samples = vec![0.0f32; VAD_SAMPLE_RATE as usize * 10]; // 10s, well under the cap
+        assert_eq!(trim_to_vocal_detection_window(&samples).len(), samples.len());
+    }
+
+    #[test]
+    fn trim_to_vocal_detection_window_caps_a_long_clip() {
+        let samples = vec![0.0f32; VAD_SAMPLE_RATE as usize * 300]; // 5 minutes
+        let trimmed = trim_to_vocal_detection_window(&samples);
+        let expected = (MAX_SECONDS_FOR_VOCAL_DETECTION * VAD_SAMPLE_RATE as f32) as usize;
+        assert_eq!(trimmed.len(), expected);
     }
 
     #[test]
