@@ -782,20 +782,23 @@ button.panel-handle-right:active:not(:disabled) {
   pointer-events: none;
 }
 
-/* The indicator itself: a small glass square, not a full-bleed frame —
-   same glass treatment as .modal-card (rgba(--modal-rgb) + blur) so it
-   reads as this app's own "elevated surface", not a generic drop-zone
-   dashed rectangle. */
+/* The indicator itself: a glass square, not a full-bleed frame — same
+   glass treatment as .modal-card (rgba(--modal-rgb) + blur) so it reads
+   as this app's own "elevated surface", not a generic drop-zone dashed
+   rectangle. Sized for presence (this is the one thing on screen while
+   a drag is in progress) — the icon/text inside stay at their own fixed
+   size regardless, so more room here just reads as breathing room, not
+   bigger content. */
 .external-drop-overlay-frame {
   display: flex;
   flex-direction: column;
   align-items: center;
   justify-content: center;
-  gap: 8px;
-  width: 124px;
-  height: 124px;
+  gap: 10px;
+  width: 208px;
+  height: 208px;
   border: 1px solid rgba(var(--accent-rgb), 0.25);
-  border-radius: 22px;
+  border-radius: 32px;
   background: rgba(var(--modal-rgb), 0.88);
   backdrop-filter: blur(20px) saturate(1.1);
   box-shadow: 0 18px 40px rgba(0, 0, 0, 0.28);
@@ -825,18 +828,28 @@ button.panel-handle-right:active:not(:disabled) {
 }
 
 /* A brief, auto-dismissing confirmation once a dropped import finishes —
-   see showImportToast. Floats above the sidebar's own panel-handle
-   buttons, top-left, well clear of the transport bar and any modal. */
+   see showImportToast. Centered over the canvas at the exact same spot
+   .external-drop-overlay used (that's where a user's eyes already are,
+   having just dropped a file there) rather than up in the topbar, where
+   it used to collide with the search field. Same inset-0-and-center
+   wrapper + separate visual pill as the drop indicator, for the same
+   reason: the wrapper only positions it, so animating the wrapper moves
+   the pill without the wrapper itself needing to look like anything. */
 .import-toast {
   position: absolute;
-  top: 14px;
-  left: 50%;
-  transform: translateX(-50%);
+  inset: 0;
   z-index: 50;
   display: flex;
   align-items: center;
+  justify-content: center;
+  pointer-events: none;
+}
+
+.import-toast-pill {
+  display: flex;
+  align-items: center;
   gap: 8px;
-  padding: 9px 16px;
+  padding: 9px 18px;
   border-radius: 999px;
   border: 1px solid rgba(52, 211, 153, 0.28);
   background: rgba(var(--modal-rgb), 0.92);
@@ -846,7 +859,6 @@ button.panel-handle-right:active:not(:disabled) {
   font-size: 12.5px;
   font-weight: 600;
   white-space: nowrap;
-  pointer-events: none;
 }
 
 .topbar {

@@ -3838,21 +3838,6 @@ export function App() {
       >
         {inspectorCollapsed ? <ChevronLeft size={13} /> : <ChevronRight size={13} />}
       </button>
-      <AnimatePresence>
-        {importToast ? (
-          <motion.div
-            className="import-toast"
-            key={importToast.id}
-            initial={{ opacity: 0, y: 10, scale: 0.98 }}
-            animate={{ opacity: 1, y: 0, scale: 1 }}
-            exit={{ opacity: 0, y: 6, scale: 0.98 }}
-            transition={{ duration: 0.22, ease: [0.4, 0, 0.2, 1] }}
-          >
-            <CheckCircle2 size={15} />
-            <span>{importToast.message}</span>
-          </motion.div>
-        ) : null}
-      </AnimatePresence>
       <aside className={sidebarCollapsed ? "sidebar collapsed" : "sidebar"} aria-label="Library">
         <div className="panel-body">
           <div className="library-select-row">
@@ -4399,6 +4384,23 @@ export function App() {
                 <Import size={22} />
                 <p>Drop to import</p>
               </motion.div>
+            </motion.div>
+          ) : null}
+        </AnimatePresence>
+        <AnimatePresence>
+          {importToast ? (
+            <motion.div
+              className="import-toast"
+              key={importToast.id}
+              initial={{ opacity: 0, scale: 0.94 }}
+              animate={{ opacity: 1, scale: 1 }}
+              exit={{ opacity: 0, scale: 0.96 }}
+              transition={{ duration: 0.18, ease: [0.4, 0, 0.2, 1] }}
+            >
+              <div className="import-toast-pill">
+                <CheckCircle2 size={15} />
+                <span>{importToast.message}</span>
+              </div>
             </motion.div>
           ) : null}
         </AnimatePresence>
