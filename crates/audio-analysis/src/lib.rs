@@ -536,6 +536,21 @@ const VAD_CHUNK_SIZE: usize = 512;
 const VAD_SPEECH_PROBABILITY_THRESHOLD: f32 = 0.5;
 const MIN_SECONDS_FOR_VOCAL_DETECTION: f32 = 1.0;
 
+// `VoiceActivityDetector::builder().build()` loads and initializes a Silero
+// ONNX inference session — real, measurable setup cost, not just a struct
+// literal. detect_vocal_ratio used to pay that on *every single call*
+// (every analyzed file), on top of running potentially thousands of
+// inference passes (one per VAD_CHUNK_SIZE-sample chunk) over the file's
+// full length. VAD_SAMPLE_RATE/VAD_CHUNK_SIZE are both fixed constants, so
+// there's nothing that ever needs a differently-configured instance —
+// caching one per worker thread (spawn_blocking's blocking-thread pool
+// reuses its threads across a steady stream of jobs, which this is) means
+// only that thread's *first* analysis job ever pays the load cost.
+thread_local! {
+    static VAD_DETECTOR: std::cell::RefCell<Option<voice_activity_detector::VoiceActivityDetector>> =
+        const { std::cell::RefCell::new(None) };
+}
+
 /// Fraction of the clip Silero VAD classifies as speech (0.0-1.0), or `None`
 /// for clips too short to meaningfully sample, or if the model fails to
 /// load. Silero only accepts 8kHz or 16kHz mono input, so this downmixes and
@@ -552,32 +567,38 @@ pub fn detect_vocal_ratio(buffer: &DecodedAudioBuffer) -> Option<f32> {
         return None;
     }
 
-    let mut vad = voice_activity_detector::VoiceActivityDetector::builder()
-        .sample_rate(VAD_SAMPLE_RATE)
-        .chunk_size(VAD_CHUNK_SIZE)
-        .build()
-        .ok()?;
-
-    let mut speech_chunks = 0usize;
-    let mut total_chunks = 0usize;
-    for chunk in resampled.chunks(VAD_CHUNK_SIZE) {
-        // Drop a trailing partial chunk rather than padding it with silence,
-        // which would bias it toward "non-speech".
-        if chunk.len() < VAD_CHUNK_SIZE {
-            break;
+    VAD_DETECTOR.with(|cell| {
+        let mut slot = cell.borrow_mut();
+        if slot.is_none() {
+            *slot = voice_activity_detector::VoiceActivityDetector::builder()
+                .sample_rate(VAD_SAMPLE_RATE)
+                .chunk_size(VAD_CHUNK_SIZE)
+                .build()
+                .ok();
         }
-        let probability = vad.predict(chunk.to_vec());
-        total_chunks += 1;
-        if probability > VAD_SPEECH_PROBABILITY_THRESHOLD {
-            speech_chunks += 1;
+        let vad = slot.as_mut()?;
+
+        let mut speech_chunks = 0usize;
+        let mut total_chunks = 0usize;
+        for chunk in resampled.chunks(VAD_CHUNK_SIZE) {
+            // Drop a trailing partial chunk rather than padding it with
+            // silence, which would bias it toward "non-speech".
+            if chunk.len() < VAD_CHUNK_SIZE {
+                break;
+            }
+            let probability = vad.predict(chunk.to_vec());
+            total_chunks += 1;
+            if probability > VAD_SPEECH_PROBABILITY_THRESHOLD {
+                speech_chunks += 1;
+            }
         }
-    }
 
-    if total_chunks == 0 {
-        return None;
-    }
+        if total_chunks == 0 {
+            return None;
+        }
 
-    Some(speech_chunks as f32 / total_chunks as f32)
+        Some(speech_chunks as f32 / total_chunks as f32)
+    })
 }
 
 /// Simple linear-interpolation resampler. Not audiophile-grade, but that's
