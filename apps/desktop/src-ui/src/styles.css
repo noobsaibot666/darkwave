@@ -2473,6 +2473,17 @@ dd {
   color: var(--radar-accent-strong);
 }
 
+/* A flex item's default min-width is auto, not 0 — without this, this
+   span refuses to shrink below its text's full unwrapped width (the
+   classic flexbox overflow trap), so the description never actually
+   wraps and just runs past the menu's edge instead. flex: 1 lets it
+   claim the row's remaining width; min-width: 0 lets it shrink to fit,
+   which is what lets the text wrap at all. */
+.radar-sync-menu-item-body {
+  flex: 1;
+  min-width: 0;
+}
+
 .radar-sync-menu-item-title {
   display: block;
   font-size: 13.5px;

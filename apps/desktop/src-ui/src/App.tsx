@@ -4086,7 +4086,7 @@ export function App() {
                         <span className="radar-sync-menu-item-icon">
                           <RefreshCw size={14} />
                         </span>
-                        <span>
+                        <span className="radar-sync-menu-item-body">
                           <span className="radar-sync-menu-item-title">Re-analyse everything</span>
                           <span className="radar-sync-menu-item-desc">
                             {bulkAssetIds.length > 0
@@ -4116,7 +4116,7 @@ export function App() {
                         <span className="radar-sync-menu-item-icon">
                           <Sparkles size={14} />
                         </span>
-                        <span>
+                        <span className="radar-sync-menu-item-body">
                           <span className="radar-sync-menu-item-title">Backfill Tempo/Key/Pitch/Vocals</span>
                           <span className="radar-sync-menu-item-desc">
                             Whole library only. Catches tracks analysed before key/pitch detection existed — skips
