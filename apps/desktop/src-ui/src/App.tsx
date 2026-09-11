@@ -1518,7 +1518,19 @@ export function App() {
     const next = !audioAnalysisPaused;
     setAudioAnalysisPaused(next);
     invoke("set_audio_analysis_paused", { paused: next }).catch(() => {});
-    if (!next && activeLibraryId) runJobDrain(activeLibraryId, ["audio_analysis"]);
+    if (next) {
+      // The in-flight drain loop's current backend call can take a while
+      // to come back (it's mid-flight, possibly queued behind other work)
+      // and only notices the pause on its *next* iteration — without this,
+      // its live "Analyzing audio 22/3421 · 1%" row sat there next to the
+      // new "Audio analysis paused" row until that call finally returned,
+      // looking like two contradictory rows for the same thing. Hiding it
+      // immediately on click is purely cosmetic: the loop still winds
+      // itself down and cleans up its own bookkeeping in the background.
+      setJobProgress((previous) => previous.filter((entry) => entry.kind !== "audio_analysis"));
+    } else if (activeLibraryId) {
+      runJobDrain(activeLibraryId, ["audio_analysis"]);
+    }
   }, [audioAnalysisPaused, activeLibraryId, runJobDrain]);
 
   // A library catalogued before waveform caching existed (or one with a lot
@@ -1530,7 +1542,13 @@ export function App() {
     const next = !waveformGenerationPaused;
     setWaveformGenerationPaused(next);
     invoke("set_waveform_generation_paused", { paused: next }).catch(() => {});
-    if (!next && activeLibraryId) runJobDrain(activeLibraryId, ["waveform_generation"]);
+    if (next) {
+      // See the matching comment in handleToggleAudioAnalysisPaused — same
+      // "live row lingers next to the new paused row" fix.
+      setJobProgress((previous) => previous.filter((entry) => entry.kind !== "waveform_generation"));
+    } else if (activeLibraryId) {
+      runJobDrain(activeLibraryId, ["waveform_generation"]);
+    }
   }, [waveformGenerationPaused, activeLibraryId, runJobDrain]);
 
   const handleRetryFailedJobs = useCallback(
