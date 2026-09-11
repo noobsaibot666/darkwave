@@ -153,12 +153,6 @@ type VisibleFilter = {
 
 type SelectionMode = "Replace" | "Toggle" | "Range";
 
-type BrowserCommand =
-  | { MoveSelection: { delta: number } }
-  | { FocusRow: { index: number } }
-  | { SelectFocused: { mode: SelectionMode } }
-  | "SelectAllVisible";
-
 type BrowserState = {
   visible_asset_ids: string[];
   focused_index: number;

@@ -2728,7 +2728,20 @@ async fn run_similarity_worker(
     use tauri_plugin_shell::process::CommandEvent;
     use tauri_plugin_shell::ShellExt;
 
-    let mut guard = worker_state.0.lock().await;
+    // Bounded even at the lock-acquisition step, not just the response
+    // wait below: if whatever's currently holding this mutex is itself
+    // stuck — the write to the child's stdin, the spawn, anywhere before
+    // it reaches its own timeout — every later caller queuing behind it
+    // would otherwise wait forever too, turning one hang into a
+    // permanent stall for every audio-analysis job from then on rather
+    // than just the one file that triggered it. Fingerprinting is
+    // explicitly a nice-to-have (see the module-level doc comment); this
+    // caller gives up its own turn instead of waiting indefinitely for a
+    // lock that may never come free.
+    let mut guard = match tokio::time::timeout(std::time::Duration::from_secs(20), worker_state.0.lock()).await {
+        Ok(guard) => guard,
+        Err(_) => return None,
+    };
 
     if guard.is_none() {
         let sidecar = app.shell().sidecar("similarity-worker").ok()?;

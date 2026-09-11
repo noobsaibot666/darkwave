@@ -1054,18 +1054,43 @@ impl Catalog {
         asset_id: Uuid,
         instruments: &[(String, f64)],
     ) -> Result<(), StorageError> {
-        self.connection.execute(
-            "DELETE FROM asset_instruments WHERE asset_id = ?1",
-            params![asset_id.to_string()],
-        )?;
-        for (instrument, confidence) in instruments {
+        // Wrapped in a transaction so a mid-loop failure (a disk error, a
+        // lock timeout) can't leave the delete committed but only some of
+        // the new rows inserted — a real, if rare, way this asset's
+        // instrument set could otherwise end up silently truncated rather
+        // than either the old set or the new one. `Catalog`'s methods take
+        // `&self`, not `&mut self`, so this is raw BEGIN/COMMIT rather than
+        // rusqlite's `Connection::transaction` (which needs `&mut`) — same
+        // pattern already used for the bulk test fixture insert elsewhere
+        // in this file.
+        self.connection.execute_batch("BEGIN IMMEDIATE")?;
+        let result = (|| -> Result<(), StorageError> {
             self.connection.execute(
-                "INSERT OR REPLACE INTO asset_instruments (asset_id, instrument, confidence)
-                 VALUES (?1, ?2, ?3)",
-                params![asset_id.to_string(), instrument, confidence],
+                "DELETE FROM asset_instruments WHERE asset_id = ?1",
+                params![asset_id.to_string()],
             )?;
+            for (instrument, confidence) in instruments {
+                self.connection.execute(
+                    "INSERT OR REPLACE INTO asset_instruments (asset_id, instrument, confidence)
+                     VALUES (?1, ?2, ?3)",
+                    params![asset_id.to_string(), instrument, confidence],
+                )?;
+            }
+            Ok(())
+        })();
+        match result {
+            Ok(()) => {
+                self.connection.execute_batch("COMMIT")?;
+                Ok(())
+            }
+            Err(error) => {
+                // Best-effort — the original error is what's reported
+                // either way, this just avoids leaving the connection with
+                // an open transaction that would poison every later query.
+                let _ = self.connection.execute_batch("ROLLBACK");
+                Err(error)
+            }
         }
-        Ok(())
     }
 
     /// One asset's detected instruments, strongest first.
@@ -2610,6 +2635,14 @@ impl Catalog {
               ON assets(library_id, media_type, date_added);
             CREATE INDEX IF NOT EXISTS idx_background_jobs_pending
               ON background_jobs(state, priority, created_at);
+            -- latest_job_state_for_asset (the Sonic Radar inspector's
+            -- per-track Analyze buttons poll this every ~800ms while
+            -- waiting on a result) filters by asset_id + kind and orders
+            -- by updated_at — without this, every one of those polls was
+            -- a full table scan of every job ever queued, competing for
+            -- the same catalog mutex background job processing needs.
+            CREATE INDEX IF NOT EXISTS idx_background_jobs_asset_kind
+              ON background_jobs(asset_id, kind, updated_at);
             CREATE INDEX IF NOT EXISTS idx_asset_tags_asset ON asset_tags(asset_id);
             CREATE INDEX IF NOT EXISTS idx_asset_tags_tag_state_asset
               ON asset_tags(tag_id, approval_state, asset_id);
