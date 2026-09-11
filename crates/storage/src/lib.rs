@@ -804,6 +804,52 @@ impl Catalog {
         Ok(jobs)
     }
 
+    /// Same contract as `claim_pending_jobs(WaveformGeneration, limit)`, but
+    /// skips any asset that also has a pending or `processing`
+    /// `AudioAnalysis` job. `analyze_asset_audio` decodes the file once and
+    /// fills the waveform cache as a side effect (see
+    /// `complete_pending_jobs_for_asset`'s caller, `persist_waveform_payload`),
+    /// so claiming a WaveformGeneration job ahead of that asset's
+    /// AudioAnalysis job just means decoding the same file a second time —
+    /// the analysis pass completes this job on its own once it gets there.
+    /// A bulk backfill that queues both kinds together for the whole library
+    /// (the common case after any analysis-schema change) used to pay for
+    /// every file's decode twice; this only actually claims a waveform job
+    /// for the case the kind was designed for — an asset whose analysis is
+    /// already done (or was never queued), so nothing else is ever going to
+    /// fill its waveform cache for it.
+    pub fn claim_pending_waveform_jobs(&self, limit: usize) -> Result<Vec<JobRecord>, StorageError> {
+        let mut statement = self.connection.prepare(
+            "UPDATE background_jobs SET state = 'processing', updated_at = ?1
+             WHERE id IN (
+               SELECT b.id FROM background_jobs b
+               WHERE b.state = 'pending' AND b.kind = 'waveform_generation'
+                 AND NOT EXISTS (
+                   SELECT 1 FROM background_jobs a
+                   WHERE a.asset_id = b.asset_id
+                     AND a.kind = 'audio_analysis'
+                     AND a.state IN ('pending', 'processing')
+                 )
+               ORDER BY b.priority ASC, b.created_at ASC
+               LIMIT ?2
+             )
+             RETURNING id, asset_id, kind, priority",
+        )?;
+
+        let jobs = statement
+            .query_map(params![Utc::now().to_rfc3339(), limit as i64], |row| {
+                Ok(JobRecord {
+                    id: parse_uuid(row.get::<_, String>(0)?),
+                    asset_id: parse_uuid(row.get::<_, String>(1)?),
+                    kind: job_kind_from_db(&row.get::<_, String>(2)?),
+                    priority: row.get(3)?,
+                })
+            })?
+            .collect::<Result<Vec<_>, _>>()?;
+
+        Ok(jobs)
+    }
+
     /// Resets any job of `kind` left in `'processing'` for at least
     /// `STUCK_PROCESSING_THRESHOLD` back to `'pending'` — `claim_pending_jobs`
     /// marks a job `'processing'` before doing the real work, so a job whose
@@ -3563,6 +3609,52 @@ mod tests {
             .pending_jobs_of_kind(JobKind::AudioAnalysis, 10)
             .expect("pending jobs")
             .is_empty());
+    }
+
+    #[test]
+    fn claim_pending_waveform_jobs_skips_assets_with_a_pending_audio_analysis_twin() {
+        let catalog_path = unique_catalog_path("waveform-claim-skip");
+        let catalog = Catalog::open(&catalog_path).expect("open catalog");
+        let library = catalog.create_library("Jobs", "/library").expect("library");
+
+        // Backfilled together, like a real bulk import: both jobs queued for
+        // this asset. Its AudioAnalysis pass will decode the file and fill
+        // the waveform cache as a side effect, so its WaveformGeneration job
+        // shouldn't be claimed (and independently decoded) ahead of that.
+        let both_pending = test_asset(&catalog, library.id, "both.wav", "hash-both-pending");
+        catalog
+            .enqueue_job(both_pending.id, JobKind::WaveformGeneration, 40)
+            .expect("enqueue waveform");
+        catalog
+            .enqueue_job(both_pending.id, JobKind::AudioAnalysis, 40)
+            .expect("enqueue analysis");
+
+        // The case claim_pending_waveform_jobs exists for: a library
+        // retrofitted with waveform caching after analysis already ran, so
+        // nothing else is ever going to fill this one's waveform cache.
+        let waveform_only = test_asset(&catalog, library.id, "solo.wav", "hash-waveform-only");
+        catalog
+            .enqueue_job(waveform_only.id, JobKind::WaveformGeneration, 40)
+            .expect("enqueue waveform");
+
+        let claimed = catalog
+            .claim_pending_waveform_jobs(10)
+            .expect("claim waveform jobs");
+
+        assert_eq!(
+            claimed.len(),
+            1,
+            "only the asset with no pending/processing AudioAnalysis twin should be claimed"
+        );
+        assert_eq!(claimed[0].asset_id, waveform_only.id);
+
+        // The skipped job is untouched — still pending, still claimable once
+        // its analysis twin is gone (completed, failed, whatever).
+        let still_pending = catalog
+            .pending_jobs_of_kind(JobKind::WaveformGeneration, 10)
+            .expect("pending waveform jobs");
+        assert_eq!(still_pending.len(), 1);
+        assert_eq!(still_pending[0].asset_id, both_pending.id);
     }
 
     #[test]

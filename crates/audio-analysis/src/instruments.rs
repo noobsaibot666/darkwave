@@ -75,7 +75,24 @@ pub fn load_instrument_model(model_path: &Path, class_map_path: &Path) -> Option
         return None;
     }
 
-    let session = Session::builder().ok()?.commit_from_file(model_path).ok()?;
+    // Capped rather than ORT's default (one thread per logical core): this
+    // session already only ever runs one inference at a time (the caller
+    // serialises on a mutex — see the module doc on process_instrument_jobs),
+    // so letting ONE call claim every core just means it fights the OTHER
+    // background job kinds (waveform generation, audio analysis) that are
+    // typically churning through the same large backlog concurrently, on
+    // their own native threads, for the same CPU. Observed on a 10-core
+    // machine: with this left at ORT's default, instrument detection alone
+    // spun up threads across every core while waveform/analysis were also
+    // mid-backlog, which is what made the whole app (including the UI
+    // thread) feel starved rather than just "busy". 2 threads keeps this
+    // model's own latency reasonable without trying to own the machine.
+    let session = Session::builder()
+        .ok()?
+        .with_intra_threads(2)
+        .ok()?
+        .commit_from_file(model_path)
+        .ok()?;
 
     let input_name = session.inputs.first()?.name.clone();
     // TF-Hub YAMNet exports order outputs as (scores, embeddings,

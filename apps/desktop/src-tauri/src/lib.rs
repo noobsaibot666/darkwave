@@ -1973,8 +1973,12 @@ async fn process_waveform_jobs(
         catalog
             .reset_stuck_processing_jobs(JobKind::WaveformGeneration)
             .map_err(storage_error_message)?;
+        // Not the generic claim_pending_jobs: this skips any asset whose
+        // AudioAnalysis job is also still pending/processing, since that
+        // pass decodes the file once and fills the waveform cache as a side
+        // effect anyway — see claim_pending_waveform_jobs's doc comment.
         catalog
-            .claim_pending_jobs(JobKind::WaveformGeneration, 24)
+            .claim_pending_waveform_jobs(24)
             .map_err(storage_error_message)?
     };
 
