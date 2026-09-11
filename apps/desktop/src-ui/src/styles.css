@@ -69,6 +69,14 @@
   --sfx-to: #d69e0a;
   --sfx-ink: #fbd34d;
   --sfx-glow: rgba(214, 158, 10, 0.45);
+
+  /* Stems (a detected group of separated-instrument files sharing one
+     browsable row) get their own accent — a violet, distinct from the
+     player orange, Sonic Radar cyan, and SFX gold already in use. Used
+     for the row badge and the inspector's Stems panel. */
+  --stem-accent: #a78bfa;
+  --stem-accent-strong: #c4b5fd;
+  --stem-accent-rgb: 167, 139, 250;
 }
 
 /* Light mode palette reference: Silver Mist #E4E4E4, Flameburst Orange
@@ -109,6 +117,11 @@
   --radar-accent: #0e7490;
   --radar-accent-strong: #0891b2;
   --radar-accent-rgb: 14, 116, 144;
+
+  /* Deeper violet for the same contrast reason as radar-accent above. */
+  --stem-accent: #7c3aed;
+  --stem-accent-strong: #6d28d9;
+  --stem-accent-rgb: 124, 58, 237;
 }
 
 * {
@@ -1410,6 +1423,24 @@ button:disabled,
   white-space: nowrap;
 }
 
+/* "This track has stems available" — sits right after the display name.
+   inline-flex + a fixed size keeps it from being squashed by the name's
+   own ellipsis truncation on an ordinary-length name; a very long name
+   can still clip it, same as it would any other trailing text. */
+.stem-badge {
+  display: inline-flex;
+  flex-shrink: 0;
+  align-items: center;
+  justify-content: center;
+  width: 16px;
+  height: 16px;
+  margin-left: 6px;
+  border-radius: 5px;
+  background: rgba(var(--stem-accent-rgb), 0.16);
+  color: var(--stem-accent-strong);
+  vertical-align: middle;
+}
+
 .waveform {
   display: flex;
   align-items: center;
@@ -2563,6 +2594,23 @@ dd {
   accent-color: #8f8f92;
 }
 
+/* The external-drop-destination prompt's "remember for this session"
+   toggle — a simple checkbox + label, not the icon/label/value grid
+   .settings-row is shaped for. */
+.drop-remember-row {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  font-size: 13px;
+  color: var(--text-secondary);
+}
+
+.drop-remember-row input[type="checkbox"] {
+  width: 16px;
+  height: 16px;
+  accent-color: var(--accent);
+}
+
 .settings-subhead {
   margin: 18px 0 10px;
   font-size: 12px;
@@ -2939,6 +2987,42 @@ dd {
   line-height: 1.5;
 }
 
+/* A settings-hint's tone, but sized to sit inline inside a
+   .settings-row-value (no block margins) — the "import subfolders" row's
+   empty state. */
+.settings-inline-hint {
+  color: var(--text-muted);
+  font-size: 12px;
+}
+
+/* One configured import-drop subfolder, in the "Import subfolders"
+   settings row — a removable chip, same shape as a tag chip elsewhere. */
+.import-subfolder-chip {
+  display: inline-flex;
+  align-items: center;
+  gap: 5px;
+  padding: 3px 6px 3px 10px;
+  border-radius: 999px;
+  background: var(--control-bg);
+  color: var(--text-primary);
+  font-size: 12px;
+}
+
+.import-subfolder-chip button {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  width: 16px;
+  height: 16px;
+  border-radius: 999px;
+  color: var(--text-muted);
+}
+
+.import-subfolder-chip button:hover {
+  background: rgba(var(--ink-rgb), 0.12);
+  color: var(--text-primary);
+}
+
 .library-admin-list {
   display: grid;
   gap: 8px;
@@ -3285,6 +3369,78 @@ dd {
 .sonic-radar-track-section .section-header h2,
 .sonic-radar-track-section .section-header h2 svg {
   color: var(--radar-accent);
+}
+
+/* Inspector "Stems" section — only rendered when the selected asset is
+   part of a detected stem group. Tinted with the violet stem accent, the
+   same one the browser row badge uses, so the two read as one feature. */
+.stems-track-section .section-header h2,
+.stems-track-section .section-header h2 svg {
+  color: var(--stem-accent-strong);
+}
+
+.stem-member-list {
+  display: flex;
+  flex-direction: column;
+  gap: 4px;
+}
+
+.stem-member-row {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  width: 100%;
+  min-height: 32px;
+  padding: 0 10px;
+  border: 1px solid transparent;
+  border-radius: var(--radius-sm);
+  background: var(--control-bg);
+  color: var(--text-primary);
+  font-size: 13px;
+  text-align: left;
+  transition: background 120ms ease, border-color 120ms ease;
+}
+
+.stem-member-row:hover {
+  background: var(--control-bg-hover);
+}
+
+.stem-member-row.active {
+  border-color: rgba(var(--stem-accent-rgb), 0.5);
+  background: rgba(var(--stem-accent-rgb), 0.14);
+  color: var(--stem-accent-strong);
+}
+
+.stem-member-icon {
+  display: inline-flex;
+  flex: 0 0 auto;
+  align-items: center;
+  justify-content: center;
+  width: 22px;
+  height: 22px;
+  border-radius: 999px;
+  background: rgba(var(--stem-accent-rgb), 0.16);
+  color: var(--stem-accent-strong);
+}
+
+.stem-member-label {
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.stem-member-primary-tag {
+  flex-shrink: 0;
+  margin-left: auto;
+  padding: 2px 7px;
+  border-radius: 999px;
+  background: rgba(var(--stem-accent-rgb), 0.22);
+  color: var(--stem-accent-strong);
+  font-size: 10px;
+  font-weight: 700;
+  letter-spacing: 0.03em;
+  text-transform: uppercase;
 }
 
 .radar-status-list {

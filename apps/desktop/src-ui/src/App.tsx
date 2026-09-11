@@ -1,5 +1,6 @@
 import { convertFileSrc, invoke } from "@tauri-apps/api/core";
 import { listen } from "@tauri-apps/api/event";
+import { getCurrentWebview } from "@tauri-apps/api/webview";
 import { AnimatePresence, motion, useMotionValue, useTransform } from "motion/react";
 import { open as openDialog, save as saveDialog, confirm as confirmDialog } from "@tauri-apps/plugin-dialog";
 import { revealItemInDir } from "@tauri-apps/plugin-opener";
@@ -28,6 +29,7 @@ import {
   HelpCircle,
   Import,
   KeyRound,
+  Layers,
   Library,
   Link2,
   ListFilter,
@@ -77,6 +79,10 @@ type LibraryRecord = {
   name: string;
   media_root: string;
   import_root: string | null;
+  /** Named subfolders under media_root a dropped file can be filed into
+   * (e.g. ["Soundtrack", "SFX"]). Empty means one destination — no
+   * "which folder" prompt needed on drop. */
+  import_subfolders: string[];
 };
 
 type AssetPath = { Managed: string } | { Referenced: string };
@@ -113,6 +119,14 @@ type AssetRecord = {
   /** Krumhansl-Schmuckler musical key, e.g. "C major" / "A minor". */
   detected_key: string | null;
   key_strength: number | null;
+  /** Shared by every member of a detected stem group (the full mix plus
+   * its separated-instrument siblings). `null` if not part of one. */
+  stem_group_id: string | null;
+  /** This member's part within its stem group, e.g. "Full Mix", "Drums". */
+  stem_label: string | null;
+  /** The one member per stem_group_id shown as the browsable row — the
+   * rest are only reachable through its Stems panel. */
+  stem_is_primary: boolean;
 };
 
 type ImportFailure = {
@@ -123,6 +137,10 @@ type ImportFailure = {
 type ImportFolderResult = {
   imported: AssetRecord[];
   failed: ImportFailure[];
+};
+
+type DroppedImportResult = ImportFolderResult & {
+  stem_groups_detected: number;
 };
 
 type DeleteLibraryResult = {
@@ -980,6 +998,21 @@ export function App() {
   const [onboardingBusy, setOnboardingBusy] = useState(false);
   const [onboardingError, setOnboardingError] = useState<string | null>(null);
   const [importStatus, setImportStatus] = useState<string | null>(null);
+  // Files/folders dropped onto the window from outside the app (Finder,
+  // Downloads...). Set only when the active library has 2+ configured
+  // import_subfolders and no remembered choice yet this session — the
+  // modal that reads this asks "which folder", then either imports
+  // directly (0 or 1 subfolders) or defers to the remembered choice.
+  const [externalDropPrompt, setExternalDropPrompt] = useState<{
+    libraryId: string;
+    paths: string[];
+    subfolders: string[];
+  } | null>(null);
+  const [externalDropRememberChoice, setExternalDropRememberChoice] = useState(false);
+  // Session-only by design (a ref, never persisted) — "remember my
+  // choice" means "for the rest of this run", not forever; the prompt
+  // comes back on the next launch even if this was checked last time.
+  const rememberedDropSubfolderRef = useRef<{ libraryId: string; subfolder: string | null } | null>(null);
   const [activeFilter, setActiveFilter] = useState<ActiveFilter>("all");
   const [sidebarCollapsed, setSidebarCollapsed] = useState(false);
   const [inspectorCollapsed, setInspectorCollapsed] = useState(false);
@@ -1054,6 +1087,12 @@ export function App() {
   const [appliedTags, setAppliedTags] = useState<TagRecord[]>([]);
   const [suggestedTags, setSuggestedTags] = useState<TagRecord[]>([]);
   const [assetInstruments, setAssetInstruments] = useState<{ name: string; confidence: number }[]>([]);
+  // Every member of the selected asset's stem group (primary/full-mix
+  // first) — the inspector's Stems panel. Empty whenever the selection
+  // isn't part of a group at all, not just while a fetch is pending, so
+  // the panel can tell "no stems" from "still loading" if it ever needs
+  // to (it currently doesn't bother — the section just doesn't render).
+  const [stemGroupMembers, setStemGroupMembers] = useState<AssetRecord[]>([]);
   const [newTagName, setNewTagName] = useState("");
   const [newTagFacet, setNewTagFacet] = useState("action");
 
@@ -1062,6 +1101,7 @@ export function App() {
   const [newProjectName, setNewProjectName] = useState("");
   const [newProjectExportPath, setNewProjectExportPath] = useState("");
   const [newProjectSfxExportPath, setNewProjectSfxExportPath] = useState("");
+  const [newImportSubfolderName, setNewImportSubfolderName] = useState("");
   // The sidebar's hover-to-reveal edit icon on a project row opens this —
   // editProjectId doubles as "is the modal open".
   const [editProjectId, setEditProjectId] = useState<string | null>(null);
@@ -1192,7 +1232,16 @@ export function App() {
     } else {
       base = assets;
     }
-    return formatFilter ? base.filter((asset) => detectAudioFormat(asset) === formatFilter) : base;
+    if (formatFilter) {
+      base = base.filter((asset) => detectAudioFormat(asset) === formatFilter);
+    }
+    // A stem group's non-primary members (the individual instrument
+    // parts) never show up as their own row in the main browser — only
+    // the primary (the full mix, or a stand-in when no full mix exists)
+    // does, with the rest reachable through its own Stems panel. Applied
+    // last, after every other filter, so this holds no matter how the
+    // list is currently filtered.
+    return base.filter((asset) => !asset.stem_group_id || asset.stem_is_primary);
   }, [assets, activeFilter, formatFilter]);
 
   const instrumentFilter =
@@ -1723,6 +1772,7 @@ export function App() {
       setSuggestedTags([]);
       setSourceDraft(null);
       setAssetInstruments([]);
+      setStemGroupMembers([]);
       return;
     }
     refreshAssetTags(selectedAssetId);
@@ -1730,6 +1780,29 @@ export function App() {
       .then(setAssetInstruments)
       .catch(() => setAssetInstruments([]));
   }, [selectedAssetId, refreshAssetTags]);
+
+  // Separate from the effect above: keyed on the group id (a plain string,
+  // stable across re-renders) rather than the freshly-`.find()`'d
+  // selectedAsset object, which would otherwise re-trigger this on every
+  // render rather than only when the selection actually changes.
+  const selectedAssetStemGroupId = selectedAsset?.stem_group_id ?? null;
+  useEffect(() => {
+    if (!selectedAssetStemGroupId) {
+      setStemGroupMembers([]);
+      return;
+    }
+    let live = true;
+    invoke<AssetRecord[]>("stem_group_members", { groupId: selectedAssetStemGroupId })
+      .then((members) => {
+        if (live) setStemGroupMembers(members);
+      })
+      .catch(() => {
+        if (live) setStemGroupMembers([]);
+      });
+    return () => {
+      live = false;
+    };
+  }, [selectedAssetStemGroupId]);
 
   const loadAssetForPlayback = useCallback(async (asset: AssetRecord, autoplay: boolean) => {
     const path = await invoke<string>("asset_playback_path", { assetId: asset.id });
@@ -2737,6 +2810,39 @@ export function App() {
     setLibraries((previous) => previous.map((library) => (library.id === updated.id ? updated : library)));
   }, [activeLibraryId]);
 
+  // Named subfolders under media_root a file dropped onto the window can
+  // be filed into (see the externalDropPrompt flow) — 0 or 1 means a drop
+  // never has to ask "which one"; 2+ does, unless the user's remembered a
+  // choice for this session.
+  const handleAddImportSubfolder = useCallback(async () => {
+    const name = newImportSubfolderName.trim();
+    if (!activeLibraryId || !name) return;
+    const next = [...(activeLibrary?.import_subfolders ?? []), name];
+    const updated = await invoke<LibraryRecord>("set_library_import_subfolders", {
+      libraryId: activeLibraryId,
+      names: next
+    }).catch(() => null);
+    if (updated) {
+      setLibraries((previous) => previous.map((library) => (library.id === updated.id ? updated : library)));
+      setNewImportSubfolderName("");
+    }
+  }, [activeLibraryId, activeLibrary, newImportSubfolderName]);
+
+  const handleRemoveImportSubfolder = useCallback(
+    async (name: string) => {
+      if (!activeLibraryId) return;
+      const next = (activeLibrary?.import_subfolders ?? []).filter((existing) => existing !== name);
+      const updated = await invoke<LibraryRecord>("set_library_import_subfolders", {
+        libraryId: activeLibraryId,
+        names: next
+      }).catch(() => null);
+      if (updated) {
+        setLibraries((previous) => previous.map((library) => (library.id === updated.id ? updated : library)));
+      }
+    },
+    [activeLibraryId, activeLibrary]
+  );
+
   const handleImportFolder = useCallback(async () => {
     if (!activeLibraryId) return;
 
@@ -2769,6 +2875,105 @@ export function App() {
       setImportStatus(`Import failed: ${String(error)}`);
     }
   }, [activeLibraryId, activeLibrary, searchQuery, activeFilter, refreshAssets, refreshMaintenance, runJobDrain]);
+
+  // Actually runs a drop's import once the destination is known (either
+  // there was nothing to ask, or handleExternalFileDrop/the prompt modal
+  // already resolved one) — copies each path into the library's own
+  // folder and catalogs it there; see import_dropped_paths.
+  const runDroppedImport = useCallback(
+    (libraryId: string, paths: string[], targetSubfolder: string | null) => {
+      setImportStatus(`Importing ${paths.length} item${paths.length === 1 ? "" : "s"}…`);
+      invoke<DroppedImportResult>("import_dropped_paths", {
+        libraryId,
+        paths,
+        targetSubfolder
+      })
+        .then((result) => {
+          const stemsNote =
+            result.stem_groups_detected > 0
+              ? ` · ${result.stem_groups_detected} stem group${result.stem_groups_detected === 1 ? "" : "s"} organized`
+              : "";
+          setImportStatus(
+            result.failed.length > 0
+              ? `Imported ${result.imported.length}, ${result.failed.length} failed${stemsNote}`
+              : `Imported ${result.imported.length} sound${result.imported.length === 1 ? "" : "s"}${stemsNote}`
+          );
+          if (libraryId === activeLibraryId) {
+            refreshAssets(libraryId, searchQuery, activeFilter);
+            refreshMaintenance(libraryId);
+          }
+          runJobDrain(libraryId);
+        })
+        .catch((error) => setImportStatus(`Import failed: ${String(error)}`));
+    },
+    [activeLibraryId, searchQuery, activeFilter, refreshAssets, refreshMaintenance, runJobDrain]
+  );
+
+  // Entry point for a real OS-level drop (see the onDragDropEvent effect
+  // below) — decides whether the destination is already known (0 or 1
+  // configured import_subfolders, or a remembered choice from earlier
+  // this session) or whether the user needs to be asked.
+  const handleExternalFileDrop = useCallback(
+    (paths: string[]) => {
+      if (!activeLibraryId || paths.length === 0) return;
+      const subfolders = activeLibrary?.import_subfolders ?? [];
+
+      if (subfolders.length <= 1) {
+        runDroppedImport(activeLibraryId, paths, subfolders[0] ?? null);
+        return;
+      }
+
+      const remembered = rememberedDropSubfolderRef.current;
+      if (remembered && remembered.libraryId === activeLibraryId) {
+        runDroppedImport(activeLibraryId, paths, remembered.subfolder);
+        return;
+      }
+
+      setExternalDropRememberChoice(false);
+      setExternalDropPrompt({ libraryId: activeLibraryId, paths, subfolders });
+    },
+    [activeLibraryId, activeLibrary, runDroppedImport]
+  );
+
+  // Real OS-level file drop (Finder, Downloads...) — distinct from the
+  // in-app pointer-based drag (a track onto a project) built earlier;
+  // this is Tauri's own window-level drag-drop, native drops from
+  // outside the webview entirely. dragDropEnabled defaults to true and
+  // nothing in this app relies on HTML5 drag-and-drop anymore (the
+  // in-app drag uses pointer events specifically to avoid that), so
+  // there's no conflict enabling both.
+  useEffect(() => {
+    let unlisten: (() => void) | undefined;
+    let cancelled = false;
+    getCurrentWebview()
+      .onDragDropEvent((event) => {
+        if (event.payload.type === "drop") {
+          handleExternalFileDrop(event.payload.paths);
+        }
+      })
+      .then((off) => {
+        if (cancelled) off();
+        else unlisten = off;
+      })
+      .catch(() => {});
+    return () => {
+      cancelled = true;
+      unlisten?.();
+    };
+  }, [handleExternalFileDrop]);
+
+  const handleConfirmExternalDropDestination = useCallback(
+    (subfolder: string | null) => {
+      if (!externalDropPrompt) return;
+      const { libraryId, paths } = externalDropPrompt;
+      if (externalDropRememberChoice) {
+        rememberedDropSubfolderRef.current = { libraryId, subfolder };
+      }
+      setExternalDropPrompt(null);
+      runDroppedImport(libraryId, paths, subfolder);
+    },
+    [externalDropPrompt, externalDropRememberChoice, runDroppedImport]
+  );
 
   // Checks both of a library's folders for new sounds: media_root (via
   // refresh_library, unchanged) and, if one is configured, the separate
@@ -4499,7 +4704,14 @@ export function App() {
                 <div className="waveform" aria-hidden="true" style={{ color: rowIconColor }}>
                   <RowIcon size={16} />
                 </div>
-                <strong>{asset.display_name}</strong>
+                <strong>
+                  {asset.display_name}
+                  {asset.stem_group_id ? (
+                    <span className="stem-badge" title="Stems available — select to view in the inspector">
+                      <Layers size={11} />
+                    </span>
+                  ) : null}
+                </strong>
                 <span>{asset.media_type}</span>
                 <span>{asset.storage_mode}</span>
                 <span>{formatFileSize(asset.file_size)}</span>
@@ -4922,6 +5134,47 @@ export function App() {
               ))}
           </div>
         </CollapsibleSection>
+        {selectedAsset && stemGroupMembers.length > 0 ? (
+          <CollapsibleSection
+            id="stems-track"
+            title="Stems"
+            icon={<Layers size={14} />}
+            className="stems-track-section"
+            collapsed={collapsedSections.has("stems-track")}
+            onToggle={toggleSection}
+          >
+            <p className="settings-hint">
+              {stemGroupMembers.length} part{stemGroupMembers.length === 1 ? "" : "s"} — pick one to
+              play, independent of the browser's own selection.
+            </p>
+            <div className="stem-member-list">
+              {stemGroupMembers.map((member) => {
+                const isLoaded = playingAssetId === member.id;
+                return (
+                  <button
+                    key={member.id}
+                    type="button"
+                    className={isLoaded ? "stem-member-row active" : "stem-member-row"}
+                    onClick={() => {
+                      if (isLoaded) {
+                        const audio = audioRef.current;
+                        if (audio) (audio.paused ? audio.play() : audio.pause());
+                      } else {
+                        loadAssetForPlayback(member, true);
+                      }
+                    }}
+                  >
+                    <span className="stem-member-icon">
+                      {isLoaded && isPlaying ? <Pause size={13} /> : <Play size={13} />}
+                    </span>
+                    <span className="stem-member-label">{member.stem_label ?? member.display_name}</span>
+                    {member.stem_is_primary ? <span className="stem-member-primary-tag">Primary</span> : null}
+                  </button>
+                );
+              })}
+            </div>
+          </CollapsibleSection>
+        ) : null}
         <CollapsibleSection
           id="sonic-radar-track"
           title="Sonic Radar"
@@ -5406,7 +5659,58 @@ export function App() {
                           <span>Status</span>
                           <strong>{formatMediaRootStatus(mediaRootStatus?.status)}</strong>
                         </div>
+                        <div className="settings-row">
+                          <FolderOpen size={14} />
+                          <span>Import subfolders</span>
+                          <div className="settings-row-value">
+                            {(activeLibrary?.import_subfolders ?? []).length === 0 ? (
+                              <span className="settings-inline-hint">
+                                None — a file dropped on the window goes straight to the media root
+                              </span>
+                            ) : (
+                              (activeLibrary?.import_subfolders ?? []).map((name) => (
+                                <span key={name} className="import-subfolder-chip">
+                                  {name}
+                                  <button
+                                    type="button"
+                                    aria-label={`Remove ${name}`}
+                                    onClick={() => handleRemoveImportSubfolder(name)}
+                                  >
+                                    <X size={11} />
+                                  </button>
+                                </span>
+                              ))
+                            )}
+                          </div>
+                        </div>
+                        <div className="settings-row">
+                          <Plus size={14} />
+                          <span>Add subfolder</span>
+                          <div className="settings-row-value">
+                            <input
+                              placeholder="e.g. Soundtrack"
+                              value={newImportSubfolderName}
+                              onChange={(event) => setNewImportSubfolderName(event.target.value)}
+                              onKeyDown={(event) => {
+                                if (event.key === "Enter") handleAddImportSubfolder();
+                              }}
+                            />
+                            <button
+                              type="button"
+                              className="text-button"
+                              disabled={!newImportSubfolderName.trim()}
+                              onClick={handleAddImportSubfolder}
+                            >
+                              Add
+                            </button>
+                          </div>
+                        </div>
                       </div>
+                      <p className="settings-hint">
+                        With 2 or more subfolders, dropping a file onto the window asks which one it
+                        goes into — with a "remember for this session" option. 0 or 1 means it never
+                        asks.
+                      </p>
                     </div>
 
                     <div className="settings-section">
@@ -6046,6 +6350,67 @@ export function App() {
               >
                 Create Project
               </button>
+            </div>
+          </motion.div>
+        </motion.div>
+      ) : null}
+      </AnimatePresence>
+      <AnimatePresence>
+      {externalDropPrompt ? (
+        <motion.div
+          className="modal-overlay"
+          onClick={() => setExternalDropPrompt(null)}
+          initial={{ opacity: 0 }}
+          animate={{ opacity: 1 }}
+          exit={{ opacity: 0 }}
+          transition={{ duration: 0.18 }}
+        >
+          <motion.div
+            className="modal-card"
+            onClick={(event) => event.stopPropagation()}
+            aria-label="Where should this go?"
+            initial={{ opacity: 0, scale: 0.96, y: 10 }}
+            animate={{ opacity: 1, scale: 1, y: 0 }}
+            exit={{ opacity: 0, scale: 0.96, y: 10 }}
+            transition={{ duration: 0.2, ease: [0.4, 0, 0.2, 1] }}
+          >
+            <div className="modal-head">
+              <h1>Where should this go?</h1>
+              <button
+                type="button"
+                className="icon-button"
+                aria-label="Close"
+                onClick={() => setExternalDropPrompt(null)}
+              >
+                <X size={16} />
+              </button>
+            </div>
+            <div className="settings-stack">
+              <p className="settings-hint">
+                {externalDropPrompt.paths.length === 1
+                  ? "1 dropped item — pick a folder to import it into."
+                  : `${externalDropPrompt.paths.length} dropped items — pick a folder to import them into.`}
+              </p>
+              <div className="drop-target-grid">
+                {externalDropPrompt.subfolders.map((subfolder) => (
+                  <button
+                    key={subfolder}
+                    type="button"
+                    onClick={() => handleConfirmExternalDropDestination(subfolder)}
+                  >
+                    {subfolder}
+                  </button>
+                ))}
+              </div>
+              <label className="drop-remember-row">
+                <input
+                  type="checkbox"
+                  checked={externalDropRememberChoice}
+                  onChange={(event) => setExternalDropRememberChoice(event.target.checked)}
+                />
+                <span>Remember my choice for this session</span>
+              </label>
+              <p className="settings-hint">You'll be asked again the next time the app opens.</p>
             </div>
           </motion.div>
         </motion.div>

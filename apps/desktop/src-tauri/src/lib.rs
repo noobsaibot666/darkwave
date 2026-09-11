@@ -1517,12 +1517,16 @@ fn set_library_import_subfolders(
     state: tauri::State<CatalogState>,
     library_id: String,
     names: Vec<String>,
-) -> Result<(), String> {
+) -> Result<LibraryRecord, String> {
     let library_id = parse_uuid_field(&library_id, "library id")?;
     let catalog = state.0.lock().expect("catalog mutex poisoned");
     catalog
         .set_library_import_subfolders(library_id, &names)
-        .map_err(storage_error_message)
+        .map_err(storage_error_message)?;
+    catalog
+        .get_library(library_id)
+        .map_err(storage_error_message)?
+        .ok_or_else(|| "library not found after setting import subfolders".to_string())
 }
 
 /// Re-scans a library's media root for audio files not yet in the catalog (e.g. dropped
