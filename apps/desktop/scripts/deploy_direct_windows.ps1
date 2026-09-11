@@ -48,8 +48,13 @@ Copy-Item (Join-Path $WorkspaceRoot "target\release\similarity-worker.exe") `
 # direct-dist feature + tauri.direct.conf.json, same as macOS's build step.
 # tauri.windows.conf.json is layered on top (Windows-only): it adds
 # DirectML.dll to bundle.resources so the ONNX Runtime DirectML EP is
-# present next to the installed .exe. --config merges left-to-right, so this
-# only augments tauri.direct.conf.json, never replaces it.
+# present next to the installed .exe. Tauri's config merge is JSON Merge
+# Patch (RFC 7396) — objects merge key by key, but arrays REPLACE the base
+# array wholesale, they don't concatenate. bundle.resources is an array, so
+# tauri.windows.conf.json must repeat every entry the base tauri.conf.json
+# already lists there (models/*, for the Sonic Radar instrument-detection
+# model) alongside DirectML.dll, or a Windows build silently drops the
+# model bundling instead of augmenting it.
 # --bundles nsis pinned explicitly (not relying on "targets":"all") so a
 # stray MSI/WiX pass never runs alongside it.
 Write-Host "[2/4] Building (direct-dist, NSIS)..."

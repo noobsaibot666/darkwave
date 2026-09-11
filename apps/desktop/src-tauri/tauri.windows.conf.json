@@ -1,5 +1,5 @@
 {
   "bundle": {
-    "resources": ["DirectML.dll"]
+    "resources": ["models/*", "DirectML.dll"]
   }
 }
