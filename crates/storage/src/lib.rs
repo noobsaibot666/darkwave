@@ -501,6 +501,17 @@ impl Catalog {
             .iter()
             .map(|name| name.trim().to_string())
             .filter(|name| !name.is_empty())
+            // Subfolders are always joined onto the library's own
+            // media_root as a single path segment (see
+            // import_dropped_paths) — a name containing a separator or
+            // ".." could otherwise redirect a drop outside the library
+            // entirely, silently, from what looks like an ordinary
+            // settings field. Not a privilege-escalation risk (single-user
+            // local app; the user already has whatever filesystem access
+            // this would grant), but a real footgun worth closing: a typo
+            // here shouldn't be able to make "drop to import" quietly
+            // write files somewhere the user never intended.
+            .filter(|name| !name.contains('/') && !name.contains('\\') && name != "." && name != "..")
             .filter(|name| seen.insert(name.to_lowercase()))
             .collect();
         let json = if cleaned.is_empty() {
@@ -4769,6 +4780,34 @@ mod tests {
             .expect("clear subfolders");
         let cleared = catalog.get_library(library.id).expect("get").expect("exists");
         assert_eq!(cleared.import_subfolders, Vec::<String>::new());
+    }
+
+    #[test]
+    fn library_import_subfolders_rejects_path_traversal_and_separators() {
+        let catalog_path = unique_catalog_path("import-subfolders-traversal");
+        let catalog = Catalog::open(&catalog_path).expect("open catalog");
+        let library = catalog.create_library("One", "/library").expect("library");
+
+        catalog
+            .set_library_import_subfolders(
+                library.id,
+                &[
+                    "Soundtrack".to_string(),
+                    "../../etc".to_string(),
+                    "..".to_string(),
+                    ".".to_string(),
+                    "nested/path".to_string(),
+                    "back\\slash".to_string(),
+                ],
+            )
+            .expect("set subfolders");
+        let loaded = catalog.get_library(library.id).expect("get").expect("exists");
+
+        // Only the one legitimate single-segment name survives — a
+        // subfolder is always joined onto media_root as one path segment
+        // (import_dropped_paths), so anything that could redirect a drop
+        // outside the library is dropped rather than stored.
+        assert_eq!(loaded.import_subfolders, vec!["Soundtrack".to_string()]);
     }
 
     #[test]
