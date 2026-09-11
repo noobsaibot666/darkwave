@@ -2674,15 +2674,25 @@ async fn analyze_asset_audio(
 
             let waveform = build_waveform_payload(&buffer);
             let needs_review = audio_analysis::is_likely_silent_or_corrupt(&buffer);
-            let measurements = audio_analysis::measure(&buffer);
-            let suggested_tags = audio_analysis::suggest_action_tags(&buffer, measurements)
-                .into_iter()
-                .map(|tag| tag.as_str())
-                .collect::<Vec<_>>();
-            let tempo = audio_analysis::estimate_tempo(&buffer);
-            let pitch = audio_analysis::estimate_pitch(&buffer);
-            let key = audio_analysis::estimate_key(&buffer);
-            let vocal_ratio = audio_analysis::detect_vocal_ratio(&buffer);
+
+            // Every one of tempo/pitch/key/vocal-ratio/measure independently
+            // downmixes the same decoded buffer to mono internally — for a
+            // multi-minute file that's the same O(n) pass paid six times
+            // over. Downmix once here and hand every pass the same slice
+            // instead (see audio_analysis::measure_from_mono's doc comment).
+            let mono = audio_analysis::mono_samples(&buffer);
+            let sample_rate = buffer.sample_rate;
+
+            let measurements = audio_analysis::measure_from_mono(&mono, sample_rate);
+            let suggested_tags =
+                audio_analysis::suggest_action_tags_from_mono(&mono, sample_rate, measurements)
+                    .into_iter()
+                    .map(|tag| tag.as_str())
+                    .collect::<Vec<_>>();
+            let tempo = audio_analysis::estimate_tempo_from_mono(&mono, sample_rate);
+            let pitch = audio_analysis::estimate_pitch_from_mono(&mono, sample_rate);
+            let key = audio_analysis::estimate_key_from_mono(&mono, sample_rate);
+            let vocal_ratio = audio_analysis::detect_vocal_ratio_from_mono(&mono, sample_rate);
 
             let channels = buffer.channels.max(1) as u64;
             let duration_ms = if buffer.sample_rate > 0 {

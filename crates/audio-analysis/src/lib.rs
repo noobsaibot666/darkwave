@@ -74,7 +74,15 @@ pub fn is_likely_silent_or_corrupt(buffer: &DecodedAudioBuffer) -> bool {
 }
 
 pub fn measure(buffer: &DecodedAudioBuffer) -> AudioMeasurements {
-    let mono = mono_samples(buffer);
+    measure_from_mono(&mono_samples(buffer), buffer.sample_rate)
+}
+
+/// Same as `measure`, given an already-downmixed buffer. `analyze_asset_audio`
+/// (the one real caller that runs every analysis pass over the same file)
+/// downmixes once and shares that buffer across every pass instead of each
+/// one calling `mono_samples` on the original stereo buffer independently —
+/// a real, if modest, cost for a multi-minute file repeated six times over.
+pub fn measure_from_mono(mono: &[f32], sample_rate: u32) -> AudioMeasurements {
     let peak = mono.iter().fold(0.0f32, |max, sample| max.max(sample.abs()));
     let peak_db = if peak > 0.0 {
         20.0 * peak.log10()
@@ -82,11 +90,11 @@ pub fn measure(buffer: &DecodedAudioBuffer) -> AudioMeasurements {
         SILENT_PEAK_DB_FLOOR
     };
 
-    let envelope = energy_envelope(&mono, buffer.sample_rate, ENVELOPE_FRAME_MS);
-    let duration_secs = mono.len() as f32 / buffer.sample_rate.max(1) as f32;
+    let envelope = energy_envelope(mono, sample_rate, ENVELOPE_FRAME_MS);
+    let duration_secs = mono.len() as f32 / sample_rate.max(1) as f32;
     let transient_density = count_onsets(&envelope) as f32 / duration_secs.max(0.001);
 
-    let low_frequency_energy = low_frequency_energy_ratio(&mono, buffer.sample_rate);
+    let low_frequency_energy = low_frequency_energy_ratio(mono, sample_rate);
 
     AudioMeasurements {
         peak_db,
@@ -103,13 +111,18 @@ const MAX_BPM: u32 = 220;
 /// envelope. Not studio-grade — a simple, dependency-free approximation.
 /// Returns `None` for clips too short to meaningfully autocorrelate.
 pub fn estimate_tempo(buffer: &DecodedAudioBuffer) -> Option<TempoEstimate> {
-    let mono = mono_samples(buffer);
-    let duration_secs = mono.len() as f32 / buffer.sample_rate.max(1) as f32;
+    estimate_tempo_from_mono(&mono_samples(buffer), buffer.sample_rate)
+}
+
+/// Same as `estimate_tempo`, given an already-downmixed buffer — see
+/// `measure_from_mono`'s doc comment for why this split exists.
+pub fn estimate_tempo_from_mono(mono: &[f32], sample_rate: u32) -> Option<TempoEstimate> {
+    let duration_secs = mono.len() as f32 / sample_rate.max(1) as f32;
     if duration_secs < MIN_TEMPO_DURATION_SECS {
         return None;
     }
 
-    let envelope = energy_envelope(&mono, buffer.sample_rate, ENVELOPE_FRAME_MS);
+    let envelope = energy_envelope(mono, sample_rate, ENVELOPE_FRAME_MS);
     if envelope.len() < 4 {
         return None;
     }
@@ -180,8 +193,17 @@ pub fn suggest_action_tags(
     buffer: &DecodedAudioBuffer,
     measurements: AudioMeasurements,
 ) -> Vec<ActionTag> {
-    let mono = mono_samples(buffer);
-    let duration_secs = mono.len() as f32 / buffer.sample_rate.max(1) as f32;
+    suggest_action_tags_from_mono(&mono_samples(buffer), buffer.sample_rate, measurements)
+}
+
+/// Same as `suggest_action_tags`, given an already-downmixed buffer — see
+/// `measure_from_mono`'s doc comment for why this split exists.
+pub fn suggest_action_tags_from_mono(
+    mono: &[f32],
+    sample_rate: u32,
+    measurements: AudioMeasurements,
+) -> Vec<ActionTag> {
+    let duration_secs = mono.len() as f32 / sample_rate.max(1) as f32;
     let mut tags = Vec::new();
 
     if duration_secs <= IMPACT_MAX_DURATION_SECS
@@ -195,7 +217,7 @@ pub fn suggest_action_tags(
         tags.push(ActionTag::Whoosh);
     }
 
-    if duration_secs >= RISE_MIN_DURATION_SECS && trends_upward(&mono, buffer.sample_rate) {
+    if duration_secs >= RISE_MIN_DURATION_SECS && trends_upward(mono, sample_rate) {
         tags.push(ActionTag::Rise);
     }
 
@@ -291,7 +313,12 @@ pub struct PitchEstimate {
 /// are likely) and keeps the clearest hit rather than betting everything
 /// on a single window from dead-center.
 pub fn estimate_pitch(buffer: &DecodedAudioBuffer) -> Option<PitchEstimate> {
-    let mono = mono_samples(buffer);
+    estimate_pitch_from_mono(&mono_samples(buffer), buffer.sample_rate)
+}
+
+/// Same as `estimate_pitch`, given an already-downmixed buffer — see
+/// `measure_from_mono`'s doc comment for why this split exists.
+pub fn estimate_pitch_from_mono(mono: &[f32], sample_rate: u32) -> Option<PitchEstimate> {
     if mono.len() < MIN_SAMPLES_FOR_PITCH {
         return None;
     }
@@ -307,7 +334,7 @@ pub fn estimate_pitch(buffer: &DecodedAudioBuffer) -> Option<PitchEstimate> {
         let window = &mono[start..start + window_size];
         if let Some(pitch) = detector.get_pitch(
             window,
-            buffer.sample_rate as usize,
+            sample_rate as usize,
             PITCH_POWER_THRESHOLD,
             PITCH_CLARITY_THRESHOLD,
         ) {
@@ -401,7 +428,13 @@ pub struct KeyEstimate {
 /// (correlation below `KEY_MIN_STRENGTH`). Works on polyphonic music,
 /// unlike `estimate_pitch`.
 pub fn estimate_key(buffer: &DecodedAudioBuffer) -> Option<KeyEstimate> {
-    let estimate = estimate_key_unfiltered(buffer)?;
+    estimate_key_from_mono(&mono_samples(buffer), buffer.sample_rate)
+}
+
+/// Same as `estimate_key`, given an already-downmixed buffer — see
+/// `measure_from_mono`'s doc comment for why this split exists.
+pub fn estimate_key_from_mono(mono: &[f32], sample_rate: u32) -> Option<KeyEstimate> {
+    let estimate = estimate_key_unfiltered_from_mono(mono, sample_rate)?;
     if estimate.strength < KEY_MIN_STRENGTH {
         return None;
     }
@@ -413,8 +446,13 @@ pub fn estimate_key(buffer: &DecodedAudioBuffer) -> Option<KeyEstimate> {
 /// (or, for calibration/diagnostics, doesn't) whether the correlation is
 /// strong enough to call. `estimate_key` is just this plus that one cut.
 pub fn estimate_key_unfiltered(buffer: &DecodedAudioBuffer) -> Option<KeyEstimate> {
-    let mono = mono_samples(buffer);
-    let sample_rate = buffer.sample_rate.max(1) as f32;
+    estimate_key_unfiltered_from_mono(&mono_samples(buffer), buffer.sample_rate)
+}
+
+/// Same as `estimate_key_unfiltered`, given an already-downmixed buffer —
+/// see `measure_from_mono`'s doc comment for why this split exists.
+fn estimate_key_unfiltered_from_mono(mono: &[f32], sample_rate: u32) -> Option<KeyEstimate> {
+    let sample_rate = sample_rate.max(1) as f32;
     if mono.len() < KEY_MIN_SAMPLES || sample_rate <= 0.0 {
         return None;
     }
@@ -582,13 +620,18 @@ fn trim_to_vocal_detection_window(resampled: &[f32]) -> &[f32] {
 /// load. Silero only accepts 8kHz or 16kHz mono input, so this downmixes and
 /// resamples a copy of the buffer first — the original is untouched.
 pub fn detect_vocal_ratio(buffer: &DecodedAudioBuffer) -> Option<f32> {
-    let mono = mono_samples(buffer);
-    let duration_secs = mono.len() as f32 / buffer.sample_rate.max(1) as f32;
+    detect_vocal_ratio_from_mono(&mono_samples(buffer), buffer.sample_rate)
+}
+
+/// Same as `detect_vocal_ratio`, given an already-downmixed buffer — see
+/// `measure_from_mono`'s doc comment for why this split exists.
+pub fn detect_vocal_ratio_from_mono(mono: &[f32], sample_rate: u32) -> Option<f32> {
+    let duration_secs = mono.len() as f32 / sample_rate.max(1) as f32;
     if duration_secs < MIN_SECONDS_FOR_VOCAL_DETECTION {
         return None;
     }
 
-    let resampled = resample_linear(&mono, buffer.sample_rate.max(1), VAD_SAMPLE_RATE);
+    let resampled = resample_linear(mono, sample_rate.max(1), VAD_SAMPLE_RATE);
     if resampled.len() < VAD_CHUNK_SIZE {
         return None;
     }
@@ -678,7 +721,7 @@ fn trends_upward(mono: &[f32], sample_rate: u32) -> bool {
     last_avg > first_avg * RISE_TREND_RATIO
 }
 
-pub(crate) fn mono_samples(buffer: &DecodedAudioBuffer) -> Vec<f32> {
+pub fn mono_samples(buffer: &DecodedAudioBuffer) -> Vec<f32> {
     let channels = buffer.channels.max(1) as usize;
     if channels == 1 {
         return buffer.samples.clone();
