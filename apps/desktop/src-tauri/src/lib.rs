@@ -2376,8 +2376,6 @@ async fn process_audio_analysis_jobs(
             .map_err(storage_error_message)?
     };
 
-    let worker_state = app.state::<SimilarityWorkerState>();
-
     // Bounded rather than "all claimed jobs at once": the CPU-bound
     // decode/DSP/VAD work already gets real OS-thread parallelism via
     // spawn_blocking inside analyze_asset_audio, so this just caps how many
@@ -2388,7 +2386,7 @@ async fn process_audio_analysis_jobs(
     const AUDIO_ANALYSIS_CONCURRENCY: usize = 4;
 
     let mut results = stream::iter(jobs)
-        .map(|job| process_one_audio_analysis_job(&app, &state, &job_control, worker_state.inner(), job))
+        .map(|job| process_one_audio_analysis_job(&app, &state, &job_control, job))
         .buffer_unordered(AUDIO_ANALYSIS_CONCURRENCY);
 
     let mut processed = 0usize;
@@ -2427,7 +2425,6 @@ async fn process_one_audio_analysis_job(
     app: &tauri::AppHandle,
     state: &tauri::State<'_, CatalogState>,
     job_control: &tauri::State<'_, JobControlState>,
-    worker_state: &SimilarityWorkerState,
     job: storage::JobRecord,
 ) -> bool {
     use std::sync::atomic::Ordering;
@@ -2487,7 +2484,7 @@ async fn process_one_audio_analysis_job(
         return true;
     }
 
-    let outcome = analyze_asset_audio(app, worker_state, &local_path).await;
+    let outcome = analyze_asset_audio(app, job.asset_id, &local_path).await;
     let succeeded = outcome.is_ok();
 
     let catalog = state.0.lock().expect("catalog mutex poisoned");
@@ -2621,7 +2618,7 @@ struct AudioAnalysisOutcome {
 
 async fn analyze_asset_audio(
     app: &tauri::AppHandle,
-    worker_state: &SimilarityWorkerState,
+    asset_id: Uuid,
     path: &str,
 ) -> Result<AudioAnalysisOutcome, String> {
     // Decode + DSP + VAD inference are all synchronous, CPU-bound Rust —
@@ -2634,7 +2631,7 @@ async fn analyze_asset_audio(
     // spawn_blocking moves it onto Tokio's separate blocking-thread pool,
     // where it can run at full CPU cost without starving the UI thread.
     let path_owned = path.to_string();
-    let (needs_review, suggested_tags, vocal_ratio, mut update, waveform) =
+    let (needs_review, suggested_tags, vocal_ratio, update, waveform) =
         tauri::async_runtime::spawn_blocking(move || -> Result<_, String> {
             let buffer = audio_metadata::decode_any_supported_audio(&path_owned)
                 .map_err(|error| format!("{error:?}"))?;
@@ -2679,7 +2676,29 @@ async fn analyze_asset_audio(
         .await
         .map_err(|error| format!("audio analysis task panicked: {error}"))??;
 
-    update.perceptual_fingerprint = run_similarity_worker(app, worker_state, path).await;
+    // Fingerprinting runs fully detached from job completion — see the
+    // module note on run_similarity_worker for why. A full song can
+    // legitimately take longer to fingerprint than any timeout worth
+    // gating a job's completion on (bliss-audio's own feature extraction
+    // over several minutes of audio is real, CPU-bound work, not a
+    // hang), and this analysis job's *real* results — tempo, key, pitch,
+    // vocal ratio, the waveform — are already known at this point and
+    // shouldn't wait on a nice-to-have. When (if) the fingerprint
+    // arrives, it's written on its own via set_perceptual_fingerprint,
+    // which touches only that one column.
+    let app_owned = app.clone();
+    let path_owned = path.to_string();
+    tauri::async_runtime::spawn(async move {
+        let worker_state = app_owned.state::<SimilarityWorkerState>();
+        let Some(fingerprint) = run_similarity_worker(&app_owned, worker_state.inner(), &path_owned).await else {
+            return;
+        };
+        let catalog_state = app_owned.state::<CatalogState>();
+        let catalog = catalog_state.0.lock().expect("catalog mutex poisoned");
+        if let Err(error) = catalog.set_perceptual_fingerprint(asset_id, Some(fingerprint)) {
+            eprintln!("similarity-worker: failed to persist fingerprint for {asset_id}: {error:?}");
+        }
+    });
 
     Ok(AudioAnalysisOutcome {
         needs_review,
@@ -2709,17 +2728,20 @@ async fn analyze_asset_audio(
 ///
 /// This does mean concurrent analysis jobs take turns at the fingerprint
 /// step specifically, even though their much heavier decode/DSP/VAD work
-/// (see `analyze_asset_audio`) runs fully in parallel — real-world
-/// measurement (a batch that should take seconds sitting at 0% for
-/// minutes, CPU busy the whole time on other jobs' decode work) is what
-/// this doc comment used to say would justify revisiting that trade-off:
-/// a handful of files in one real library reliably made the sidecar hang
-/// or crawl, and because every *other* in-flight job's `analyze_asset_audio`
-/// call blocks on this same lock at its very last line, one bad file
-/// stalled the throughput of the whole concurrent batch, not just its own
-/// job. The timeout below is what actually bounds that now; a small pool
-/// of resident workers would remove the serialization point entirely, but
-/// isn't implemented here.
+/// runs fully in parallel — that used to matter more than it should have:
+/// `analyze_asset_audio` called this inline as its last step, so one file
+/// that made the sidecar hang or crawl (a real, repeatedly observed case —
+/// a handful of full-length songs in one real library, not a hang bug;
+/// bliss-audio's own feature extraction over several minutes of audio is
+/// genuine CPU-bound work) blocked every *other* concurrently-decoding
+/// job's completion behind this same lock, not just its own. Fingerprinting
+/// is now detached entirely from job completion (see `analyze_asset_audio`),
+/// so a slow or stuck sidecar only delays when a fingerprint shows up, if
+/// ever — it can no longer delay the job itself. The timeout below (and the
+/// one around acquiring the lock in the first place) still bounds how long
+/// one bad file can tie up the *fingerprint* pipeline specifically; a small
+/// pool of resident workers would remove the serialization point entirely,
+/// but isn't implemented here.
 async fn run_similarity_worker(
     app: &tauri::AppHandle,
     worker_state: &SimilarityWorkerState,

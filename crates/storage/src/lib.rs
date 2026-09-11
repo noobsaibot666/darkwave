@@ -928,6 +928,26 @@ impl Catalog {
         Ok(())
     }
 
+    /// Sets just the perceptual fingerprint, leaving every other analysis
+    /// field untouched — for the similarity-worker's fingerprint, which
+    /// now finishes on its own detached timeline well after
+    /// `set_audio_analysis` already completed the job (see
+    /// `analyze_asset_audio`'s doc comment for why): a full
+    /// `set_audio_analysis` call here would blindly overwrite tempo/key/
+    /// pitch/vocal-ratio with whatever this call happened to be given,
+    /// which for a detached late-arriving write is nothing meaningful.
+    pub fn set_perceptual_fingerprint(
+        &self,
+        asset_id: Uuid,
+        fingerprint: Option<String>,
+    ) -> Result<(), StorageError> {
+        self.connection.execute(
+            "UPDATE assets SET perceptual_fingerprint = ?1 WHERE id = ?2",
+            params![fingerprint, asset_id.to_string()],
+        )?;
+        Ok(())
+    }
+
     pub fn set_audio_analysis(
         &self,
         asset_id: Uuid,
@@ -4246,6 +4266,46 @@ mod tests {
         let loaded = catalog.get_asset(asset.id).expect("get").expect("exists");
         assert_eq!(loaded.detected_key.as_deref(), Some("A minor"));
         assert_eq!(loaded.key_strength, Some(0.83));
+    }
+
+    #[test]
+    fn set_perceptual_fingerprint_leaves_the_rest_of_the_analysis_alone() {
+        // The similarity-worker's fingerprint now arrives on its own
+        // detached timeline, well after set_audio_analysis already
+        // completed the job — this must be a narrow, single-column write,
+        // not something that could stomp tempo/key/pitch/vocal-ratio with
+        // whatever a late write happens to carry.
+        let catalog_path = unique_catalog_path("perceptual-fingerprint");
+        let catalog = Catalog::open(&catalog_path).expect("open catalog");
+        let library = catalog.create_library("Fingerprints", "/library").expect("library");
+        let asset = test_asset(&catalog, library.id, "song.wav", "hash-fingerprint");
+
+        catalog
+            .set_audio_analysis(
+                asset.id,
+                AudioAnalysisUpdate {
+                    detected_key: Some("A minor".to_string()),
+                    key_strength: Some(0.83),
+                    bpm: Some(120.0),
+                    ..Default::default()
+                },
+            )
+            .expect("analysis");
+
+        catalog
+            .set_perceptual_fingerprint(asset.id, Some("[0.1,0.2,0.3]".to_string()))
+            .expect("fingerprint");
+
+        let loaded = catalog.get_asset(asset.id).expect("get").expect("exists");
+        assert_eq!(loaded.detected_key.as_deref(), Some("A minor"));
+        assert_eq!(loaded.key_strength, Some(0.83));
+        assert_eq!(loaded.bpm, Some(120.0));
+
+        // perceptual_fingerprint isn't on AssetRecord (it's an opaque
+        // internal vector, never surfaced to the UI) — perceptual_fingerprints
+        // is its own accessor, used by similarity search.
+        let fingerprints = catalog.perceptual_fingerprints(library.id).expect("fingerprints");
+        assert_eq!(fingerprints, vec![(asset.id, "[0.1,0.2,0.3]".to_string())]);
     }
 
     #[test]
