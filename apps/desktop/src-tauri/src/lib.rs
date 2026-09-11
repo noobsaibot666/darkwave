@@ -1972,19 +1972,44 @@ async fn process_one_instrument_job(
     true
 }
 
-/// The Sonic Radar "sync" button: re-queue every analysis pass
-/// (waveform, tempo/key/vocal, instruments) for a selection — or the whole
-/// library when nothing is selected — so assets whose original jobs
-/// already completed pick up newer detection (ADR 0032). Returns the total
-/// number of jobs queued; the frontend then drives the normal drain.
+/// Job priority resync_analysis queues at for each kind — kept alongside
+/// resync_analysis rather than in `JobKind` itself since it's a UI-driven
+/// "how urgent is a manual re-analysis" choice, not an intrinsic property of
+/// the kind.
+fn resync_priority_for_job_kind(kind: &JobKind) -> i64 {
+    match kind {
+        JobKind::MetadataExtraction => 10,
+        JobKind::Hashing => 20,
+        JobKind::WaveformGeneration => 30,
+        JobKind::AudioAnalysis => 40,
+        JobKind::InstrumentDetection => 50,
+    }
+}
+
+/// The Sonic Radar "sync" button, and the inspector's per-track Analyze
+/// buttons: re-queue analysis for a selection — or the whole library when
+/// nothing is selected — so assets whose original jobs already completed
+/// pick up newer detection (ADR 0032). Returns the total number of jobs
+/// queued; the frontend then drives the normal drain.
+///
+/// `kinds` (job-kind strings, e.g. "audio_analysis", "instrument_detection")
+/// lets a caller target just one pass — the inspector's Sonic Radar section
+/// uses this so re-analyzing one asset doesn't also re-run every other pass
+/// on it. Omitted or empty defaults to all three passes (waveform, audio
+/// analysis, instrument detection), which is what the sidebar's whole-
+/// selection sync button relies on. Note tempo/key/pitch/vocals are *not*
+/// independently selectable: `analyze_asset_audio` decodes the file once and
+/// fills all four from that single pass, so every one of them maps to the
+/// same "audio_analysis" kind.
 // (async): the whole-library form runs bulk INSERT…SELECT over the entire
-// assets table three times; on a large library that's enough work that it
-// must not sit on the main thread (ADR 0024's recurring lesson).
+// assets table up to three times; on a large library that's enough work
+// that it must not sit on the main thread (ADR 0024's recurring lesson).
 #[tauri::command(async)]
 fn resync_analysis(
     state: tauri::State<'_, CatalogState>,
     library_id: String,
     asset_ids: Vec<String>,
+    kinds: Option<Vec<String>>,
 ) -> Result<usize, String> {
     let library_id = parse_uuid_field(&library_id, "library id")?;
     let asset_ids = asset_ids
@@ -1992,14 +2017,18 @@ fn resync_analysis(
         .map(|id| parse_uuid_field(id, "asset id"))
         .collect::<Result<Vec<_>, _>>()?;
 
+    let selected_kinds = match kinds {
+        Some(names) if !names.is_empty() => names
+            .iter()
+            .map(|name| parse_job_kind_field(name))
+            .collect::<Result<Vec<_>, _>>()?,
+        _ => vec![JobKind::WaveformGeneration, JobKind::AudioAnalysis, JobKind::InstrumentDetection],
+    };
+
     let catalog = state.0.lock().expect("catalog mutex poisoned");
-    let kinds = [
-        (JobKind::WaveformGeneration, 30_i64),
-        (JobKind::AudioAnalysis, 40),
-        (JobKind::InstrumentDetection, 50),
-    ];
     let mut queued = 0usize;
-    for (kind, priority) in kinds {
+    for kind in selected_kinds {
+        let priority = resync_priority_for_job_kind(&kind);
         queued += if asset_ids.is_empty() {
             catalog
                 .requeue_analysis_for_library(library_id, kind, priority)

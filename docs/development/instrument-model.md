@@ -19,18 +19,52 @@ rebuild — but requires an app restart to pick up.
 
 ## Where to get them
 
-YAMNet ships from TensorFlow Hub as a SavedModel/TFLite. Convert to ONNX
-with `tf2onnx`, keeping the **1-D float32 waveform input** (16 kHz mono) and
-the per-frame `scores` output — the graph already contains the log-mel
-frontend, so nothing else is needed on the Rust side:
+YAMNet ships from TensorFlow Hub as a `hub.load()`-able SavedModel. It
+doesn't expose a `serving_default` signature with a plain waveform input by
+default, so wrap it before converting — `hub.load()` returns
+`(scores, embeddings, log_mel_spectrogram)` from a plain call, so a thin
+`tf.Module` around it with an explicit `input_signature=[TensorSpec([None],
+float32)]` and a `{"scores": scores}` return gives `tf2onnx` a concrete
+signature to convert, and keeps the **1-D float32 waveform input** (16 kHz
+mono) and a `scores`-named output the Rust side matches by substring:
 
-```
-pip install tensorflow tensorflow-hub tf2onnx
-python -m tf2onnx.convert --saved-model <yamnet_saved_model> --output yamnet.onnx --opset 13
+```python
+import tensorflow as tf, tensorflow_hub as hub
+yamnet = hub.load("https://tfhub.dev/google/yamnet/1")
+
+class YAMNetWaveformModel(tf.Module):
+    def __init__(self, yamnet):
+        super().__init__()
+        self.yamnet = yamnet
+    @tf.function(input_signature=[tf.TensorSpec(shape=[None], dtype=tf.float32, name="waveform")])
+    def __call__(self, waveform):
+        scores, embeddings, spectrogram = self.yamnet(waveform)
+        return {"scores": scores}
+
+wrapper = YAMNetWaveformModel(yamnet)
+tf.saved_model.save(wrapper, "yamnet_saved_model", signatures={"serving_default": wrapper.__call__.get_concrete_function()})
 ```
 
-The class map is `yamnet_class_map.csv` from the same TF-Hub asset
-(`https://storage.googleapis.com/audioset/yamnet_class_map.csv`).
+```bash
+pip install tensorflow tensorflow-hub tf2onnx onnx onnxruntime
+python -m tf2onnx.convert --saved-model yamnet_saved_model --output yamnet.onnx --opset 13 --signature_def serving_default
+```
+
+Two toolchain snags hit in practice (as of late 2026) — worth checking
+first rather than re-discovering:
+
+- **TensorFlow has no wheel for very new Python versions** (nothing for
+  3.14 at time of writing). Use whatever's the latest Python TF actually
+  ships for — 3.10 worked — in a throwaway venv.
+- **Pin `onnx` down from latest** if `import onnx` fails with
+  `ml_dtypes` has no attribute `float4_e2m1fn` — TF 2.16's `ml_dtypes` pin
+  is older than current `onnx` expects. `onnx==1.16.1` paired cleanly with
+  `tensorflow==2.16.2` here.
+
+The class map is `yamnet_class_map.csv` from the same TF-Hub asset. The
+doc's previous URL (`storage.googleapis.com/audioset/yamnet_class_map.csv`)
+now 404s — pull it from TensorFlow's own repo instead:
+`https://raw.githubusercontent.com/tensorflow/models/master/research/audioset/yamnet/yamnet_class_map.csv`.
 
 Verify the ONNX I/O before shipping:
 - exactly one input, rank-1 float32 (`[num_samples]`)

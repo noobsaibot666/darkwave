@@ -8,9 +8,11 @@ import {
   Activity,
   Archive,
   Bell,
+  CheckCircle2,
   ChevronDown,
   ChevronLeft,
   ChevronRight,
+  Circle,
   Clapperboard,
   Contrast,
   Copy,
@@ -1027,6 +1029,23 @@ export function App() {
   // instrument-detection drain (its jobs stay pending harmlessly).
   const [instrumentDetectionAvailable, setInstrumentDetectionAvailable] = useState<boolean | null>(null);
   const [resyncing, setResyncing] = useState(false);
+  // Sonic Radar inspector panel: which per-asset analysis kind is currently
+  // queued/running (drives the row's progress bar/disabled state) and the
+  // last status line shown under the row list. Both reset when selection
+  // changes. sonicRadarBusyKind only clears once jobProgress/
+  // jobCompletionSummaries confirm the drain actually finished — not right
+  // after the queue call returns — so the UI never claims "analyzed" ahead
+  // of the backend actually having run it.
+  const [sonicRadarBusyKind, setSonicRadarBusyKind] = useState<"audio_analysis" | "instrument_detection" | null>(
+    null
+  );
+  const [sonicRadarStatus, setSonicRadarStatus] = useState<string | null>(null);
+  // True once jobProgress has shown sonicRadarBusyKind's entry at least
+  // once — distinguishes "the drain hasn't picked our job up yet" from
+  // "the drain finished" when jobProgress reports zero pending for a kind
+  // in both cases.
+  const sonicRadarSeenPendingRef = useRef(false);
+  const sonicRadarTimeoutRef = useRef<ReturnType<typeof setTimeout> | null>(null);
   const [backgroundActivityOpen, setBackgroundActivityOpen] = useState(false);
   const drainingJobKinds = useRef<Set<string>>(new Set());
   const [offlineControl, setOfflineControl] = useState<OfflineControlState | null>(null);
@@ -1597,6 +1616,13 @@ export function App() {
   }, [selectedAssetId, visibleAssets, browserRowHeightPx]);
 
   useEffect(() => {
+    setSonicRadarStatus(null);
+    setSonicRadarBusyKind(null);
+    sonicRadarSeenPendingRef.current = false;
+    if (sonicRadarTimeoutRef.current) {
+      clearTimeout(sonicRadarTimeoutRef.current);
+      sonicRadarTimeoutRef.current = null;
+    }
     if (!selectedAssetId) {
       setAppliedTags([]);
       setSuggestedTags([]);
@@ -2500,6 +2526,95 @@ export function App() {
       .catch((error) => setRefreshStatus(`Re-analysis failed: ${String(error)}`))
       .finally(() => setResyncing(false));
   }, [activeLibraryId, bulkAssetIds, runJobDrain, resyncing]);
+
+  // Sonic Radar inspector panel: analyze just the selected sound, and only
+  // the one job kind its missing row asked for. Tempo/key/pitch/vocals all
+  // come out of the same decode+DSP pass (analyze_asset_audio decodes the
+  // file once and fills every one of those fields together), so there's no
+  // "just tempo" job to run — every row in that group queues the same
+  // "audio_analysis" kind. Instrument detection is a genuinely separate
+  // model/pass, so it gets its own kind.
+  //
+  // sonicRadarBusyKind is deliberately NOT cleared here once the queue call
+  // resolves — that would just mean the job was *inserted*, not that it ran.
+  // The effect below watching jobProgress/jobCompletionSummaries is what
+  // actually clears it, once the drain reports the job finished (and,
+  // separately, whether it succeeded or failed).
+  const handleAnalyzeAssetKind = useCallback(
+    (kind: "audio_analysis" | "instrument_detection") => {
+      if (!activeLibraryId || !selectedAssetId || sonicRadarBusyKind) return;
+      sonicRadarSeenPendingRef.current = false;
+      if (sonicRadarTimeoutRef.current) {
+        clearTimeout(sonicRadarTimeoutRef.current);
+        sonicRadarTimeoutRef.current = null;
+      }
+      setSonicRadarBusyKind(kind);
+      setSonicRadarStatus(
+        kind === "audio_analysis" ? "Queuing tempo/key/pitch/vocal analysis…" : "Queuing instrument detection…"
+      );
+      invoke<number>("resync_analysis", { libraryId: activeLibraryId, assetIds: [selectedAssetId], kinds: [kind] })
+        .then((queued) => {
+          if (kind === "audio_analysis" && audioAnalysisPaused) {
+            // Queued, but nothing will drive it until the user resumes audio
+            // analysis (Maintenance) — don't sit here "Analyzing…" forever
+            // waiting for a drain that isn't going to run.
+            setSonicRadarStatus(
+              queued > 0
+                ? "Queued — audio analysis is paused; resume it in Maintenance to run this"
+                : "Nothing new to queue"
+            );
+            setSonicRadarBusyKind(null);
+            return;
+          }
+          setSonicRadarStatus("Analyzing…");
+          runJobDrain(activeLibraryId, [kind]);
+          // Safety net: if the drain never reports back (e.g. it was
+          // deduped against an already-running drain whose progress we
+          // never observed), don't leave the row spinning forever.
+          sonicRadarTimeoutRef.current = setTimeout(() => {
+            setSonicRadarBusyKind((current) => (current === kind ? null : current));
+            setSonicRadarStatus("Still running — check Background Activity for status");
+          }, 45000);
+        })
+        .catch((error) => {
+          setSonicRadarStatus(`Couldn't queue analysis: ${String(error)}`);
+          setSonicRadarBusyKind(null);
+        });
+    },
+    [activeLibraryId, selectedAssetId, runJobDrain, audioAnalysisPaused, sonicRadarBusyKind]
+  );
+
+  // Confirms the queued job actually finished (completed OR failed) before
+  // clearing the busy state, using the same ground-truth job_status diff
+  // runJobDrain already computes for the global completion toasts — not an
+  // optimistic timer. jobProgress no longer listing the kind means the
+  // backend drained it to zero pending; jobCompletionSummaries (when
+  // present) says whether that drain actually succeeded.
+  useEffect(() => {
+    if (!sonicRadarBusyKind) return;
+    const stillPending = jobProgress.some((job) => job.kind === sonicRadarBusyKind);
+    if (stillPending) {
+      sonicRadarSeenPendingRef.current = true;
+      return;
+    }
+    if (!sonicRadarSeenPendingRef.current) return; // drain hasn't picked it up yet
+    if (sonicRadarTimeoutRef.current) {
+      clearTimeout(sonicRadarTimeoutRef.current);
+      sonicRadarTimeoutRef.current = null;
+    }
+    const summary = jobCompletionSummaries[sonicRadarBusyKind];
+    setSonicRadarStatus(summary ? describeJobCompletion(summary).headline : "Done");
+    // Instrument detections live in a separate table (asset_instruments),
+    // not on the asset record refreshAssets already re-fetches — refetch it
+    // explicitly so the Instruments row's checkmark reflects the real
+    // result instead of the stale pre-analysis list.
+    if (sonicRadarBusyKind === "instrument_detection" && selectedAssetId) {
+      invoke<{ name: string; confidence: number }[]>("asset_instruments", { assetId: selectedAssetId })
+        .then(setAssetInstruments)
+        .catch(() => {});
+    }
+    setSonicRadarBusyKind(null);
+  }, [jobProgress, jobCompletionSummaries, sonicRadarBusyKind, selectedAssetId]);
 
   const handleExportSelected = useCallback(
     async (format?: "wav24") => {
@@ -4294,6 +4409,127 @@ export function App() {
                 </button>
               ))}
           </div>
+        </CollapsibleSection>
+        <CollapsibleSection
+          id="sonic-radar-track"
+          title="Sonic Radar"
+          icon={<Activity size={14} />}
+          className="sonic-radar-track-section"
+          collapsed={collapsedSections.has("sonic-radar-track")}
+          onToggle={toggleSection}
+        >
+          {selectedAsset ? (
+            <>
+              <div className="radar-status-list">
+                {[
+                  {
+                    key: "tempo",
+                    label: "Tempo",
+                    detected: selectedAsset.bpm != null,
+                    value: selectedAsset.bpm != null ? `~${Math.round(selectedAsset.bpm)} BPM` : null,
+                    kind: "audio_analysis" as const,
+                    hint: "Runs the full audio analysis pass (tempo, key, pitch, and vocals are detected together in one decode)"
+                  },
+                  {
+                    key: "key",
+                    label: "Key",
+                    detected: selectedAsset.detected_key != null,
+                    value: selectedAsset.detected_key,
+                    kind: "audio_analysis" as const,
+                    hint: "Runs the full audio analysis pass (tempo, key, pitch, and vocals are detected together in one decode)"
+                  },
+                  {
+                    key: "pitch",
+                    label: "Pitch",
+                    detected: selectedAsset.musical_key != null,
+                    value: selectedAsset.musical_key,
+                    kind: "audio_analysis" as const,
+                    hint: "Runs the full audio analysis pass (tempo, key, pitch, and vocals are detected together in one decode)"
+                  },
+                  {
+                    key: "vocals",
+                    label: "Vocals",
+                    detected: selectedAsset.vocal_ratio != null,
+                    value:
+                      selectedAsset.vocal_ratio != null
+                        ? `${(selectedAsset.vocal_ratio ?? 0) >= VOCAL_RATIO_THRESHOLD ? "Vocal" : "Instrumental"} · ${Math.round(
+                            (selectedAsset.vocal_ratio ?? 0) * 100
+                          )}%`
+                        : null,
+                    kind: "audio_analysis" as const,
+                    hint: "Runs the full audio analysis pass (tempo, key, pitch, and vocals are detected together in one decode)"
+                  },
+                  {
+                    key: "instruments",
+                    label: "Instruments",
+                    detected: assetInstruments.length > 0,
+                    value: assetInstruments.length > 0 ? `${assetInstruments.length} detected` : null,
+                    kind: "instrument_detection" as const,
+                    hint: "Runs instrument detection separately — it's its own model/pass, not part of the audio analysis above"
+                  }
+                ].map((row) => {
+                  const busyHere = sonicRadarBusyKind === row.kind;
+                  const modelMissing = row.kind === "instrument_detection" && instrumentDetectionAvailable === false;
+                  return (
+                    <div className="radar-status-row" key={row.key}>
+                      <span className={row.detected ? "radar-status-icon detected" : "radar-status-icon"}>
+                        {row.detected ? <CheckCircle2 size={15} /> : <Circle size={15} />}
+                      </span>
+                      <span className="radar-status-name">{row.label}</span>
+                      {row.detected ? (
+                        <span className="radar-status-value">{row.value}</span>
+                      ) : modelMissing ? (
+                        <span className="radar-status-hint" title="Detection model isn't installed — see docs">
+                          Model not installed
+                        </span>
+                      ) : (
+                        <button
+                          type="button"
+                          className="radar-analyze-btn"
+                          // Only one analysis runs from this panel at a time — a
+                          // second click here would just requeue the same job
+                          // (or the other kind's job) on top of one already
+                          // in flight, with no way to show two progress bars
+                          // at once, so every not-yet-detected row disables
+                          // while any kind is busy, not just its own.
+                          disabled={sonicRadarBusyKind !== null}
+                          title={row.hint}
+                          onClick={() => handleAnalyzeAssetKind(row.kind)}
+                        >
+                          {busyHere ? "Analyzing…" : "Analyze"}
+                        </button>
+                      )}
+                    </div>
+                  );
+                })}
+              </div>
+              {sonicRadarBusyKind ? (
+                (() => {
+                  const job = jobProgress.find((entry) => entry.kind === sonicRadarBusyKind);
+                  const done = job ? job.total - job.pending : 0;
+                  const percent = job && job.total > 0 ? Math.round((done / job.total) * 100) : null;
+                  return (
+                    <div className="radar-progress" aria-label="Analysis progress" role="status">
+                      <span className="radar-progress-track">
+                        <span
+                          className={percent == null ? "radar-progress-fill indeterminate" : "radar-progress-fill"}
+                          style={{ width: `${percent ?? 30}%` }}
+                        />
+                      </span>
+                      <span className="radar-progress-label">
+                        {sonicRadarStatus ?? "Analyzing…"}
+                        {job ? ` (${done}/${job.total})` : ""}
+                      </span>
+                    </div>
+                  );
+                })()
+              ) : sonicRadarStatus ? (
+                <div className="status-line">{sonicRadarStatus}</div>
+              ) : null}
+            </>
+          ) : (
+            <span className="empty-hint">Select a sound to see its Sonic Radar status</span>
+          )}
         </CollapsibleSection>
         {selectedAsset && (selectedAsset.embedded_title || selectedAsset.embedded_genre || selectedAsset.embedded_comment) ? (
           <CollapsibleSection
