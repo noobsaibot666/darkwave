@@ -165,6 +165,7 @@ pub struct LicenseReportRow {
     pub attribution: Option<String>,
     pub restrictions: Option<String>,
     pub receipt_path: Option<String>,
+    pub license_valid_until: Option<String>,
     pub usage_status: String,
     pub destination: Option<String>,
 }
@@ -479,7 +480,7 @@ impl Default for ExportQueue {
 
 pub fn render_license_report_csv(rows: &[LicenseReportRow]) -> String {
     let mut output = String::from(
-        "asset_title,original_filename,provider,source_url,license_type,license_status,attribution,restrictions,receipt_path,usage_status,destination\n",
+        "asset_title,original_filename,provider,source_url,license_type,license_status,attribution,restrictions,receipt_path,license_valid_until,usage_status,destination\n",
     );
 
     for row in rows {
@@ -493,6 +494,7 @@ pub fn render_license_report_csv(rows: &[LicenseReportRow]) -> String {
             row.attribution.as_deref().unwrap_or_default(),
             row.restrictions.as_deref().unwrap_or_default(),
             row.receipt_path.as_deref().unwrap_or_default(),
+            row.license_valid_until.as_deref().unwrap_or_default(),
             row.usage_status.as_str(),
             row.destination.as_deref().unwrap_or_default(),
         ];
@@ -981,6 +983,7 @@ mod tests {
             attribution: Some("Artist \"A\"".to_string()),
             restrictions: Some("client project only".to_string()),
             receipt_path: Some("receipts/boom.pdf".to_string()),
+            license_valid_until: Some("2027-01-05".to_string()),
             usage_status: "exported".to_string(),
             destination: Some("/project/audio/impact.wav".to_string()),
         }]);
@@ -989,6 +992,7 @@ mod tests {
         assert!(csv.contains("\"Dark, Metallic Hit\""));
         assert!(csv.contains("\"Artist \"\"A\"\"\""));
         assert!(csv.contains("receipts/boom.pdf"));
+        assert!(csv.contains("2027-01-05"));
     }
 
     #[test]

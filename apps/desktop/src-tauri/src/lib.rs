@@ -448,6 +448,16 @@ fn maintenance_report(
         }
     }
 
+    let expired_licenses = catalog
+        .assets_with_expired_license(library_id, &license_documents::today_iso())
+        .map_err(storage_error_message)?;
+    for (asset_id, expired_on) in expired_licenses {
+        findings.push(maintenance::MaintenanceFinding::license_expired(
+            asset_id,
+            &expired_on,
+        ));
+    }
+
     // One finding per pending job, but capped: a whole-library re-sync (ADR
     // 0032) or a fresh bulk import can leave thousands pending for a few
     // minutes, and the maintenance panel only shows a count — thousands of
@@ -1141,6 +1151,7 @@ fn export_project_license_report(
             attribution: row.attribution,
             restrictions: row.restrictions,
             receipt_path: row.receipt_path,
+            license_valid_until: row.license_valid_until,
             usage_status: row.usage_status,
             destination: row.destination,
         })
@@ -3622,6 +3633,184 @@ fn set_source_record(
         .map_err(storage_error_message)
 }
 
+#[derive(Debug, serde::Serialize)]
+struct LicenseDateCandidateDto {
+    date: String,
+    keyword: String,
+    context: String,
+}
+
+#[derive(Debug, serde::Serialize)]
+struct LicenseDocumentAttachOutcome {
+    source: SourceRecordDraft,
+    candidates: Vec<LicenseDateCandidateDto>,
+}
+
+fn license_document_relative_path(asset_id: Uuid, original_filename: &str) -> String {
+    format!(
+        "License/{}-{}",
+        asset_id,
+        export_pipeline::sanitize_filename(original_filename)
+    )
+}
+
+fn asset_media_root(catalog: &Catalog, asset_id: Uuid) -> Result<PathBuf, String> {
+    let asset = catalog
+        .get_asset(asset_id)
+        .map_err(storage_error_message)?
+        .ok_or_else(|| "asset not found".to_string())?;
+    let library = catalog
+        .get_library(asset.library_id)
+        .map_err(storage_error_message)?
+        .ok_or_else(|| "library not found".to_string())?;
+    Ok(PathBuf::from(library.media_root))
+}
+
+/// Copies a license/usage-rights PDF the user picked into
+/// `<media_root>/License/`, best-effort extracts candidate expiry dates
+/// (a parse failure here — encrypted, scanned/image-only, malformed PDF —
+/// does not fail the attach, it just means zero candidates), and records
+/// the document's path on the asset's `source_records` row. Deliberately
+/// does **not** write `license_valid_until` itself — the returned
+/// candidates are suggestions for the frontend to offer, never applied
+/// unseen. See `crates/license-documents` for why.
+///
+/// A plain `&Catalog` function (like `resolve_asset_path`) rather than
+/// taking `tauri::State` directly, so it's callable from a unit test
+/// without a running Tauri app.
+fn attach_license_document_impl(
+    catalog: &Catalog,
+    asset_id: Uuid,
+    source_path: &std::path::Path,
+) -> Result<LicenseDocumentAttachOutcome, String> {
+    let media_root = asset_media_root(catalog, asset_id)?;
+    let original_filename = source_path
+        .file_name()
+        .and_then(|name| name.to_str())
+        .ok_or_else(|| "license document has no filename".to_string())?;
+    let relative_path = license_document_relative_path(asset_id, original_filename);
+
+    let mut draft = catalog
+        .get_source_record(asset_id)
+        .map_err(storage_error_message)?
+        .unwrap_or(SourceRecordDraft {
+            asset_id,
+            ..Default::default()
+        });
+
+    // Replacing an already-attached document with a differently-named
+    // file (e.g. a renewed license PDF) would otherwise leave the old copy
+    // orphaned under License/ forever — best-effort, since a missing old
+    // file (already deleted by hand) shouldn't block attaching the new one.
+    if let Some(previous_relative_path) = &draft.license_document_path {
+        if previous_relative_path != &relative_path {
+            let _ = std::fs::remove_file(media_root.join(previous_relative_path));
+        }
+    }
+
+    let license_dir = media_root.join("License");
+    std::fs::create_dir_all(&license_dir)
+        .map_err(|error| format!("create License folder: {error}"))?;
+    let source_bytes =
+        std::fs::read(source_path).map_err(|error| format!("read license document: {error}"))?;
+    let destination = media_root.join(&relative_path);
+    std::fs::write(&destination, &source_bytes)
+        .map_err(|error| format!("copy license document: {error}"))?;
+
+    let candidates = license_documents::extract_text(&source_bytes)
+        .ok()
+        .map(|text| license_documents::find_date_candidates(&text))
+        .unwrap_or_default();
+
+    draft.license_document_path = Some(relative_path);
+    catalog
+        .set_source_record(draft.clone())
+        .map_err(storage_error_message)?;
+
+    Ok(LicenseDocumentAttachOutcome {
+        source: draft,
+        candidates: candidates
+            .into_iter()
+            .map(|candidate| LicenseDateCandidateDto {
+                date: candidate.date.to_string(),
+                keyword: candidate.keyword.to_string(),
+                context: candidate.context,
+            })
+            .collect(),
+    })
+}
+
+#[tauri::command(async)]
+fn attach_license_document(
+    state: tauri::State<CatalogState>,
+    asset_id: String,
+    source_path: String,
+) -> Result<LicenseDocumentAttachOutcome, String> {
+    let asset_id = parse_uuid_field(&asset_id, "asset id")?;
+    let catalog = state.0.lock().expect("catalog mutex poisoned");
+    attach_license_document_impl(&catalog, asset_id, std::path::Path::new(&source_path))
+}
+
+/// Best-effort deletes the attached PDF and clears its path. Leaves a
+/// manually-confirmed `license_valid_until` in place (the user's own
+/// judgment doesn't depend on the file still existing); clears it if it
+/// was still just an unconfirmed extracted suggestion, since its only
+/// source of truth is gone. `license_valid_from` is never touched here —
+/// unlike `license_valid_until`, nothing in this feature ever suggests a
+/// start date from the PDF, so it's always something the user typed
+/// themselves and `license_expiry_source` (which only describes
+/// `license_valid_until`'s provenance) has no bearing on it.
+fn remove_license_document_impl(catalog: &Catalog, asset_id: Uuid) -> Result<(), String> {
+    let Some(mut draft) = catalog.get_source_record(asset_id).map_err(storage_error_message)? else {
+        return Ok(());
+    };
+
+    if let Some(relative_path) = draft.license_document_path.take() {
+        if let Ok(media_root) = asset_media_root(catalog, asset_id) {
+            let _ = std::fs::remove_file(media_root.join(relative_path));
+        }
+    }
+
+    if draft.license_expiry_source.as_deref() == Some("extracted") {
+        draft.license_valid_until = None;
+        draft.license_expiry_source = None;
+    }
+
+    catalog.set_source_record(draft).map_err(storage_error_message)
+}
+
+#[tauri::command(async)]
+fn remove_license_document(state: tauri::State<CatalogState>, asset_id: String) -> Result<(), String> {
+    let asset_id = parse_uuid_field(&asset_id, "asset id")?;
+    let catalog = state.0.lock().expect("catalog mutex poisoned");
+    remove_license_document_impl(&catalog, asset_id)
+}
+
+/// Resolves the attached PDF's relative path to an absolute one, for the
+/// frontend's "Reveal in Folder" button (mirrors `resolve_asset_path`).
+fn resolve_license_document_path_impl(catalog: &Catalog, asset_id: Uuid) -> Result<Option<String>, String> {
+    let Some(relative_path) = catalog
+        .get_source_record(asset_id)
+        .map_err(storage_error_message)?
+        .and_then(|draft| draft.license_document_path)
+    else {
+        return Ok(None);
+    };
+
+    let media_root = asset_media_root(catalog, asset_id)?;
+    Ok(Some(media_root.join(relative_path).to_string_lossy().to_string()))
+}
+
+#[tauri::command]
+fn resolve_license_document_path(
+    state: tauri::State<CatalogState>,
+    asset_id: String,
+) -> Result<Option<String>, String> {
+    let asset_id = parse_uuid_field(&asset_id, "asset id")?;
+    let catalog = state.0.lock().expect("catalog mutex poisoned");
+    resolve_license_document_path_impl(&catalog, asset_id)
+}
+
 #[tauri::command]
 fn export_selected_asset(
     state: tauri::State<CatalogState>,
@@ -4143,6 +4332,9 @@ pub fn run() {
             assets_in_smart_collection,
             get_source_record,
             set_source_record,
+            attach_license_document,
+            remove_license_document,
+            resolve_license_document_path,
             export_selected_asset,
             load_app_preferences,
             save_app_preferences,
@@ -4365,4 +4557,176 @@ mod tests {
         );
     }
 
+    fn temp_dir(label: &str) -> std::path::PathBuf {
+        let dir = std::env::temp_dir().join(format!(
+            "darkwave-license-doc-test-{label}-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        dir
+    }
+
+    fn catalog_with_asset(media_root: &std::path::Path) -> (storage::Catalog, uuid::Uuid) {
+        let catalog = storage::Catalog::open(":memory:").expect("open catalog");
+        let library = catalog
+            .create_library("Test Library", media_root.to_string_lossy())
+            .expect("create library");
+        let (asset, _created) = catalog
+            .register_asset(storage::NewAssetRecord {
+                library_id: library.id,
+                original_filename: "track.wav".to_string(),
+                display_name: "Track".to_string(),
+                path: storage::AssetPath::Managed("Media/00/track.wav".to_string()),
+                storage_mode: shared_types::StorageMode::Managed,
+                content_hash: Some("hash-license-doc-test".to_string()),
+                media_type: "music".to_string(),
+                file_size: 0,
+                availability_state: shared_types::AvailabilityState::Local,
+            })
+            .expect("register asset");
+        (catalog, asset.id)
+    }
+
+    #[test]
+    fn attach_license_document_copies_into_media_root_license_folder_and_extracts_candidates() {
+        let media_root = temp_dir("attach");
+        let (catalog, asset_id) = catalog_with_asset(&media_root);
+
+        let source_dir = temp_dir("attach-source");
+        let source_path = source_dir.join("My License.pdf");
+        // Not a real PDF — attach must still succeed (extraction is
+        // best-effort) and just report zero candidates.
+        std::fs::write(&source_path, b"not actually a pdf").unwrap();
+
+        let outcome = super::attach_license_document_impl(&catalog, asset_id, &source_path)
+            .expect("attach should succeed even when extraction fails");
+
+        assert!(outcome.candidates.is_empty());
+        let relative_path = outcome
+            .source
+            .license_document_path
+            .clone()
+            .expect("document path recorded");
+        assert!(relative_path.starts_with(&format!("License/{asset_id}-")));
+        assert!(media_root.join(&relative_path).exists());
+
+        let reloaded = catalog
+            .get_source_record(asset_id)
+            .expect("query")
+            .expect("record exists");
+        assert_eq!(reloaded.license_document_path, Some(relative_path));
+
+        std::fs::remove_dir_all(&media_root).ok();
+        std::fs::remove_dir_all(&source_dir).ok();
+    }
+
+    #[test]
+    fn attaching_a_replacement_document_removes_the_previous_file() {
+        let media_root = temp_dir("attach-replace");
+        let (catalog, asset_id) = catalog_with_asset(&media_root);
+        let source_dir = temp_dir("attach-replace-source");
+
+        let first_source = source_dir.join("Old License.pdf");
+        std::fs::write(&first_source, b"not actually a pdf").unwrap();
+        let first_outcome = super::attach_license_document_impl(&catalog, asset_id, &first_source).expect("first attach");
+        let first_relative_path = first_outcome.source.license_document_path.expect("first path recorded");
+        let first_absolute_path = media_root.join(&first_relative_path);
+        assert!(first_absolute_path.exists());
+
+        let second_source = source_dir.join("Renewed License.pdf");
+        std::fs::write(&second_source, b"not actually a pdf either").unwrap();
+        let second_outcome = super::attach_license_document_impl(&catalog, asset_id, &second_source).expect("second attach");
+        let second_relative_path = second_outcome.source.license_document_path.expect("second path recorded");
+
+        assert_ne!(first_relative_path, second_relative_path);
+        assert!(!first_absolute_path.exists(), "replaced document should be cleaned up");
+        assert!(media_root.join(&second_relative_path).exists());
+
+        std::fs::remove_dir_all(&media_root).ok();
+        std::fs::remove_dir_all(&source_dir).ok();
+    }
+
+    #[test]
+    fn remove_license_document_deletes_file_and_clears_extracted_dates_but_keeps_manual_ones() {
+        let media_root = temp_dir("remove");
+        let (catalog, asset_id) = catalog_with_asset(&media_root);
+        let source_dir = temp_dir("remove-source");
+        let source_path = source_dir.join("license.pdf");
+        std::fs::write(&source_path, b"not actually a pdf").unwrap();
+
+        let outcome = super::attach_license_document_impl(&catalog, asset_id, &source_path).expect("attach");
+        let mut draft = outcome.source;
+        draft.license_valid_until = Some("2027-01-05".to_string());
+        draft.license_expiry_source = Some("manual".to_string());
+        catalog.set_source_record(draft).expect("save manual date");
+
+        super::remove_license_document_impl(&catalog, asset_id).expect("remove");
+
+        let reloaded = catalog
+            .get_source_record(asset_id)
+            .expect("query")
+            .expect("record exists");
+        assert_eq!(reloaded.license_document_path, None);
+        // A manually-confirmed date must survive document removal.
+        assert_eq!(reloaded.license_valid_until.as_deref(), Some("2027-01-05"));
+
+        std::fs::remove_dir_all(&media_root).ok();
+        std::fs::remove_dir_all(&source_dir).ok();
+    }
+
+    #[test]
+    fn remove_license_document_clears_only_the_unconfirmed_extracted_date_not_a_manual_valid_from() {
+        let media_root = temp_dir("remove-mixed");
+        let (catalog, asset_id) = catalog_with_asset(&media_root);
+        let source_dir = temp_dir("remove-mixed-source");
+        let source_path = source_dir.join("license.pdf");
+        std::fs::write(&source_path, b"not actually a pdf").unwrap();
+
+        let outcome = super::attach_license_document_impl(&catalog, asset_id, &source_path).expect("attach");
+        let mut draft = outcome.source;
+        // license_valid_from is manually typed (there is no extraction path
+        // for it at all) while license_valid_until is still just an
+        // unconfirmed extracted suggestion — license_expiry_source only
+        // describes the latter, and must not cause the former to be wiped.
+        draft.license_valid_from = Some("2026-01-01".to_string());
+        draft.license_valid_until = Some("2027-01-05".to_string());
+        draft.license_expiry_source = Some("extracted".to_string());
+        catalog.set_source_record(draft).expect("save mixed manual/extracted dates");
+
+        super::remove_license_document_impl(&catalog, asset_id).expect("remove");
+
+        let reloaded = catalog
+            .get_source_record(asset_id)
+            .expect("query")
+            .expect("record exists");
+        assert_eq!(reloaded.license_valid_from.as_deref(), Some("2026-01-01"));
+        assert_eq!(reloaded.license_valid_until, None);
+        assert_eq!(reloaded.license_expiry_source, None);
+
+        std::fs::remove_dir_all(&media_root).ok();
+        std::fs::remove_dir_all(&source_dir).ok();
+    }
+
+    #[test]
+    fn resolve_license_document_path_returns_absolute_path_under_media_root() {
+        let media_root = temp_dir("resolve");
+        let (catalog, asset_id) = catalog_with_asset(&media_root);
+        let source_dir = temp_dir("resolve-source");
+        let source_path = source_dir.join("license.pdf");
+        std::fs::write(&source_path, b"not actually a pdf").unwrap();
+        super::attach_license_document_impl(&catalog, asset_id, &source_path).expect("attach");
+
+        let resolved = super::resolve_license_document_path_impl(&catalog, asset_id)
+            .expect("resolve")
+            .expect("path present");
+        assert!(std::path::Path::new(&resolved).starts_with(&media_root));
+        assert!(std::path::Path::new(&resolved).exists());
+
+        std::fs::remove_dir_all(&media_root).ok();
+        std::fs::remove_dir_all(&source_dir).ok();
+    }
 }

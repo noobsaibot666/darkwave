@@ -6,6 +6,7 @@ use uuid::Uuid;
 pub enum MaintenanceFindingKind {
     MissingMedia,
     LicenseReviewRequired,
+    LicenseExpired,
     StaleWaveformCache,
     DuplicateContent,
 }
@@ -77,6 +78,15 @@ impl MaintenanceFinding {
             kind: MaintenanceFindingKind::LicenseReviewRequired,
             asset_ids: vec![asset_id],
             detail: "Source or license status needs review".to_string(),
+            recommended_action: MaintenanceAction::Review,
+        }
+    }
+
+    pub fn license_expired(asset_id: Uuid, expired_on: &str) -> Self {
+        Self {
+            kind: MaintenanceFindingKind::LicenseExpired,
+            asset_ids: vec![asset_id],
+            detail: format!("License expired on {expired_on}"),
             recommended_action: MaintenanceAction::Review,
         }
     }
@@ -240,6 +250,17 @@ mod tests {
         assert_eq!(finding.kind, MaintenanceFindingKind::DuplicateContent);
         assert_eq!(finding.recommended_action, MaintenanceAction::Review);
         assert_eq!(finding.asset_ids, vec![first, second]);
+    }
+
+    #[test]
+    fn license_expired_reports_the_expiry_date_and_recommends_review() {
+        let asset_id = Uuid::new_v4();
+        let finding = MaintenanceFinding::license_expired(asset_id, "2026-01-01");
+
+        assert_eq!(finding.kind, MaintenanceFindingKind::LicenseExpired);
+        assert_eq!(finding.recommended_action, MaintenanceAction::Review);
+        assert_eq!(finding.asset_ids, vec![asset_id]);
+        assert!(finding.detail.contains("2026-01-01"));
     }
 
     #[test]

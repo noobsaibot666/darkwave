@@ -408,6 +408,7 @@ pub fn commit_prepared_import(
                 attribution: source_context.attribution,
                 restrictions: source_context.restrictions,
                 receipt_path: source_context.receipt_path,
+                ..Default::default()
             })?;
         }
 

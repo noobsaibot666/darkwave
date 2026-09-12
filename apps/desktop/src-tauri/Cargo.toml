@@ -22,6 +22,7 @@ command-palette = { path = "../../../crates/command-palette" }
 export-pipeline = { path = "../../../crates/export-pipeline" }
 fingerprint = { path = "../../../crates/fingerprint" }
 import-pipeline = { path = "../../../crates/import-pipeline" }
+license-documents = { path = "../../../crates/license-documents" }
 library-core = { path = "../../../crates/library-core" }
 library-sync = { path = "../../../crates/library-sync" }
 maintenance = { path = "../../../crates/maintenance" }

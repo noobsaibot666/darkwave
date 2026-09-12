@@ -21,6 +21,7 @@ import {
   Copy,
   Database,
   Eye,
+  FileText,
   FileWarning,
   Flag,
   FolderCheck,
@@ -251,7 +252,56 @@ type SourceRecordDraft = {
   attribution: string | null;
   restrictions: string | null;
   receipt_path: string | null;
+  license_document_path: string | null;
+  license_valid_from: string | null;
+  license_valid_until: string | null;
+  license_expiry_source: string | null;
 };
+
+type LicenseDateCandidate = { date: string; keyword: string; context: string };
+
+type LicenseDocumentAttachOutcome = {
+  source: SourceRecordDraft;
+  candidates: LicenseDateCandidate[];
+};
+
+function emptySourceDraft(assetId: string): SourceRecordDraft {
+  return {
+    asset_id: assetId,
+    provider: null,
+    source_url: null,
+    license_type: null,
+    license_status: null,
+    attribution: null,
+    restrictions: null,
+    receipt_path: null,
+    license_document_path: null,
+    license_valid_from: null,
+    license_valid_until: null,
+    license_expiry_source: null
+  };
+}
+
+type LicenseValidityTone = "none" | "valid" | "soon" | "expired";
+
+// String comparison is intentional and correct for ISO YYYY-MM-DD dates
+// (lexicographic order matches chronological order) — mirrors the same
+// comparison the backend's assets_with_expired_license query does, so the
+// badge here and the Maintenance "License expired" finding never disagree.
+function licenseValidityStatus(validUntil: string | null): { label: string; tone: LicenseValidityTone } {
+  if (!validUntil) return { label: "No expiry set", tone: "none" };
+
+  const today = new Date().toISOString().slice(0, 10);
+  if (validUntil < today) return { label: `Expired since ${validUntil}`, tone: "expired" };
+
+  const daysLeft = Math.round(
+    (Date.parse(`${validUntil}T00:00:00Z`) - Date.parse(`${today}T00:00:00Z`)) / 86_400_000
+  );
+  if (daysLeft <= 30) {
+    return { label: `Expires in ${daysLeft} day${daysLeft === 1 ? "" : "s"} (${validUntil})`, tone: "soon" };
+  }
+  return { label: `Valid until ${validUntil}`, tone: "valid" };
+}
 
 type MaintenanceReport = {
   total_findings: number;
@@ -628,6 +678,7 @@ const JOB_KINDS: {
 const maintenanceLabels: Record<string, string> = {
   MissingMedia: "Missing media",
   LicenseReviewRequired: "License review",
+  LicenseExpired: "License expired",
   StaleWaveformCache: "Waveform cache",
   DuplicateContent: "Duplicates"
 };
@@ -1145,6 +1196,8 @@ export function App() {
   const [redoStack, setRedoStack] = useState<{ id: string; label: string }[]>([]);
 
   const [sourceDraft, setSourceDraft] = useState<SourceRecordDraft | null>(null);
+  const [licenseDateCandidates, setLicenseDateCandidates] = useState<LicenseDateCandidate[]>([]);
+  const [licenseDocumentStatus, setLicenseDocumentStatus] = useState<string | null>(null);
   const [maintenanceReport, setMaintenanceReport] = useState<MaintenanceReport | null>(null);
   const [mediaRootStatus, setMediaRootStatus] = useState<{ status: string; reconnectRequired: boolean } | null>(null);
   const [exportStatus, setExportStatus] = useState<string | null>(null);
@@ -1529,21 +1582,10 @@ export function App() {
       .then(setSuggestedTags)
       .catch(() => setSuggestedTags([]));
     invoke<SourceRecordDraft | null>("get_source_record", { assetId })
-      .then((record) =>
-        setSourceDraft(
-          record ?? {
-            asset_id: assetId,
-            provider: null,
-            source_url: null,
-            license_type: null,
-            license_status: null,
-            attribution: null,
-            restrictions: null,
-            receipt_path: null
-          }
-        )
-      )
+      .then((record) => setSourceDraft(record ?? emptySourceDraft(assetId)))
       .catch(() => setSourceDraft(null));
+    setLicenseDateCandidates([]);
+    setLicenseDocumentStatus(null);
   }, []);
 
   useEffect(() => {
@@ -2521,6 +2563,76 @@ export function App() {
       .then(() => activeLibraryId && refreshMaintenance(activeLibraryId))
       .catch(() => {});
   }, [sourceDraft, activeLibraryId, refreshMaintenance]);
+
+  const handleAttachLicenseDocument = useCallback(async () => {
+    if (!sourceDraft) return;
+    const selected = await openDialog({
+      multiple: false,
+      filters: [{ name: "PDF", extensions: ["pdf"] }],
+      title: "Choose a license PDF"
+    });
+    if (typeof selected !== "string") return;
+
+    setLicenseDocumentStatus("Attaching…");
+    try {
+      const outcome = await invoke<LicenseDocumentAttachOutcome>("attach_license_document", {
+        assetId: sourceDraft.asset_id,
+        sourcePath: selected
+      });
+      setLicenseDateCandidates(outcome.candidates);
+      setSourceDraft((previous) => {
+        if (!previous) return previous;
+        // A single high-confidence candidate is worth pre-filling so
+        // confirming is one click — but never overwrite a date the user
+        // already entered or confirmed.
+        const singleCandidate = outcome.candidates.length === 1 ? outcome.candidates[0] : null;
+        return {
+          ...previous,
+          license_document_path: outcome.source.license_document_path,
+          ...(singleCandidate && !previous.license_valid_until
+            ? { license_valid_until: singleCandidate.date, license_expiry_source: "extracted" }
+            : {})
+        };
+      });
+      setLicenseDocumentStatus(
+        outcome.candidates.length > 0
+          ? `Attached — found ${outcome.candidates.length} possible expiry date${outcome.candidates.length === 1 ? "" : "s"}, please confirm below`
+          : "Attached — no expiry date detected, enter one manually if known"
+      );
+      if (activeLibraryId) refreshMaintenance(activeLibraryId);
+    } catch (error) {
+      setLicenseDocumentStatus(`Attach failed: ${String(error)}`);
+    }
+  }, [sourceDraft, activeLibraryId, refreshMaintenance]);
+
+  const handleRemoveLicenseDocument = useCallback(() => {
+    if (!sourceDraft) return;
+    const assetId = sourceDraft.asset_id;
+    invoke("remove_license_document", { assetId })
+      .then(() => invoke<SourceRecordDraft | null>("get_source_record", { assetId }))
+      .then((record) => {
+        setSourceDraft(record ?? emptySourceDraft(assetId));
+        setLicenseDateCandidates([]);
+        setLicenseDocumentStatus("License document removed");
+        if (activeLibraryId) refreshMaintenance(activeLibraryId);
+      })
+      .catch((error) => setLicenseDocumentStatus(`Remove failed: ${String(error)}`));
+  }, [sourceDraft, activeLibraryId, refreshMaintenance]);
+
+  const handleRevealLicenseDocument = useCallback(() => {
+    if (!sourceDraft) return;
+    invoke<string | null>("resolve_license_document_path", { assetId: sourceDraft.asset_id })
+      .then((path) => {
+        if (path) return revealItemInDir(path);
+      })
+      .catch((error) => setLicenseDocumentStatus(`Reveal failed: ${String(error)}`));
+  }, [sourceDraft]);
+
+  const handleUseLicenseDateCandidate = useCallback((date: string) => {
+    setSourceDraft((previous) =>
+      previous ? { ...previous, license_valid_until: date, license_expiry_source: "extracted" } : previous
+    );
+  }, []);
 
   const handleMoveToTrash = useCallback(() => {
     if (!selectedAssetId || !activeLibraryId) return;
@@ -5510,6 +5622,87 @@ export function App() {
                   onChange={(event) => setSourceDraft({ ...sourceDraft, license_status: event.target.value || null })}
                 />
               </div>
+
+              <div className="license-document">
+                <div className="license-document-row">
+                  {sourceDraft.license_document_path ? (
+                    <>
+                      <FileText size={14} />
+                      <span className="license-document-name" title={sourceDraft.license_document_path}>
+                        {sourceDraft.license_document_path.split("/").pop()}
+                      </span>
+                      <button type="button" className="text-button" onClick={handleRevealLicenseDocument}>
+                        Reveal in {isMacPlatform ? "Finder" : "Explorer"}
+                      </button>
+                      <button type="button" className="text-button" onClick={handleRemoveLicenseDocument}>
+                        Remove
+                      </button>
+                    </>
+                  ) : (
+                    <button type="button" className="text-button" onClick={handleAttachLicenseDocument}>
+                      <Import size={14} />
+                      Attach License PDF…
+                    </button>
+                  )}
+                </div>
+
+                <div className="license-dates">
+                  <label>
+                    Valid from
+                    <input
+                      type="date"
+                      value={sourceDraft.license_valid_from ?? ""}
+                      onChange={(event) =>
+                        setSourceDraft({ ...sourceDraft, license_valid_from: event.target.value || null })
+                      }
+                    />
+                  </label>
+                  <label>
+                    Valid until
+                    <input
+                      type="date"
+                      value={sourceDraft.license_valid_until ?? ""}
+                      onChange={(event) =>
+                        setSourceDraft({
+                          ...sourceDraft,
+                          license_valid_until: event.target.value || null,
+                          license_expiry_source: event.target.value ? "manual" : null
+                        })
+                      }
+                    />
+                  </label>
+                </div>
+
+                {licenseDateCandidates.length > 0 ? (
+                  <div className="license-candidates">
+                    <span className="license-candidates-label">Detected in the PDF:</span>
+                    {licenseDateCandidates.map((candidate) => (
+                      <button
+                        type="button"
+                        key={`${candidate.date}-${candidate.keyword}`}
+                        className="license-candidate-chip"
+                        title={candidate.context}
+                        onClick={() => handleUseLicenseDateCandidate(candidate.date)}
+                      >
+                        Use {candidate.date} ({candidate.keyword})
+                      </button>
+                    ))}
+                  </div>
+                ) : null}
+
+                {(() => {
+                  const validity = licenseValidityStatus(sourceDraft.license_valid_until);
+                  return (
+                    <span className={`license-validity-badge license-validity-${validity.tone}`}>
+                      {validity.label}
+                    </span>
+                  );
+                })()}
+                {sourceDraft.license_expiry_source === "extracted" ? (
+                  <span className="license-expiry-hint">Detected from the PDF — please confirm</span>
+                ) : null}
+              </div>
+
               <button type="button" className="primary-action" onClick={handleSaveSource}>
                 <Save size={15} />
                 Save source
@@ -5518,6 +5711,7 @@ export function App() {
           ) : (
             <span className="empty-hint">Select a sound to edit source and license</span>
           )}
+          {licenseDocumentStatus ? <div className="status-line">{licenseDocumentStatus}</div> : null}
           {exportStatus ? <div className="status-line">{exportStatus}</div> : null}
         </CollapsibleSection>
         <CollapsibleSection id="maintenance" title="Maintenance" collapsed={collapsedSections.has("maintenance")} onToggle={toggleSection}>

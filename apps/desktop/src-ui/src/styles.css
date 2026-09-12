@@ -77,6 +77,13 @@
   --stem-accent: #a78bfa;
   --stem-accent-strong: #c4b5fd;
   --stem-accent-rgb: 167, 139, 250;
+
+  /* License-validity badge (Source & License panel, Sonic Radar
+     inspector) — good/warn/bad, the one place in the app that needs a
+     plain traffic-light semantic rather than a product accent color. */
+  --status-good: #4ade80;
+  --status-warn: #fbbf24;
+  --status-bad: #f87171;
 }
 
 /* Light mode palette reference: Silver Mist #E4E4E4, Flameburst Orange
@@ -122,6 +129,12 @@
   --stem-accent: #7c3aed;
   --stem-accent-strong: #6d28d9;
   --stem-accent-rgb: 124, 58, 237;
+
+  /* Deeper/darker so each still holds contrast on the light silver
+     background, same reasoning as radar-accent/stem-accent above. */
+  --status-good: #15803d;
+  --status-warn: #b45309;
+  --status-bad: #b91c1c;
 }
 
 * {
@@ -1899,6 +1912,107 @@ h2 {
 
 .source-fields input:focus-visible {
   border-color: rgba(var(--ink-rgb), 0.4);
+}
+
+.license-document {
+  display: flex;
+  flex-direction: column;
+  gap: 10px;
+  margin-top: 4px;
+}
+
+.license-document-row {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  flex-wrap: wrap;
+}
+
+.license-document-name {
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  max-width: 200px;
+  font-size: 12px;
+  color: var(--text-secondary);
+}
+
+.license-dates {
+  display: flex;
+  gap: 10px;
+  flex-wrap: wrap;
+}
+
+.license-dates label {
+  display: flex;
+  flex-direction: column;
+  gap: 4px;
+  font-size: 11px;
+  color: var(--text-muted);
+}
+
+.license-dates input[type="date"] {
+  height: 36px;
+  padding: 0 10px;
+  border: 1px solid rgba(var(--ink-rgb), 0.1);
+  border-radius: 10px;
+  background: rgba(var(--ink-rgb), 0.05);
+  color: var(--text-primary);
+  font-size: 13px;
+}
+
+.license-candidates {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  flex-wrap: wrap;
+  font-size: 11px;
+}
+
+.license-candidates-label {
+  color: var(--text-muted);
+}
+
+.license-candidate-chip {
+  padding: 4px 10px;
+  border: 1px solid rgba(var(--ink-rgb), 0.14);
+  border-radius: 999px;
+  background: var(--surface-hover);
+  color: var(--text-tertiary);
+  font-size: 11px;
+  font-weight: 600;
+}
+
+.license-candidate-chip:hover {
+  background: var(--surface-hover-strong);
+}
+
+.license-validity-badge {
+  align-self: flex-start;
+  padding: 4px 10px;
+  border-radius: 999px;
+  font-size: 11px;
+  font-weight: 700;
+  background: rgba(var(--ink-rgb), 0.08);
+  color: var(--text-tertiary);
+}
+
+.license-validity-valid {
+  color: var(--status-good);
+}
+
+.license-validity-soon {
+  color: var(--status-warn);
+}
+
+.license-validity-expired {
+  color: var(--status-bad);
+}
+
+.license-expiry-hint {
+  font-size: 11px;
+  color: var(--text-muted);
+  font-style: italic;
 }
 
 .duplicate-actions {

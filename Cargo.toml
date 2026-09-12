@@ -11,6 +11,7 @@ members = [
   "crates/fingerprint",
   "crates/import-pipeline",
   "crates/library-core",
+  "crates/license-documents",
   "crates/release-readiness",
   "crates/maintenance",
   "crates/preferences",

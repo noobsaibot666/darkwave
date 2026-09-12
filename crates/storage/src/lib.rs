@@ -284,6 +284,22 @@ pub struct SourceRecordDraft {
     pub attribution: Option<String>,
     pub restrictions: Option<String>,
     pub receipt_path: Option<String>,
+    /// Path to a copied-in license/usage-rights PDF, relative to the
+    /// library's `media_root` (same convention as `AssetPath::Managed`'s
+    /// relative path) — e.g. `License/<asset-id>-invoice.pdf`. Set by
+    /// `attach_license_document`, never typed directly by the user.
+    pub license_document_path: Option<String>,
+    /// ISO `YYYY-MM-DD`. Nullable — most license PDFs don't state a start
+    /// date, only an expiry.
+    pub license_valid_from: Option<String>,
+    /// ISO `YYYY-MM-DD`. The authoritative field the expired/valid badge is
+    /// computed from — deliberately separate from `license_status`'s free
+    /// text, which the user typed and isn't machine-checked.
+    pub license_valid_until: Option<String>,
+    /// `"manual"` (the user typed or confirmed it) or `"extracted"` (still
+    /// exactly what `license-documents::find_date_candidates` suggested,
+    /// unconfirmed). Used only for a UI hint, never to gate anything.
+    pub license_expiry_source: Option<String>,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
@@ -298,6 +314,7 @@ pub struct ProjectSourceReportRow {
     pub attribution: Option<String>,
     pub restrictions: Option<String>,
     pub receipt_path: Option<String>,
+    pub license_valid_until: Option<String>,
     pub usage_status: String,
     pub destination: Option<String>,
 }
@@ -2295,8 +2312,9 @@ impl Catalog {
         self.connection.execute(
             "INSERT INTO source_records (
                 id, asset_id, provider, source_url, license_type, license_status,
-                attribution, restrictions, receipt_path
-             ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)",
+                attribution, restrictions, receipt_path,
+                license_document_path, license_valid_from, license_valid_until, license_expiry_source
+             ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13)",
             params![
                 Uuid::new_v4().to_string(),
                 draft.asset_id.to_string(),
@@ -2307,6 +2325,10 @@ impl Catalog {
                 draft.attribution,
                 draft.restrictions,
                 draft.receipt_path,
+                draft.license_document_path,
+                draft.license_valid_from,
+                draft.license_valid_until,
+                draft.license_expiry_source,
             ],
         )?;
 
@@ -2329,6 +2351,7 @@ impl Catalog {
                 source_records.attribution,
                 source_records.restrictions,
                 source_records.receipt_path,
+                source_records.license_valid_until,
                 usage_events.event_type,
                 usage_events.destination
              FROM usage_events
@@ -2350,8 +2373,9 @@ impl Catalog {
                     attribution: row.get(7)?,
                     restrictions: row.get(8)?,
                     receipt_path: row.get(9)?,
-                    usage_status: row.get(10)?,
-                    destination: row.get(11)?,
+                    license_valid_until: row.get(10)?,
+                    usage_status: row.get(11)?,
+                    destination: row.get(12)?,
                 })
             })?
             .collect::<Result<Vec<_>, _>>()?;
@@ -2476,7 +2500,8 @@ impl Catalog {
         self.connection
             .query_row(
                 "SELECT asset_id, provider, source_url, license_type, license_status,
-                    attribution, restrictions, receipt_path
+                    attribution, restrictions, receipt_path,
+                    license_document_path, license_valid_from, license_valid_until, license_expiry_source
                  FROM source_records WHERE asset_id = ?1",
                 params![asset_id.to_string()],
                 |row| {
@@ -2489,6 +2514,10 @@ impl Catalog {
                         attribution: row.get(5)?,
                         restrictions: row.get(6)?,
                         receipt_path: row.get(7)?,
+                        license_document_path: row.get(8)?,
+                        license_valid_from: row.get(9)?,
+                        license_valid_until: row.get(10)?,
+                        license_expiry_source: row.get(11)?,
                     })
                 },
             )
@@ -2522,6 +2551,36 @@ impl Catalog {
             .map_err(StorageError::from)?;
 
         Ok(ids)
+    }
+
+    /// Assets in this library whose confirmed `license_valid_until` has
+    /// already passed `today` (an ISO `YYYY-MM-DD` string — plain string
+    /// comparison is correct here since ISO dates sort lexicographically).
+    /// Backs the `LicenseExpired` maintenance finding. A null
+    /// `license_valid_until` (no expiry set, or nothing confirmed yet)
+    /// never counts as expired.
+    pub fn assets_with_expired_license(
+        &self,
+        library_id: Uuid,
+        today: &str,
+    ) -> Result<Vec<(Uuid, String)>, StorageError> {
+        let mut statement = self.connection.prepare(
+            "SELECT source_records.asset_id, source_records.license_valid_until
+             FROM source_records
+             INNER JOIN assets ON assets.id = source_records.asset_id
+             WHERE assets.library_id = ?1
+               AND source_records.license_valid_until IS NOT NULL
+               AND source_records.license_valid_until < ?2",
+        )?;
+        let rows = statement
+            .query_map(params![library_id.to_string(), today], |row| {
+                Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))
+            })?
+            .map(|result| result.map(|(asset_id, expiry)| (parse_uuid(asset_id), expiry)))
+            .collect::<Result<Vec<_>, _>>()
+            .map_err(StorageError::from)?;
+
+        Ok(rows)
     }
 
     pub fn move_asset_to_trash(
@@ -2898,6 +2957,13 @@ impl Catalog {
         // set_library_import_subfolders. `None`/absent means "just one
         // destination, media_root itself" — no prompt needed on drop.
         self.ensure_column("libraries", "import_subfolders", "TEXT")?;
+        // See SourceRecordDraft's doc comments for what each of these
+        // means — license_valid_until is the one the expired/valid badge
+        // and the LicenseExpired maintenance finding are computed from.
+        self.ensure_column("source_records", "license_document_path", "TEXT")?;
+        self.ensure_column("source_records", "license_valid_from", "TEXT")?;
+        self.ensure_column("source_records", "license_valid_until", "TEXT")?;
+        self.ensure_column("source_records", "license_expiry_source", "TEXT")?;
 
         Ok(())
     }
@@ -5066,6 +5132,7 @@ mod tests {
                 attribution: Some("Boom Library / Artist Pack".to_string()),
                 restrictions: Some("client project only".to_string()),
                 receipt_path: Some("receipts/boom-library-2026-07.pdf".to_string()),
+                ..Default::default()
             })
             .expect("source");
         catalog
@@ -5120,6 +5187,7 @@ mod tests {
                 attribution: None,
                 restrictions: None,
                 receipt_path: None,
+                ..Default::default()
             })
             .expect("old source");
         catalog
@@ -5132,6 +5200,7 @@ mod tests {
                 attribution: None,
                 restrictions: None,
                 receipt_path: None,
+                ..Default::default()
             })
             .expect("new source");
         catalog
@@ -5170,6 +5239,88 @@ mod tests {
     }
 
     #[test]
+    fn license_document_and_expiry_fields_round_trip() {
+        let catalog_path = unique_catalog_path("source-license-fields");
+        let catalog = Catalog::open(&catalog_path).expect("open catalog");
+        let library = catalog
+            .create_library("License Fields", "/library")
+            .expect("library");
+        let asset = test_asset(&catalog, library.id, "licensed.wav", "hash-license-fields");
+
+        catalog
+            .set_source_record(SourceRecordDraft {
+                asset_id: asset.id,
+                license_document_path: Some("License/licensed-invoice.pdf".to_string()),
+                license_valid_from: Some("2026-01-01".to_string()),
+                license_valid_until: Some("2027-01-05".to_string()),
+                license_expiry_source: Some("extracted".to_string()),
+                ..Default::default()
+            })
+            .expect("save source with license fields");
+
+        let source = catalog
+            .get_source_record(asset.id)
+            .expect("query")
+            .expect("record exists");
+        assert_eq!(source.license_document_path.as_deref(), Some("License/licensed-invoice.pdf"));
+        assert_eq!(source.license_valid_from.as_deref(), Some("2026-01-01"));
+        assert_eq!(source.license_valid_until.as_deref(), Some("2027-01-05"));
+        assert_eq!(source.license_expiry_source.as_deref(), Some("extracted"));
+    }
+
+    #[test]
+    fn assets_with_expired_license_only_returns_past_confirmed_dates_in_that_library() {
+        let catalog_path = unique_catalog_path("source-license-expired");
+        let catalog = Catalog::open(&catalog_path).expect("open catalog");
+        let library = catalog
+            .create_library("Expiry", "/library")
+            .expect("library");
+        let other_library = catalog
+            .create_library("Other Expiry", "/other")
+            .expect("other library");
+
+        let expired = test_asset(&catalog, library.id, "expired.wav", "hash-expired");
+        let still_valid = test_asset(&catalog, library.id, "valid.wav", "hash-valid");
+        let no_expiry = test_asset(&catalog, library.id, "no-expiry.wav", "hash-no-expiry");
+        let expired_elsewhere = test_asset(&catalog, other_library.id, "expired-other.wav", "hash-expired-other");
+
+        catalog
+            .set_source_record(SourceRecordDraft {
+                asset_id: expired.id,
+                license_valid_until: Some("2020-01-01".to_string()),
+                ..Default::default()
+            })
+            .expect("expired source");
+        catalog
+            .set_source_record(SourceRecordDraft {
+                asset_id: still_valid.id,
+                license_valid_until: Some("2099-01-01".to_string()),
+                ..Default::default()
+            })
+            .expect("valid source");
+        catalog
+            .set_source_record(SourceRecordDraft {
+                asset_id: no_expiry.id,
+                provider: Some("Some Provider".to_string()),
+                ..Default::default()
+            })
+            .expect("no-expiry source");
+        catalog
+            .set_source_record(SourceRecordDraft {
+                asset_id: expired_elsewhere.id,
+                license_valid_until: Some("2020-01-01".to_string()),
+                ..Default::default()
+            })
+            .expect("expired source in other library");
+
+        let expired_assets = catalog
+            .assets_with_expired_license(library.id, "2026-09-12")
+            .expect("query");
+
+        assert_eq!(expired_assets, vec![(expired.id, "2020-01-01".to_string())]);
+    }
+
+    #[test]
     fn asset_ids_with_source_record_matches_per_asset_lookups_and_stays_library_scoped() {
         let catalog_path = unique_catalog_path("source-ids-batch");
         let catalog = Catalog::open(&catalog_path).expect("open catalog");
@@ -5194,6 +5345,7 @@ mod tests {
                 attribution: None,
                 restrictions: None,
                 receipt_path: None,
+                ..Default::default()
             })
             .expect("source");
         catalog
@@ -5206,6 +5358,7 @@ mod tests {
                 attribution: None,
                 restrictions: None,
                 receipt_path: None,
+                ..Default::default()
             })
             .expect("source");
 
