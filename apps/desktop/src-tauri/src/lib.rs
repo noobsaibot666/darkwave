@@ -4265,7 +4265,7 @@ pub fn run() {
                         }
                     }
                 }
-                // Don't leave a live caffeinate child (macOS) or an engaged
+                // Don't leave an engaged IOPMAssertion (macOS) or
                 // ES_SYSTEM_REQUIRED assertion (Windows) behind once the app
                 // is quitting — see power.rs.
                 if let Some(power_state) = window.app_handle().try_state::<power::PowerAssertionState>() {
