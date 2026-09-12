@@ -117,6 +117,19 @@ pub struct AppPreferences {
     /// global but import is always library-scoped.
     #[serde(default)]
     pub watched_folder_library_id: Option<String>,
+    /// Whether the desktop app should hold a system idle-sleep assertion
+    /// (caffeinate -i on macOS, SetThreadExecutionState on Windows) while
+    /// there's unpaused background-job work pending, so a large overnight
+    /// analysis batch isn't cut short by the machine sleeping. Defaults to
+    /// `true` — including for preference files saved before this field
+    /// existed — since that's the behavior an overnight batch needs; the
+    /// preference exists as an opt-out, not an opt-in.
+    #[serde(default = "default_prevent_sleep_during_analysis")]
+    pub prevent_sleep_during_analysis: bool,
+}
+
+fn default_prevent_sleep_during_analysis() -> bool {
+    true
 }
 
 impl ShortcutMap {
@@ -279,6 +292,7 @@ impl AppPreferences {
             theme: ThemePreference::default(),
             watched_folder_path: None,
             watched_folder_library_id: None,
+            prevent_sleep_during_analysis: true,
         }
     }
 }

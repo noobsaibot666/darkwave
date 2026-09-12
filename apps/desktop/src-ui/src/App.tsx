@@ -16,6 +16,7 @@ import {
   ChevronRight,
   Circle,
   Clapperboard,
+  Coffee,
   Contrast,
   Copy,
   Database,
@@ -276,6 +277,7 @@ type AppPreferences = {
   theme: "Dark" | "Light" | "System";
   watched_folder_path: string | null;
   watched_folder_library_id: string | null;
+  prevent_sleep_during_analysis: boolean;
 };
 
 type SoundCategory = "music" | "voice" | "instrumental" | "sound_effect";
@@ -3435,6 +3437,18 @@ export function App() {
     });
   }, []);
 
+  const handleToggleSleepPrevention = useCallback(() => {
+    setPreferences((previous) => {
+      if (!previous) return previous;
+      const next = {
+        ...previous,
+        prevent_sleep_during_analysis: !previous.prevent_sleep_during_analysis
+      };
+      invoke("save_app_preferences", { preferences: next }).catch(() => {});
+      return next;
+    });
+  }, []);
+
   const handleSetTheme = useCallback((theme: AppPreferences["theme"]) => {
     setPreferences((previous) => {
       if (!previous) return previous;
@@ -5880,6 +5894,26 @@ export function App() {
                             Stop Watching
                           </button>
                         ) : null}
+                      </div>
+                    </div>
+
+                    <div className="settings-section">
+                      <h2>Background Analysis</h2>
+                      <div className="settings-grid">
+                        <label className="settings-row">
+                          <Coffee size={14} />
+                          <span>Keep the computer awake while analyzing</span>
+                          <input
+                            type="checkbox"
+                            checked={preferences?.prevent_sleep_during_analysis ?? true}
+                            onChange={handleToggleSleepPrevention}
+                          />
+                        </label>
+                        <div className="status-line">
+                          Prevents idle system sleep (not display sleep) while audio analysis,
+                          waveform generation, or instrument detection jobs are pending and not
+                          paused — so a large overnight batch finishes instead of being cut short.
+                        </div>
                       </div>
                     </div>
                   </>

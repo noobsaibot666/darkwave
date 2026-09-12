@@ -1,4 +1,5 @@
 mod license;
+mod power;
 mod security_scoped_bookmark;
 
 use std::collections::HashSet;
@@ -3818,6 +3819,7 @@ pub fn run() {
                 audio_analysis_paused: std::sync::atomic::AtomicBool::new(false),
                 waveform_generation_paused: std::sync::atomic::AtomicBool::new(false),
             });
+            app.manage(power::PowerAssertionState::new());
             app.manage(SimilarityWorkerState(tokio::sync::Mutex::new(None)));
             app.manage(InstrumentModelState {
                 model: std::sync::Arc::new(Mutex::new(None)),
@@ -3896,6 +3898,96 @@ pub fn run() {
                     }
 
                     let _ = worker_app_handle.emit("background-tick", ());
+                }
+            });
+
+            // Autonomous overnight drive loop: unlike the worker thread
+            // above (which only nudges the frontend via background-tick),
+            // this tokio task calls the same job-kind processors the
+            // frontend calls via invoke() directly, so a queued batch keeps
+            // draining even if the webview is backgrounded or throttled by
+            // the OS. It also holds a power assertion (see power.rs) for as
+            // long as there's real *unpaused* work outstanding, which is
+            // what lets a large overnight batch actually finish instead of
+            // being cut short by idle system sleep — released the moment
+            // the queue empties or the user pauses, so it never holds the
+            // machine awake for no reason.
+            let drive_app_handle = app.handle().clone();
+            tauri::async_runtime::spawn(async move {
+                use std::sync::atomic::Ordering;
+
+                loop {
+                    let _ = process_pending_jobs(drive_app_handle.state::<CatalogState>());
+
+                    let waveform_processed = process_waveform_jobs(
+                        drive_app_handle.clone(),
+                        drive_app_handle.state::<CatalogState>(),
+                        drive_app_handle.state::<JobControlState>(),
+                    )
+                    .await
+                    .unwrap_or(0);
+
+                    let instrument_processed = process_instrument_jobs(
+                        drive_app_handle.clone(),
+                        drive_app_handle.state::<CatalogState>(),
+                        drive_app_handle.state::<InstrumentModelState>(),
+                    )
+                    .await
+                    .unwrap_or(0);
+
+                    let analysis_processed = process_audio_analysis_jobs(
+                        drive_app_handle.clone(),
+                        drive_app_handle.state::<CatalogState>(),
+                        drive_app_handle.state::<JobControlState>(),
+                    )
+                    .await
+                    .unwrap_or(0);
+
+                    // Paused kinds are deliberately excluded here (not just
+                    // skipped above) — a paused queue still has pending
+                    // rows, but nothing is actually going to touch them
+                    // until the user unpauses, so it shouldn't keep the
+                    // machine awake either.
+                    let unpaused_pending = {
+                        let job_control = drive_app_handle.state::<JobControlState>();
+                        let catalog_state = drive_app_handle.state::<CatalogState>();
+                        let catalog = catalog_state.0.lock().expect("catalog mutex poisoned");
+                        let mut total = catalog
+                            .pending_job_count(JobKind::MetadataExtraction)
+                            .unwrap_or(0)
+                            + catalog
+                                .pending_job_count(JobKind::InstrumentDetection)
+                                .unwrap_or(0);
+                        if !job_control.audio_analysis_paused.load(Ordering::SeqCst) {
+                            total += catalog.pending_job_count(JobKind::AudioAnalysis).unwrap_or(0);
+                        }
+                        if !job_control.waveform_generation_paused.load(Ordering::SeqCst) {
+                            total += catalog
+                                .pending_job_count(JobKind::WaveformGeneration)
+                                .unwrap_or(0);
+                        }
+                        total
+                    };
+
+                    let sleep_prevention_enabled = preferences_path(&drive_app_handle)
+                        .ok()
+                        .and_then(|path| preferences::load_preferences(path).ok())
+                        .map(|preferences| preferences.prevent_sleep_during_analysis)
+                        .unwrap_or(true);
+
+                    let power_state = drive_app_handle.state::<power::PowerAssertionState>();
+                    if unpaused_pending > 0 && sleep_prevention_enabled {
+                        power_state.engage();
+                    } else {
+                        power_state.release();
+                    }
+
+                    let idle = unpaused_pending == 0
+                        && waveform_processed == 0
+                        && instrument_processed == 0
+                        && analysis_processed == 0;
+                    tokio::time::sleep(std::time::Duration::from_secs(if idle { 5 } else { 1 }))
+                        .await;
                 }
             });
 
@@ -3983,6 +4075,12 @@ pub fn run() {
                             let _ = std::fs::remove_file(entry.path());
                         }
                     }
+                }
+                // Don't leave a live caffeinate child (macOS) or an engaged
+                // ES_SYSTEM_REQUIRED assertion (Windows) behind once the app
+                // is quitting — see power.rs.
+                if let Some(power_state) = window.app_handle().try_state::<power::PowerAssertionState>() {
+                    power_state.release();
                 }
             }
         })

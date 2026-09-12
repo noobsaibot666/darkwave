@@ -7,6 +7,33 @@ Newest entry on top. Add a new entry, don't edit old ones.
 
 ---
 
+## 2026-09-12 — new: keep-awake during overnight analysis batches (needs your eyes on Windows)
+
+Added `apps/desktop/src-tauri/src/power.rs` + a new autonomous job-drive loop in `lib.rs`'s
+`setup()`. Goal: a big analysis batch queued up and left to run overnight shouldn't get cut short
+by the OS idle-sleeping the machine. Two platform paths, no new deps:
+
+- macOS: spawns `/usr/bin/caffeinate -i` while there's unpaused pending work, kills it when the
+  queue empties/pauses/the window closes. Verified locally (unit tests in `power.rs` spawn a real
+  `caffeinate` and confirm it lives/dies correctly) and by watching `ps aux | grep caffeinate`
+  during a real analysis batch.
+- Windows: calls `SetThreadExecutionState(ES_CONTINUOUS | ES_SYSTEM_REQUIRED)` to engage, back to
+  `ES_CONTINUOUS` alone to release — via a hand-rolled `extern "system"` binding to `kernel32`
+  (see `power.rs`'s `#[cfg(target_os = "windows")] mod imp`). **I can't verify this from macOS.**
+
+Please sanity-check on Windows after pulling: queue up a handful of pending analysis jobs (import
+something, or use a library with a backlog), let it idle a bit while jobs are processing, and
+confirm via Task Manager → Details (or `powercfg /requests` in an elevated prompt) that
+`darkwave-desktop.exe` is holding an `ES_SYSTEM_REQUIRED` request while jobs are pending, and that
+it goes away once the queue drains or you pause analysis in the UI. There's also a new "Keep the
+computer awake while analyzing" toggle in Settings → General if you want to confirm the opt-out
+path too (should mean no request is ever held even with jobs pending).
+
+`cargo check`/`cargo test`/`cargo clippy` all pass on macOS for both the default and
+`direct-dist` feature builds; nothing new needed on the Rust side beyond a pull.
+
+---
+
 ## 2026-09-11 — main synced again, pull now (bigger batch)
 
 `main` updated: `918e5b5` → `838d32d` — a long session, several real
