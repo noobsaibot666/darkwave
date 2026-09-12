@@ -76,6 +76,23 @@ COPYFILE_DISABLE=1 productbuild \
   --sign "$INSTALLER_IDENTITY" \
   "$PKG_OUT"
 
+echo "[7/7] Recording this build in the version ledger..."
+LEDGER="$WORKSPACE_ROOT/docs/macos/version-ledger.md"
+if [ -f "$LEDGER" ]; then
+  TODAY=$(date +%F)
+  NEW_ROW="| $TODAY | $SHORT_VER | $BUILD_VER | Built | Not yet uploaded — update this row once Transporter tells you the outcome. |"
+  # Insert right after the table's header separator (the first `|---…` line)
+  # so the newest entry lands on top, matching this file's own "newest on
+  # top, don't edit old rows" convention.
+  awk -v row="$NEW_ROW" '
+    { print }
+    /^\|-+\|/ && !inserted { print row; inserted = 1 }
+  ' "$LEDGER" > "$LEDGER.tmp" && mv "$LEDGER.tmp" "$LEDGER"
+  echo "    Logged to docs/macos/version-ledger.md — update its Status once you know the upload outcome."
+else
+  echo "    docs/macos/version-ledger.md not found — skipping ledger update."
+fi
+
 echo ""
 echo "✓ $PKG_OUT ready  (version $SHORT_VER, build $BUILD_VER)"
 echo ""
