@@ -20,7 +20,7 @@ top; don't edit old rows, append.
 
 | Date | Version | Build | Status | Notes |
 |------|---------|-------|--------|-------|
-| 2026-09-12 | 0.3.0 | 10 | Built | License PDF attach/expiry tracking + sandbox-safe sleep-prevention fix (caffeinate → IOPMAssertionCreateWithName; the old approach silently failed under the App Sandbox). Not yet uploaded. |
+| 2026-09-12 | 0.3.0 | 10 | Uploaded | License PDF attach/expiry tracking + sandbox-safe sleep-prevention fix (caffeinate → IOPMAssertionCreateWithName; the old approach silently failed under the App Sandbox). Transporter log confirmed `CREATE BUILD` 201 (created) and the asset description upload reaching `COMPLETE` state — delivery to App Store Connect succeeded. Still waiting on Apple's review decision (Approved/Rejected not known yet). |
 | 2026-09-12 | 0.2.1 | 10 | Rejected (409) | Transporter: "must contain a higher version than that of the previously approved version [0.2.1]" — confirms 0.2.1 itself was already approved at some earlier build (exact approved build number not recorded pre-ledger; 8, 9, or 10's predecessor). Superseded by the 0.3.0/10 row above — needed a version bump, not just a build bump. |
 | 2026-09-01 | 0.2.1 | 9 | Uploaded (outcome not recorded) | Bumped from build 8 per commit `d0d3869` ("build 8 already registered in App Store Connect"). |
 | 2026-09-01 | 0.2.1 | 8 | Uploaded (outcome not recorded) | First 0.2.1 build, per commit `47a4ba9` ("App Store 0.2.0 was already approved"). Also the commit that fixed the icon padding (`fc15ec3`) and the missing `network.client` entitlement blank-screen rejection (`caaf3f8`) landed in this 0.2.1 cycle. |
