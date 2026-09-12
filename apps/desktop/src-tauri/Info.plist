@@ -6,5 +6,49 @@
     <false/>
     <key>CFBundleVersion</key>
     <string>10</string>
+    <!--
+      Tauri's own `bundle.fileAssociations` (tauri.conf.json) generates the
+      CFBundleDocumentTypes/UTExportedTypeDeclarations entries that make
+      double-click-to-open and the UTI registration work at all, but its
+      schema has no per-association icon field (checked against the
+      installed @tauri-apps/cli's config schema — FileAssociation has no
+      `icon` key). This fragment is merged into that generated Info.plist
+      at bundle time and adds only the one thing it can't express:
+      CFBundleTypeIconFile per document type. The icon files themselves
+      (document-darkwave.icns / document-darkwave-backup.icns) are staged
+      into the bundle via `bundle.resources`, same as the models/* files
+      already are.
+    -->
+    <key>CFBundleDocumentTypes</key>
+    <array>
+        <dict>
+            <key>CFBundleTypeName</key>
+            <string>Darkwave Library</string>
+            <key>LSItemContentTypes</key>
+            <array>
+                <string>dev.darkwave.library</string>
+            </array>
+            <key>CFBundleTypeIconFile</key>
+            <string>document-darkwave.icns</string>
+            <key>CFBundleTypeRole</key>
+            <string>Editor</string>
+            <key>LSHandlerRank</key>
+            <string>Owner</string>
+        </dict>
+        <dict>
+            <key>CFBundleTypeName</key>
+            <string>Darkwave Library Backup</string>
+            <key>LSItemContentTypes</key>
+            <array>
+                <string>dev.darkwave.library-backup</string>
+            </array>
+            <key>CFBundleTypeIconFile</key>
+            <string>document-darkwave-backup.icns</string>
+            <key>CFBundleTypeRole</key>
+            <string>Viewer</string>
+            <key>LSHandlerRank</key>
+            <string>Owner</string>
+        </dict>
+    </array>
 </dict>
 </plist>

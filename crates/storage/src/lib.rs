@@ -57,6 +57,35 @@ pub struct LibraryRecord {
     pub import_subfolders: Vec<String>,
 }
 
+/// A folder the user has pointed Darkwave at, beyond the single implicit
+/// `media_root`/`import_root` every library already had — see `add_folder`.
+/// Both `role` and `kind` are plain strings (matching how `media_type` is
+/// already stored on `AssetRecord`), not Rust enums: known `role` values are
+/// `"music"`, `"sound_effect"`, `"voiceover"`, `"foley"`, `"ambience"`,
+/// `"documents"`, `"needs_review"`, or `None` for "no specific type"; known
+/// `kind` values are `"media_root"`, `"watched"`, and `"documents"`.
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+pub struct FolderRecord {
+    pub id: Uuid,
+    pub library_id: Uuid,
+    pub path: String,
+    pub role: Option<String>,
+    pub kind: String,
+    pub created_at: String,
+}
+
+/// A file discovered inside a `kind = "documents"` folder — see
+/// `record_folder_document`. Inventory only: no analysis, no `AssetRecord`.
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+pub struct FolderDocumentRecord {
+    pub id: Uuid,
+    pub library_id: Uuid,
+    pub folder_id: Uuid,
+    pub path: String,
+    pub filename: String,
+    pub discovered_at: String,
+}
+
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 pub enum AssetPath {
     Managed(String),
@@ -245,6 +274,20 @@ pub struct CollectionRecord {
     pub sfx_export_path: Option<String>,
 }
 
+/// A categorized export destination on a project beyond the two built-in
+/// slots (`CollectionRecord::export_path`/`sfx_export_path`) — see
+/// `add_project_export_folder`. `role` uses the same vocabulary a library
+/// `folders` row does: `"music"`, `"sound_effect"`, `"voiceover"`,
+/// `"foley"`, `"ambience"`, `"documents"`.
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+pub struct ProjectExportFolderRecord {
+    pub id: Uuid,
+    pub collection_id: Uuid,
+    pub path: String,
+    pub role: String,
+    pub created_at: String,
+}
+
 /// One (asset, project) membership row — see `project_memberships_for_library`.
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 pub struct AssetProjectMembership {
@@ -382,6 +425,41 @@ impl Catalog {
         let catalog = Self { connection };
         catalog.migrate()?;
         Ok(catalog)
+    }
+
+    /// Forces every committed WAL frame back into the main database file
+    /// and truncates the WAL — needed before a plain filesystem copy of the
+    /// database file (e.g. migrating a legacy shared catalog into a new
+    /// per-library `.darkwave` file) so the copy can't silently miss
+    /// recent writes that are still sitting only in `-wal`. A no-op, not an
+    /// error, if this connection isn't in WAL mode for some reason.
+    pub fn checkpoint_wal(&self) -> Result<(), StorageError> {
+        self.connection
+            .query_row("PRAGMA wal_checkpoint(TRUNCATE)", [], |_row| Ok(()))
+            .map_err(StorageError::from)
+    }
+
+    /// Opens (creating if needed) a standalone project file: a `.darkwave`
+    /// catalog the user saves, moves, and reopens like any other document,
+    /// as opposed to a row inside one shared app-data catalog. Each project
+    /// file owns exactly one library — if `path` is brand new, `name` seeds
+    /// that library's name (with an empty `media_root`, to be set by the
+    /// folder-setup step that follows); if `path` already holds a project,
+    /// its existing library row is returned untouched and `name` is
+    /// ignored. A project file that somehow already has more than one
+    /// `libraries` row (should not happen through normal app usage) returns
+    /// the first one created rather than erroring, since there's no UI for
+    /// picking among several.
+    pub fn open_or_init_library_file(
+        path: impl AsRef<Path>,
+        name: impl AsRef<str>,
+    ) -> Result<(Self, LibraryRecord), StorageError> {
+        let catalog = Self::open(path)?;
+        let library = match catalog.list_libraries()?.into_iter().next() {
+            Some(existing) => existing,
+            None => catalog.create_library(name, "")?,
+        };
+        Ok((catalog, library))
     }
 
     pub fn create_library(
@@ -543,6 +621,139 @@ impl Catalog {
             params![json, library_id.to_string()],
         )?;
         Ok(())
+    }
+
+    /// Adds a folder Darkwave should watch for this library — the basic
+    /// single-folder setup adds exactly one (`role: None, kind:
+    /// "media_root"`, mirroring `media_root` itself); the advanced setup
+    /// adds one per additional folder, each optionally tagged with the
+    /// media type it's expected to hold. `kind` is a plain string
+    /// (`"media_root"` | `"watched"` | `"documents"`) rather than a Rust
+    /// enum, matching how `media_type` on `AssetRecord` is already stored —
+    /// no validation is done here on either string; callers (the Tauri
+    /// commands) own picking from the known set.
+    pub fn add_folder(
+        &self,
+        library_id: Uuid,
+        path: impl AsRef<str>,
+        role: Option<&str>,
+        kind: impl AsRef<str>,
+    ) -> Result<FolderRecord, StorageError> {
+        let folder = FolderRecord {
+            id: Uuid::new_v4(),
+            library_id,
+            path: path.as_ref().to_string(),
+            role: role.map(|value| value.to_string()),
+            kind: kind.as_ref().to_string(),
+            created_at: Utc::now().to_rfc3339(),
+        };
+        self.connection.execute(
+            "INSERT INTO folders (id, library_id, path, role, kind, created_at) VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
+            params![
+                folder.id.to_string(),
+                folder.library_id.to_string(),
+                folder.path,
+                folder.role,
+                folder.kind,
+                folder.created_at
+            ],
+        )?;
+        Ok(folder)
+    }
+
+    pub fn list_folders(&self, library_id: Uuid) -> Result<Vec<FolderRecord>, StorageError> {
+        let mut statement = self.connection.prepare(
+            "SELECT id, library_id, path, role, kind, created_at
+             FROM folders WHERE library_id = ?1 ORDER BY created_at ASC",
+        )?;
+        let folders = statement
+            .query_map(params![library_id.to_string()], |row| {
+                Ok(FolderRecord {
+                    id: parse_uuid(row.get::<_, String>(0)?),
+                    library_id: parse_uuid(row.get::<_, String>(1)?),
+                    path: row.get(2)?,
+                    role: row.get(3)?,
+                    kind: row.get(4)?,
+                    created_at: row.get(5)?,
+                })
+            })?
+            .collect::<Result<Vec<_>, _>>()?;
+        Ok(folders)
+    }
+
+    /// Removes a watched folder. Only ever the `folders` row itself (plus
+    /// its `folder_documents` rows, via cascade) — never touches anything
+    /// on disk, and never touches assets already imported from files that
+    /// used to live under it (they stay in the catalog, just with no
+    /// folder-role signal to fall back on for anything imported later).
+    pub fn remove_folder(&self, folder_id: Uuid) -> Result<(), StorageError> {
+        self.connection.execute(
+            "DELETE FROM folders WHERE id = ?1",
+            params![folder_id.to_string()],
+        )?;
+        Ok(())
+    }
+
+    pub fn set_folder_role(&self, folder_id: Uuid, role: Option<&str>) -> Result<(), StorageError> {
+        self.connection.execute(
+            "UPDATE folders SET role = ?1 WHERE id = ?2",
+            params![role, folder_id.to_string()],
+        )?;
+        Ok(())
+    }
+
+    /// Records a file discovered inside a `kind = "documents"` folder (a
+    /// licence/PDF folder, typically) — inventory only, never an
+    /// `AssetRecord` and never a background job. `(folder_id, path)` is
+    /// unique, so polling the same folder tick after tick is a safe no-op
+    /// for files already known; returns `true` only when this call is what
+    /// actually added the row, so a caller (the watched-folder poller) can
+    /// tell a genuinely new discovery from an already-seen one without a
+    /// separate read first.
+    pub fn record_folder_document(
+        &self,
+        folder_id: Uuid,
+        library_id: Uuid,
+        path: impl AsRef<str>,
+    ) -> Result<bool, StorageError> {
+        let path = path.as_ref();
+        let filename = Path::new(path)
+            .file_name()
+            .and_then(|name| name.to_str())
+            .unwrap_or(path);
+        let inserted = self.connection.execute(
+            "INSERT OR IGNORE INTO folder_documents (id, library_id, folder_id, path, filename, discovered_at)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
+            params![
+                Uuid::new_v4().to_string(),
+                library_id.to_string(),
+                folder_id.to_string(),
+                path,
+                filename,
+                Utc::now().to_rfc3339()
+            ],
+        )?;
+        Ok(inserted > 0)
+    }
+
+    pub fn list_folder_documents(&self, folder_id: Uuid) -> Result<Vec<FolderDocumentRecord>, StorageError> {
+        let mut statement = self.connection.prepare(
+            "SELECT id, library_id, folder_id, path, filename, discovered_at
+             FROM folder_documents WHERE folder_id = ?1 ORDER BY discovered_at ASC",
+        )?;
+        let documents = statement
+            .query_map(params![folder_id.to_string()], |row| {
+                Ok(FolderDocumentRecord {
+                    id: parse_uuid(row.get::<_, String>(0)?),
+                    library_id: parse_uuid(row.get::<_, String>(1)?),
+                    folder_id: parse_uuid(row.get::<_, String>(2)?),
+                    path: row.get(3)?,
+                    filename: row.get(4)?,
+                    discovered_at: row.get(5)?,
+                })
+            })?
+            .collect::<Result<Vec<_>, _>>()?;
+        Ok(documents)
     }
 
     /// Deletes a library and every catalog row that belongs to it (assets,
@@ -1690,6 +1901,79 @@ impl Catalog {
         self.connection.execute(
             "UPDATE collections SET sfx_export_path = ?1 WHERE id = ?2",
             params![sfx_export_path, collection_id.to_string()],
+        )?;
+        Ok(())
+    }
+
+    /// Adds a categorized export folder to a project — the advanced
+    /// counterpart to `export_path`/`sfx_export_path`. `role` uses the same
+    /// vocabulary a library `folders` row does (music, sound_effect,
+    /// voiceover, foley, ambience, documents); `export_asset_to_project`
+    /// checks these before falling back to the two built-in slots.
+    pub fn add_project_export_folder(
+        &self,
+        collection_id: Uuid,
+        path: impl AsRef<str>,
+        role: impl AsRef<str>,
+    ) -> Result<ProjectExportFolderRecord, StorageError> {
+        let folder = ProjectExportFolderRecord {
+            id: Uuid::new_v4(),
+            collection_id,
+            path: path.as_ref().to_string(),
+            role: role.as_ref().to_string(),
+            created_at: Utc::now().to_rfc3339(),
+        };
+        self.connection.execute(
+            "INSERT INTO project_export_folders (id, collection_id, path, role, created_at) VALUES (?1, ?2, ?3, ?4, ?5)",
+            params![
+                folder.id.to_string(),
+                folder.collection_id.to_string(),
+                folder.path,
+                folder.role,
+                folder.created_at
+            ],
+        )?;
+        Ok(folder)
+    }
+
+    pub fn list_project_export_folders(
+        &self,
+        collection_id: Uuid,
+    ) -> Result<Vec<ProjectExportFolderRecord>, StorageError> {
+        let mut statement = self.connection.prepare(
+            "SELECT id, collection_id, path, role, created_at
+             FROM project_export_folders WHERE collection_id = ?1 ORDER BY created_at ASC",
+        )?;
+        let folders = statement
+            .query_map(params![collection_id.to_string()], |row| {
+                Ok(ProjectExportFolderRecord {
+                    id: parse_uuid(row.get::<_, String>(0)?),
+                    collection_id: parse_uuid(row.get::<_, String>(1)?),
+                    path: row.get(2)?,
+                    role: row.get(3)?,
+                    created_at: row.get(4)?,
+                })
+            })?
+            .collect::<Result<Vec<_>, _>>()?;
+        Ok(folders)
+    }
+
+    pub fn remove_project_export_folder(&self, folder_id: Uuid) -> Result<(), StorageError> {
+        self.connection.execute(
+            "DELETE FROM project_export_folders WHERE id = ?1",
+            params![folder_id.to_string()],
+        )?;
+        Ok(())
+    }
+
+    pub fn set_project_export_folder_role(
+        &self,
+        folder_id: Uuid,
+        role: impl AsRef<str>,
+    ) -> Result<(), StorageError> {
+        self.connection.execute(
+            "UPDATE project_export_folders SET role = ?1 WHERE id = ?2",
+            params![role.as_ref(), folder_id.to_string()],
         )?;
         Ok(())
     }
@@ -2859,6 +3143,22 @@ impl Catalog {
               PRIMARY KEY (collection_id, asset_id)
             );
 
+            -- A categorized export destination on a project, beyond the two
+            -- built-in ones (`collections.export_path`/`sfx_export_path`):
+            -- role uses the same vocabulary as a library `folders` row
+            -- (music/sound_effect/voiceover/foley/ambience/documents), so
+            -- an asset already carrying that media_type routes here on
+            -- export instead of falling through to the generic sfx bucket.
+            -- Basic projects never touch this table — export_path/
+            -- sfx_export_path alone still fully define where things go.
+            CREATE TABLE IF NOT EXISTS project_export_folders (
+              id TEXT PRIMARY KEY,
+              collection_id TEXT NOT NULL REFERENCES collections(id) ON DELETE CASCADE,
+              path TEXT NOT NULL,
+              role TEXT NOT NULL,
+              created_at TEXT NOT NULL
+            );
+
             CREATE TABLE IF NOT EXISTS source_records (
               id TEXT PRIMARY KEY,
               asset_id TEXT NOT NULL REFERENCES assets(id) ON DELETE CASCADE,
@@ -2888,6 +3188,39 @@ impl Catalog {
               payload TEXT NOT NULL,
               created_at TEXT NOT NULL,
               applied_at TEXT
+            );
+
+            -- A folder the user has told Darkwave about, beyond the single
+            -- implicit `media_root` every library already had: the basic
+            -- single-folder setup gets exactly one row here (role NULL,
+            -- kind 'media_root'), mirroring `libraries.media_root`; the
+            -- advanced multi-folder setup adds one row per additional
+            -- folder, each optionally tagged with the media type it's
+            -- expected to hold (a strong classification signal on import —
+            -- see import-pipeline — but never the only one). `kind`
+            -- 'documents' (e.g. a folder of licence PDFs) is watched for
+            -- inventory only, never fed through audio import/analysis.
+            CREATE TABLE IF NOT EXISTS folders (
+              id TEXT PRIMARY KEY,
+              library_id TEXT NOT NULL REFERENCES libraries(id) ON DELETE CASCADE,
+              path TEXT NOT NULL,
+              role TEXT,
+              kind TEXT NOT NULL DEFAULT 'media_root',
+              created_at TEXT NOT NULL
+            );
+
+            -- A file discovered inside a `kind = 'documents'` folder —
+            -- inventory only: no analysis job, no AssetRecord. See
+            -- docs/genesis plan and ADR discussion on the license-documents
+            -- folder case for why this stays deliberately lightweight.
+            CREATE TABLE IF NOT EXISTS folder_documents (
+              id TEXT PRIMARY KEY,
+              library_id TEXT NOT NULL REFERENCES libraries(id) ON DELETE CASCADE,
+              folder_id TEXT NOT NULL REFERENCES folders(id) ON DELETE CASCADE,
+              path TEXT NOT NULL,
+              filename TEXT NOT NULL,
+              discovered_at TEXT NOT NULL,
+              UNIQUE (folder_id, path)
             );
 
             CREATE VIRTUAL TABLE IF NOT EXISTS assets_fts USING fts5(
@@ -3369,6 +3702,58 @@ mod tests {
     }
 
     #[test]
+    fn checkpoint_wal_flushes_writes_to_the_main_file_for_a_plain_copy() {
+        let catalog_path = unique_catalog_path("checkpoint-wal");
+        let catalog = Catalog::open(&catalog_path).expect("open catalog");
+        catalog
+            .create_library("Checkpoint Test", "")
+            .expect("create library");
+        catalog.checkpoint_wal().expect("checkpoint wal");
+        drop(catalog);
+
+        // A copy of the main file alone (no -wal/-shm sidecars) must be a
+        // fully valid, complete catalog — exactly what a raw fs::copy-based
+        // migration relies on.
+        let copy_path = unique_catalog_path("checkpoint-wal-copy");
+        fs::copy(&catalog_path, &copy_path).expect("copy main db file");
+        let copied = Catalog::open(&copy_path).expect("open copied catalog");
+        assert_eq!(copied.list_libraries().expect("list").len(), 1);
+    }
+
+    #[test]
+    fn open_or_init_library_file_creates_a_single_library_on_a_fresh_file() {
+        let project_path = unique_catalog_path("project-fresh");
+        let (catalog, library) =
+            Catalog::open_or_init_library_file(&project_path, "My Library").expect("init project");
+
+        assert_eq!(library.name, "My Library");
+        assert_eq!(library.media_root, "");
+        assert_eq!(catalog.list_libraries().expect("list").len(), 1);
+    }
+
+    #[test]
+    fn open_or_init_library_file_reopens_the_existing_library_unchanged() {
+        let project_path = unique_catalog_path("project-reopen");
+        let (catalog, created) =
+            Catalog::open_or_init_library_file(&project_path, "My Library").expect("init project");
+        catalog
+            .set_library_media_root(created.id, "/Users/example/Sounds")
+            .expect("set media root");
+        drop(catalog);
+
+        // Passing a different name on reopen must not rename or duplicate
+        // the existing library — a project file only ever gets its name
+        // from the New Setup flow, once.
+        let (reopened, library) =
+            Catalog::open_or_init_library_file(&project_path, "Ignored Name").expect("reopen project");
+
+        assert_eq!(library.id, created.id);
+        assert_eq!(library.name, "My Library");
+        assert_eq!(library.media_root, "/Users/example/Sounds");
+        assert_eq!(reopened.list_libraries().expect("list").len(), 1);
+    }
+
+    #[test]
     fn set_library_media_root_updates_an_initially_empty_root() {
         let catalog_path = unique_catalog_path("set-media-root");
         let catalog = Catalog::open(&catalog_path).expect("open catalog");
@@ -3468,6 +3853,147 @@ mod tests {
             vec![first.id, second.id]
         );
         assert_eq!(libraries[1].name, second.name);
+    }
+
+    #[test]
+    fn add_folder_defaults_and_list_folders_orders_by_creation() {
+        let catalog_path = unique_catalog_path("folders-basic");
+        let catalog = Catalog::open(&catalog_path).expect("open catalog");
+        let library = catalog
+            .create_library("Home Studio", "/Users/editor/Sounds")
+            .expect("create library");
+
+        let media_root_folder = catalog
+            .add_folder(library.id, "/Users/editor/Sounds", None, "media_root")
+            .expect("add media root folder");
+        let sfx_folder = catalog
+            .add_folder(library.id, "/Users/editor/SFX", Some("sound_effect"), "watched")
+            .expect("add sfx folder");
+
+        assert_eq!(media_root_folder.role, None);
+        assert_eq!(media_root_folder.kind, "media_root");
+        assert_eq!(sfx_folder.role, Some("sound_effect".to_string()));
+
+        let folders = catalog.list_folders(library.id).expect("list folders");
+        assert_eq!(
+            folders.iter().map(|folder| folder.id).collect::<Vec<_>>(),
+            vec![media_root_folder.id, sfx_folder.id]
+        );
+    }
+
+    #[test]
+    fn list_folders_is_scoped_to_its_own_library() {
+        let catalog_path = unique_catalog_path("folders-scoped");
+        let catalog = Catalog::open(&catalog_path).expect("open catalog");
+        let one = catalog.create_library("One", "/one").expect("create one");
+        let two = catalog.create_library("Two", "/two").expect("create two");
+        catalog
+            .add_folder(one.id, "/one/Music", Some("music"), "watched")
+            .expect("add folder to one");
+        catalog
+            .add_folder(two.id, "/two/Foley", Some("foley"), "watched")
+            .expect("add folder to two");
+
+        assert_eq!(catalog.list_folders(one.id).expect("list one").len(), 1);
+        assert_eq!(catalog.list_folders(two.id).expect("list two").len(), 1);
+    }
+
+    #[test]
+    fn set_folder_role_updates_an_existing_folder() {
+        let catalog_path = unique_catalog_path("folders-set-role");
+        let catalog = Catalog::open(&catalog_path).expect("open catalog");
+        let library = catalog.create_library("Home Studio", "/sounds").expect("create library");
+        let folder = catalog
+            .add_folder(library.id, "/sounds/Misc", None, "watched")
+            .expect("add folder");
+
+        catalog
+            .set_folder_role(folder.id, Some("ambience"))
+            .expect("set role");
+
+        let updated = catalog
+            .list_folders(library.id)
+            .expect("list folders")
+            .into_iter()
+            .find(|entry| entry.id == folder.id)
+            .expect("folder still present");
+        assert_eq!(updated.role, Some("ambience".to_string()));
+    }
+
+    #[test]
+    fn remove_folder_deletes_only_the_targeted_folder() {
+        let catalog_path = unique_catalog_path("folders-remove");
+        let catalog = Catalog::open(&catalog_path).expect("open catalog");
+        let library = catalog.create_library("Home Studio", "/sounds").expect("create library");
+        let keep = catalog
+            .add_folder(library.id, "/sounds/Keep", None, "watched")
+            .expect("add keep folder");
+        let remove = catalog
+            .add_folder(library.id, "/sounds/Remove", None, "watched")
+            .expect("add remove folder");
+
+        catalog.remove_folder(remove.id).expect("remove folder");
+
+        let remaining = catalog.list_folders(library.id).expect("list folders");
+        assert_eq!(remaining.len(), 1);
+        assert_eq!(remaining[0].id, keep.id);
+    }
+
+    #[test]
+    fn deleting_a_library_cascades_to_its_folders() {
+        let catalog_path = unique_catalog_path("folders-cascade");
+        let catalog = Catalog::open(&catalog_path).expect("open catalog");
+        let library = catalog.create_library("Home Studio", "/sounds").expect("create library");
+        catalog
+            .add_folder(library.id, "/sounds/Misc", None, "watched")
+            .expect("add folder");
+
+        catalog.delete_library(library.id).expect("delete library");
+
+        assert_eq!(catalog.list_folders(library.id).expect("list folders").len(), 0);
+    }
+
+    #[test]
+    fn record_folder_document_reports_true_only_for_a_genuinely_new_path() {
+        let catalog_path = unique_catalog_path("folder-documents-new");
+        let catalog = Catalog::open(&catalog_path).expect("open catalog");
+        let library = catalog.create_library("Home Studio", "/sounds").expect("create library");
+        let folder = catalog
+            .add_folder(library.id, "/sounds/Licence", Some("documents"), "documents")
+            .expect("add folder");
+
+        let first = catalog
+            .record_folder_document(folder.id, library.id, "/sounds/Licence/receipt.pdf")
+            .expect("record first");
+        let second = catalog
+            .record_folder_document(folder.id, library.id, "/sounds/Licence/receipt.pdf")
+            .expect("record duplicate");
+
+        assert!(first, "first sighting of a path must report true");
+        assert!(!second, "re-polling the same path must not report true again");
+        assert_eq!(catalog.list_folder_documents(folder.id).expect("list").len(), 1);
+    }
+
+    #[test]
+    fn list_folder_documents_derives_filename_and_orders_by_discovery() {
+        let catalog_path = unique_catalog_path("folder-documents-list");
+        let catalog = Catalog::open(&catalog_path).expect("open catalog");
+        let library = catalog.create_library("Home Studio", "/sounds").expect("create library");
+        let folder = catalog
+            .add_folder(library.id, "/sounds/Licence", Some("documents"), "documents")
+            .expect("add folder");
+
+        catalog
+            .record_folder_document(folder.id, library.id, "/sounds/Licence/a.pdf")
+            .expect("record a");
+        catalog
+            .record_folder_document(folder.id, library.id, "/sounds/Licence/b.pdf")
+            .expect("record b");
+
+        let documents = catalog.list_folder_documents(folder.id).expect("list");
+        assert_eq!(documents.len(), 2);
+        assert_eq!(documents[0].filename, "a.pdf");
+        assert_eq!(documents[1].filename, "b.pdf");
     }
 
     #[test]
@@ -4909,6 +5435,106 @@ mod tests {
             .expect("get collection")
             .expect("collection exists");
         assert_eq!(cleared.export_path, None);
+    }
+
+    #[test]
+    fn project_export_folders_round_trip_and_order_by_creation() {
+        let catalog_path = unique_catalog_path("project-export-folders");
+        let catalog = Catalog::open(&catalog_path).expect("open catalog");
+        let library = catalog.create_library("One", "/library").expect("library");
+        let project = catalog
+            .create_collection(library.id, "Trailer", CollectionType::Project)
+            .expect("project");
+
+        let foley = catalog
+            .add_project_export_folder(project.id, "/Edit/Trailer/Foley", "foley")
+            .expect("add foley folder");
+        let ambience = catalog
+            .add_project_export_folder(project.id, "/Edit/Trailer/Ambience", "ambience")
+            .expect("add ambience folder");
+
+        let folders = catalog
+            .list_project_export_folders(project.id)
+            .expect("list folders");
+        assert_eq!(
+            folders.iter().map(|folder| folder.id).collect::<Vec<_>>(),
+            vec![foley.id, ambience.id]
+        );
+        assert_eq!(folders[0].role, "foley");
+    }
+
+    #[test]
+    fn set_project_export_folder_role_updates_an_existing_folder() {
+        let catalog_path = unique_catalog_path("project-export-folders-set-role");
+        let catalog = Catalog::open(&catalog_path).expect("open catalog");
+        let library = catalog.create_library("One", "/library").expect("library");
+        let project = catalog
+            .create_collection(library.id, "Trailer", CollectionType::Project)
+            .expect("project");
+        let folder = catalog
+            .add_project_export_folder(project.id, "/Edit/Trailer/Misc", "sound_effect")
+            .expect("add folder");
+
+        catalog
+            .set_project_export_folder_role(folder.id, "voiceover")
+            .expect("set role");
+
+        let updated = catalog
+            .list_project_export_folders(project.id)
+            .expect("list folders")
+            .into_iter()
+            .find(|entry| entry.id == folder.id)
+            .expect("folder still present");
+        assert_eq!(updated.role, "voiceover");
+    }
+
+    #[test]
+    fn remove_project_export_folder_deletes_only_the_targeted_folder() {
+        let catalog_path = unique_catalog_path("project-export-folders-remove");
+        let catalog = Catalog::open(&catalog_path).expect("open catalog");
+        let library = catalog.create_library("One", "/library").expect("library");
+        let project = catalog
+            .create_collection(library.id, "Trailer", CollectionType::Project)
+            .expect("project");
+        let keep = catalog
+            .add_project_export_folder(project.id, "/Edit/Trailer/Keep", "music")
+            .expect("add keep folder");
+        let remove = catalog
+            .add_project_export_folder(project.id, "/Edit/Trailer/Remove", "documents")
+            .expect("add remove folder");
+
+        catalog
+            .remove_project_export_folder(remove.id)
+            .expect("remove folder");
+
+        let remaining = catalog
+            .list_project_export_folders(project.id)
+            .expect("list folders");
+        assert_eq!(remaining.len(), 1);
+        assert_eq!(remaining[0].id, keep.id);
+    }
+
+    #[test]
+    fn deleting_a_library_cascades_to_its_projects_export_folders() {
+        let catalog_path = unique_catalog_path("project-export-folders-cascade");
+        let catalog = Catalog::open(&catalog_path).expect("open catalog");
+        let library = catalog.create_library("One", "/library").expect("library");
+        let project = catalog
+            .create_collection(library.id, "Trailer", CollectionType::Project)
+            .expect("project");
+        catalog
+            .add_project_export_folder(project.id, "/Edit/Trailer/Foley", "foley")
+            .expect("add folder");
+
+        catalog.delete_library(library.id).expect("delete library");
+
+        assert_eq!(
+            catalog
+                .list_project_export_folders(project.id)
+                .expect("list folders")
+                .len(),
+            0
+        );
     }
 
     #[test]

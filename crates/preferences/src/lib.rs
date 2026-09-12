@@ -107,16 +107,6 @@ pub struct AppPreferences {
     pub reduced_transparency: bool,
     #[serde(default)]
     pub theme: ThemePreference,
-    /// A single folder (matching the plan's "Watched Downloads folder,"
-    /// singular) the standing background worker polls for new, stable
-    /// audio files and imports automatically. `None` disables watching.
-    #[serde(default)]
-    pub watched_folder_path: Option<String>,
-    /// Which library newly-discovered watched-folder files import into —
-    /// required alongside `watched_folder_path` since preferences are
-    /// global but import is always library-scoped.
-    #[serde(default)]
-    pub watched_folder_library_id: Option<String>,
     /// Whether the desktop app should hold a system idle-sleep assertion
     /// (caffeinate -i on macOS, SetThreadExecutionState on Windows) while
     /// there's unpaused background-job work pending, so a large overnight
@@ -126,10 +116,79 @@ pub struct AppPreferences {
     /// preference exists as an opt-out, not an opt-in.
     #[serde(default = "default_prevent_sleep_during_analysis")]
     pub prevent_sleep_during_analysis: bool,
+    /// Project files (`.darkwave`) opened before, most-recently-opened
+    /// first, capped at `MAX_RECENT_LIBRARY_FILES` — surfaced on the first-run
+    /// screen so reopening a known project doesn't require the native file
+    /// picker every time.
+    #[serde(default)]
+    pub recent_library_files: Vec<RecentLibraryFileEntry>,
+    /// The project file path to reopen automatically on next launch,
+    /// skipping the first-run screen entirely (mirrors reopening the last
+    /// document in an editor like After Effects). `None` before any project
+    /// has ever been opened, or after the app is told to always ask.
+    #[serde(default)]
+    pub last_active_library_file_path: Option<String>,
 }
+
+/// One entry in the recent-projects list shown on the first-run screen.
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+pub struct RecentLibraryFileEntry {
+    pub path: String,
+    pub name: String,
+    pub last_opened_at_ms: u64,
+}
+
+/// How many recent projects to remember — enough to be useful, small enough
+/// to stay a quick glance rather than its own scrollable archive.
+pub const MAX_RECENT_LIBRARY_FILES: usize = 10;
 
 fn default_prevent_sleep_during_analysis() -> bool {
     true
+}
+
+impl AppPreferences {
+    /// Records a project as just-opened: moves it to the front of
+    /// `recent_library_files` (de-duplicating by path) and sets it as the
+    /// project to reopen automatically next launch. Call this on every
+    /// successful project open, whether via New Setup, Open Library, a
+    /// recent-projects click, or a double-clicked `.darkwave` file.
+    pub fn record_library_file_opened(&mut self, path: impl AsRef<str>, name: impl AsRef<str>, now_ms: u64) {
+        let path = path.as_ref().to_string();
+        self.add_recent_library_file(&path, name, now_ms);
+        self.last_active_library_file_path = Some(path);
+    }
+
+    /// Adds a library file to the recent list without making it the
+    /// active/reopen-on-launch project — used when a library file now
+    /// exists but wasn't actually opened this session, e.g. right after
+    /// migrating a legacy shared-catalog library into its own `.darkwave`
+    /// file: it belongs on the first-run screen's recents list so the
+    /// user's next click can open it, but nothing should silently open it
+    /// on their behalf before they choose to.
+    pub fn add_recent_library_file(&mut self, path: impl AsRef<str>, name: impl AsRef<str>, now_ms: u64) {
+        let path = path.as_ref().to_string();
+        self.recent_library_files.retain(|entry| entry.path != path);
+        self.recent_library_files.insert(
+            0,
+            RecentLibraryFileEntry {
+                path,
+                name: name.as_ref().to_string(),
+                last_opened_at_ms: now_ms,
+            },
+        );
+        self.recent_library_files.truncate(MAX_RECENT_LIBRARY_FILES);
+    }
+
+    /// Drops a project from the recent list — call this when a
+    /// remembered path no longer resolves (moved, deleted, or its volume
+    /// is unmounted), so a stale entry doesn't keep reappearing forever.
+    pub fn forget_library_file(&mut self, path: impl AsRef<str>) {
+        let path = path.as_ref();
+        self.recent_library_files.retain(|entry| entry.path != path);
+        if self.last_active_library_file_path.as_deref() == Some(path) {
+            self.last_active_library_file_path = None;
+        }
+    }
 }
 
 impl ShortcutMap {
@@ -290,9 +349,9 @@ impl AppPreferences {
             reduced_motion: false,
             reduced_transparency: false,
             theme: ThemePreference::default(),
-            watched_folder_path: None,
-            watched_folder_library_id: None,
             prevent_sleep_during_analysis: true,
+            recent_library_files: Vec::new(),
+            last_active_library_file_path: None,
         }
     }
 }
@@ -525,9 +584,66 @@ mod tests {
 
         assert!(!loaded.reduced_motion);
         assert!(!loaded.reduced_transparency);
-        assert_eq!(loaded.watched_folder_path, None);
-        assert_eq!(loaded.watched_folder_library_id, None);
         assert_eq!(loaded.theme, ThemePreference::Dark);
+        assert!(loaded.recent_library_files.is_empty());
+        assert_eq!(loaded.last_active_library_file_path, None);
+    }
+
+    #[test]
+    fn recording_a_project_opened_moves_it_to_front_and_sets_last_active() {
+        let mut preferences = AppPreferences::default_for_editorial_audio();
+        preferences.record_library_file_opened("/a/One.darkwave", "One", 100);
+        preferences.record_library_file_opened("/b/Two.darkwave", "Two", 200);
+
+        assert_eq!(preferences.recent_library_files.len(), 2);
+        assert_eq!(preferences.recent_library_files[0].path, "/b/Two.darkwave");
+        assert_eq!(preferences.recent_library_files[1].path, "/a/One.darkwave");
+        assert_eq!(
+            preferences.last_active_library_file_path,
+            Some("/b/Two.darkwave".to_string())
+        );
+
+        // Reopening an already-recent project de-duplicates instead of
+        // appending a second entry, and moves it back to the front.
+        preferences.record_library_file_opened("/a/One.darkwave", "One", 300);
+        assert_eq!(preferences.recent_library_files.len(), 2);
+        assert_eq!(preferences.recent_library_files[0].path, "/a/One.darkwave");
+    }
+
+    #[test]
+    fn recent_library_files_are_capped() {
+        let mut preferences = AppPreferences::default_for_editorial_audio();
+        for i in 0..(MAX_RECENT_LIBRARY_FILES + 5) {
+            preferences.record_library_file_opened(format!("/p{i}.darkwave"), format!("P{i}"), i as u64);
+        }
+
+        assert_eq!(preferences.recent_library_files.len(), MAX_RECENT_LIBRARY_FILES);
+        // Most recently opened stays first.
+        assert_eq!(
+            preferences.recent_library_files[0].path,
+            format!("/p{}.darkwave", MAX_RECENT_LIBRARY_FILES + 4)
+        );
+    }
+
+    #[test]
+    fn adding_a_recent_library_file_does_not_set_it_as_last_active() {
+        let mut preferences = AppPreferences::default_for_editorial_audio();
+        preferences.add_recent_library_file("/a/Migrated.darkwave", "Migrated", 100);
+
+        assert_eq!(preferences.recent_library_files.len(), 1);
+        assert_eq!(preferences.recent_library_files[0].path, "/a/Migrated.darkwave");
+        assert_eq!(preferences.last_active_library_file_path, None);
+    }
+
+    #[test]
+    fn forgetting_a_project_removes_it_and_clears_last_active_if_matched() {
+        let mut preferences = AppPreferences::default_for_editorial_audio();
+        preferences.record_library_file_opened("/a/One.darkwave", "One", 100);
+
+        preferences.forget_library_file("/a/One.darkwave");
+
+        assert!(preferences.recent_library_files.is_empty());
+        assert_eq!(preferences.last_active_library_file_path, None);
     }
 
     #[test]

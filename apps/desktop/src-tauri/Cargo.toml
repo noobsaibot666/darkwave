@@ -39,6 +39,11 @@ tauri-plugin-clipboard-manager = "2"
 tauri-plugin-dialog = "2"
 tauri-plugin-fs = "2"
 tauri-plugin-opener = "2"
+# Forwards a second launch's CLI args (a double-clicked .darkwave file, on
+# Windows in particular — macOS delivers that as RunEvent::Opened instead,
+# even to an already-running instance) to the already-running app rather
+# than spawning a second window onto the same library file.
+tauri-plugin-single-instance = "2"
 serde.workspace = true
 serde_json.workspace = true
 trash = { path = "../../../crates/trash" }

@@ -241,8 +241,9 @@ pub fn import_file(
     library_id: Uuid,
     path: impl AsRef<Path>,
     mode: ImportMode,
+    folder_role: Option<&str>,
 ) -> Result<AssetRecord, ImportError> {
-    let prepared = prepare_import(path, mode)?;
+    let prepared = prepare_import(path, mode, folder_role)?;
     commit_prepared_import(catalog, library_id, prepared, None)
 }
 
@@ -252,8 +253,9 @@ pub fn import_file_with_source_context(
     path: impl AsRef<Path>,
     mode: ImportMode,
     source_context: ImportSourceContext,
+    folder_role: Option<&str>,
 ) -> Result<AssetRecord, ImportError> {
-    let prepared = prepare_import(path, mode)?;
+    let prepared = prepare_import(path, mode, folder_role)?;
     commit_prepared_import(catalog, library_id, prepared, Some(source_context))
 }
 
@@ -294,7 +296,11 @@ impl PreparedImport {
 /// Returns [`ImportError::UnsupportedFormat`] for anything whose extension
 /// isn't a recognized audio type, exactly as `import_file` does, so callers
 /// can keep treating that as a silent skip.
-pub fn prepare_import(path: impl AsRef<Path>, mode: ImportMode) -> Result<PreparedImport, ImportError> {
+pub fn prepare_import(
+    path: impl AsRef<Path>,
+    mode: ImportMode,
+    folder_role: Option<&str>,
+) -> Result<PreparedImport, ImportError> {
     let path = path.as_ref();
     let metadata = extract_immediate_metadata(path)?;
 
@@ -324,7 +330,7 @@ pub fn prepare_import(path: impl AsRef<Path>, mode: ImportMode) -> Result<Prepar
     let mut tag_suggestions = search::suggest_tags_from_filename(&original_filename);
     tag_suggestions.extend(metadata_tag_suggestions(path));
     let media_type = refine_media_type_by_size(
-        infer_media_type_from_suggestions(&tag_suggestions),
+        resolve_media_type(&tag_suggestions, folder_role),
         metadata.file_size,
     );
 
@@ -454,6 +460,28 @@ fn stream_content_hash(path: &Path) -> Result<String, ImportError> {
     }
 
     Ok(format!("{:x}", hasher.finalize()))
+}
+
+/// Folds a folder's configured role (see `storage::FolderRecord`) into
+/// media-type derivation as a fallback, never an override: a folder role is
+/// bulk, low-effort evidence ("I put a pile of stuff in the Music folder"),
+/// while a filename or embedded-metadata signal is per-file and already
+/// reasonably specific by the time `infer_media_type_from_suggestions`
+/// returns anything other than its generic `"other"` fallback. A file
+/// that's already clearly labeled by its own name/metadata keeps that
+/// answer even if it's sitting in a folder tagged with a different role —
+/// only a file with no signal of its own falls back to the folder's role,
+/// and only then to `"other"`.
+fn resolve_media_type(suggestions: &[search::TagSuggestion], folder_role: Option<&str>) -> String {
+    let inferred = infer_media_type_from_suggestions(suggestions);
+    if inferred != "other" {
+        return inferred;
+    }
+
+    match folder_role.map(normalize_media_type) {
+        Some(role) if !role.is_empty() => role,
+        _ => "other".to_string(),
+    }
 }
 
 fn infer_media_type_from_suggestions(suggestions: &[search::TagSuggestion]) -> String {
@@ -738,7 +766,7 @@ mod tests {
             .create_library("Import", "/library")
             .expect("library");
         let imported =
-            import_file(&catalog, library.id, &audio_path, ImportMode::Referenced).expect("import");
+            import_file(&catalog, library.id, &audio_path, ImportMode::Referenced, None).expect("import");
 
         assert_eq!(imported.original_filename, "referenced-impact.wav");
         assert_eq!(imported.storage_mode, StorageMode::Referenced);
@@ -766,7 +794,7 @@ mod tests {
         let audio_path = unique_audio_path("prepare-commit-impact.wav");
         fs::write(&audio_path, b"prepare then commit").expect("fixture");
 
-        let prepared = prepare_import(&audio_path, ImportMode::Referenced).expect("prepare");
+        let prepared = prepare_import(&audio_path, ImportMode::Referenced, None).expect("prepare");
         assert_eq!(prepared.original_filename(), "prepare-commit-impact.wav");
         assert_eq!(prepared.source_path(), audio_path.as_path());
 
@@ -792,7 +820,7 @@ mod tests {
         fs::write(&path, b"not audio").expect("fixture");
 
         assert!(matches!(
-            prepare_import(&path, ImportMode::Referenced),
+            prepare_import(&path, ImportMode::Referenced, None),
             Err(ImportError::UnsupportedFormat(_))
         ));
     }
@@ -815,14 +843,14 @@ mod tests {
             .expect("library");
 
         let first =
-            import_file(&catalog, library.id, &audio_path, ImportMode::Referenced).expect("first import");
+            import_file(&catalog, library.id, &audio_path, ImportMode::Referenced, None).expect("first import");
         let jobs_after_first = catalog
             .pending_job_count(JobKind::AudioAnalysis)
             .expect("job count");
         assert_eq!(jobs_after_first, 1);
 
         let second =
-            import_file(&catalog, library.id, &audio_path, ImportMode::Referenced).expect("second import");
+            import_file(&catalog, library.id, &audio_path, ImportMode::Referenced, None).expect("second import");
         let jobs_after_second = catalog
             .pending_job_count(JobKind::AudioAnalysis)
             .expect("job count");
@@ -847,7 +875,7 @@ mod tests {
             .create_library("Managed Import", media_root.to_string_lossy())
             .expect("library");
         let imported =
-            import_file(&catalog, library.id, &audio_path, ImportMode::Managed).expect("import");
+            import_file(&catalog, library.id, &audio_path, ImportMode::Managed, None).expect("import");
 
         assert_eq!(imported.storage_mode, StorageMode::Managed);
         assert_eq!(
@@ -874,7 +902,7 @@ mod tests {
             .expect("library");
 
         let imported =
-            import_file(&catalog, library.id, &audio_path, ImportMode::Referenced).expect("import");
+            import_file(&catalog, library.id, &audio_path, ImportMode::Referenced, None).expect("import");
         let suggested_tags = catalog
             .pending_suggested_tags(imported.id)
             .expect("suggestions");
@@ -895,9 +923,49 @@ mod tests {
             .expect("library");
 
         let imported =
-            import_file(&catalog, library.id, &audio_path, ImportMode::Referenced).expect("import");
+            import_file(&catalog, library.id, &audio_path, ImportMode::Referenced, None).expect("import");
 
         assert_eq!(imported.media_type, "sound_effect");
+    }
+
+    #[test]
+    fn resolve_media_type_fills_the_gap_with_folder_role_when_nothing_else_signals() {
+        let no_signal_suggestions: Vec<search::TagSuggestion> = Vec::new();
+        assert_eq!(resolve_media_type(&no_signal_suggestions, Some("music")), "music");
+        assert_eq!(resolve_media_type(&no_signal_suggestions, None), "other");
+    }
+
+    #[test]
+    fn resolve_media_type_keeps_a_real_filename_signal_over_a_conflicting_folder_role() {
+        // "dark-metal-impact.wav" alone already yields a specific signal
+        // (sound_effect, via the action/source facet) — a folder tagged
+        // "music" must not override evidence this specific about the file
+        // itself.
+        let suggestions = search::suggest_tags_from_filename("dark-metal-impact.wav");
+        assert_eq!(resolve_media_type(&suggestions, Some("music")), "sound_effect");
+    }
+
+    #[test]
+    fn import_uses_the_folder_role_when_the_filename_gives_no_signal() {
+        let catalog_path = unique_catalog_path("folder-role-import");
+        let audio_path = unique_audio_path("asset001.wav");
+        // Large enough that refine_media_type_by_size's small-file
+        // sound_effect fallback can't mask the folder-role result.
+        fs::write(&audio_path, vec![0u8; 10_000_000]).expect("fixture");
+
+        let catalog = Catalog::open(&catalog_path).expect("catalog");
+        let library = catalog.create_library("Folder Role", "/library").expect("library");
+
+        let imported = import_file(
+            &catalog,
+            library.id,
+            &audio_path,
+            ImportMode::Referenced,
+            Some("ambience"),
+        )
+        .expect("import");
+
+        assert_eq!(imported.media_type, "ambience");
     }
 
     #[test]
@@ -914,7 +982,7 @@ mod tests {
             .expect("library");
 
         let imported =
-            import_file(&catalog, library.id, &audio_path, ImportMode::Referenced).expect("import");
+            import_file(&catalog, library.id, &audio_path, ImportMode::Referenced, None).expect("import");
         let suggested_tags = catalog
             .pending_suggested_tags(imported.id)
             .expect("suggestions");
@@ -948,6 +1016,7 @@ mod tests {
                 restrictions: Some("client projects allowed".to_string()),
                 receipt_path: Some("receipts/boom-2026.pdf".to_string()),
             },
+            None,
         )
         .expect("import");
         let project = catalog

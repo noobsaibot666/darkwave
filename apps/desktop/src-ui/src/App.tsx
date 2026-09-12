@@ -88,6 +88,55 @@ type LibraryRecord = {
   import_subfolders: string[];
 };
 
+/** A `.darkwave` library file opened before, most recent first — see
+ * `preferences::RecentLibraryFileEntry` on the Rust side. */
+type RecentLibraryFileEntry = {
+  path: string;
+  name: string;
+  last_opened_at_ms: number;
+};
+
+/** A folder registered against a library beyond its implicit media_root —
+ * see `storage::FolderRecord`. */
+type FolderRecord = {
+  id: string;
+  library_id: string;
+  path: string;
+  role: string | null;
+  kind: string;
+  created_at: string;
+};
+
+/** Role choices offered when adding an advanced (non-primary) folder during
+ * New Setup — mirrors the media_type-ish strings import classification
+ * already understands, plus "documents" for a licence/PDF-only folder.
+ * Labels intentionally match mediaTypeOptions' own labels for the same
+ * values (defined further below, alongside the browser's classification
+ * buttons) — see that array's own comment on why the two must read as the
+ * same taxonomy, not a second, differently-worded one; "music" is labeled
+ * "Soundtrack" there, not "Music". */
+const FOLDER_ROLE_OPTIONS: Array<{ value: string; label: string }> = [
+  { value: "", label: "No specific type" },
+  { value: "music", label: "Soundtrack" },
+  { value: "sound_effect", label: "Sound Effect" },
+  { value: "voiceover", label: "Voiceover" },
+  { value: "foley", label: "Foley" },
+  { value: "ambience", label: "Ambience" },
+  { value: "documents", label: "Licence / Documents" }
+];
+
+/** Role choices for a project's categorized export folders. Unlike
+ * FOLDER_ROLE_OPTIONS (import-side watched folders), "documents" and "no
+ * specific type" don't belong here: an asset's media_type is never
+ * "documents" (that's only a folder-kind for PDF/licence inventory, never
+ * assigned to an actual asset), and an export folder with no role could
+ * never match anything on export — every entry needs a real media_type an
+ * asset can actually carry, since export_asset_to_project routes by exact
+ * match against it. */
+const PROJECT_EXPORT_FOLDER_ROLE_OPTIONS = FOLDER_ROLE_OPTIONS.filter(
+  (option) => option.value && option.value !== "documents"
+);
+
 type AssetPath = { Managed: string } | { Referenced: string };
 
 type AssetRecord = {
@@ -189,6 +238,17 @@ type CollectionRecord = {
   query_definition: string | null;
   export_path: string | null;
   sfx_export_path: string | null;
+};
+
+/** A categorized export destination on a project beyond its two built-in
+ * slots — see `storage::ProjectExportFolderRecord`. `role` shares the same
+ * vocabulary as a library `FolderRecord`'s role. */
+type ProjectExportFolderRecord = {
+  id: string;
+  collection_id: string;
+  path: string;
+  role: string;
+  created_at: string;
 };
 
 type AssetProjectMembership = {
@@ -325,9 +385,9 @@ type AppPreferences = {
   reduced_motion: boolean;
   reduced_transparency: boolean;
   theme: "Dark" | "Light" | "System";
-  watched_folder_path: string | null;
-  watched_folder_library_id: string | null;
   prevent_sleep_during_analysis: boolean;
+  recent_library_files: RecentLibraryFileEntry[];
+  last_active_library_file_path: string | null;
 };
 
 type SoundCategory = "music" | "voice" | "instrumental" | "sound_effect";
@@ -433,10 +493,8 @@ type OfflineControlCommand =
 
 type BackupPackage = {
   library_id: string;
-  manifest_revision: number;
   media_root: string;
-  catalog_snapshot_path: string;
-  manifest_path: string;
+  backup_file_path: string;
   created_at_ms: number;
 };
 
@@ -1042,15 +1100,52 @@ export function App() {
   // First-run wizard state (see the `librariesLoaded && (libraries.length
   // === 0 || onboardingLibrary)` branch below). Keeping the just-created
   // library here — not just its id — is what keeps the wizard on screen
-  // through steps 2/3: `libraries.length` stops being 0 the moment step 1
-  // creates it, so `onboardingLibrary` is what the branch condition falls
-  // back on until the wizard explicitly finishes.
-  const [onboardingStep, setOnboardingStep] = useState<0 | 1 | 2>(0);
+  // through the later steps: `libraries.length` stops being 0 the moment
+  // step 1 creates it, so `onboardingLibrary` is what the branch condition
+  // falls back on until the wizard explicitly finishes.
+  //
+  // Step 0 is the New Setup / Open Library choice (plus a recent-libraries
+  // list); step 1 names the new library file and picks its save location;
+  // steps 2/3 are the existing media-root/import-root folder setup, only
+  // reached via New Setup — Open Library (or a recent-file click) skips
+  // straight into the app since that library file is already configured.
+  const [onboardingStep, setOnboardingStep] = useState<0 | 1 | 2 | 3>(0);
   const [onboardingLibrary, setOnboardingLibrary] = useState<LibraryRecord | null>(null);
+  const [onboardingLibraryFilePath, setOnboardingLibraryFilePath] = useState("");
   const [onboardingMediaRoot, setOnboardingMediaRoot] = useState("");
+  // Advanced setup: additional folders added on the media-root step, each
+  // optionally tagged with the media type it's expected to hold — turned
+  // into `folders` rows (kind "watched", or "documents" for the licence/PDF
+  // case) alongside the implicit media_root folder once step 2 confirms.
+  // The basic single-folder user never touches this — it stays empty and
+  // only the media_root folder itself gets registered.
+  const [onboardingAdvancedFolders, setOnboardingAdvancedFolders] = useState<
+    Array<{ path: string; role: string }>
+  >([]);
   const [onboardingImportRoot, setOnboardingImportRoot] = useState("");
   const [onboardingBusy, setOnboardingBusy] = useState(false);
   const [onboardingError, setOnboardingError] = useState<string | null>(null);
+  const [onboardingNetworkPathWarning, setOnboardingNetworkPathWarning] = useState<string | null>(null);
+  const [recentLibraryFiles, setRecentLibraryFiles] = useState<RecentLibraryFileEntry[]>([]);
+  // `null` while unknown (fetched once on launch, alongside list_libraries).
+  // A real project file open (New Setup, Open Library, reopening the last
+  // one, a double-clicked file) sets this to its path. Staying `null` while
+  // `libraries` is non-empty means the app booted straight into the legacy
+  // shared catalog.sqlite that predates the library-file model — that's
+  // exactly the migration-screen condition below, not the New Setup/Open
+  // Library first-run screen (which only applies when `libraries` is also
+  // empty).
+  const [activeLibraryFilePath, setActiveLibraryFilePath] = useState<string | null | undefined>(undefined);
+  // "Remind me later" on the migration screen — a session-only dismissal
+  // (not persisted), so the app remains fully usable against the legacy
+  // catalog for the rest of this run, exactly as it already was before this
+  // feature existed. The prompt reappears next launch since nothing was
+  // actually migrated.
+  const [migrationDismissed, setMigrationDismissed] = useState(false);
+  type MigrationRowStatus = "pending" | "migrating" | "done" | "failed";
+  const [migrationStatus, setMigrationStatus] = useState<Record<string, MigrationRowStatus>>({});
+  const [migrationErrors, setMigrationErrors] = useState<Record<string, string>>({});
+  const [migrationBusy, setMigrationBusy] = useState(false);
   const [importStatus, setImportStatus] = useState<string | null>(null);
   // Files/folders dropped onto the window from outside the app (Finder,
   // Downloads...). Set only when the active library has 2+ configured
@@ -1169,10 +1264,17 @@ export function App() {
   const [newTagFacet, setNewTagFacet] = useState("action");
 
   const [collections, setCollections] = useState<CollectionRecord[]>([]);
+  const [libraryFolders, setLibraryFolders] = useState<FolderRecord[]>([]);
   const [projectMemberships, setProjectMemberships] = useState<AssetProjectMembership[]>([]);
   const [newProjectName, setNewProjectName] = useState("");
   const [newProjectExportPath, setNewProjectExportPath] = useState("");
   const [newProjectSfxExportPath, setNewProjectSfxExportPath] = useState("");
+  // Additional categorized export folders added while creating a project —
+  // beyond the two built-in export_path/sfx_export_path slots — each
+  // becomes a project_export_folders row once the project is created.
+  const [newProjectExportFolders, setNewProjectExportFolders] = useState<
+    Array<{ path: string; role: string }>
+  >([]);
   const [newImportSubfolderName, setNewImportSubfolderName] = useState("");
   // The sidebar's hover-to-reveal edit icon on a project row opens this —
   // editProjectId doubles as "is the modal open".
@@ -1180,6 +1282,12 @@ export function App() {
   const [editProjectName, setEditProjectName] = useState("");
   const [editProjectExportPath, setEditProjectExportPath] = useState("");
   const [editProjectSfxExportPath, setEditProjectSfxExportPath] = useState("");
+  // The categorized export folders already saved on the project being
+  // edited — fetched fresh each time the edit modal opens. Unlike the
+  // create-modal list above, add/remove/role-change here apply immediately
+  // (the project already exists), the same "no separate Save step" pattern
+  // Settings' Watched Folders panel uses.
+  const [editProjectExportFolders, setEditProjectExportFolders] = useState<ProjectExportFolderRecord[]>([]);
   const [lastExportProjectId, setLastExportProjectId] = useState<string | null>(null);
   const [drExportStatus, setDrExportStatus] = useState<string | null>(null);
   const [projectAddToast, setProjectAddToast] = useState<{ projectId: string; message: string } | null>(null);
@@ -1564,6 +1672,12 @@ export function App() {
       .catch(() => setCollections([]));
   }, []);
 
+  const refreshLibraryFolders = useCallback((libraryId: string) => {
+    invoke<FolderRecord[]>("list_folders", { libraryId })
+      .then(setLibraryFolders)
+      .catch(() => setLibraryFolders([]));
+  }, []);
+
   const refreshProjectMemberships = useCallback((libraryId: string) => {
     invoke<AssetProjectMembership[]>("project_memberships_for_library", { libraryId })
       .then(setProjectMemberships)
@@ -1703,6 +1817,15 @@ export function App() {
       })
       .catch(() => setLibraries([]))
       .finally(() => setLibrariesLoaded(true));
+    // Only actually shown on the first-run screen (libraries.length === 0),
+    // but harmless — and one less round trip — to fetch it unconditionally
+    // up front rather than only once the wizard is about to render.
+    invoke<RecentLibraryFileEntry[]>("list_recent_library_files")
+      .then(setRecentLibraryFiles)
+      .catch(() => setRecentLibraryFiles([]));
+    invoke<string | null>("active_library_file_path")
+      .then(setActiveLibraryFilePath)
+      .catch(() => setActiveLibraryFilePath(null));
   }, []);
 
   useEffect(() => {
@@ -1712,6 +1835,7 @@ export function App() {
   useEffect(() => {
     if (!activeLibraryId) return;
     refreshCollections(activeLibraryId);
+    refreshLibraryFolders(activeLibraryId);
     refreshProjectMemberships(activeLibraryId);
     refreshMaintenance(activeLibraryId);
     refreshTrashItems(activeLibraryId);
@@ -1733,6 +1857,7 @@ export function App() {
   }, [
     activeLibraryId,
     refreshCollections,
+    refreshLibraryFolders,
     refreshProjectMemberships,
     refreshMaintenance,
     refreshTrashItems,
@@ -2175,22 +2300,62 @@ export function App() {
     };
   }, [handleUndo, handleRedo]);
 
-  const handleCreateProject = useCallback(() => {
+  const handleCreateProject = useCallback(async () => {
     if (!activeLibraryId || !newProjectName.trim()) return;
-    invoke<CollectionRecord>("create_project", {
-      libraryId: activeLibraryId,
-      name: newProjectName.trim(),
-      exportPath: newProjectExportPath.trim() || null,
-      sfxExportPath: newProjectSfxExportPath.trim() || null
-    })
-      .then((project) => {
-        setCollections((previous) => [...previous, project]);
-        setNewProjectName("");
-        setNewProjectExportPath("");
-        setNewProjectSfxExportPath("");
-      })
-      .catch(() => {});
-  }, [activeLibraryId, newProjectName, newProjectExportPath, newProjectSfxExportPath]);
+    try {
+      const project = await invoke<CollectionRecord>("create_project", {
+        libraryId: activeLibraryId,
+        name: newProjectName.trim(),
+        exportPath: newProjectExportPath.trim() || null,
+        sfxExportPath: newProjectSfxExportPath.trim() || null
+      });
+      for (const folder of newProjectExportFolders) {
+        await invoke("add_project_export_folder", {
+          projectId: project.id,
+          path: folder.path,
+          role: folder.role
+        }).catch(() => {});
+      }
+      setCollections((previous) => [...previous, project]);
+      setNewProjectName("");
+      setNewProjectExportPath("");
+      setNewProjectSfxExportPath("");
+      setNewProjectExportFolders([]);
+    } catch {
+      // Surfaced nowhere specific today — matches this handler's existing
+      // silent-failure behavior for create_project itself.
+    }
+  }, [activeLibraryId, newProjectName, newProjectExportPath, newProjectSfxExportPath, newProjectExportFolders]);
+
+  // "+ Add export folder" on the New Project modal — lets a project be set
+  // up with more than the two built-in export slots right from creation,
+  // one folder + category at a time (a literal "how many folders do you
+  // need" numeric prompt would just mean pre-filling N blank rows the user
+  // has to configure anyway, so this is the same incremental pattern the
+  // onboarding advanced-folder step and Settings' Watched Folders use).
+  const handleAddNewProjectExportFolder = useCallback(async () => {
+    const selected = await openDialog({
+      directory: true,
+      multiple: false,
+      title: "Choose an export folder for this project"
+    });
+    if (typeof selected !== "string") return;
+    setNewProjectExportFolders((previous) =>
+      previous.some((folder) => folder.path === selected)
+        ? previous
+        : [...previous, { path: selected, role: "music" }]
+    );
+  }, []);
+
+  const handleSetNewProjectExportFolderRole = useCallback((path: string, role: string) => {
+    setNewProjectExportFolders((previous) =>
+      previous.map((folder) => (folder.path === path ? { ...folder, role } : folder))
+    );
+  }, []);
+
+  const handleRemoveNewProjectExportFolder = useCallback((path: string) => {
+    setNewProjectExportFolders((previous) => previous.filter((folder) => folder.path !== path));
+  }, []);
 
   const handleChooseProjectExportPath = useCallback(async () => {
     const selected = await openDialog({
@@ -2215,7 +2380,53 @@ export function App() {
     setEditProjectName(project.name);
     setEditProjectExportPath(project.export_path ?? "");
     setEditProjectSfxExportPath(project.sfx_export_path ?? "");
+    invoke<ProjectExportFolderRecord[]>("list_project_export_folders", { projectId: project.id })
+      .then(setEditProjectExportFolders)
+      .catch(() => setEditProjectExportFolders([]));
   }, []);
+
+  const refreshEditProjectExportFolders = useCallback((projectId: string) => {
+    invoke<ProjectExportFolderRecord[]>("list_project_export_folders", { projectId })
+      .then(setEditProjectExportFolders)
+      .catch(() => setEditProjectExportFolders([]));
+  }, []);
+
+  // Add/remove/re-tag a categorized export folder on an already-existing
+  // project — applied immediately (no separate Save step), same pattern
+  // Settings' Watched Folders panel uses for library folders.
+  const handleAddEditProjectExportFolder = useCallback(async () => {
+    if (!editProjectId) return;
+    const selected = await openDialog({
+      directory: true,
+      multiple: false,
+      title: "Choose an export folder for this project"
+    });
+    if (typeof selected !== "string") return;
+    await invoke("add_project_export_folder", {
+      projectId: editProjectId,
+      path: selected,
+      role: "music"
+    }).catch(() => {});
+    refreshEditProjectExportFolders(editProjectId);
+  }, [editProjectId, refreshEditProjectExportFolders]);
+
+  const handleSetEditProjectExportFolderRole = useCallback(
+    async (folderId: string, role: string) => {
+      if (!editProjectId) return;
+      await invoke("set_project_export_folder_role", { folderId, role }).catch(() => {});
+      refreshEditProjectExportFolders(editProjectId);
+    },
+    [editProjectId, refreshEditProjectExportFolders]
+  );
+
+  const handleRemoveEditProjectExportFolder = useCallback(
+    async (folderId: string) => {
+      if (!editProjectId) return;
+      await invoke("remove_project_export_folder", { folderId }).catch(() => {});
+      refreshEditProjectExportFolders(editProjectId);
+    },
+    [editProjectId, refreshEditProjectExportFolders]
+  );
 
   const handleChooseEditProjectExportPath = useCallback(async () => {
     const selected = await openDialog({ directory: true, multiple: false, title: "Choose a sound folder" });
@@ -2733,39 +2944,53 @@ export function App() {
 
   const handleBackupLibrary = useCallback(async () => {
     if (!activeLibraryId) return;
-    const destination = await openDialog({ directory: true, multiple: false, title: "Choose backup destination" });
+    const destination = await saveDialog({
+      title: "Save a backup of this library",
+      defaultPath: `${activeLibrary?.name ?? "Library"}.darkwavebak`,
+      filters: [{ name: "Darkwave Library Backup", extensions: ["darkwavebak"] }]
+    });
     if (typeof destination !== "string") return;
+
+    // Same corruption-risk check New Setup's save dialog already runs —
+    // a backup file is an equally critical single-file write, so a
+    // dropped connection mid-save deserves the same warning here.
+    const tolerant = await invoke<boolean>("is_path_network_tolerant", { path: destination }).catch(() => true);
+    const networkWarning = tolerant
+      ? ""
+      : " — this looks like a network drive; a dropped connection mid-save risks corrupting it";
 
     setBackupStatus("Backing up…");
     try {
       const backupPackage = await invoke<BackupPackage>("backup_library", {
-        libraryId: activeLibraryId,
-        backupDir: destination
+        backupFilePath: destination
       });
-      setBackupStatus(`Backed up to ${backupPackage.catalog_snapshot_path}`);
+      setBackupStatus(`Backed up to ${backupPackage.backup_file_path}${networkWarning}`);
     } catch (error) {
       setBackupStatus(`Backup failed: ${String(error)}`);
     }
-  }, [activeLibraryId]);
+  }, [activeLibraryId, activeLibrary?.name]);
 
   const handleRestoreLibrary = useCallback(async () => {
-    const source = await openDialog({ directory: true, multiple: false, title: "Choose a backup folder to restore" });
+    const source = await openDialog({
+      multiple: false,
+      title: "Choose a backup to restore",
+      filters: [{ name: "Darkwave Library Backup", extensions: ["darkwavebak"] }]
+    });
     if (typeof source !== "string") return;
 
     const confirmed = await confirmDialog(
-      "This replaces the current catalog with the selected backup. A safety copy of the current catalog is kept, but any changes made since the backup was taken will no longer be visible.",
+      "This replaces the current library with the selected backup. A safety copy of the current file is kept, but any changes made since the backup was taken will no longer be visible.",
       { title: "Restore library from backup", kind: "warning" }
     );
     if (!confirmed) return;
 
     setBackupStatus("Restoring…");
     try {
-      const libraryCount = await invoke<number>("restore_library", { backupDir: source });
-      setBackupStatus(`Restored ${libraryCount} librar${libraryCount === 1 ? "y" : "ies"} from backup`);
+      const library = await invoke<LibraryRecord>("restore_library", { backupFilePath: source });
+      setBackupStatus(`Restored "${library.name}" from backup`);
       setSelectedAssetId(null);
-      const loaded = await invoke<LibraryRecord[]>("list_libraries");
-      setLibraries(loaded);
-      setActiveLibraryId(loaded.length > 0 ? loaded[0].id : null);
+      setLibraries([library]);
+      setActiveLibraryId(library.id);
     } catch (error) {
       setBackupStatus(`Restore failed: ${String(error)}`);
     }
@@ -2837,23 +3062,67 @@ export function App() {
     setCreateLibraryModalOpen(false);
   };
 
-  // First-run wizard step 1: name the library and create it — separate from
-  // handleCreateLibrary above (used by the always-available "New Library"
-  // modal for anyone who already has a library) since this one hands off
-  // into steps 2/3 instead of finishing immediately.
-  const handleOnboardingCreateLibrary = useCallback(async () => {
+  // Resets all onboarding state and lands directly in the app with the
+  // given (already fully-configured) library — the path both Open Library
+  // and a recent-libraries click take, since neither needs the New Setup
+  // folder-configuration steps that follow library creation.
+  const finishOnboardingWithLibrary = useCallback((library: LibraryRecord, libraryFilePath: string) => {
+    setLibraries([library]);
+    setActiveLibraryId(library.id);
+    setActiveLibraryFilePath(libraryFilePath);
+    setOnboardingLibrary(null);
+    setOnboardingLibraryFilePath("");
+    setOnboardingMediaRoot("");
+    setOnboardingAdvancedFolders([]);
+    setOnboardingImportRoot("");
+    setOnboardingNetworkPathWarning(null);
+    setOnboardingError(null);
+    setOnboardingStep(0);
+  }, []);
+
+  const handleBeginNewSetup = useCallback(() => {
+    setOnboardingError(null);
+    setOnboardingNetworkPathWarning(null);
+    setOnboardingStep(1);
+  }, []);
+
+  // First-run wizard step 1: name the new library file, pick where to save
+  // it (a native save dialog, not a folder picker — this is the .darkwave
+  // file itself, distinct from the media-root folder chosen next), and
+  // create it — separate from handleCreateLibrary above (used by the
+  // always-available "New Library" modal for anyone who already has a
+  // library open) since this one hands off into the folder-setup steps
+  // instead of finishing immediately.
+  const handleOnboardingCreateLibraryFile = useCallback(async () => {
     if (!libraryName.trim()) return;
     setOnboardingBusy(true);
     setOnboardingError(null);
     try {
-      const library = await invoke<LibraryRecord>("create_library", {
-        name: libraryName.trim(),
-        mediaRoot: ""
+      const savePath = await saveDialog({
+        title: "Save your Darkwave library",
+        defaultPath: `${libraryName.trim()}.darkwave`,
+        filters: [{ name: "Darkwave Library", extensions: ["darkwave"] }]
       });
-      setLibraries((previous) => [...previous, library]);
+      if (typeof savePath !== "string") {
+        setOnboardingBusy(false);
+        return;
+      }
+      const tolerant = await invoke<boolean>("is_path_network_tolerant", { path: savePath }).catch(() => true);
+      setOnboardingNetworkPathWarning(
+        tolerant
+          ? null
+          : "That location looks like a network drive. Keeping your library file on local disk is safer — a dropped connection mid-save risks corrupting it."
+      );
+      const library = await invoke<LibraryRecord>("create_library_file", {
+        libraryFilePath: savePath,
+        name: libraryName.trim()
+      });
+      setLibraries([library]);
+      setActiveLibraryFilePath(savePath);
       setOnboardingLibrary(library);
+      setOnboardingLibraryFilePath(savePath);
       setLibraryName("");
-      setOnboardingStep(1);
+      setOnboardingStep(2);
     } catch (error) {
       setOnboardingError(String(error));
     } finally {
@@ -2861,13 +3130,161 @@ export function App() {
     }
   }, [libraryName]);
 
+  // First-run "Open Library" path — a native file picker filtered to
+  // .darkwave files, distinct from New Setup's save dialog.
+  const handleOpenLibraryFile = useCallback(async () => {
+    setOnboardingBusy(true);
+    setOnboardingError(null);
+    try {
+      const selected = await openDialog({
+        multiple: false,
+        title: "Open a Darkwave library",
+        filters: [{ name: "Darkwave Library", extensions: ["darkwave"] }]
+      });
+      if (typeof selected !== "string") {
+        setOnboardingBusy(false);
+        return;
+      }
+      const library = await invoke<LibraryRecord>("open_library_file", { libraryFilePath: selected });
+      finishOnboardingWithLibrary(library, selected);
+    } catch (error) {
+      setOnboardingError(String(error));
+    } finally {
+      setOnboardingBusy(false);
+    }
+  }, [finishOnboardingWithLibrary]);
+
+  // A click on one of the recent-libraries entries shown alongside New
+  // Setup / Open Library — same as Open Library but the path is already
+  // known, so no file dialog. A path that no longer resolves (moved,
+  // deleted, or its volume unmounted) is dropped from the list rather than
+  // left to fail silently again next time.
+  const handleOpenRecentLibraryFile = useCallback(
+    async (path: string) => {
+      setOnboardingBusy(true);
+      setOnboardingError(null);
+      try {
+        const library = await invoke<LibraryRecord>("open_library_file", { libraryFilePath: path });
+        finishOnboardingWithLibrary(library, path);
+      } catch (error) {
+        setOnboardingError(String(error));
+        setRecentLibraryFiles((previous) => previous.filter((entry) => entry.path !== path));
+      } finally {
+        setOnboardingBusy(false);
+      }
+    },
+    [finishOnboardingWithLibrary]
+  );
+
+  // Migration screen: moves one library out of the legacy shared catalog
+  // into its own `.darkwave` file. A save dialog per library (same pattern
+  // as New Setup) rather than a pre-computed default path — lets the user
+  // put each migrated library wherever they want without us guessing at a
+  // "Darkwave Projects" folder convention on their disk.
+  const handleMigrateLibrary = useCallback(async (library: LibraryRecord) => {
+    const savePath = await saveDialog({
+      title: `Save "${library.name}" as a Darkwave library`,
+      defaultPath: `${library.name}.darkwave`,
+      filters: [{ name: "Darkwave Library", extensions: ["darkwave"] }]
+    });
+    if (typeof savePath !== "string") return;
+
+    // Same corruption-risk check New Setup's save dialog already runs —
+    // migrating onto a network drive is an equally critical single-file
+    // write.
+    const tolerant = await invoke<boolean>("is_path_network_tolerant", { path: savePath }).catch(() => true);
+
+    setMigrationStatus((previous) => ({ ...previous, [library.id]: "migrating" }));
+    setMigrationErrors((previous) => {
+      const { [library.id]: _dropped, ...rest } = previous;
+      return rest;
+    });
+    try {
+      await invoke("migrate_legacy_library", { libraryId: library.id, libraryFilePath: savePath });
+      setMigrationStatus((previous) => ({ ...previous, [library.id]: "done" }));
+      if (!tolerant) {
+        setMigrationErrors((previous) => ({
+          ...previous,
+          [library.id]: "Migrated — but that location looks like a network drive, which risks corruption on a dropped connection."
+        }));
+      }
+    } catch (error) {
+      setMigrationStatus((previous) => ({ ...previous, [library.id]: "failed" }));
+      setMigrationErrors((previous) => ({ ...previous, [library.id]: String(error) }));
+    }
+  }, []);
+
+  // Only enabled once every legacy library shows "done" — closes the
+  // legacy catalog for good (renamed aside, never opened again) and lands
+  // back on the first-run screen, now with the migrated libraries in
+  // Recents so the user's next click opens one of them.
+  const handleFinishMigration = useCallback(async () => {
+    setMigrationBusy(true);
+    try {
+      await invoke("finish_legacy_migration");
+      const [loadedLibraries, loadedRecents, loadedActivePath] = await Promise.all([
+        invoke<LibraryRecord[]>("list_libraries"),
+        invoke<RecentLibraryFileEntry[]>("list_recent_library_files"),
+        invoke<string | null>("active_library_file_path")
+      ]);
+      setLibraries(loadedLibraries);
+      setRecentLibraryFiles(loadedRecents);
+      setActiveLibraryFilePath(loadedActivePath);
+      setMigrationStatus({});
+      setMigrationErrors({});
+      // The legacy catalog these referred to is gone (retired by
+      // finish_legacy_migration) — clear rather than leave stale ids
+      // dangling until a later open/create overwrites them.
+      setActiveLibraryId(null);
+      setSelectedAssetId(null);
+    } catch (error) {
+      setOnboardingError(String(error));
+    } finally {
+      setMigrationBusy(false);
+    }
+  }, []);
+
+  // "Remind me later" — a session-only dismissal, not a backend call: the
+  // legacy catalog is already the live one (see the Rust bootstrap's
+  // fallback order), so the app is already fully usable exactly as it was
+  // before this feature existed. Nothing was migrated, so the prompt
+  // reappears next launch.
+  const handleDismissMigration = useCallback(() => {
+    setMigrationDismissed(true);
+  }, []);
+
   const handleOnboardingChooseMediaRoot = useCallback(async () => {
     const selected = await openDialog({
       directory: true,
       multiple: false,
-      title: "Choose where Darkwave should keep your sound library"
+      title: "Choose the folder your actual sound files will live in"
     });
     if (typeof selected === "string") setOnboardingMediaRoot(selected);
+  }, []);
+
+  // Advanced setup: "+ Add another folder" — picks a folder, adds it to the
+  // list with no role yet (the row's own dropdown sets one). Silently
+  // ignores a folder already in the list rather than adding a duplicate.
+  const handleAddOnboardingFolder = useCallback(async () => {
+    const selected = await openDialog({
+      directory: true,
+      multiple: false,
+      title: "Choose a folder to add (e.g. your Soundtracks, SFX, or Licence folder)"
+    });
+    if (typeof selected !== "string") return;
+    setOnboardingAdvancedFolders((previous) =>
+      previous.some((folder) => folder.path === selected) ? previous : [...previous, { path: selected, role: "" }]
+    );
+  }, []);
+
+  const handleSetOnboardingFolderRole = useCallback((path: string, role: string) => {
+    setOnboardingAdvancedFolders((previous) =>
+      previous.map((folder) => (folder.path === path ? { ...folder, role } : folder))
+    );
+  }, []);
+
+  const handleRemoveOnboardingFolder = useCallback((path: string) => {
+    setOnboardingAdvancedFolders((previous) => previous.filter((folder) => folder.path !== path));
   }, []);
 
   const handleOnboardingConfirmMediaRoot = useCallback(async () => {
@@ -2881,13 +3298,34 @@ export function App() {
       });
       setOnboardingLibrary(updated);
       setLibraries((previous) => previous.map((library) => (library.id === updated.id ? updated : library)));
-      setOnboardingStep(2);
+
+      // set_library_media_root already keeps a matching `folders` row
+      // (role null, kind "media_root") in sync on the Rust side — see
+      // sync_media_root_folder — so the basic single-folder user needs
+      // nothing further here. Only the advanced extra folders below need
+      // their own explicit add_folder calls.
+      // Independent inserts (no shared ordering, no uniqueness constraint
+      // between them) — run concurrently rather than one round trip at a
+      // time, same as a user with several advanced folders configured
+      // would expect a single "Continue" click to resolve quickly.
+      await Promise.allSettled(
+        onboardingAdvancedFolders.map((folder) =>
+          invoke("add_folder", {
+            libraryId: updated.id,
+            path: folder.path,
+            role: folder.role.trim() ? folder.role : null,
+            kind: folder.role === "documents" ? "documents" : "watched"
+          })
+        )
+      );
+
+      setOnboardingStep(3);
     } catch (error) {
       setOnboardingError(String(error));
     } finally {
       setOnboardingBusy(false);
     }
-  }, [onboardingLibrary, onboardingMediaRoot]);
+  }, [onboardingLibrary, onboardingMediaRoot, onboardingAdvancedFolders]);
 
   const handleOnboardingChooseImportRoot = useCallback(async () => {
     const selected = await openDialog({
@@ -2920,9 +3358,12 @@ export function App() {
       }
       setActiveLibraryId(finalLibrary.id);
       setOnboardingLibrary(null);
+      setOnboardingLibraryFilePath("");
       setOnboardingStep(0);
       setOnboardingMediaRoot("");
+      setOnboardingAdvancedFolders([]);
       setOnboardingImportRoot("");
+      setOnboardingNetworkPathWarning(null);
     } catch (error) {
       setOnboardingError(String(error));
     } finally {
@@ -3506,6 +3947,25 @@ export function App() {
     };
   }, [activeLibraryId, runJobDrain]);
 
+  // A `.darkwave` library file opened from outside this window's own
+  // Open Library/recent-libraries UI — a Finder double-click (macOS), or a
+  // second launch attempt Windows forwards here instead of opening a
+  // duplicate window (see tauri_plugin_single_instance/RunEvent::Opened in
+  // the Rust backend). Reuses the same reset path New Setup/Open Library
+  // finish with, since it's the identical "a different library file is now
+  // the one open" transition either way.
+  useEffect(() => {
+    const unlistenLibraryFileOpened = listen<{ library: LibraryRecord; path: string }>(
+      "library-file-opened",
+      (event) => {
+        finishOnboardingWithLibrary(event.payload.library, event.payload.path);
+      }
+    );
+    return () => {
+      unlistenLibraryFileOpened.then((dispose) => dispose());
+    };
+  }, [finishOnboardingWithLibrary]);
+
   // process_audio_analysis_jobs claims and fully decodes/analyzes up to 20
   // files per invoke — real per-file work, easily minutes for a batch — so
   // without this, the progress bar only updates once the whole batch's
@@ -3570,27 +4030,38 @@ export function App() {
     });
   }, []);
 
-  const handleChooseWatchedFolder = useCallback(async () => {
+  // Settings' "Watched Folders" section — add/remove/re-tag folders for the
+  // active library after onboarding, the same underlying `folders` rows the
+  // New Setup wizard's advanced step writes (see add_folder/remove_folder/
+  // set_folder_role in the Rust backend). The standing background worker
+  // picks up any change within one tick (~20s), no restart needed.
+  const handleAddWatchedFolder = useCallback(async () => {
     if (!activeLibraryId) return;
     const folder = await openDialog({ directory: true, multiple: false, title: "Choose a folder to watch" });
     if (typeof folder !== "string") return;
+    await invoke("add_folder", { libraryId: activeLibraryId, path: folder, role: null, kind: "watched" }).catch(
+      () => {}
+    );
+    refreshLibraryFolders(activeLibraryId);
+  }, [activeLibraryId, refreshLibraryFolders]);
 
-    setPreferences((previous) => {
-      if (!previous) return previous;
-      const next = { ...previous, watched_folder_path: folder, watched_folder_library_id: activeLibraryId };
-      invoke("save_app_preferences", { preferences: next }).catch(() => {});
-      return next;
-    });
-  }, [activeLibraryId]);
+  const handleSetWatchedFolderRole = useCallback(
+    async (folderId: string, role: string) => {
+      if (!activeLibraryId) return;
+      await invoke("set_folder_role", { folderId, role: role.trim() ? role : null }).catch(() => {});
+      refreshLibraryFolders(activeLibraryId);
+    },
+    [activeLibraryId, refreshLibraryFolders]
+  );
 
-  const handleClearWatchedFolder = useCallback(() => {
-    setPreferences((previous) => {
-      if (!previous) return previous;
-      const next = { ...previous, watched_folder_path: null, watched_folder_library_id: null };
-      invoke("save_app_preferences", { preferences: next }).catch(() => {});
-      return next;
-    });
-  }, []);
+  const handleRemoveWatchedFolder = useCallback(
+    async (folderId: string) => {
+      if (!activeLibraryId) return;
+      await invoke("remove_folder", { folderId }).catch(() => {});
+      refreshLibraryFolders(activeLibraryId);
+    },
+    [activeLibraryId, refreshLibraryFolders]
+  );
 
   useEffect(() => {
     document.documentElement.classList.toggle("reduced-motion", preferences?.reduced_motion ?? false);
@@ -3807,16 +4278,108 @@ export function App() {
     );
   }
 
+  if (librariesLoaded && activeLibraryFilePath === null && libraries.length > 0 && !migrationDismissed) {
+    const allMigrated = libraries.every((library) => migrationStatus[library.id] === "done");
+    return (
+      <main className="shell setup-shell">
+        <section className="setup-card" aria-label="Migrate to Darkwave library files">
+          <div className="brand">Darkwave</div>
+          <h1>Your libraries are moving to library files</h1>
+          <p>
+            Darkwave now keeps each library as its own <code>.darkwave</code> file you can save, move, and reopen
+            like any other document — the way a video editor's project file stays separate from its footage. Save
+            each library below to give it a home.
+          </p>
+          <ul className="setup-recent-list">
+            {libraries.map((library) => {
+              const status = migrationStatus[library.id] ?? "pending";
+              return (
+                <li key={library.id} className="setup-migration-row">
+                  <span>{library.name}</span>
+                  {status === "done" ? (
+                    <span className="settings-hint">Migrated</span>
+                  ) : (
+                    <button
+                      type="button"
+                      onClick={() => handleMigrateLibrary(library)}
+                      disabled={status === "migrating"}
+                    >
+                      {status === "migrating" ? "Saving…" : status === "failed" ? "Retry…" : "Choose location…"}
+                    </button>
+                  )}
+                  {migrationErrors[library.id] ? (
+                    <p className="settings-hint">{migrationErrors[library.id]}</p>
+                  ) : null}
+                </li>
+              );
+            })}
+          </ul>
+          <div className="setup-field-row">
+            <button className="text-button" type="button" onClick={handleDismissMigration} disabled={migrationBusy}>
+              Remind me later
+            </button>
+            <button
+              className="primary-action"
+              type="button"
+              onClick={handleFinishMigration}
+              disabled={!allMigrated || migrationBusy}
+            >
+              Continue
+            </button>
+          </div>
+          {onboardingError ? <p className="settings-hint">{onboardingError}</p> : null}
+        </section>
+      </main>
+    );
+  }
+
   if (librariesLoaded && (libraries.length === 0 || onboardingLibrary)) {
     return (
       <main className="shell setup-shell">
         <section className="setup-card" aria-label="Set up Darkwave">
           <div className="brand">Darkwave</div>
-          <p className="settings-hint">Step {onboardingStep + 1} of 3</p>
+          {onboardingStep > 0 ? <p className="settings-hint">Step {onboardingStep} of 3</p> : null}
           {onboardingStep === 0 ? (
             <>
-              <h1>Create your library</h1>
-              <p>Choose a name for your sound library.</p>
+              <h1>Welcome to Darkwave</h1>
+              <p>Start a new library, or open a library file you already have.</p>
+              <div className="setup-field-row">
+                <button className="primary-action" type="button" onClick={handleBeginNewSetup}>
+                  New Setup
+                </button>
+                <button type="button" onClick={handleOpenLibraryFile} disabled={onboardingBusy}>
+                  Open Library…
+                </button>
+              </div>
+              {recentLibraryFiles.length > 0 ? (
+                <div className="setup-field">
+                  <span>Recent libraries</span>
+                  <ul className="setup-recent-list">
+                    {recentLibraryFiles.map((entry) => (
+                      <li key={entry.path}>
+                        <button
+                          type="button"
+                          className="text-button"
+                          onClick={() => handleOpenRecentLibraryFile(entry.path)}
+                          disabled={onboardingBusy}
+                        >
+                          {entry.name}
+                          <span className="settings-hint"> — {entry.path}</span>
+                        </button>
+                      </li>
+                    ))}
+                  </ul>
+                </div>
+              ) : null}
+            </>
+          ) : onboardingStep === 1 ? (
+            <>
+              <h1>Name your library</h1>
+              <p>
+                This creates a Darkwave library file (a <code>.darkwave</code> document) that holds your tags,
+                analysis, and settings — you'll pick where to save it next. It's separate from the folder your
+                actual sound files live in, which comes after.
+              </p>
               <label className="setup-field">
                 <span>Library name</span>
                 <input
@@ -3825,25 +4388,31 @@ export function App() {
                   onChange={(event) => setLibraryName(event.target.value)}
                   placeholder="Home Studio"
                   onKeyDown={(event) => {
-                    if (event.key === "Enter" && libraryName.trim() && !onboardingBusy) handleOnboardingCreateLibrary();
+                    if (event.key === "Enter" && libraryName.trim() && !onboardingBusy)
+                      handleOnboardingCreateLibraryFile();
                   }}
                 />
               </label>
               <button
                 className="primary-action"
                 type="button"
-                onClick={handleOnboardingCreateLibrary}
+                onClick={handleOnboardingCreateLibraryFile}
                 disabled={!libraryName.trim() || onboardingBusy}
               >
-                Continue
+                Choose save location…
               </button>
+              {onboardingNetworkPathWarning ? <p className="settings-hint">{onboardingNetworkPathWarning}</p> : null}
             </>
-          ) : onboardingStep === 1 ? (
+          ) : onboardingStep === 2 ? (
             <>
-              <h1>Where should Darkwave keep your sound library?</h1>
-              <p>This is the root folder your organized library lives in on disk.</p>
+              <h1>Where do your actual sound files live?</h1>
+              <p>
+                This is a plain folder on disk (or a NAS/external drive) that holds your organized audio files —
+                not the library file you just saved. Darkwave keeps the two separate, the way a video editor keeps
+                its project file apart from the footage it references.
+              </p>
               <label className="setup-field">
-                <span>Root folder</span>
+                <span>Sound files folder</span>
                 <div className="setup-field-row">
                   <input
                     autoFocus
@@ -3856,6 +4425,40 @@ export function App() {
                   </button>
                 </div>
               </label>
+              <div className="setup-field">
+                <span>
+                  Already organized into folders? (optional — Soundtracks, SFX, Foley, Licence, etc.)
+                </span>
+                {onboardingAdvancedFolders.length > 0 ? (
+                  <ul className="setup-recent-list">
+                    {onboardingAdvancedFolders.map((folder) => (
+                      <li key={folder.path} className="setup-migration-row">
+                        <span className="settings-hint">{folder.path}</span>
+                        <select
+                          value={folder.role}
+                          onChange={(event) => handleSetOnboardingFolderRole(folder.path, event.target.value)}
+                        >
+                          {FOLDER_ROLE_OPTIONS.map((option) => (
+                            <option key={option.value} value={option.value}>
+                              {option.label}
+                            </option>
+                          ))}
+                        </select>
+                        <button
+                          type="button"
+                          className="text-button"
+                          onClick={() => handleRemoveOnboardingFolder(folder.path)}
+                        >
+                          Remove
+                        </button>
+                      </li>
+                    ))}
+                  </ul>
+                ) : null}
+                <button type="button" onClick={handleAddOnboardingFolder}>
+                  + Add another folder
+                </button>
+              </div>
               <button
                 className="primary-action"
                 type="button"
@@ -5776,7 +6379,7 @@ export function App() {
           <button type="button" className="text-button" onClick={handleRestoreLibrary}>
             Restore From Backup…
           </button>
-          <div className="status-line">{backupStatus ?? "Copies the catalog snapshot and manifest to a folder you choose"}</div>
+          <div className="status-line">{backupStatus ?? "Saves a single .darkwavebak file — a snapshot of this library you choose where to keep"}</div>
         </CollapsibleSection>
         </div>
       </aside>
@@ -6064,30 +6667,48 @@ export function App() {
                     </div>
 
                     <div className="settings-section">
-                      <h2>Watched Folder</h2>
+                      <h2>Watched Folders</h2>
                       <div className="settings-grid">
-                        <div className="settings-row">
-                          <Import size={14} />
-                          <span>Folder</span>
-                          <strong className="settings-value-path" title={preferences?.watched_folder_path ?? undefined}>
-                            {preferences?.watched_folder_path ?? "Not watching"}
-                          </strong>
-                        </div>
                         <div className="status-line">
-                          New, stable files dropped here import automatically (as referenced files)
-                          into {preferences?.watched_folder_library_id === activeLibraryId
-                            ? activeLibrary?.name ?? "the active library"
-                            : "the library it was set up with"}
-                          , checked roughly every 20 seconds by the background worker.
+                          New, stable files dropped into any folder below import automatically (as referenced
+                          files) into {activeLibrary?.name ?? "the active library"}, checked roughly every 20
+                          seconds by the background worker. A folder's type is a hint for classifying files that
+                          don't already say what they are by name — it never overrides a file whose name or
+                          embedded metadata is already specific.
                         </div>
-                        <button type="button" className="text-button" onClick={handleChooseWatchedFolder} disabled={!activeLibraryId}>
-                          {preferences?.watched_folder_path ? "Change Folder…" : "Choose Folder…"}
-                        </button>
-                        {preferences?.watched_folder_path ? (
-                          <button type="button" className="text-button" onClick={handleClearWatchedFolder}>
-                            Stop Watching
-                          </button>
+                        {libraryFolders.filter((folder) => folder.kind !== "media_root").length > 0 ? (
+                          <ul className="setup-recent-list">
+                            {libraryFolders
+                              .filter((folder) => folder.kind !== "media_root")
+                              .map((folder) => (
+                                <li key={folder.id} className="setup-migration-row">
+                                  <span className="settings-value-path" title={folder.path}>
+                                    {folder.path}
+                                  </span>
+                                  <select
+                                    value={folder.role ?? ""}
+                                    onChange={(event) => handleSetWatchedFolderRole(folder.id, event.target.value)}
+                                  >
+                                    {FOLDER_ROLE_OPTIONS.map((option) => (
+                                      <option key={option.value} value={option.value}>
+                                        {option.label}
+                                      </option>
+                                    ))}
+                                  </select>
+                                  <button
+                                    type="button"
+                                    className="text-button"
+                                    onClick={() => handleRemoveWatchedFolder(folder.id)}
+                                  >
+                                    Stop Watching
+                                  </button>
+                                </li>
+                              ))}
+                          </ul>
                         ) : null}
+                        <button type="button" className="text-button" onClick={handleAddWatchedFolder} disabled={!activeLibraryId}>
+                          + Add Folder…
+                        </button>
                       </div>
                     </div>
 
@@ -6662,6 +7283,42 @@ export function App() {
                 </div>
                 <p className="settings-hint">Everything else — auto-sorted into subfolders.</p>
               </label>
+              <div className="setup-field">
+                <span>More export folders (optional)</span>
+                <p className="settings-hint">
+                  Add a folder for a specific category — a track already tagged that way exports here instead of
+                  the sound/sound effects folders above.
+                </p>
+                {newProjectExportFolders.length > 0 ? (
+                  <ul className="setup-recent-list">
+                    {newProjectExportFolders.map((folder) => (
+                      <li key={folder.path} className="setup-migration-row">
+                        <span className="settings-hint">{folder.path}</span>
+                        <select
+                          value={folder.role}
+                          onChange={(event) => handleSetNewProjectExportFolderRole(folder.path, event.target.value)}
+                        >
+                          {PROJECT_EXPORT_FOLDER_ROLE_OPTIONS.map((option) => (
+                            <option key={option.value} value={option.value}>
+                              {option.label}
+                            </option>
+                          ))}
+                        </select>
+                        <button
+                          type="button"
+                          className="text-button"
+                          onClick={() => handleRemoveNewProjectExportFolder(folder.path)}
+                        >
+                          Remove
+                        </button>
+                      </li>
+                    ))}
+                  </ul>
+                ) : null}
+                <button type="button" onClick={handleAddNewProjectExportFolder}>
+                  + Add Export Folder…
+                </button>
+              </div>
               <button
                 type="button"
                 className="primary-action"
@@ -6802,6 +7459,42 @@ export function App() {
                 </div>
                 <p className="settings-hint">Everything else — auto-sorted into subfolders.</p>
               </label>
+              <div className="setup-field">
+                <span>More export folders</span>
+                <p className="settings-hint">
+                  Add a folder for a specific category — a track already tagged that way exports here instead of
+                  the sound/sound effects folders above. Changes here apply immediately.
+                </p>
+                {editProjectExportFolders.length > 0 ? (
+                  <ul className="setup-recent-list">
+                    {editProjectExportFolders.map((folder) => (
+                      <li key={folder.id} className="setup-migration-row">
+                        <span className="settings-hint">{folder.path}</span>
+                        <select
+                          value={folder.role}
+                          onChange={(event) => handleSetEditProjectExportFolderRole(folder.id, event.target.value)}
+                        >
+                          {PROJECT_EXPORT_FOLDER_ROLE_OPTIONS.map((option) => (
+                            <option key={option.value} value={option.value}>
+                              {option.label}
+                            </option>
+                          ))}
+                        </select>
+                        <button
+                          type="button"
+                          className="text-button"
+                          onClick={() => handleRemoveEditProjectExportFolder(folder.id)}
+                        >
+                          Remove
+                        </button>
+                      </li>
+                    ))}
+                  </ul>
+                ) : null}
+                <button type="button" onClick={handleAddEditProjectExportFolder}>
+                  + Add Export Folder…
+                </button>
+              </div>
               <button
                 type="button"
                 className="primary-action"

@@ -12,8 +12,9 @@ use release_readiness::{
     UpdateChannel, UpdateChannelConfig, REQUIRED_PACKAGED_DECODER_EXTENSIONS,
 };
 use storage::{
-    AssetPath, AssetRecord, Catalog, CollectionRecord, CollectionType, JobKind, LibraryRecord,
-    SourceRecordDraft, StorageError, TagApprovalState, TagOrigin, TagRecord,
+    AssetPath, AssetRecord, Catalog, CollectionRecord, CollectionType, FolderRecord, JobKind,
+    LibraryRecord, ProjectExportFolderRecord, SourceRecordDraft, StorageError, TagApprovalState,
+    TagOrigin, TagRecord,
 };
 use tauri::Manager;
 use uuid::Uuid;
@@ -28,6 +29,16 @@ const ALL_TAG_ORIGINS: [TagOrigin; 6] = [
 ];
 
 struct CatalogState(Mutex<Catalog>);
+
+/// The currently open library file's path, if the running catalog came from
+/// a real `.darkwave` file (New Setup / Open Library / a double-clicked
+/// file). `None` while running against the legacy shared app-data
+/// `catalog.sqlite` that predates the library-file model, or before any
+/// library file has been created/opened this session — `Catalog` itself has
+/// no notion of "its own path," so this is tracked alongside it. Named
+/// distinctly from Darkwave's unrelated "Project" concept
+/// (`CollectionType::Project`, an editorial export destination).
+struct ActiveLibraryFileState(Mutex<Option<String>>);
 
 /// Mac App Store build only: holds each library's live security-scoped
 /// access for as long as the app is running (see
@@ -243,138 +254,122 @@ fn preferences_path(app: &tauri::AppHandle) -> Result<PathBuf, String> {
     Ok(dir.join("preferences.json"))
 }
 
+/// Backs up the currently open library file to a single `.darkwavebak` file
+/// at `backup_file_path` (a save dialog's result — the frontend defaults it
+/// to `"{library name}.darkwavebak"`). Unlike the old shared-catalog era,
+/// there's no separate manifest to write and copy alongside it: the
+/// `.darkwave` catalog already contains everything (assets, tags, folders)
+/// a restore needs, so checkpointing its WAL (see
+/// `storage::Catalog::checkpoint_wal`, the same mechanism
+/// `migrate_legacy_library` relies on for a safe plain-file copy) and
+/// copying the one file is the whole backup.
 #[tauri::command]
 fn backup_library(
-    app: tauri::AppHandle,
     state: tauri::State<CatalogState>,
-    library_id: String,
-    backup_dir: String,
+    active_library_file: tauri::State<ActiveLibraryFileState>,
+    backup_file_path: String,
 ) -> Result<backup::BackupPackage, String> {
-    let library_id = parse_uuid_field(&library_id, "library id")?;
-    let catalog = state.0.lock().expect("catalog mutex poisoned");
-    let library = catalog
-        .get_library(library_id)
-        .map_err(storage_error_message)?
-        .ok_or_else(|| "library not found".to_string())?;
-    let assets = catalog
-        .list_assets(library_id)
-        .map_err(storage_error_message)?;
-    drop(catalog);
+    let library_file_path = active_library_file
+        .0
+        .lock()
+        .expect("active library file mutex poisoned")
+        .clone()
+        .ok_or_else(|| "no library file is currently open to back up".to_string())?;
 
-    let manifest = assets
-        .iter()
-        .filter_map(|asset| {
-            let relative_path = match &asset.path {
-                AssetPath::Managed(path) | AssetPath::Referenced(path) => path.clone(),
-            };
-            asset
-                .content_hash
-                .clone()
-                .map(|content_hash| library_sync::ManifestAsset {
-                    id: asset.id,
-                    relative_path,
-                    content_hash,
-                })
-        })
-        .fold(
-            library_sync::PortableManifest::new(library_id, 1),
-            |manifest, asset| manifest.with_asset(asset),
-        );
+    if std::path::Path::new(&backup_file_path).exists() {
+        return Err("a file already exists at that location".to_string());
+    }
+    if let Some(parent) = std::path::Path::new(&backup_file_path).parent() {
+        std::fs::create_dir_all(parent)
+            .map_err(|error| format!("create backup folder: {error}"))?;
+    }
 
-    let app_data_dir = app
-        .path()
-        .app_data_dir()
-        .map_err(|error| format!("resolve app data directory: {error}"))?;
-    let catalog_path = app_data_dir.join("catalog.sqlite");
-    let manifest_path = app_data_dir.join("library.darkwave-manifest.json");
-    library_sync::write_manifest_file(&manifest, &manifest_path)
-        .map_err(|error| format!("{error:?}"))?;
-
-    std::fs::create_dir_all(&backup_dir)
-        .map_err(|error| format!("create backup directory {backup_dir}: {error}"))?;
-
-    let source = backup::BackupSource {
-        catalog_path: catalog_path.to_string_lossy().to_string(),
-        manifest_path: manifest_path.to_string_lossy().to_string(),
-        backup_dir,
+    let (library_id, media_root) = {
+        let catalog = state.0.lock().expect("catalog mutex poisoned");
+        catalog.checkpoint_wal().map_err(storage_error_message)?;
+        let library = catalog
+            .list_libraries()
+            .map_err(storage_error_message)?
+            .into_iter()
+            .next()
+            .ok_or_else(|| "no library found in the open catalog".to_string())?;
+        (library.id, library.media_root)
     };
 
-    backup::create_backup(
-        library_id,
-        1,
-        library.media_root,
-        &source,
-        current_time_ms(),
-        |from, to| std::fs::copy(from, to).is_ok(),
-    )
+    let source = backup::BackupSource {
+        catalog_path: library_file_path,
+        backup_file_path,
+    };
+
+    backup::create_backup(library_id, media_root, &source, current_time_ms(), |from, to| {
+        std::fs::copy(from, to).is_ok()
+    })
     .map_err(|error| format!("{error:?}"))
 }
 
-/// Restores a catalog from a backup folder produced by `backup_library`. The live
-/// SQLite connection is closed (by swapping it out for an in-memory placeholder under
-/// the same mutex the rest of the app uses) before the file on disk is touched, and the
-/// snapshot is staged next to the live catalog and only `rename`d into place once fully
-/// copied, so a failed or partial copy never corrupts the live database.
+/// Restores the currently open library file from a `.darkwavebak` snapshot.
+/// The live SQLite connection is closed (swapped out for an in-memory
+/// placeholder under the same mutex the rest of the app uses) before the
+/// file on disk is touched, and the snapshot is staged next to the live
+/// project file and only `rename`d into place once fully copied, so a
+/// failed or partial copy never corrupts the live file — the same pattern
+/// this command used for the old shared `catalog.sqlite`, just scoped to
+/// whichever project file is open now.
 #[tauri::command]
-fn restore_library(app: tauri::AppHandle, state: tauri::State<CatalogState>, backup_dir: String) -> Result<usize, String> {
-    let catalog_snapshot_path = PathBuf::from(&backup_dir)
-        .join("catalog.sqlite")
-        .to_string_lossy()
-        .to_string();
-    let manifest_snapshot_path = PathBuf::from(&backup_dir)
-        .join("library.darkwave-manifest.json")
-        .to_string_lossy()
-        .to_string();
-
-    if !std::path::Path::new(&catalog_snapshot_path).exists() {
-        return Err("no catalog.sqlite found in the selected backup folder".to_string());
-    }
-    if !std::path::Path::new(&manifest_snapshot_path).exists() {
-        return Err("no manifest found in the selected backup folder".to_string());
+fn restore_library(
+    state: tauri::State<CatalogState>,
+    active_library_file: tauri::State<ActiveLibraryFileState>,
+    backup_file_path: String,
+) -> Result<LibraryRecord, String> {
+    if !std::path::Path::new(&backup_file_path).exists() {
+        return Err("that backup file no longer exists".to_string());
     }
 
-    let app_data_dir = app
-        .path()
-        .app_data_dir()
-        .map_err(|error| format!("resolve app data directory: {error}"))?;
-    let catalog_path = app_data_dir.join("catalog.sqlite");
-    let manifest_path = app_data_dir.join("library.darkwave-manifest.json");
-    let staged_catalog_path = app_data_dir.join("catalog.sqlite.restoring");
+    let live_library_file_path = active_library_file
+        .0
+        .lock()
+        .expect("active library file mutex poisoned")
+        .clone()
+        .ok_or_else(|| "no library file is currently open to restore into".to_string())?;
 
-    std::fs::copy(&catalog_snapshot_path, &staged_catalog_path)
-        .map_err(|error| format!("stage catalog snapshot: {error}"))?;
+    let staged_path = format!("{live_library_file_path}.restoring");
+    std::fs::copy(&backup_file_path, &staged_path)
+        .map_err(|error| format!("stage backup snapshot: {error}"))?;
 
     let mut guard = state.0.lock().expect("catalog mutex poisoned");
-    let _ = std::fs::copy(&catalog_path, app_data_dir.join("catalog.sqlite.before-restore"));
+    let _ = std::fs::copy(
+        &live_library_file_path,
+        format!("{live_library_file_path}.before-restore"),
+    );
     drop(std::mem::replace(
         &mut *guard,
         Catalog::open(":memory:").map_err(storage_error_message)?,
     ));
 
-    let swap_result = std::fs::rename(&staged_catalog_path, &catalog_path)
-        .map_err(|error| format!("replace live catalog: {error}"))
-        .and_then(|_| {
-            std::fs::copy(&manifest_snapshot_path, &manifest_path)
-                .map(|_| ())
-                .map_err(|error| format!("copy manifest snapshot: {error}"))
-        });
+    let swap_result = std::fs::rename(&staged_path, &live_library_file_path)
+        .map_err(|error| format!("replace live project file: {error}"));
 
-    let reopened = Catalog::open(&catalog_path).map_err(storage_error_message);
+    let reopened = Catalog::open(&live_library_file_path).map_err(storage_error_message);
 
     match (swap_result, reopened) {
         (Ok(()), Ok(catalog)) => {
-            let library_count = catalog.list_libraries().map_err(storage_error_message)?.len();
+            let library = catalog
+                .list_libraries()
+                .map_err(storage_error_message)?
+                .into_iter()
+                .next()
+                .ok_or_else(|| "no library found in the restored file".to_string())?;
             *guard = catalog;
-            Ok(library_count)
+            Ok(library)
         }
         (Err(error), Ok(catalog)) => {
             *guard = catalog;
             Err(error)
         }
         (_, Err(open_error)) => {
-            let _ = std::fs::remove_file(&staged_catalog_path);
+            let _ = std::fs::remove_file(&staged_path);
             *guard = Catalog::open(":memory:").map_err(storage_error_message)?;
-            Err(format!("catalog unreadable after restore attempt: {open_error}"))
+            Err(format!("project file unreadable after restore attempt: {open_error}"))
         }
     }
 }
@@ -602,7 +597,7 @@ fn trash_duplicate_group(
 
 #[tauri::command]
 fn backup_restore_requirements() -> Vec<&'static str> {
-    vec!["catalog_snapshot", "portable_manifest", "media_root"]
+    vec!["catalog_snapshot", "media_root"]
 }
 
 // (async): probes the media root path with a filesystem existence check,
@@ -725,6 +720,33 @@ fn list_libraries(
     Ok(libraries)
 }
 
+/// Keeps a library's `kind = "media_root"` folder row (see `add_folder`) in
+/// sync whenever `media_root` itself changes — the New Setup wizard's basic
+/// step, the Settings "change media root" action, `import_folder`'s
+/// implicit first-import-sets-root path, and the MAS bookmark self-heal
+/// after an SMB/NAS remount (see `resolve_library_bookmark_access`) all
+/// change `media_root`, and the background poller only ever watches what's
+/// registered in `folders` — without this, any of those paths would leave
+/// the poller either watching a stale path or not watching the root at
+/// all. A no-op for an empty `media_root` (nothing to watch yet) and for a
+/// path that already matches the existing row. Best-effort: a failure here
+/// shouldn't fail whatever caller is setting `media_root`.
+fn sync_media_root_folder(catalog: &Catalog, library_id: Uuid, media_root: &str) {
+    if media_root.trim().is_empty() {
+        return;
+    }
+    let Ok(folders) = catalog.list_folders(library_id) else {
+        return;
+    };
+    if let Some(existing) = folders.iter().find(|folder| folder.kind == "media_root") {
+        if existing.path == media_root {
+            return;
+        }
+        let _ = catalog.remove_folder(existing.id);
+    }
+    let _ = catalog.add_folder(library_id, media_root, None, "media_root");
+}
+
 /// Mac App Store build only: regains security-scoped access to a library's
 /// media root on this launch, using the bookmark minted the last time its
 /// folder was freshly picked (see `store_library_bookmark_for_freshly_picked_folder`).
@@ -758,6 +780,7 @@ fn resolve_library_bookmark_access(app: &tauri::AppHandle, catalog: &Catalog, li
             let resolved_path = resolved_path.to_string_lossy();
             if resolved_path != library.media_root {
                 let _ = catalog.set_library_media_root(library.id, resolved_path.as_ref());
+                sync_media_root_folder(catalog, library.id, resolved_path.as_ref());
             }
         }
         held.insert(library.id, access);
@@ -853,6 +876,7 @@ fn set_library_media_root(
     catalog
         .set_library_media_root(library_id, &media_root)
         .map_err(storage_error_message)?;
+    sync_media_root_folder(&catalog, library_id, &media_root);
     // The dialog that produced media_root just gave this process sandbox
     // access to it — the one moment a security-scoped bookmark can actually
     // be minted for it (Mac App Store build only; see
@@ -882,6 +906,414 @@ fn set_library_import_root(
         .get_library(library_id)
         .map_err(storage_error_message)?
         .ok_or_else(|| "library not found after setting import folder".to_string())
+}
+
+/// Registers a folder Darkwave should know about for this library — the
+/// basic single-folder setup calls this once for `media_root` itself
+/// (`role: null, kind: "media_root"`); the advanced setup calls it once per
+/// additional folder the user adds, each with its own `role` (a media-type
+/// hint used by import classification — see `import-pipeline`) and `kind`
+/// (`"watched"` for an ordinary audio folder, `"documents"` for a
+/// licence/PDF folder tracked as inventory only).
+#[tauri::command]
+fn add_folder(
+    state: tauri::State<CatalogState>,
+    library_id: String,
+    path: String,
+    role: Option<String>,
+    kind: String,
+) -> Result<FolderRecord, String> {
+    let library_id = parse_uuid_field(&library_id, "library id")?;
+    let catalog = state.0.lock().expect("catalog mutex poisoned");
+    catalog
+        .add_folder(library_id, path, role.as_deref(), kind)
+        .map_err(storage_error_message)
+}
+
+#[tauri::command]
+fn list_folders(state: tauri::State<CatalogState>, library_id: String) -> Result<Vec<FolderRecord>, String> {
+    let library_id = parse_uuid_field(&library_id, "library id")?;
+    let catalog = state.0.lock().expect("catalog mutex poisoned");
+    catalog.list_folders(library_id).map_err(storage_error_message)
+}
+
+#[tauri::command]
+fn remove_folder(state: tauri::State<CatalogState>, folder_id: String) -> Result<(), String> {
+    let folder_id = parse_uuid_field(&folder_id, "folder id")?;
+    let catalog = state.0.lock().expect("catalog mutex poisoned");
+    catalog.remove_folder(folder_id).map_err(storage_error_message)
+}
+
+#[tauri::command]
+fn set_folder_role(
+    state: tauri::State<CatalogState>,
+    folder_id: String,
+    role: Option<String>,
+) -> Result<(), String> {
+    let folder_id = parse_uuid_field(&folder_id, "folder id")?;
+    let catalog = state.0.lock().expect("catalog mutex poisoned");
+    catalog
+        .set_folder_role(folder_id, role.as_deref())
+        .map_err(storage_error_message)
+}
+
+/// Looks up the configured role for `path` if it exactly matches one of the
+/// library's `folders` rows — used by `import_folder`/`refresh_library`/
+/// `scan_import_folder` so a manual bulk import of an already-configured
+/// folder gets the same classification fallback the background poller
+/// would have given the same files (see `resolve_media_type`'s
+/// fill-the-gap precedence in `import-pipeline`). `None` for any path that
+/// isn't a folder the user has explicitly registered — most manual imports,
+/// since the poller already keeps registered folders imported continuously.
+fn folder_role_for_path(catalog: &Catalog, library_id: Uuid, path: &str) -> Option<String> {
+    catalog
+        .list_folders(library_id)
+        .ok()?
+        .into_iter()
+        .find(|folder| folder.path == path)
+        .and_then(|folder| folder.role)
+}
+
+/// The library-file path the currently open catalog came from, or `None`
+/// when running against the legacy shared catalog / no library file yet —
+/// the frontend uses this to decide whether to show the first-run screen.
+/// Named distinctly from Darkwave's unrelated "Project" concept
+/// (`CollectionType::Project`, an editorial export destination) to avoid
+/// confusion with it.
+#[tauri::command]
+fn active_library_file_path(state: tauri::State<ActiveLibraryFileState>) -> Option<String> {
+    state
+        .0
+        .lock()
+        .expect("active library file mutex poisoned")
+        .clone()
+}
+
+#[tauri::command]
+fn list_recent_library_files(
+    app: tauri::AppHandle,
+) -> Result<Vec<preferences::RecentLibraryFileEntry>, String> {
+    let path = preferences_path(&app)?;
+    let preferences = preferences::load_preferences(&path).map_err(|error| format!("{error:?}"))?;
+    Ok(preferences.recent_library_files)
+}
+
+/// Whether `path` is safe to treat as a normal local catalog location
+/// (see `storage::is_network_tolerant_catalog_path`) — the frontend calls
+/// this after a New Setup save dialog or an Open Library pick to decide
+/// whether to show the "this is on a network drive" warning.
+#[tauri::command]
+fn is_path_network_tolerant(path: String) -> Result<bool, String> {
+    storage::is_network_tolerant_catalog_path(&path).map_err(storage_error_message)
+}
+
+/// Creates a brand-new `.darkwave` library file at `library_file_path` (New
+/// Setup) and makes it the active one, replacing whatever catalog was
+/// previously open (the fresh in-memory placeholder from a cold start, or
+/// another library file the user is switching away from).
+#[tauri::command]
+fn create_library_file(
+    app: tauri::AppHandle,
+    state: tauri::State<CatalogState>,
+    active_library_file: tauri::State<ActiveLibraryFileState>,
+    library_file_path: String,
+    name: String,
+) -> Result<LibraryRecord, String> {
+    if std::path::Path::new(&library_file_path).exists() {
+        return Err("a file already exists at that location".to_string());
+    }
+    if let Some(parent) = std::path::Path::new(&library_file_path).parent() {
+        std::fs::create_dir_all(parent)
+            .map_err(|error| format!("create library file folder: {error}"))?;
+    }
+
+    let (catalog, library) = Catalog::open_or_init_library_file(&library_file_path, &name)
+        .map_err(storage_error_message)?;
+    catalog
+        .seed_starter_taxonomy()
+        .map_err(storage_error_message)?;
+
+    swap_active_catalog(
+        &app,
+        &state,
+        &active_library_file,
+        catalog,
+        &library_file_path,
+        &library.name,
+    )?;
+
+    Ok(library)
+}
+
+/// Opens an existing `.darkwave` library file (Open Library, a
+/// recent-libraries click, or a double-clicked file), replacing whatever
+/// catalog was previously open.
+#[tauri::command]
+fn open_library_file(
+    app: tauri::AppHandle,
+    state: tauri::State<CatalogState>,
+    active_library_file: tauri::State<ActiveLibraryFileState>,
+    library_file_path: String,
+) -> Result<LibraryRecord, String> {
+    if !std::path::Path::new(&library_file_path).exists() {
+        return Err("that library file no longer exists".to_string());
+    }
+
+    let (catalog, library) = Catalog::open_or_init_library_file(&library_file_path, "")
+        .map_err(storage_error_message)?;
+
+    swap_active_catalog(
+        &app,
+        &state,
+        &active_library_file,
+        catalog,
+        &library_file_path,
+        &library.name,
+    )?;
+
+    Ok(library)
+}
+
+/// Shared tail end of `create_library_file`/`open_library_file`: swaps the
+/// new catalog into the same mutex `restore_library` already uses for a
+/// live catalog replacement, records the active library-file path, and
+/// updates the recent-libraries list so the first-run screen reflects it
+/// next launch.
+fn swap_active_catalog(
+    app: &tauri::AppHandle,
+    state: &tauri::State<CatalogState>,
+    active_library_file: &tauri::State<ActiveLibraryFileState>,
+    catalog: Catalog,
+    library_file_path: &str,
+    library_name: &str,
+) -> Result<(), String> {
+    {
+        let mut guard = state.0.lock().expect("catalog mutex poisoned");
+        drop(std::mem::replace(&mut *guard, catalog));
+    }
+    *active_library_file
+        .0
+        .lock()
+        .expect("active library file mutex poisoned") = Some(library_file_path.to_string());
+
+    let preferences_file = preferences_path(app)?;
+    let mut prefs = preferences::load_preferences(&preferences_file)
+        .map_err(|error| format!("{error:?}"))?;
+    prefs.record_library_file_opened(library_file_path, library_name, current_time_ms());
+    preferences::save_preferences(&preferences_file, &prefs)
+        .map_err(|error| format!("{error:?}"))?;
+
+    Ok(())
+}
+
+/// Picks the first `.darkwave` path out of a process's CLI args (skipping
+/// argv[0], the executable path itself) — how a library file's path
+/// arrives on Windows, whether from the initial launch or a second launch
+/// forwarded here by `tauri_plugin_single_instance`. Deliberately does not
+/// match `.darkwavebak` — a backup file isn't a live catalog to open
+/// directly; double-clicking one only brings Darkwave to the front for now
+/// (see the backup-format phase for an eventual restore flow).
+fn darkwave_library_path_from_args(args: &[String]) -> Option<String> {
+    args.iter()
+        .skip(1)
+        .find(|arg| arg.to_ascii_lowercase().ends_with(".darkwave"))
+        .cloned()
+}
+
+/// Opens `library_file_path` on an already-running app instance (the
+/// second-launch-forwarded-here path on Windows, or a `RunEvent::Opened`
+/// file on macOS) and tells the already-rendered frontend about it via an
+/// event, since — unlike `open_library_file` — nothing in the UI called
+/// `invoke` to trigger this and get the result back directly.
+fn open_library_file_and_notify_frontend(app: &tauri::AppHandle, library_file_path: &str) {
+    if !std::path::Path::new(library_file_path).is_file() {
+        return;
+    }
+    let (Some(state), Some(active_library_file)) = (
+        app.try_state::<CatalogState>(),
+        app.try_state::<ActiveLibraryFileState>(),
+    ) else {
+        return;
+    };
+
+    // A repeat double-click of the file already open, or a second launch
+    // pointed at it (both land here — see the single-instance callback and
+    // RunEvent::Opened), would otherwise pay for closing and reopening the
+    // live connection, a preferences.json rewrite, and a frontend event
+    // that resets onboarding/UI state, all for no actual change.
+    let already_active = active_library_file
+        .0
+        .lock()
+        .expect("active library file mutex poisoned")
+        .as_deref()
+        == Some(library_file_path);
+    if already_active {
+        return;
+    }
+
+    let opened = Catalog::open_or_init_library_file(library_file_path, "")
+        .map_err(storage_error_message)
+        .and_then(|(catalog, library)| {
+            swap_active_catalog(
+                app,
+                &state,
+                &active_library_file,
+                catalog,
+                library_file_path,
+                &library.name,
+            )?;
+            Ok(library)
+        });
+
+    if let Ok(library) = opened {
+        use tauri::Emitter;
+        let _ = app.emit(
+            "library-file-opened",
+            serde_json::json!({ "library": library, "path": library_file_path }),
+        );
+    }
+}
+
+fn legacy_catalog_path(app: &tauri::AppHandle) -> Result<PathBuf, String> {
+    app.path()
+        .app_data_dir()
+        .map(|dir| dir.join("catalog.sqlite"))
+        .map_err(|error| format!("resolve app data directory: {error}"))
+}
+
+/// Migrates one library out of the legacy shared `catalog.sqlite` into its
+/// own standalone `.darkwave` file at `library_file_path`, which must not
+/// already exist. Does not touch the live legacy catalog beyond checkpointing
+/// its WAL (see `Catalog::checkpoint_wal`) — the whole legacy file is
+/// cloned via a plain filesystem copy, then every *other* library's data is
+/// stripped out of that copy via the existing cascade-deleting
+/// `delete_library`, which already removes a library's assets, tags,
+/// collections and everything else that hangs off them (see its own doc
+/// comment) without touching sibling libraries. Cloning the whole file
+/// first — rather than re-inserting rows table by table into a fresh file
+/// — means nothing can be silently missed by an incomplete list of tables
+/// to copy.
+///
+/// Deliberately does not touch `ActiveLibraryFileState`/the running
+/// `CatalogState`, and does not mark `library_file_path` as the active
+/// project to reopen next launch — it only becomes a recent-libraries
+/// entry (see `AppPreferences::add_recent_library_file`), so the user picks
+/// when to actually open it rather than having the app silently switch
+/// underneath them mid-migration.
+#[tauri::command]
+fn migrate_legacy_library(
+    app: tauri::AppHandle,
+    state: tauri::State<CatalogState>,
+    library_id: String,
+    library_file_path: String,
+) -> Result<LibraryRecord, String> {
+    let library_id = parse_uuid_field(&library_id, "library id")?;
+
+    if std::path::Path::new(&library_file_path).exists() {
+        return Err("a file already exists at that location".to_string());
+    }
+    if let Some(parent) = std::path::Path::new(&library_file_path).parent() {
+        std::fs::create_dir_all(parent)
+            .map_err(|error| format!("create library file folder: {error}"))?;
+    }
+
+    {
+        let legacy_catalog = state.0.lock().expect("catalog mutex poisoned");
+        legacy_catalog
+            .checkpoint_wal()
+            .map_err(storage_error_message)?;
+    }
+
+    let source_path = legacy_catalog_path(&app)?;
+    std::fs::copy(&source_path, &library_file_path)
+        .map_err(|error| format!("copy legacy catalog: {error}"))?;
+
+    let migrated = Catalog::open(&library_file_path).map_err(storage_error_message)?;
+    let other_library_ids: Vec<Uuid> = migrated
+        .list_libraries()
+        .map_err(storage_error_message)?
+        .into_iter()
+        .map(|library| library.id)
+        .filter(|id| *id != library_id)
+        .collect();
+    for other_id in other_library_ids {
+        migrated
+            .delete_library(other_id)
+            .map_err(storage_error_message)?;
+    }
+
+    let library = migrated
+        .get_library(library_id)
+        .map_err(storage_error_message)?
+        .ok_or_else(|| "library not found in migrated file".to_string())?;
+
+    // The background poller now watches only what's registered in
+    // `folders` — a legacy library predates that table entirely, so
+    // without this it would silently stop being watched at all once
+    // migrated, even though its media_root was being watched before
+    // (implicitly, via the old media_root-wide refresh/import behavior).
+    // Same sync every other media_root-changing path uses.
+    sync_media_root_folder(&migrated, library_id, &library.media_root);
+
+    drop(migrated);
+
+    let preferences_file = preferences_path(&app)?;
+    let mut prefs = preferences::load_preferences(&preferences_file)
+        .map_err(|error| format!("{error:?}"))?;
+    prefs.add_recent_library_file(&library_file_path, &library.name, current_time_ms());
+    preferences::save_preferences(&preferences_file, &prefs)
+        .map_err(|error| format!("{error:?}"))?;
+
+    Ok(library)
+}
+
+/// Called once every legacy library has been migrated (see
+/// `migrate_legacy_library`): closes the live connection to the legacy
+/// shared catalog, replaces it with an empty placeholder (the same state a
+/// fresh install starts in), and renames the legacy file out of the way —
+/// never deletes it outright — so it stops being treated as a live catalog
+/// on future launches (`active_library_file_path` returning `None` with
+/// zero libraries no longer looks like "migration needed") while staying
+/// recoverable if a migration bug is later discovered.
+#[tauri::command]
+fn finish_legacy_migration(
+    app: tauri::AppHandle,
+    state: tauri::State<CatalogState>,
+    active_library_file: tauri::State<ActiveLibraryFileState>,
+) -> Result<(), String> {
+    {
+        let mut guard = state.0.lock().expect("catalog mutex poisoned");
+        let placeholder = Catalog::open(":memory:").map_err(storage_error_message)?;
+        drop(std::mem::replace(&mut *guard, placeholder));
+    }
+    *active_library_file
+        .0
+        .lock()
+        .expect("active library file mutex poisoned") = None;
+
+    let legacy_path = legacy_catalog_path(&app)?;
+    if legacy_path.exists() {
+        let mut retired_path = legacy_path.with_file_name("catalog.sqlite.pre-migration-backup");
+        let mut attempt = 1;
+        while retired_path.exists() {
+            retired_path =
+                legacy_path.with_file_name(format!("catalog.sqlite.pre-migration-backup.{attempt}"));
+            attempt += 1;
+        }
+        // Best-effort: a failed rename here (e.g. a stray file lock) still
+        // leaves the legacy file readable and inert for us, just not
+        // renamed — worth surfacing, not worth failing the whole flow over,
+        // since every library has already been safely copied out by this
+        // point.
+        if let Err(error) = std::fs::rename(&legacy_path, &retired_path) {
+            log_startup_event(&format!(
+                "could not retire legacy catalog {}: {error}",
+                legacy_path.display()
+            ));
+        }
+    }
+
+    Ok(())
 }
 
 /// Removes this library's cached preview files (the local, disposable
@@ -992,16 +1424,12 @@ fn delete_library(
 
     {
         let catalog = state.0.lock().expect("catalog mutex poisoned");
+        // Cascades to this library's folders (and everything else scoped to
+        // it) automatically — see delete_library's own doc comment — so
+        // there's no separate watched-folder preference to clean up here
+        // any more; folders are per-library catalog rows now, not a global
+        // preference.
         catalog.delete_library(library_id).map_err(storage_error_message)?;
-    }
-
-    let preferences_path = preferences_path(&app)?;
-    if let Ok(mut preferences) = preferences::load_preferences(&preferences_path) {
-        if preferences.watched_folder_library_id.as_deref() == Some(&library_id.to_string()) {
-            preferences.watched_folder_path = None;
-            preferences.watched_folder_library_id = None;
-            let _ = preferences::save_preferences(&preferences_path, &preferences);
-        }
     }
 
     Ok(DeleteLibraryResult {
@@ -1217,6 +1645,7 @@ async fn import_folder(
             catalog
                 .set_library_media_root(library_id, &folder_path)
                 .map_err(storage_error_message)?;
+            sync_media_root_folder(&catalog, library_id, &folder_path);
             // The dialog that produced folder_path just gave this process
             // sandbox access to it — the one moment a security-scoped
             // bookmark can actually be minted for it (Mac App Store build
@@ -1233,7 +1662,11 @@ async fn import_folder(
     let paths = collect_audio_files(std::path::Path::new(&folder_path))
         .map_err(|error| format!("could not read folder {folder_path}: {error}"))?;
 
-    let (imported, failed) = run_batch_import(&state, library_id, import_mode, paths).await;
+    let folder_role = {
+        let catalog = state.0.lock().expect("catalog mutex poisoned");
+        folder_role_for_path(&catalog, library_id, &folder_path)
+    };
+    let (imported, failed) = run_batch_import(&state, library_id, import_mode, paths, folder_role).await;
 
     {
         let catalog = state.0.lock().expect("catalog mutex poisoned");
@@ -1295,6 +1728,7 @@ async fn run_batch_import(
     library_id: Uuid,
     mode: ImportMode,
     paths: Vec<PathBuf>,
+    folder_role: Option<String>,
 ) -> (Vec<AssetRecord>, Vec<ImportFailure>) {
     use futures::stream::{self, StreamExt};
 
@@ -1305,16 +1739,19 @@ async fn run_batch_import(
 
     let mut prepared: Vec<(PathBuf, Result<import_pipeline::PreparedImport, ImportError>)> =
         stream::iter(paths)
-            .map(|path| async move {
-                let probe_path = path.clone();
-                let result = tauri::async_runtime::spawn_blocking(move || {
-                    import_pipeline::prepare_import(&probe_path, mode)
-                })
-                .await
-                .unwrap_or_else(|join_error| {
-                    Err(ImportError::Io(std::io::Error::other(join_error.to_string())))
-                });
-                (path, result)
+            .map(|path| {
+                let folder_role = folder_role.clone();
+                async move {
+                    let probe_path = path.clone();
+                    let result = tauri::async_runtime::spawn_blocking(move || {
+                        import_pipeline::prepare_import(&probe_path, mode, folder_role.as_deref())
+                    })
+                    .await
+                    .unwrap_or_else(|join_error| {
+                        Err(ImportError::Io(std::io::Error::other(join_error.to_string())))
+                    });
+                    (path, result)
+                }
             })
             .buffer_unordered(IMPORT_PREPARE_CONCURRENCY)
             .collect()
@@ -1442,7 +1879,11 @@ async fn import_dropped_paths(
         }
     }
 
-    let (imported, failed) = run_batch_import(&state, library_id, ImportMode::Referenced, copied_paths).await;
+    // No folder-role signal here: a drop onto the app window has no
+    // associated `folders` row to attribute it to (unlike a folder the
+    // user explicitly imports or that the background poller watches).
+    let (imported, failed) =
+        run_batch_import(&state, library_id, ImportMode::Referenced, copied_paths, None).await;
 
     let stem_groups_detected = {
         let catalog = state.0.lock().expect("catalog mutex poisoned");
@@ -1589,8 +2030,12 @@ async fn refresh_library(
         .filter(|path| !known_paths.contains(&path.to_string_lossy().to_string()))
         .collect();
 
+    let folder_role = {
+        let catalog = state.0.lock().expect("catalog mutex poisoned");
+        folder_role_for_path(&catalog, library_id, &media_root)
+    };
     let (imported, failed) =
-        run_batch_import(&state, library_id, ImportMode::Referenced, paths).await;
+        run_batch_import(&state, library_id, ImportMode::Referenced, paths, folder_role).await;
 
     {
         let catalog = state.0.lock().expect("catalog mutex poisoned");
@@ -1637,7 +2082,12 @@ async fn scan_import_folder(
     let paths = collect_audio_files(std::path::Path::new(&import_root))
         .map_err(|error| format!("could not read {import_root}: {error}"))?;
 
-    let (imported, failed) = run_batch_import(&state, library_id, ImportMode::Managed, paths).await;
+    let folder_role = {
+        let catalog = state.0.lock().expect("catalog mutex poisoned");
+        folder_role_for_path(&catalog, library_id, &import_root)
+    };
+    let (imported, failed) =
+        run_batch_import(&state, library_id, ImportMode::Managed, paths, folder_role).await;
 
     {
         let catalog = state.0.lock().expect("catalog mutex poisoned");
@@ -3464,14 +3914,72 @@ fn rename_project(
         .ok_or_else(|| "project not found".to_string())
 }
 
+/// Adds a categorized export folder to a project — the advanced
+/// counterpart to its two built-in `export_path`/`sfx_export_path` slots.
+/// `role` is one of the same media-type-ish strings a library `folders`
+/// row uses (music, sound_effect, voiceover, foley, ambience, documents);
+/// `export_asset_to_project` checks these first before falling back to the
+/// built-in two-bucket split.
+#[tauri::command]
+fn add_project_export_folder(
+    state: tauri::State<CatalogState>,
+    project_id: String,
+    path: String,
+    role: String,
+) -> Result<ProjectExportFolderRecord, String> {
+    let project_id = parse_uuid_field(&project_id, "project id")?;
+    let catalog = state.0.lock().expect("catalog mutex poisoned");
+    catalog
+        .add_project_export_folder(project_id, path, role)
+        .map_err(storage_error_message)
+}
+
+#[tauri::command]
+fn list_project_export_folders(
+    state: tauri::State<CatalogState>,
+    project_id: String,
+) -> Result<Vec<ProjectExportFolderRecord>, String> {
+    let project_id = parse_uuid_field(&project_id, "project id")?;
+    let catalog = state.0.lock().expect("catalog mutex poisoned");
+    catalog
+        .list_project_export_folders(project_id)
+        .map_err(storage_error_message)
+}
+
+#[tauri::command]
+fn remove_project_export_folder(state: tauri::State<CatalogState>, folder_id: String) -> Result<(), String> {
+    let folder_id = parse_uuid_field(&folder_id, "folder id")?;
+    let catalog = state.0.lock().expect("catalog mutex poisoned");
+    catalog
+        .remove_project_export_folder(folder_id)
+        .map_err(storage_error_message)
+}
+
+#[tauri::command]
+fn set_project_export_folder_role(
+    state: tauri::State<CatalogState>,
+    folder_id: String,
+    role: String,
+) -> Result<(), String> {
+    let folder_id = parse_uuid_field(&folder_id, "folder id")?;
+    let catalog = state.0.lock().expect("catalog mutex poisoned");
+    catalog
+        .set_project_export_folder_role(folder_id, role)
+        .map_err(storage_error_message)
+}
+
 /// The "editor's dream" button: copies one sound straight into a project's
 /// configured folder (e.g. an editing app's watch folder) so it can be
 /// dragged into a timeline immediately, without an export-destination
 /// dialog. Reuses the same editorial export pipeline as
-/// `export_selected_asset`, just with the destination pre-resolved from one
-/// of the project's two configured folders instead of a user-picked one —
-/// music goes to `export_path` (the "sound folder"), everything else goes
-/// to `sfx_export_path` (the "sound effects folder").
+/// `export_selected_asset`, just with the destination pre-resolved instead
+/// of a user-picked one. Checks the project's categorized
+/// `project_export_folders` first (a folder whose `role` matches the
+/// asset's `media_type` exactly) — only when none matches does it fall
+/// back to the two built-in slots: music goes to `export_path` (the "sound
+/// folder"), everything else goes to `sfx_export_path` (the "sound effects
+/// folder"). A basic project with no categorized folders configured
+/// behaves exactly as before.
 #[tauri::command]
 fn export_asset_to_project(
     state: tauri::State<CatalogState>,
@@ -3493,18 +4001,21 @@ fn export_asset_to_project(
         .ok_or_else(|| "asset not found".to_string())?;
 
     let is_music = asset.media_type == "music";
-    let destination_folder = if is_music {
-        project.export_path
+    let matching_custom_folder = catalog
+        .list_project_export_folders(project_id)
+        .map_err(storage_error_message)?
+        .into_iter()
+        .find(|folder| folder.role == asset.media_type);
+
+    let destination_folder = if let Some(folder) = matching_custom_folder {
+        folder.path
+    } else if is_music {
+        project.export_path.ok_or_else(|| "this project has no sound folder configured".to_string())?
     } else {
-        project.sfx_export_path
-    }
-    .ok_or_else(|| {
-        if is_music {
-            "this project has no sound folder configured".to_string()
-        } else {
-            "this project has no sound effects folder configured".to_string()
-        }
-    })?;
+        project
+            .sfx_export_path
+            .ok_or_else(|| "this project has no sound effects folder configured".to_string())?
+    };
 
     let source_path = match &asset.path {
         AssetPath::Referenced(path) => path.clone(),
@@ -3967,6 +4478,22 @@ pub fn run() {
     log_startup_event("run() starting");
 
     let builder = tauri::Builder::default()
+        // Must be the first plugin registered (see the plugin's own docs) —
+        // its callback fires in the *already-running* instance whenever a
+        // second launch happens (e.g. double-clicking a second `.darkwave`
+        // file on Windows, where the file path arrives as a plain CLI arg
+        // rather than through macOS's RunEvent::Opened), so that launch
+        // gets forwarded here instead of opening a second window onto a
+        // library file that's already open elsewhere.
+        .plugin(tauri_plugin_single_instance::init(|app, argv, _cwd| {
+            if let Some(path) = darkwave_library_path_from_args(&argv) {
+                open_library_file_and_notify_frontend(app, &path);
+            }
+            if let Some(window) = app.get_webview_window("main") {
+                let _ = window.unminimize();
+                let _ = window.set_focus();
+            }
+        }))
         .plugin(tauri_plugin_clipboard_manager::init())
         .plugin(tauri_plugin_dialog::init())
         .plugin(tauri_plugin_fs::init())
@@ -3995,15 +4522,79 @@ pub fn run() {
                 return Ok(());
             }
 
-            let catalog = match Catalog::open(app_data_dir.join("catalog.sqlite")) {
-                Ok(catalog) => catalog,
-                Err(error) => {
-                    report_fatal_setup_error(app.handle(), "open the local catalog database", error);
-                    return Ok(());
+            // Bootstrap order: (1) a `.darkwave` file passed on the command
+            // line — how Windows hands us the path when the app is launched
+            // fresh by double-clicking a file (macOS delivers that as
+            // RunEvent::Opened instead, handled separately below, but this
+            // also harmlessly covers a `darkwave-desktop /path/to/x.darkwave`
+            // launch on any platform); (2) reopen the last library file the
+            // user had open, so relaunching feels like reopening a document
+            // in After Effects rather than starting over; (3) fall back to
+            // the legacy shared catalog.sqlite for anyone who hasn't
+            // migrated to the library-file model yet — the frontend detects
+            // this case via `active_library_file_path` returning `None` and
+            // shows the migration screen instead of the New Setup/Open
+            // Library first-run screen; (4) a fresh install with none of the
+            // above gets an empty in-memory placeholder, replaced the moment
+            // the first-run screen calls
+            // `create_library_file`/`open_library_file`.
+            let legacy_catalog_path = app_data_dir.join("catalog.sqlite");
+            let preferences_file_path = app_data_dir.join("preferences.json");
+            let startup_preferences = preferences::load_preferences(&preferences_file_path)
+                .unwrap_or_else(|_| preferences::AppPreferences::default_for_editorial_audio());
+
+            let cli_args: Vec<String> = std::env::args().collect();
+            let candidate_library_file_path = darkwave_library_path_from_args(&cli_args)
+                .filter(|path| std::path::Path::new(path).is_file())
+                .or_else(|| {
+                    startup_preferences
+                        .last_active_library_file_path
+                        .clone()
+                        .filter(|path| std::path::Path::new(path).is_file())
+                });
+
+            let (catalog, active_library_file_path) = if let Some(library_file_path) =
+                candidate_library_file_path
+            {
+                match Catalog::open(&library_file_path) {
+                    Ok(catalog) => (catalog, Some(library_file_path)),
+                    Err(error) => {
+                        log_startup_event(&format!(
+                            "could not reopen last library file {library_file_path}: {error} — falling back"
+                        ));
+                        match Catalog::open(&legacy_catalog_path) {
+                            Ok(catalog) => (catalog, None),
+                            Err(error) => {
+                                report_fatal_setup_error(
+                                    app.handle(),
+                                    "open the local catalog database",
+                                    error,
+                                );
+                                return Ok(());
+                            }
+                        }
+                    }
+                }
+            } else if legacy_catalog_path.exists() {
+                match Catalog::open(&legacy_catalog_path) {
+                    Ok(catalog) => (catalog, None),
+                    Err(error) => {
+                        report_fatal_setup_error(app.handle(), "open the local catalog database", error);
+                        return Ok(());
+                    }
+                }
+            } else {
+                match Catalog::open(":memory:") {
+                    Ok(catalog) => (catalog, None),
+                    Err(error) => {
+                        report_fatal_setup_error(app.handle(), "open the local catalog database", error);
+                        return Ok(());
+                    }
                 }
             };
             log_startup_event("catalog opened");
             app.manage(CatalogState(Mutex::new(catalog)));
+            app.manage(ActiveLibraryFileState(Mutex::new(active_library_file_path)));
             app.manage(JobControlState {
                 audio_analysis_paused: std::sync::atomic::AtomicBool::new(false),
                 waveform_generation_paused: std::sync::atomic::AtomicBool::new(false),
@@ -4018,69 +4609,174 @@ pub fn run() {
             app.manage(BookmarkAccessState(Mutex::new(std::collections::HashMap::new())));
 
             // Standing background worker: requeues jobs that failed with
-            // retries left, polls the configured watched folder (if any),
-            // then tells the frontend to drain whatever's pending. This is
-            // what actually fixes jobs only ever processing right after
-            // Import/Refresh — everywhere, not just those two triggers, and
-            // it's what makes watched-folder import a live feature instead
-            // of tested-but-never-invoked library code. A plain thread +
+            // retries left, polls every folder configured on the currently
+            // open library (see `folders`/`add_folder`), then tells the
+            // frontend to drain whatever's pending. This is what actually
+            // fixes jobs only ever processing right after Import/Refresh —
+            // everywhere, not just those two triggers, and it's what makes
+            // watched-folder import a live feature instead of
+            // tested-but-never-invoked library code. A plain thread +
             // sleep, not async/tokio: each tick's own work (a few SQL
-            // statements, one directory read) is fast and synchronous, so
-            // there's nothing here that benefits from an async runtime.
+            // statements, a handful of directory reads) is fast and
+            // synchronous, so there's nothing here that benefits from an
+            // async runtime.
             let worker_app_handle = app.handle().clone();
             std::thread::spawn(move || {
                 use tauri::Emitter;
-                // Owned across ticks so its internal size-stabilization
-                // state persists between polls, same as import_pipeline's
-                // own design intends. Recreated if the configured path
-                // changes; cleared if watching is turned off.
-                let mut watched_poller: Option<(String, import_pipeline::WatchedFolderPoller)> =
-                    None;
+                // Keyed by folder path so each folder's own file-size
+                // stability state persists across ticks, same as
+                // import_pipeline's own single-folder design always
+                // intended. Rebuilt from the open library's `folders` rows
+                // every tick (one query, no filesystem work of its own) —
+                // adding, removing, or re-tagging a folder in Settings or
+                // during New Setup takes effect on the very next tick, no
+                // restart and no separate invalidation signal needed. A
+                // `kind = "documents"` folder never gets an entry here —
+                // it's scanned separately below, since it's plain
+                // inventory, not an audio-import source.
+                let mut watched_pollers: std::collections::HashMap<
+                    PathBuf,
+                    (Uuid, Option<String>, import_pipeline::WatchedFolderPoller),
+                > = std::collections::HashMap::new();
+                // Mirrors watched_pollers, but for "documents" folders:
+                // paths already recorded (or already known to fail — see
+                // below), so an unchanged folder costs zero catalog work
+                // on repeat ticks instead of re-running an INSERT OR
+                // IGNORE per file every 20s forever.
+                let mut documents_seen: std::collections::HashMap<Uuid, std::collections::HashSet<PathBuf>> =
+                    std::collections::HashMap::new();
 
                 loop {
                     std::thread::sleep(std::time::Duration::from_secs(20));
 
                     if let Some(state) = worker_app_handle.try_state::<CatalogState>() {
-                        let catalog = state.0.lock().expect("catalog mutex poisoned");
-                        const MAX_JOB_ATTEMPTS: i64 = 3;
-                        let _ = catalog.requeue_failed_jobs(MAX_JOB_ATTEMPTS);
+                        // Brief lock: job requeue plus reading which
+                        // library/folders are currently configured. Every
+                        // filesystem poll, directory listing, and file hash
+                        // below runs with the lock released — a slow or
+                        // unresponsive folder (a stalled NAS/SMB mount, a
+                        // documents folder with hundreds of files) can then
+                        // only block this worker thread, never every
+                        // foreground command that shares this same mutex
+                        // (add_folder, list_libraries, any asset/tag query,
+                        // export_asset_to_project, etc.). The catalog is
+                        // re-locked only briefly, per file actually
+                        // committed — the same hash-outside/commit-inside
+                        // split `run_batch_import` already uses.
+                        let library_and_folders = {
+                            let catalog = state.0.lock().expect("catalog mutex poisoned");
+                            const MAX_JOB_ATTEMPTS: i64 = 3;
+                            let _ = catalog.requeue_failed_jobs(MAX_JOB_ATTEMPTS);
 
-                        if let Ok(preferences_path) = preferences_path(&worker_app_handle) {
-                            if let Ok(preferences) = preferences::load_preferences(&preferences_path)
-                            {
-                                match (
-                                    preferences.watched_folder_path,
-                                    preferences
-                                        .watched_folder_library_id
-                                        .as_deref()
-                                        .and_then(|id| Uuid::parse_str(id).ok()),
-                                ) {
-                                    (Some(folder), Some(library_id)) => {
-                                        let poller = match &mut watched_poller {
-                                            Some((path, poller)) if *path == folder => poller,
-                                            _ => {
-                                                watched_poller = Some((
-                                                    folder.clone(),
-                                                    import_pipeline::WatchedFolderPoller::new(
-                                                        folder.clone(),
-                                                    ),
-                                                ));
-                                                &mut watched_poller.as_mut().expect("just set").1
-                                            }
-                                        };
+                            // One project file = one library (see the
+                            // project-file model) — the worker always
+                            // watches whichever library the currently open
+                            // catalog holds, never a preferences-level
+                            // global setting.
+                            catalog
+                                .list_libraries()
+                                .ok()
+                                .and_then(|libraries| libraries.into_iter().next())
+                                .map(|library| {
+                                    let folders = catalog.list_folders(library.id).unwrap_or_default();
+                                    (library.id, folders)
+                                })
+                        };
 
-                                        if let Ok(candidates) = poller.poll() {
-                                            for candidate in candidates {
-                                                let _ = import_pipeline::import_file(
-                                                    &catalog,
-                                                    library_id,
-                                                    &candidate.path,
-                                                    import_pipeline::ImportMode::Referenced,
-                                                );
-                                            }
-                                        }
+                        if let Some((library_id, folders)) = library_and_folders {
+                            let audio_folders: std::collections::HashMap<
+                                PathBuf,
+                                (Uuid, Option<String>),
+                            > = folders
+                                .iter()
+                                .filter(|folder| folder.kind != "documents")
+                                .map(|folder| {
+                                    (
+                                        PathBuf::from(&folder.path),
+                                        (folder.id, folder.role.clone()),
+                                    )
+                                })
+                                .collect();
+
+                            // Drop pollers for folders that were removed
+                            // (or renamed away) since the last tick.
+                            watched_pollers.retain(|path, _| audio_folders.contains_key(path));
+                            documents_seen.retain(|folder_id, _| {
+                                folders
+                                    .iter()
+                                    .any(|folder| folder.kind == "documents" && folder.id == *folder_id)
+                            });
+
+                            for (path, (folder_id, role)) in &audio_folders {
+                                let entry = watched_pollers.entry(path.clone()).or_insert_with(|| {
+                                    (
+                                        *folder_id,
+                                        role.clone(),
+                                        import_pipeline::WatchedFolderPoller::new(path.clone()),
+                                    )
+                                });
+                                // A role edited in Settings since the last
+                                // tick should apply to the very next file
+                                // this folder yields.
+                                entry.1 = role.clone();
+
+                                // Filesystem-only (fs::read_dir + per-file
+                                // metadata) — no catalog access, so no lock
+                                // needed for this step.
+                                let candidates = entry.2.poll().unwrap_or_default();
+                                for candidate in candidates {
+                                    // The slow, disk-bound part (streamed
+                                    // SHA-256 + metadata/tag extraction) —
+                                    // runs fully unlocked, same as
+                                    // run_batch_import's own prepare stage.
+                                    let prepared = import_pipeline::prepare_import(
+                                        &candidate.path,
+                                        import_pipeline::ImportMode::Referenced,
+                                        entry.1.as_deref(),
+                                    );
+                                    if let Ok(prepared) = prepared {
+                                        let catalog = state.0.lock().expect("catalog mutex poisoned");
+                                        let _ = import_pipeline::commit_prepared_import(
+                                            &catalog, library_id, prepared, None,
+                                        );
                                     }
-                                    _ => watched_poller = None,
+                                }
+                            }
+
+                            // Documents folders (e.g. a Licence/PDF
+                            // folder): plain inventory. Listing the
+                            // directory happens unlocked; only the actual
+                            // insert (skipped entirely once a path is in
+                            // documents_seen) takes a brief lock, one file
+                            // at a time.
+                            for folder in folders.iter().filter(|folder| folder.kind == "documents") {
+                                let Ok(entries) = std::fs::read_dir(&folder.path) else {
+                                    continue;
+                                };
+                                let seen = documents_seen.entry(folder.id).or_default();
+                                for entry in entries.flatten() {
+                                    let is_file = entry
+                                        .metadata()
+                                        .map(|metadata| metadata.is_file())
+                                        .unwrap_or(false);
+                                    if !is_file {
+                                        continue;
+                                    }
+                                    let path = entry.path();
+                                    if seen.contains(&path) {
+                                        continue;
+                                    }
+                                    let catalog = state.0.lock().expect("catalog mutex poisoned");
+                                    let recorded = catalog
+                                        .record_folder_document(
+                                            folder.id,
+                                            library_id,
+                                            path.to_string_lossy().as_ref(),
+                                        )
+                                        .unwrap_or(false);
+                                    if recorded {
+                                        seen.insert(path);
+                                    }
                                 }
                             }
                         }
@@ -4289,6 +4985,17 @@ pub fn run() {
             set_library_media_root,
             set_library_import_root,
             set_library_import_subfolders,
+            add_folder,
+            list_folders,
+            remove_folder,
+            set_folder_role,
+            active_library_file_path,
+            list_recent_library_files,
+            is_path_network_tolerant,
+            create_library_file,
+            open_library_file,
+            migrate_legacy_library,
+            finish_legacy_migration,
             import_dropped_paths,
             detect_stem_groups,
             stem_group_members,
@@ -4324,6 +5031,10 @@ pub fn run() {
             set_project_export_path,
             set_project_sfx_export_path,
             rename_project,
+            add_project_export_folder,
+            list_project_export_folders,
+            remove_project_export_folder,
+            set_project_export_folder_role,
             export_asset_to_project,
             add_to_collection,
             assets_in_collection,
@@ -4378,8 +5089,22 @@ pub fn run() {
             license::recover_license_key,
             license::init_trial
         ])
-        .run(tauri::generate_context!())
-        .expect("failed to run Darkwave desktop shell");
+        .build(tauri::generate_context!())
+        .expect("failed to build Darkwave desktop shell")
+        .run(|app_handle, event| {
+            // macOS's document-open mechanism (Finder double-click, or the
+            // Dock icon's Open Recent menu) — delivered here whether this
+            // is a fresh launch or the app was already running, unlike the
+            // single-instance plugin's callback above, which only fires for
+            // a *second* launch attempt (mainly the Windows path).
+            if let tauri::RunEvent::Opened { urls } = event {
+                for url in urls {
+                    if let Ok(path) = url.to_file_path() {
+                        open_library_file_and_notify_frontend(app_handle, &path.to_string_lossy());
+                    }
+                }
+            }
+        });
 }
 
 #[cfg(test)]
@@ -4398,6 +5123,109 @@ mod tests {
     fn parse_uuid_field_accepts_uuid_input() {
         let id = uuid::Uuid::new_v4();
         assert_eq!(super::parse_uuid_field(&id.to_string(), "library id"), Ok(id));
+    }
+
+    #[test]
+    fn darkwave_library_path_from_args_finds_a_darkwave_file_case_insensitively() {
+        let args = vec![
+            "darkwave-desktop.exe".to_string(),
+            "C:\\Users\\Name\\My Library.DARKWAVE".to_string(),
+        ];
+        assert_eq!(
+            super::darkwave_library_path_from_args(&args),
+            Some("C:\\Users\\Name\\My Library.DARKWAVE".to_string())
+        );
+    }
+
+    #[test]
+    fn darkwave_library_path_from_args_ignores_a_bak_file_and_argv_zero() {
+        let args = vec![
+            "/Volumes/x/My Library.darkwave".to_string(), // argv[0], must be skipped
+            "/Volumes/x/My Library.darkwavebak".to_string(),
+        ];
+        assert_eq!(super::darkwave_library_path_from_args(&args), None);
+    }
+
+    #[test]
+    fn darkwave_library_path_from_args_returns_none_with_no_matching_arg() {
+        assert_eq!(
+            super::darkwave_library_path_from_args(&["darkwave-desktop".to_string()]),
+            None
+        );
+    }
+
+    #[test]
+    fn folder_role_for_path_matches_a_registered_folder_and_ignores_others() {
+        let catalog = storage::Catalog::open(":memory:").expect("open catalog");
+        let library = catalog.create_library("Home Studio", "/sounds").expect("library");
+        catalog
+            .add_folder(library.id, "/sounds/SFX", Some("sound_effect"), "watched")
+            .expect("add folder");
+
+        assert_eq!(
+            super::folder_role_for_path(&catalog, library.id, "/sounds/SFX"),
+            Some("sound_effect".to_string())
+        );
+        assert_eq!(
+            super::folder_role_for_path(&catalog, library.id, "/sounds/Unregistered"),
+            None
+        );
+    }
+
+    #[test]
+    fn sync_media_root_folder_registers_a_folder_when_none_exists() {
+        let catalog = storage::Catalog::open(":memory:").expect("open catalog");
+        let library = catalog.create_library("Home Studio", "").expect("library");
+
+        super::sync_media_root_folder(&catalog, library.id, "/sounds");
+
+        let folders = catalog.list_folders(library.id).expect("list folders");
+        assert_eq!(folders.len(), 1);
+        assert_eq!(folders[0].path, "/sounds");
+        assert_eq!(folders[0].kind, "media_root");
+        assert_eq!(folders[0].role, None);
+    }
+
+    #[test]
+    fn sync_media_root_folder_replaces_a_stale_path_without_duplicating() {
+        let catalog = storage::Catalog::open(":memory:").expect("open catalog");
+        let library = catalog.create_library("Home Studio", "/old/mount").expect("library");
+        super::sync_media_root_folder(&catalog, library.id, "/old/mount");
+
+        // Simulates the MAS bookmark self-heal: the same logical folder
+        // remounts under a different /Volumes/... path.
+        super::sync_media_root_folder(&catalog, library.id, "/new/mount");
+
+        let folders = catalog.list_folders(library.id).expect("list folders");
+        assert_eq!(folders.len(), 1, "must replace, not duplicate, the media_root folder");
+        assert_eq!(folders[0].path, "/new/mount");
+    }
+
+    #[test]
+    fn sync_media_root_folder_is_a_no_op_for_an_empty_path() {
+        let catalog = storage::Catalog::open(":memory:").expect("open catalog");
+        let library = catalog.create_library("Home Studio", "").expect("library");
+
+        super::sync_media_root_folder(&catalog, library.id, "   ");
+
+        assert_eq!(catalog.list_folders(library.id).expect("list folders").len(), 0);
+    }
+
+    #[test]
+    fn sync_media_root_folder_does_not_disturb_other_folders() {
+        let catalog = storage::Catalog::open(":memory:").expect("open catalog");
+        let library = catalog.create_library("Home Studio", "/sounds").expect("library");
+        catalog
+            .add_folder(library.id, "/sounds/SFX", Some("sound_effect"), "watched")
+            .expect("add watched folder");
+
+        super::sync_media_root_folder(&catalog, library.id, "/sounds");
+        super::sync_media_root_folder(&catalog, library.id, "/sounds/relocated");
+
+        let folders = catalog.list_folders(library.id).expect("list folders");
+        assert_eq!(folders.len(), 2);
+        assert!(folders.iter().any(|folder| folder.path == "/sounds/SFX" && folder.kind == "watched"));
+        assert!(folders.iter().any(|folder| folder.path == "/sounds/relocated" && folder.kind == "media_root"));
     }
 
     #[test]
@@ -4550,10 +5378,10 @@ mod tests {
     }
 
     #[test]
-    fn backup_restore_requirements_include_catalog_manifest_and_media_root() {
+    fn backup_restore_requirements_include_catalog_snapshot_and_media_root() {
         assert_eq!(
             super::backup_restore_requirements(),
-            vec!["catalog_snapshot", "portable_manifest", "media_root"]
+            vec!["catalog_snapshot", "media_root"]
         );
     }
 

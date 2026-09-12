@@ -38,8 +38,36 @@
       "icons/icon.icns",
       "icons/icon.ico"
     ],
+    "fileAssociations": [
+      {
+        "ext": ["darkwave"],
+        "name": "Darkwave Library",
+        "description": "Darkwave Library",
+        "role": "Editor",
+        "rank": "Owner",
+        "exportedType": {
+          "identifier": "dev.darkwave.library",
+          "conformsTo": ["public.database", "public.data"]
+        }
+      },
+      {
+        "ext": ["darkwavebak"],
+        "name": "Darkwave Library Backup",
+        "description": "Darkwave Library Backup",
+        "role": "Viewer",
+        "rank": "Owner",
+        "exportedType": {
+          "identifier": "dev.darkwave.library-backup",
+          "conformsTo": ["public.data"]
+        }
+      }
+    ],
     "externalBin": ["binaries/similarity-worker"],
-    "resources": ["models/*"],
+    "resources": {
+      "models/*": "models/",
+      "icons/document-darkwave.icns": "document-darkwave.icns",
+      "icons/document-darkwave-backup.icns": "document-darkwave-backup.icns"
+    },
     "macOS": {
       "entitlements": "entitlements.mas.plist",
       "hardenedRuntime": true,

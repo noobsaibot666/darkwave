@@ -2392,6 +2392,50 @@ dd {
   margin-top: 4px;
 }
 
+.setup-card .setup-field-row .primary-action,
+.setup-card .setup-field-row > button {
+  flex: 1;
+}
+
+.setup-recent-list {
+  display: flex;
+  flex-direction: column;
+  gap: 4px;
+  margin: 0;
+  padding: 0;
+  list-style: none;
+  max-height: 160px;
+  overflow-y: auto;
+}
+
+.setup-recent-list button {
+  display: block;
+  width: 100%;
+  padding: 6px 4px;
+  text-align: left;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.setup-recent-list .settings-hint {
+  font-size: 11px;
+}
+
+.setup-migration-row {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 8px;
+  flex-wrap: wrap;
+  padding: 4px 0;
+}
+
+.setup-migration-row .settings-hint {
+  flex-basis: 100%;
+  margin: 0;
+}
+
 .setup-card .primary-action:disabled {
   opacity: 0.5;
 }

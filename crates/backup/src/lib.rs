@@ -1,78 +1,62 @@
-use std::path::Path;
-
 use serde::{Deserialize, Serialize};
 use uuid::Uuid;
 
+/// A backup is a single `.darkwavebak` file — a plain copy of the project's
+/// `.darkwave` catalog at the moment of backup (the caller is expected to
+/// checkpoint its WAL first, e.g. via `storage::Catalog::checkpoint_wal`, so
+/// the copy is complete). Nothing else needs to travel alongside it: the
+/// catalog file already contains every asset, tag, and folder-role a
+/// restore needs — there is no separate manifest to keep in sync with it,
+/// unlike the old shared-catalog era's `library.darkwave-manifest.json`
+/// (a derived, regeneratable export, never independent state).
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 pub struct BackupPackage {
     pub library_id: Uuid,
-    pub manifest_revision: u64,
     pub media_root: String,
-    pub catalog_snapshot_path: String,
-    pub manifest_path: String,
+    pub backup_file_path: String,
     pub created_at_ms: u64,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 pub struct RestorePlan {
     pub library_id: Uuid,
-    pub manifest_revision: u64,
     pub media_root: String,
-    pub catalog_snapshot_path: String,
-    pub manifest_path: String,
+    pub backup_file_path: String,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub enum RestoreValidationError {
-    MissingCatalogSnapshot,
-    MissingManifest,
+    MissingBackupFile,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct BackupSource {
     pub catalog_path: String,
-    pub manifest_path: String,
-    pub backup_dir: String,
+    pub backup_file_path: String,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub enum BackupError {
     CatalogSnapshotFailed,
-    ManifestSnapshotFailed,
 }
 
-/// Copies the live catalog and manifest into `source.backup_dir` via the injected `copy`
-/// operation, producing a package that can later be restored. Stops after the catalog
-/// snapshot fails so a partial, manifest-less backup is never reported as usable.
+/// Copies the live catalog to `source.backup_file_path` via the injected
+/// `copy` operation, producing a package describing what was just written.
 pub fn create_backup(
     library_id: Uuid,
-    manifest_revision: u64,
     media_root: impl Into<String>,
     source: &BackupSource,
     created_at_ms: u64,
     mut copy: impl FnMut(&str, &str) -> bool,
 ) -> Result<BackupPackage, BackupError> {
-    let backup_dir = Path::new(&source.backup_dir);
-    let catalog_snapshot_path = backup_dir.join("catalog.sqlite").to_string_lossy().to_string();
-    let manifest_path = backup_dir
-        .join("library.darkwave-manifest.json")
-        .to_string_lossy()
-        .to_string();
-
-    if !copy(&source.catalog_path, &catalog_snapshot_path) {
+    if !copy(&source.catalog_path, &source.backup_file_path) {
         return Err(BackupError::CatalogSnapshotFailed);
-    }
-
-    if !copy(&source.manifest_path, &manifest_path) {
-        return Err(BackupError::ManifestSnapshotFailed);
     }
 
     Ok(BackupPackage {
         library_id,
-        manifest_revision,
         media_root: media_root.into(),
-        catalog_snapshot_path,
-        manifest_path,
+        backup_file_path: source.backup_file_path.clone(),
         created_at_ms,
     })
 }
@@ -81,10 +65,8 @@ impl BackupPackage {
     pub fn restore_plan(&self) -> RestorePlan {
         RestorePlan {
             library_id: self.library_id,
-            manifest_revision: self.manifest_revision,
             media_root: self.media_root.clone(),
-            catalog_snapshot_path: self.catalog_snapshot_path.clone(),
-            manifest_path: self.manifest_path.clone(),
+            backup_file_path: self.backup_file_path.clone(),
         }
     }
 
@@ -92,12 +74,8 @@ impl BackupPackage {
         &self,
         exists: impl Fn(&str) -> bool,
     ) -> Result<(), RestoreValidationError> {
-        if !exists(&self.catalog_snapshot_path) {
-            return Err(RestoreValidationError::MissingCatalogSnapshot);
-        }
-
-        if !exists(&self.manifest_path) {
-            return Err(RestoreValidationError::MissingManifest);
+        if !exists(&self.backup_file_path) {
+            return Err(RestoreValidationError::MissingBackupFile);
         }
 
         Ok(())
@@ -107,25 +85,20 @@ impl BackupPackage {
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub enum RestoreError {
     CatalogRestoreFailed,
-    ManifestRestoreFailed,
 }
 
 impl RestorePlan {
-    /// Copies the backed-up catalog and manifest into their live locations via the
-    /// injected `copy` operation. Callers should run `validate_restore_inputs` first;
-    /// this only reports whether each copy itself succeeded.
+    /// Copies the backed-up catalog into its live project-file location via
+    /// the injected `copy` operation. Callers should run
+    /// `validate_restore_inputs` first; this only reports whether the copy
+    /// itself succeeded.
     pub fn apply(
         &self,
         destination_catalog_path: &str,
-        destination_manifest_path: &str,
         mut copy: impl FnMut(&str, &str) -> bool,
     ) -> Result<(), RestoreError> {
-        if !copy(&self.catalog_snapshot_path, destination_catalog_path) {
+        if !copy(&self.backup_file_path, destination_catalog_path) {
             return Err(RestoreError::CatalogRestoreFailed);
-        }
-
-        if !copy(&self.manifest_path, destination_manifest_path) {
-            return Err(RestoreError::ManifestRestoreFailed);
         }
 
         Ok(())
@@ -138,13 +111,11 @@ mod tests {
     use uuid::Uuid;
 
     #[test]
-    fn backup_package_preserves_manifest_and_media_root() {
+    fn backup_package_preserves_media_root() {
         let package = BackupPackage {
             library_id: Uuid::new_v4(),
-            manifest_revision: 42,
             media_root: "/Volumes/Sound Library".to_string(),
-            catalog_snapshot_path: "Backups/catalog.sqlite".to_string(),
-            manifest_path: "Backups/library.darkwave-manifest.json".to_string(),
+            backup_file_path: "Backups/My Library.darkwavebak".to_string(),
             created_at_ms: 1_000,
         };
 
@@ -153,139 +124,98 @@ mod tests {
     }
 
     #[test]
-    fn restore_validation_rejects_missing_catalog_snapshot() {
+    fn restore_validation_rejects_missing_backup_file() {
         let package = test_package();
 
         assert_eq!(
-            package.validate_restore_inputs(|path| path.ends_with("manifest.json")),
-            Err(RestoreValidationError::MissingCatalogSnapshot)
+            package.validate_restore_inputs(|_| false),
+            Err(RestoreValidationError::MissingBackupFile)
         );
     }
 
     #[test]
-    fn restore_validation_rejects_missing_manifest() {
-        let package = test_package();
-
-        assert_eq!(
-            package.validate_restore_inputs(|path| path.ends_with("catalog.sqlite")),
-            Err(RestoreValidationError::MissingManifest)
-        );
-    }
-
-    #[test]
-    fn restore_validation_accepts_complete_package() {
+    fn restore_validation_accepts_an_existing_backup_file() {
         let package = test_package();
 
         assert_eq!(package.validate_restore_inputs(|_| true), Ok(()));
     }
 
     #[test]
-    fn create_backup_snapshots_catalog_and_manifest_into_backup_dir() {
+    fn create_backup_snapshots_the_catalog_into_the_backup_file_path() {
         let library_id = Uuid::new_v4();
         let source = BackupSource {
-            catalog_path: "AppData/catalog.sqlite".to_string(),
-            manifest_path: "Library/library.darkwave-manifest.json".to_string(),
-            backup_dir: "Backups/2026-07-30/".to_string(),
+            catalog_path: "AppData/My Library.darkwave".to_string(),
+            backup_file_path: "Backups/2026-07-30/My Library.darkwavebak".to_string(),
         };
         let mut copied = Vec::new();
 
-        let package = create_backup(library_id, 9, "/Volumes/SFX", &source, 1_700, |from, to| {
+        let package = create_backup(library_id, "/Volumes/SFX", &source, 1_700, |from, to| {
             copied.push((from.to_string(), to.to_string()));
             true
         })
         .expect("backup created");
 
         assert_eq!(package.library_id, library_id);
-        assert_eq!(package.manifest_revision, 9);
         assert_eq!(package.media_root, "/Volumes/SFX");
         assert_eq!(
-            package.catalog_snapshot_path,
-            "Backups/2026-07-30/catalog.sqlite"
-        );
-        assert_eq!(
-            package.manifest_path,
-            "Backups/2026-07-30/library.darkwave-manifest.json"
+            package.backup_file_path,
+            "Backups/2026-07-30/My Library.darkwavebak"
         );
         assert_eq!(
             copied,
-            vec![
-                (
-                    "AppData/catalog.sqlite".to_string(),
-                    "Backups/2026-07-30/catalog.sqlite".to_string()
-                ),
-                (
-                    "Library/library.darkwave-manifest.json".to_string(),
-                    "Backups/2026-07-30/library.darkwave-manifest.json".to_string()
-                ),
-            ]
+            vec![(
+                "AppData/My Library.darkwave".to_string(),
+                "Backups/2026-07-30/My Library.darkwavebak".to_string()
+            )]
         );
     }
 
     #[test]
-    fn create_backup_stops_after_catalog_snapshot_failure() {
+    fn create_backup_reports_failure_without_producing_a_package() {
         let source = BackupSource {
-            catalog_path: "AppData/catalog.sqlite".to_string(),
-            manifest_path: "Library/library.darkwave-manifest.json".to_string(),
-            backup_dir: "Backups/2026-07-30".to_string(),
+            catalog_path: "AppData/My Library.darkwave".to_string(),
+            backup_file_path: "Backups/2026-07-30/My Library.darkwavebak".to_string(),
         };
 
-        let result = create_backup(Uuid::new_v4(), 1, "/Volumes/SFX", &source, 1_700, |_, _| {
-            false
-        });
+        let result = create_backup(Uuid::new_v4(), "/Volumes/SFX", &source, 1_700, |_, _| false);
 
         assert_eq!(result, Err(BackupError::CatalogSnapshotFailed));
     }
 
     #[test]
-    fn restore_plan_applies_catalog_and_manifest_copies() {
+    fn restore_plan_applies_the_catalog_copy() {
         let plan = test_package().restore_plan();
         let mut copied = Vec::new();
 
-        let result = plan.apply(
-            "AppData/catalog.sqlite",
-            "Library/manifest.json",
-            |from, to| {
-                copied.push((from.to_string(), to.to_string()));
-                true
-            },
-        );
+        let result = plan.apply("AppData/My Library.darkwave", |from, to| {
+            copied.push((from.to_string(), to.to_string()));
+            true
+        });
 
         assert_eq!(result, Ok(()));
         assert_eq!(
             copied,
-            vec![
-                (
-                    "catalog.sqlite".to_string(),
-                    "AppData/catalog.sqlite".to_string()
-                ),
-                (
-                    "manifest.json".to_string(),
-                    "Library/manifest.json".to_string()
-                ),
-            ]
+            vec![(
+                "My Library.darkwavebak".to_string(),
+                "AppData/My Library.darkwave".to_string()
+            )]
         );
     }
 
     #[test]
-    fn restore_plan_reports_manifest_copy_failure() {
+    fn restore_plan_reports_catalog_copy_failure() {
         let plan = test_package().restore_plan();
 
-        let result = plan.apply(
-            "AppData/catalog.sqlite",
-            "Library/manifest.json",
-            |from, _| from == "catalog.sqlite",
-        );
+        let result = plan.apply("AppData/My Library.darkwave", |_, _| false);
 
-        assert_eq!(result, Err(RestoreError::ManifestRestoreFailed));
+        assert_eq!(result, Err(RestoreError::CatalogRestoreFailed));
     }
 
     fn test_package() -> BackupPackage {
         BackupPackage {
             library_id: Uuid::new_v4(),
-            manifest_revision: 7,
             media_root: "/library".to_string(),
-            catalog_snapshot_path: "catalog.sqlite".to_string(),
-            manifest_path: "manifest.json".to_string(),
+            backup_file_path: "My Library.darkwavebak".to_string(),
             created_at_ms: 1_000,
         }
     }
