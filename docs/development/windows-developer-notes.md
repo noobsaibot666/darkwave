@@ -7,6 +7,25 @@ Newest entry on top. Add a new entry, don't edit old ones.
 
 ---
 
+## 2026-09-12 (later) — new: license PDF attach/expiry tracking (new crate, needs your eyes); one correction below
+
+Added a new workspace crate, `crates/license-documents` (pure Rust, no system libraries — `pdf-extract`/`lopdf` for PDF text extraction, `regex` for date-keyword scanning, `chrono` for date math). Lets a user attach a track's bundled license PDF; the app copies it into `<library media_root>/License/`, best-effort extracts candidate expiry dates as suggestions (never auto-applied — the user always confirms), and shows a valid/expiring-soon/expired badge in the Source & License inspector panel plus a library-wide Maintenance finding.
+
+**First `cargo build`/`cargo check` after pulling will fetch ~15 new crates** (aes/cbc/ecb/sha2/md-5/ttf-parser/etc. — all pulled in transitively by `lopdf` for encrypted-PDF support, all pure Rust, no `vcpkg`/system-library dependency) — expect a longer first build, not a failure. I can't verify the actual Windows compile from macOS, though every dependency here is a widely-used, routinely-cross-platform-built crate (no red flags in `cargo tree`).
+
+Please sanity-check on Windows after pulling:
+
+- `cargo build`/`cargo test -p license-documents` actually succeeds (this is the part I can't verify from here).
+- In the app: select a track, Source & License panel → "Attach License PDF…" — confirm the native file dialog filters to `.pdf`, the file lands in `<media_root>\License\`, "Reveal in Explorer" opens the right folder, and the valid/expired badge renders correctly.
+
+**Correction to the 2026-09-12 (earlier) entry below**: the macOS side of the keep-awake fix changed since that note — it no longer spawns `/usr/bin/caffeinate` (that silently fails under the Mac App Store's sandbox; App Sandbox blocks spawning any binary not embedded in the app bundle). It now calls `IOPMAssertionCreateWithName` directly (verified against real `pmset -g assertions` output, sandboxed and non-sandboxed both). **This doesn't touch the Windows `SetThreadExecutionState` path at all** — that code is unchanged, and the sanity-check ask below is still open (no reply in `macos-developer-notes.md` yet).
+
+Also: marketing version bumped `0.2.1` → `0.3.0` (`tauri.conf.json`/`package.json`/`Cargo.toml`, all three move together) — App Store Connect rejected a same-version resubmission (0.2.1 was already approved). Not a Windows-specific concern, just context for why the version number moved. See `docs/macos/version-ledger.md` if curious — it's the new source of truth for what's been built/uploaded/approved on that channel.
+
+`cargo check`/`cargo test`/`cargo clippy` all pass on macOS for both the default and `direct-dist` feature builds (`cargo build --release` too, both feature sets).
+
+---
+
 ## 2026-09-12 — new: keep-awake during overnight analysis batches (needs your eyes on Windows)
 
 Added `apps/desktop/src-tauri/src/power.rs` + a new autonomous job-drive loop in `lib.rs`'s
