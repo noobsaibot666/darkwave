@@ -949,12 +949,24 @@ impl Catalog {
     /// back to `'pending'`, so this can't spin faster than that). Returns
     /// the counter's new value so the caller can compare it against its own
     /// cap and decide whether to finally call `fail_job` instead.
+    ///
+    /// Counts into `availability_attempts`, a column separate from
+    /// `attempts` — deliberately: `attempts` is what `fail_job` increments
+    /// and what `requeue_failed_jobs`'s 3-try auto-retry cap is checked
+    /// against. A file that flakes on availability a couple of times before
+    /// finally being found, then goes on to hit a genuine, unrelated
+    /// processing failure (a decode error, say), must still get its full
+    /// share of automatic retries for that real failure — sharing one
+    /// counter between "silently waiting for a file to reappear" and "an
+    /// actual attempt that failed" would let a merely-slow NAS mount burn
+    /// through the real-failure retry budget before real processing ever
+    /// ran once.
     pub fn mark_job_attempt(&self, job_id: Uuid) -> Result<i64, StorageError> {
         self.connection
             .query_row(
-                "UPDATE background_jobs SET attempts = attempts + 1, updated_at = ?1
+                "UPDATE background_jobs SET availability_attempts = availability_attempts + 1, updated_at = ?1
                  WHERE id = ?2
-                 RETURNING attempts",
+                 RETURNING availability_attempts",
                 params![Utc::now().to_rfc3339(), job_id.to_string()],
                 |row| row.get(0),
             )
@@ -3179,6 +3191,7 @@ impl Catalog {
               priority INTEGER NOT NULL DEFAULT 100,
               state TEXT NOT NULL DEFAULT 'pending',
               attempts INTEGER NOT NULL DEFAULT 0,
+              availability_attempts INTEGER NOT NULL DEFAULT 0,
               error TEXT,
               created_at TEXT NOT NULL,
               updated_at TEXT NOT NULL
@@ -3392,6 +3405,10 @@ impl Catalog {
         self.ensure_column("source_records", "license_valid_from", "TEXT")?;
         self.ensure_column("source_records", "license_valid_until", "TEXT")?;
         self.ensure_column("source_records", "license_expiry_source", "TEXT")?;
+        // See mark_job_attempt's doc comment: kept separate from `attempts`
+        // so silent availability retries can't eat into the unrelated
+        // real-failure auto-retry cap.
+        self.ensure_column("background_jobs", "availability_attempts", "INTEGER NOT NULL DEFAULT 0")?;
 
         Ok(())
     }
