@@ -4293,13 +4293,22 @@ export function App() {
           !document.querySelector(".modal-overlay")
         ) {
           event.preventDefault();
-          setSearchQuery((previous) => previous + event.key);
+          // Replaces, not appends: this branch only ever runs while the
+          // search input is NOT focused (isTypingTarget already returned
+          // above otherwise), so it only fires once per typing burst — the
+          // moment focus lands on the input below, every further keystroke
+          // goes through its own onChange and appends normally there.
+          // Appending here instead used to mean a search from a previous,
+          // already-finished lookup was still sitting in the box, and a
+          // brand new type-to-search burst kept building on top of it
+          // instead of starting clean.
+          setSearchQuery(event.key);
           const input = searchInputRef.current;
           if (input) {
             input.focus();
             // Wait a frame so the controlled input has actually re-rendered
-            // with the appended character before moving the caret — doing
-            // it synchronously would still see the pre-update value length.
+            // with the new character before moving the caret — doing it
+            // synchronously would still see the pre-update value length.
             requestAnimationFrame(() => {
               const end = input.value.length;
               input.setSelectionRange(end, end);
