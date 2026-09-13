@@ -40,6 +40,34 @@ struct CatalogState(Mutex<Catalog>);
 /// (`CollectionType::Project`, an editorial export destination).
 struct ActiveLibraryFileState(Mutex<Option<String>>);
 
+/// Snapshot of which library file is active right now, for comparing across
+/// a long `.await` (decode/DSP/model inference) that doesn't hold the
+/// catalog mutex. See `active_library_changed_since` for why this matters.
+fn active_library_snapshot(active_library_file: &tauri::State<'_, ActiveLibraryFileState>) -> Option<String> {
+    active_library_file
+        .0
+        .lock()
+        .expect("active library file mutex poisoned")
+        .clone()
+}
+
+/// True if `open_library_file`/`open_library_file_and_notify_frontend` swapped
+/// the active catalog out from under a job while it was mid-`.await`. The
+/// catalog mutex is deliberately released across that await (ADR 0023/0024 —
+/// holding it there blocks the whole app), but that means a job can resume
+/// holding onto a `job`/`asset_id` that belongs to a `Catalog` instance which
+/// has since been replaced (and dropped) by `swap_active_catalog`. Writing
+/// the result into the *new* catalog would silently no-op (`UPDATE ... WHERE
+/// id = ?` matching zero rows there) while still reporting success, and the
+/// stale asset would never reappear in the now-active library's canvas —
+/// this check exists to catch that instead of letting it happen quietly.
+fn active_library_changed_since(
+    snapshot: &Option<String>,
+    active_library_file: &tauri::State<'_, ActiveLibraryFileState>,
+) -> bool {
+    active_library_snapshot(active_library_file) != *snapshot
+}
+
 /// Mac App Store build only: holds each library's live security-scoped
 /// access for as long as the app is running (see
 /// src/security_scoped_bookmark.rs). Keyed by library id so re-resolving
@@ -2422,6 +2450,7 @@ async fn process_waveform_jobs(
     app: tauri::AppHandle,
     state: tauri::State<'_, CatalogState>,
     job_control: tauri::State<'_, JobControlState>,
+    active_library_file: tauri::State<'_, ActiveLibraryFileState>,
 ) -> Result<usize, String> {
     use futures::stream::{self, StreamExt};
     use std::sync::atomic::Ordering;
@@ -2457,7 +2486,7 @@ async fn process_waveform_jobs(
     const WAVEFORM_CONCURRENCY: usize = 2;
 
     let mut results = stream::iter(jobs)
-        .map(|job| process_one_waveform_job(&app, &state, job))
+        .map(|job| process_one_waveform_job(&app, &state, &active_library_file, job))
         .buffer_unordered(WAVEFORM_CONCURRENCY);
 
     let mut processed = 0usize;
@@ -2473,6 +2502,7 @@ async fn process_waveform_jobs(
 async fn process_one_waveform_job(
     app: &tauri::AppHandle,
     state: &tauri::State<'_, CatalogState>,
+    active_library_file: &tauri::State<'_, ActiveLibraryFileState>,
     job: storage::JobRecord,
 ) -> bool {
     let asset = {
@@ -2523,10 +2553,19 @@ async fn process_one_waveform_job(
     }
 
     let decode_path = local_path.clone();
+    let library_before_decode = active_library_snapshot(active_library_file);
     let decoded = tauri::async_runtime::spawn_blocking(move || {
         audio_metadata::decode_any_supported_audio(&decode_path).map_err(|error| format!("{error:?}"))
     })
     .await;
+
+    if active_library_changed_since(&library_before_decode, active_library_file) {
+        eprintln!(
+            "waveform: active library changed mid-job for asset {}, discarding result",
+            job.asset_id
+        );
+        return false;
+    }
 
     let catalog = state.0.lock().expect("catalog mutex poisoned");
     match decoded {
@@ -2579,6 +2618,7 @@ async fn process_instrument_jobs(
     app: tauri::AppHandle,
     state: tauri::State<'_, CatalogState>,
     model_state: tauri::State<'_, InstrumentModelState>,
+    active_library_file: tauri::State<'_, ActiveLibraryFileState>,
 ) -> Result<usize, String> {
     use std::sync::atomic::Ordering;
 
@@ -2624,7 +2664,7 @@ async fn process_instrument_jobs(
 
     let mut processed = 0usize;
     for job in jobs {
-        if process_one_instrument_job(&app, &state, &model_state, job).await {
+        if process_one_instrument_job(&app, &state, &model_state, &active_library_file, job).await {
             processed += 1;
         }
     }
@@ -2635,6 +2675,7 @@ async fn process_one_instrument_job(
     app: &tauri::AppHandle,
     state: &tauri::State<'_, CatalogState>,
     model_state: &tauri::State<'_, InstrumentModelState>,
+    active_library_file: &tauri::State<'_, ActiveLibraryFileState>,
     job: storage::JobRecord,
 ) -> bool {
     let asset = {
@@ -2674,6 +2715,7 @@ async fn process_one_instrument_job(
     }
 
     let model = model_state.model.clone();
+    let library_before_detection = active_library_snapshot(active_library_file);
     let detected = tauri::async_runtime::spawn_blocking(move || -> Result<Vec<(String, f64)>, String> {
         let buffer = audio_metadata::decode_any_supported_audio(&local_path)
             .map_err(|error| format!("{error:?}"))?;
@@ -2687,6 +2729,14 @@ async fn process_one_instrument_job(
             .collect())
     })
     .await;
+
+    if active_library_changed_since(&library_before_detection, active_library_file) {
+        eprintln!(
+            "instrument-detection: active library changed mid-job for asset {}, discarding result",
+            job.asset_id
+        );
+        return false;
+    }
 
     let catalog = state.0.lock().expect("catalog mutex poisoned");
     match detected {
@@ -3054,6 +3104,7 @@ async fn process_audio_analysis_jobs(
     app: tauri::AppHandle,
     state: tauri::State<'_, CatalogState>,
     job_control: tauri::State<'_, JobControlState>,
+    active_library_file: tauri::State<'_, ActiveLibraryFileState>,
 ) -> Result<usize, String> {
     use futures::stream::{self, StreamExt};
     use std::sync::atomic::Ordering;
@@ -3087,7 +3138,7 @@ async fn process_audio_analysis_jobs(
     const AUDIO_ANALYSIS_CONCURRENCY: usize = 4;
 
     let mut results = stream::iter(jobs)
-        .map(|job| process_one_audio_analysis_job(&app, &state, &job_control, job))
+        .map(|job| process_one_audio_analysis_job(&app, &state, &job_control, &active_library_file, job))
         .buffer_unordered(AUDIO_ANALYSIS_CONCURRENCY);
 
     let mut processed = 0usize;
@@ -3126,6 +3177,7 @@ async fn process_one_audio_analysis_job(
     app: &tauri::AppHandle,
     state: &tauri::State<'_, CatalogState>,
     job_control: &tauri::State<'_, JobControlState>,
+    active_library_file: &tauri::State<'_, ActiveLibraryFileState>,
     job: storage::JobRecord,
 ) -> bool {
     use std::sync::atomic::Ordering;
@@ -3185,8 +3237,24 @@ async fn process_one_audio_analysis_job(
         return true;
     }
 
+    let library_before_analysis = active_library_snapshot(active_library_file);
     let outcome = analyze_asset_audio(app, job.asset_id, &local_path).await;
     let succeeded = outcome.is_ok();
+
+    if active_library_changed_since(&library_before_analysis, active_library_file) {
+        // The active library was swapped mid-analysis (e.g. File > Open
+        // Library / Last Open while a batch was running) — the catalog this
+        // job was claimed from is gone, and the now-active one has no row
+        // for job.id/asset_id. Drop the result instead of writing it into
+        // the wrong catalog or reporting a false success; the abandoned
+        // 'processing' row self-heals via reset_stuck_processing_jobs once
+        // its own library is reopened.
+        eprintln!(
+            "audio-analysis: active library changed mid-job for asset {}, discarding result",
+            job.asset_id
+        );
+        return false;
+    }
 
     let catalog = state.0.lock().expect("catalog mutex poisoned");
     let saved = match outcome {
@@ -4808,6 +4876,7 @@ pub fn run() {
                         drive_app_handle.clone(),
                         drive_app_handle.state::<CatalogState>(),
                         drive_app_handle.state::<JobControlState>(),
+                        drive_app_handle.state::<ActiveLibraryFileState>(),
                     )
                     .await
                     .unwrap_or(0);
@@ -4816,6 +4885,7 @@ pub fn run() {
                         drive_app_handle.clone(),
                         drive_app_handle.state::<CatalogState>(),
                         drive_app_handle.state::<InstrumentModelState>(),
+                        drive_app_handle.state::<ActiveLibraryFileState>(),
                     )
                     .await
                     .unwrap_or(0);
@@ -4824,6 +4894,7 @@ pub fn run() {
                         drive_app_handle.clone(),
                         drive_app_handle.state::<CatalogState>(),
                         drive_app_handle.state::<JobControlState>(),
+                        drive_app_handle.state::<ActiveLibraryFileState>(),
                     )
                     .await
                     .unwrap_or(0);

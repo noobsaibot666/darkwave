@@ -1088,6 +1088,12 @@ export function App() {
   const [librariesLoaded, setLibrariesLoaded] = useState(false);
   const [libraries, setLibraries] = useState<LibraryRecord[]>([]);
   const [activeLibraryId, setActiveLibraryId] = useState<string | null>(null);
+  // Mirrors activeLibraryId for runJobDrain's async loop to read without
+  // re-running the effect/closure on every library swap — see its use below.
+  const activeLibraryIdRef = useRef<string | null>(null);
+  useEffect(() => {
+    activeLibraryIdRef.current = activeLibraryId;
+  }, [activeLibraryId]);
   const [assets, setAssets] = useState<AssetRecord[]>([]);
   const [selectedAssetId, setSelectedAssetId] = useState<string | null>(null);
   const [browserState, setBrowserState] = useState<BrowserState | null>(null);
@@ -1630,6 +1636,16 @@ export function App() {
             (async () => {
               let remaining = startPending;
               for (let iterations = 0; iterations < 200 && remaining > 0; iterations += 1) {
+                // The active library can be swapped mid-drain (File > Open
+                // Library / Last Open) while this loop is still awaiting a
+                // multi-minute analysis batch for `libraryId`. The job
+                // commands below operate on whatever catalog is *currently*
+                // active, not necessarily `libraryId` — so once the two
+                // diverge, stop rather than keep attributing another
+                // library's job counts to this drain, and never let the
+                // stale `libraryId` below overwrite the canvas that's now
+                // showing a different, unrelated library.
+                if (activeLibraryIdRef.current !== libraryId) break;
                 const processed = await invoke<number>(config.command).catch(() => 0);
                 if (processed === 0) break;
                 remaining = Math.max(0, remaining - processed);
@@ -1639,6 +1655,7 @@ export function App() {
               }
               setJobProgress((previous) => previous.filter((entry) => entry.kind !== config.kind));
               drainingJobKinds.current.delete(config.kind);
+              if (activeLibraryIdRef.current !== libraryId) return;
               refreshAssets(libraryId, searchQuery, activeFilter);
 
               // Ground-truth diff against the DB (not the locally-tracked
