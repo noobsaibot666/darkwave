@@ -3519,6 +3519,52 @@ fn waveform_generation_paused(job_control: tauri::State<JobControlState>) -> boo
         .load(std::sync::atomic::Ordering::SeqCst)
 }
 
+/// Ceiling on how long `detect_vocal_ratio_with_timeout` waits for Silero
+/// VAD (via the `ort`/ONNX Runtime crate) before giving up and reporting no
+/// vocal data. Real VAD inference over even a full-length track finishes in
+/// well under a second (chunked at 512 samples, CPU-only, one inference
+/// engine thread — see `voice_activity_detector`'s session config); this
+/// exists for the failure mode actually observed on one real Windows
+/// machine, not the ordinary case.
+const VOCAL_DETECTION_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(15);
+
+/// Runs Silero VAD on a background thread and gives up after
+/// `VOCAL_DETECTION_TIMEOUT` instead of waiting forever.
+///
+/// `voice_activity_detector`'s ONNX session is a single process-wide
+/// `LazyLock`, built lazily on whichever thread first calls into it; if that
+/// first build (or a later `session.run`) ever wedges — an unresponsive
+/// ONNX Runtime/execution-provider init has been observed for real on one
+/// Windows machine, no error, no panic, it just never returns — every
+/// thread that ever reaches this code queues up behind the same stuck
+/// `LazyLock`/mutex forever, one at a time, and audio-analysis jobs pile up
+/// as permanently `'processing'` without ever completing or failing (this
+/// is the bug: not the retry-loop this whole job-queue design already
+/// guards against, but the analysis step itself never returning at all).
+/// Bounding the wait on a detached thread can't un-stick that thread, but it
+/// stops one wedged native call from wedging every future job too — the
+/// caller gets `None` (already the documented graceful-degradation case for
+/// vocal detection, see `docs/development/windows-setup.md`) and moves on.
+fn detect_vocal_ratio_with_timeout(mono: Vec<f32>, sample_rate: u32) -> Option<f32> {
+    let (tx, rx) = std::sync::mpsc::channel();
+    std::thread::spawn(move || {
+        // Errors are expected here if the receiving end already gave up
+        // and dropped `rx` after timing out — this thread may still be
+        // stuck in ONNX Runtime long after its job has moved on.
+        let _ = tx.send(audio_analysis::detect_vocal_ratio_from_mono(&mono, sample_rate));
+    });
+    match rx.recv_timeout(VOCAL_DETECTION_TIMEOUT) {
+        Ok(vocal_ratio) => vocal_ratio,
+        Err(_) => {
+            eprintln!(
+                "audio-analysis: vocal-ratio detection did not return within {VOCAL_DETECTION_TIMEOUT:?} — \
+                 treating as no vocal data (see detect_vocal_ratio_with_timeout's doc comment)"
+            );
+            None
+        }
+    }
+}
+
 struct AudioAnalysisOutcome {
     needs_review: bool,
     suggested_tags: Vec<&'static str>,
@@ -3571,7 +3617,7 @@ async fn analyze_asset_audio(
             let tempo = audio_analysis::estimate_tempo_from_mono(&mono, sample_rate);
             let pitch = audio_analysis::estimate_pitch_from_mono(&mono, sample_rate);
             let key = audio_analysis::estimate_key_from_mono(&mono, sample_rate);
-            let vocal_ratio = audio_analysis::detect_vocal_ratio_from_mono(&mono, sample_rate);
+            let vocal_ratio = detect_vocal_ratio_with_timeout(mono.clone(), sample_rate);
 
             let channels = buffer.channels.max(1) as u64;
             let duration_ms = if buffer.sample_rate > 0 {
