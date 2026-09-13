@@ -7,6 +7,30 @@ Newest entry on top. Add a new entry, don't edit old ones.
 
 ---
 
+## 2026-09-13 — third and fourth fixes on top of the two below — still haven't seen a pull from you, please grab everything at once
+
+Two more critical fixes since the waveform-CPU one below. If you haven't pulled since the
+tracks-vanishing fix (`2fb8550`), pull `main` now (`89b1b6b`) to get all four in one rebuild:
+
+1. **Waveform jobs never actually completed** (`crates/storage/src/lib.rs`,
+   `complete_pending_jobs_for_asset`): the SQL only matched `state = 'pending'`, but the
+   standalone waveform-job path calls it after the job's already `'processing'` — so it never
+   matched, the job sat `'processing'` until the 3-minute stuck-job timeout put it back to
+   `'pending'`, and it got reclaimed and rebuilt forever. This is the "waveform generation never
+   stops, keeps reprocessing already-done tracks" bug — commit `7d8d2be`.
+2. **Multi-selecting several tracks, then adding them to a Project (drag or the sidebar button)
+   only added a fraction of them, or none** (`apps/desktop/src-ui/src/App.tsx` +
+   `crates/workspace-state/src/lib.rs`): the real multi-selection lives in `browserState`, kept
+   separate from `selectedAssetId` (just "last clicked row"). The effect that rebuilds
+   `browserState` on every asset-list refresh only ever restored the single `selectedAssetId`,
+   silently collapsing a real multi-selection down to one row (or zero) whenever a refresh landed
+   between selecting tracks and clicking "add to project" — which on a library with any real
+   background job backlog is often. Added `BrowserCommand::SelectIndices` to restore the full
+   previous selection in one call — commit `89b1b6b`.
+
+Both are pure Rust/TS logic, not platform-specific — please ship whatever you build after this
+pull as 0.3.1 build 13 or higher (check the ledger first, as always).
+
 ## 2026-09-13 — second fix on top of the one below: waveform generation was stealing CPU and disrupting selection
 
 Same day, one more before you build — pull `main` again (commit `7aaad82`, on top of the
