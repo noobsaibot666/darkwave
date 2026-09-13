@@ -20,6 +20,7 @@ top; don't edit old rows, append.
 
 | Date | Version | Build | Status | Notes |
 |------|---------|-------|--------|-------|
+| 2026-09-13 | 0.3.0 | 11 | Built | Redesigned New Setup's sound-files step (explicit one-folder-vs-organized-folders choice, per-row Browse), added File > Open Library / Last Open, and fixed the .darkwave document icon to match the app icon instead of a generic document glyph. Not yet uploaded — update this row once Transporter tells you the outcome. |
 | 2026-09-12 | 0.3.0 | 10 | Uploaded | License PDF attach/expiry tracking + sandbox-safe sleep-prevention fix (caffeinate → IOPMAssertionCreateWithName; the old approach silently failed under the App Sandbox). Transporter log confirmed `CREATE BUILD` 201 (created) and the asset description upload reaching `COMPLETE` state — delivery to App Store Connect succeeded. Still waiting on Apple's review decision (Approved/Rejected not known yet). |
 | 2026-09-12 | 0.2.1 | 10 | Rejected (409) | Transporter: "must contain a higher version than that of the previously approved version [0.2.1]" — confirms 0.2.1 itself was already approved at some earlier build (exact approved build number not recorded pre-ledger; 8, 9, or 10's predecessor). Superseded by the 0.3.0/10 row above — needed a version bump, not just a build bump. |
 | 2026-09-01 | 0.2.1 | 9 | Uploaded (outcome not recorded) | Bumped from build 8 per commit `d0d3869` ("build 8 already registered in App Store Connect"). |
