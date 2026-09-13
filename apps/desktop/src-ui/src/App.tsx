@@ -1332,6 +1332,7 @@ export function App() {
   const [commandPaletteResults, setCommandPaletteResults] = useState<PaletteCommand[]>([]);
   const [commandPaletteActiveIndex, setCommandPaletteActiveIndex] = useState(0);
   const commandPaletteInputRef = useRef<HTMLInputElement | null>(null);
+  const searchInputRef = useRef<HTMLInputElement | null>(null);
 
   const [undoStack, setUndoStack] = useState<{ id: string; label: string }[]>([]);
   const [redoStack, setRedoStack] = useState<{ id: string; label: string }[]>([]);
@@ -4227,7 +4228,39 @@ export function App() {
       const binding = preferences?.shortcuts.bindings.find(
         (candidate) => candidate.accelerator === acceleratorFor(event)
       );
-      if (!binding) return;
+      if (!binding) {
+        // No configured shortcut claims this key. If it's a plain printable
+        // character — no modifier (a real shortcut would have one, or would
+        // have matched above), not the space bar (reserved for playback,
+        // same as most media apps), and no modal currently open to capture
+        // it instead — redirect it into the search box instead of letting
+        // it silently do nothing. Matches type-ahead search in Finder/
+        // Gmail/etc.: no need to click into the search field first just to
+        // start typing a query.
+        if (
+          !event.metaKey &&
+          !event.ctrlKey &&
+          !event.altKey &&
+          event.key.length === 1 &&
+          event.key !== " " &&
+          !document.querySelector(".modal-overlay")
+        ) {
+          event.preventDefault();
+          setSearchQuery((previous) => previous + event.key);
+          const input = searchInputRef.current;
+          if (input) {
+            input.focus();
+            // Wait a frame so the controlled input has actually re-rendered
+            // with the appended character before moving the caret — doing
+            // it synchronously would still see the pre-update value length.
+            requestAnimationFrame(() => {
+              const end = input.value.length;
+              input.setSelectionRange(end, end);
+            });
+          }
+        }
+        return;
+      }
 
       switch (binding.command) {
         case "TogglePlayback":
@@ -4612,12 +4645,6 @@ export function App() {
   // there's one place to check for anything happening in the background.
   const activityPreparing = importStatus === "Importing…" || refreshStatus === "Scanning for new files…";
   const activityBusy = jobProgress.length > 0;
-  // A ~3-minute analysis batch previously had no on-screen sign of life
-  // beyond a small toolbar icon (easy to miss, no sense of how much work is
-  // left) — a completely healthy run read as a hang. This renders as its
-  // own banner right under the topbar instead, visible from any tab/section
-  // without needing to notice and open Background Activity.
-  const activityBannerText = activityPreparing ? importStatus ?? refreshStatus ?? "Working…" : null;
   const waveformActiveIndex = peaks && duration > 0 ? Math.floor((currentTime / duration) * peaks.length) : -1;
   const drTargetAssetId = playingAssetId ?? selectedAssetId;
   const drTargetProject = collections.find((project) => project.id === lastExportProjectId) ?? null;
@@ -5277,6 +5304,7 @@ export function App() {
           <label className="search">
             <Search size={16} />
             <input
+              ref={searchInputRef}
               placeholder="Search sounds, tags, source, license"
               value={searchQuery}
               onChange={(event) => setSearchQuery(event.target.value)}
@@ -5379,35 +5407,6 @@ export function App() {
             <Settings size={17} />
           </button>
         </header>
-        {activityBusy || activityPreparing ? (
-          <button
-            type="button"
-            className="background-activity-banner"
-            onClick={() => setBackgroundActivityOpen(true)}
-            aria-label="Background activity in progress — click for details"
-          >
-            {activityBannerText ? (
-              <span className="background-activity-banner-item">
-                <span className="background-activity-banner-label">{activityBannerText}</span>
-              </span>
-            ) : null}
-            {jobProgress.map((job) => {
-              const done = job.total - job.pending;
-              const percent = job.total > 0 ? Math.round((done / job.total) * 100) : 0;
-              return (
-                <span className="background-activity-banner-item" key={job.kind}>
-                  <span className="background-activity-banner-label">
-                    {job.label}: {done}/{job.total}
-                    {job.failed > 0 ? ` · ${job.failed} failed` : ""}
-                  </span>
-                  <span className="background-activity-banner-track">
-                    <span className="background-activity-banner-fill" style={{ width: `${percent}%` }} />
-                  </span>
-                </span>
-              );
-            })}
-          </button>
-        ) : null}
         {licenseMode === "trial" ? (
           <button
             type="button"
