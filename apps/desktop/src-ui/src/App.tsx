@@ -1354,6 +1354,15 @@ export function App() {
   // clicked Analyze again) quietly stops touching state instead of racing
   // a newer one.
   const sonicRadarRequestIdRef = useRef(0);
+  // Same pattern: refreshAssets can be triggered concurrently (a job drain
+  // finishing, a background-tick, a manual filter change) and its
+  // invoke() calls aren't guaranteed to resolve in the order they were
+  // sent — a slower earlier call landing after a faster later one would
+  // otherwise clobber `assets` with stale data, which the "selection no
+  // longer in the list" effect below would then act on. Bumped at the
+  // start of every refreshAssets call; a resolving request checks its own
+  // captured id against this before calling setAssets.
+  const refreshAssetsRequestIdRef = useRef(0);
   const [backgroundActivityOpen, setBackgroundActivityOpen] = useState(false);
   const drainingJobKinds = useRef<Set<string>>(new Set());
   const [offlineControl, setOfflineControl] = useState<OfflineControlState | null>(null);
@@ -1527,29 +1536,36 @@ export function App() {
 
   const refreshAssets = useCallback(
     (libraryId: string, query: string, filter: ActiveFilter) => {
+      const requestId = ++refreshAssetsRequestIdRef.current;
+      const isCurrent = () => refreshAssetsRequestIdRef.current === requestId;
+      const applyResult = (result: AssetRecord[]) => {
+        if (isCurrent()) setAssets(result);
+      };
+      const applyEmpty = () => {
+        if (isCurrent()) setAssets([]);
+      };
+
       if (typeof filter === "object" && "project" in filter) {
         const command = filter.smart ? "assets_in_smart_collection" : "assets_in_collection";
-        invoke<AssetRecord[]>(command, { collectionId: filter.project })
-          .then(setAssets)
-          .catch(() => setAssets([]));
+        invoke<AssetRecord[]>(command, { collectionId: filter.project }).then(applyResult).catch(applyEmpty);
         return;
       }
       if (typeof filter === "object" && "tag" in filter) {
         invoke<AssetRecord[]>("assets_for_tag", { libraryId, tagId: filter.tag })
-          .then(setAssets)
-          .catch(() => setAssets([]));
+          .then(applyResult)
+          .catch(applyEmpty);
         return;
       }
       if (typeof filter === "object" && "instrumentPage" in filter) {
         // On the pill page the list isn't shown; in results mode fetch the
         // OR-match set. Empty selection => nothing.
         if (filter.instrumentPage || filter.instruments.length === 0) {
-          setAssets([]);
+          applyEmpty();
           return;
         }
         invoke<AssetRecord[]>("assets_by_instruments", { libraryId, instruments: filter.instruments })
-          .then(setAssets)
-          .catch(() => setAssets([]));
+          .then(applyResult)
+          .catch(applyEmpty);
         return;
       }
 
@@ -1568,7 +1584,7 @@ export function App() {
           ? invoke<AssetRecord[]>("search_assets", { libraryId, query })
           : invoke<AssetRecord[]>("list_assets", { libraryId });
 
-      request.then(setAssets).catch(() => setAssets([]));
+      request.then(applyResult).catch(applyEmpty);
     },
     [rangeFilters]
   );
@@ -1656,7 +1672,19 @@ export function App() {
               setJobProgress((previous) => previous.filter((entry) => entry.kind !== config.kind));
               drainingJobKinds.current.delete(config.kind);
               if (activeLibraryIdRef.current !== libraryId) return;
-              refreshAssets(libraryId, searchQuery, activeFilter);
+              // waveform_generation touches no field AssetRecord carries —
+              // the strip itself is fetched separately, on demand, via
+              // get_waveform (see loadPeaksForAsset) — so refreshing the
+              // whole list here bought nothing but churn: every batch (and
+              // with a big backlog, this kind drains near-continuously)
+              // replaced `assets` wholesale, which the "selection no longer
+              // in the list" effect below then reacted to, quietly
+              // deselecting/reordering the track a user was in the middle
+              // of picking. Skipping it here removes that churn at the
+              // source instead of trying to out-guard it downstream.
+              if (config.kind !== "waveform_generation") {
+                refreshAssets(libraryId, searchQuery, activeFilter);
+              }
 
               // Ground-truth diff against the DB (not the locally-tracked
               // counters above) for the "what actually happened" summary —

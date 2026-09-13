@@ -21,13 +21,18 @@ pub struct WaveformCache {
 
 impl WaveformCache {
     pub fn from_samples(samples: &[f32], sample_rate: u32) -> Self {
-        let full = generate_peaks(samples, samples.len().max(1));
-
+        // Each resolution is generated directly from `samples`, not via a
+        // one-bucket-per-sample "full" array downsampled three times after
+        // the fact — that intermediate used to be samples.len() long (tens
+        // of millions of PeakLevel entries for an ordinary multi-minute
+        // track), all of it discarded immediately after. Building only the
+        // three bounded resolutions actually needed cuts both the memory
+        // churn and the redundant passes over the sample buffer.
         Self {
             sample_rate,
-            row: downsample_peaks(&full, 128),
-            inspector: downsample_peaks(&full, 512),
-            transport: downsample_peaks(&full, 2048),
+            row: generate_peaks(samples, 128),
+            inspector: generate_peaks(samples, 512),
+            transport: generate_peaks(samples, 2048),
         }
     }
 
