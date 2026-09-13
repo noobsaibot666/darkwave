@@ -7,6 +7,34 @@ Newest entry on top. Add a new entry, don't edit old ones.
 
 ---
 
+## 2026-09-13 — merged your audio-analysis-retry-loop fix, plus two corrections on top — pull main
+
+Your `fix/audio-analysis-retry-loop` branch (`fb893f6`) was the right fix for the "3526 files,
+finishes, restarts, never stops" bug — merged as PR #4 (`d0d2207`). Two things I found and fixed
+on top before/after merging, both worth knowing about:
+
+1. `mark_job_attempt` was counting silent availability-retries into the same `attempts` column
+   `fail_job` uses for the real-failure auto-retry cap (`requeue_failed_jobs`, 3 tries). A file that
+   flaked on availability a couple of times before finally being found, then hit a genuine decode
+   error, would already be past its real-failure retry budget before that error ever got a fair
+   shot. Split into its own `background_jobs.availability_attempts` column instead — see
+   `mark_job_attempt`'s doc comment in `crates/storage/src/lib.rs`.
+2. `process_one_waveform_job`'s two "file unavailable" branches called `defer_unavailable_job` but
+   discarded its return value and always `return false`d, unlike your instrument-detection version
+   which correctly propagates it. A waveform job that finally exhausted the silent-retry cap and
+   got really failed was never counted as "processed" by the batch loop — fixed to match
+   instrument-detection's pattern.
+
+Also landed as a follow-up (PR #5, `740a879`): the audio-analysis/waveform/instrument progress
+events now carry the asset's filename (`JobFileProgressEvent`), so Background Activity shows which
+file each kind is currently working on, not just a count. If you ever add a fourth job kind with
+the same "file might not be reachable yet" shape, use `defer_unavailable_job` — never
+`requeue_job_as_pending` for that case, see the new CLAUDE.md section on this.
+
+Pull `main` (`740a879`) to get all three commits in one rebuild. No schema action needed — the new
+`availability_attempts` column is added via the existing idempotent `ensure_column` migration on
+next launch, same as every other column added this way.
+
 ## 2026-09-13 — fifth fix, same pull as below — still haven't seen anything from you
 
 One more, small: `process_one_waveform_job` (`apps/desktop/src-tauri/src/lib.rs`) now checks

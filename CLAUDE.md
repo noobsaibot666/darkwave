@@ -33,6 +33,35 @@ Every past "notarization 401" / "Transporter rejected" incident came from using 
 - **Every App Store upload needs a fresh build number** — bump `CFBundleVersion` in `apps/desktop/src-tauri/Info.plist` (marketing version comes from `tauri.conf.json`, also mirrored in `package.json` and `Cargo.toml`). App Store Connect 409s a re-used `(CFBundleShortVersionString, CFBundleVersion)` pair, and `CFBundleShortVersionString` must exceed the last *approved* version — **check `docs/macos/version-ledger.md` before bumping either one**, it's the actual record of what's been built/uploaded/approved (this exact 409 happened twice — 0.2.1/10 on 2026-09-12, 0.3.0/11 on 2026-09-13 — both times because the ledger's Status field wasn't updated once approval actually landed). `scripts/mac_sign_and_package_mas.sh` appends a row automatically every time it signs a `.pkg`; update that row's Status by hand once Transporter reports the outcome. All three build scripts (`mac_sign_and_package_mas.sh`, `deploy_direct_macos.sh`, `deploy_direct_windows.ps1`) now check the ledger themselves before building (`check_version_ledger.sh` / `.ps1`) and refuse to proceed if the version/build would repeat something the ledger already shows — this catches the mistake before a wasted build, but it's still only as good as the Status field a human keeps current.
 - **App Store listing name:** `Darkwave — Sound Library` (plain "Darkwave" is taken — App Store names are globally unique).
 
+## Background jobs — never requeue an unreachable file straight to `pending`
+
+This happened on 2026-09-13: the standing background worker (`apps/desktop/src-tauri/src/lib.rs`,
+spawned in `.setup()`) drives `process_audio_analysis_jobs`/`process_waveform_jobs`/
+`process_instrument_jobs` on a ~1 second cycle for as long as the app is open. A job whose asset
+file wasn't reachable yet (unmounted NAS share, external drive, a Referenced path not warmed into
+the local cache) used to be requeued straight back to `'pending'` with zero backoff — the very
+next 1-second tick reclaimed it and hit the same unreachable file again, forever, invisibly (no
+error, no stop). On a 3526-file library this looked exactly like "background analysis loops
+forever, never stops, occasionally fails but keeps going" — fixed in PR #4/#5.
+
+**The rule going forward:** any job kind that can hit a file that simply isn't reachable *yet*
+(as opposed to a real processing failure — corrupt file, decode error, etc.) must call
+`defer_unavailable_job` (`apps/desktop/src-tauri/src/lib.rs`), never
+`catalog.requeue_job_as_pending`. `defer_unavailable_job` leaves the row `'processing'` and counts
+a silent retry via `mark_job_attempt`, paced by `reset_stuck_processing_jobs`'s existing 3-minute
+age floor — so a retry can happen at most every ~3 minutes, not every second — and only fails the
+job for real (visibly, recoverable via "Retry Failed Jobs") after
+`MAX_SILENT_AVAILABILITY_ATTEMPTS` (20, ~1 hour). `requeue_job_as_pending` is reserved for a
+caller that knows the claim was abandoned for a specific, immediate reason and wants it reclaimed
+right away (e.g. the queue being paused mid-batch) — using it for "not ready yet, try later" is
+exactly what causes this bug.
+
+The silent-retry counter lives in its own `background_jobs.availability_attempts` column,
+deliberately separate from `attempts` (which `fail_job` increments and which the real-failure
+auto-retry cap in `requeue_failed_jobs` checks against) — sharing one counter between "waiting for
+a file to reappear" and "an actual attempt that failed" lets a merely-slow NAS mount burn through
+a file's real-failure retry budget before real processing ever runs once.
+
 ## Keep every dev machine on the same version — branch hygiene
 
 Development happens on more than one machine (this Mac, and a Windows machine — see
