@@ -455,38 +455,6 @@ button.panel-handle-right:active:not(:disabled) {
   cursor: default;
 }
 
-.project-add-toast {
-  position: absolute;
-  left: 26px;
-  top: -4px;
-  font-size: 10px;
-  font-weight: 650;
-  padding: 2px 6px;
-  border-radius: 999px;
-  background: rgba(52, 211, 153, 0.18);
-  color: #059669;
-  white-space: nowrap;
-  pointer-events: none;
-  animation: project-add-toast-fade 2s ease forwards;
-}
-
-@keyframes project-add-toast-fade {
-  0% {
-    opacity: 0;
-    transform: translateY(2px);
-  }
-  10% {
-    opacity: 1;
-    transform: translateY(0);
-  }
-  80% {
-    opacity: 1;
-  }
-  100% {
-    opacity: 0;
-  }
-}
-
 .nav-item-row .nav-item {
   flex: 1;
   min-width: 0;
@@ -554,14 +522,6 @@ button.panel-handle-right:active:not(:disabled) {
 .dr-button:disabled {
   opacity: 0.35;
   cursor: default;
-}
-
-.dr-status {
-  font-size: 11px;
-  color: var(--text-muted);
-  white-space: nowrap;
-  overflow: hidden;
-  text-overflow: ellipsis;
 }
 
 .nav-heading {
@@ -1618,32 +1578,160 @@ h2 {
   min-width: 0;
 }
 
-.drop-target-grid button.project-chip {
+/* The Projects grid in the inspector — one card per project, both a drop
+   target (the whole card, via data-drop-project-id) and a click target
+   (the .project-card-add button inside it). Two independent columns on a
+   comfortably wide inspector, collapsing to one rather than truncating
+   names when it isn't — the old 2-up grid never gave a longer project
+   name anywhere to go but an ellipsis. */
+.project-grid {
+  display: grid;
+  grid-template-columns: repeat(auto-fill, minmax(132px, 1fr));
+  gap: 10px;
+  min-width: 0;
+}
+
+.project-card {
+  position: relative;
+  min-width: 0;
+}
+
+/* Drag-over highlight, sidebar Projects rows and inspector project cards
+   alike — dropping a dragged track here adds it to that project. */
+.nav-item-row.drag-over,
+.project-card.drag-over {
+  border-radius: 12px;
+  background: rgba(var(--radar-accent-rgb), 0.16);
+  outline: 1.5px dashed var(--radar-accent);
+  outline-offset: -1.5px;
+}
+
+.project-card-add {
   display: flex;
-  align-items: center;
+  flex-direction: column;
+  align-items: flex-start;
   gap: 8px;
+  width: 100%;
+  min-height: 72px;
+  padding: 12px;
+  border: 1px solid var(--control-border);
+  border-radius: 12px;
+  background: var(--control-bg);
+  color: var(--text-primary);
   text-align: left;
-  transition: background 120ms ease, border-color 120ms ease;
+  transition: background 120ms ease, border-color 120ms ease, transform 120ms ease;
+}
+
+.project-card-add:hover {
+  background: var(--control-bg-hover);
+  border-color: rgba(var(--radar-accent-rgb), 0.4);
+  transform: translateY(-1px);
 }
 
 /* Visual stand-in for :disabled — kept a real (non-disabled) button so it
    still receives drag/drop events when nothing is click-selected. */
-.project-chip.no-selection {
-  opacity: 0.4;
+.project-card-add.no-selection {
+  opacity: 0.45;
 }
 
-.project-chip.no-selection:hover {
-  opacity: 0.7;
+.project-card-add.no-selection:hover {
+  opacity: 0.75;
+  transform: none;
 }
 
-/* Drag-over highlight, sidebar Projects rows and inspector project chips
-   alike — dropping a dragged track here adds it to that project. */
-.nav-item-row.drag-over,
-.project-chip.drag-over {
+.project-card-icon {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  width: 30px;
+  height: 30px;
+  flex: 0 0 auto;
+  border-radius: 9px;
+  background: rgba(var(--radar-accent-rgb), 0.14);
+  color: var(--radar-accent-strong);
+}
+
+.project-card-name {
+  width: 100%;
+  font-size: 12.5px;
+  font-weight: 600;
+  line-height: 1.3;
+  overflow: hidden;
+  display: -webkit-box;
+  -webkit-line-clamp: 2;
+  -webkit-box-orient: vertical;
+}
+
+/* Same accent-badge language as .drag-preview-count — a count is its own
+   small piece of information layered on top of the card, not another
+   in-flow row that would fight the card's own size. */
+.project-card-count {
+  position: absolute;
+  top: -7px;
+  right: -7px;
+  min-width: 20px;
+  height: 20px;
+  padding: 0 6px;
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  border-radius: 999px;
+  background: var(--radar-accent);
+  color: #06202a;
+  font-size: 11px;
+  font-weight: 800;
+  border: 2px solid var(--surface-solid);
+  transition: transform 120ms ease;
+}
+
+.project-card-count:hover {
+  transform: scale(1.08);
+}
+
+.project-tracks-popover {
+  position: fixed;
+  z-index: 30;
+  width: 240px;
+  max-height: 320px;
+  padding: 10px;
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+}
+
+.project-tracks-popover-head {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 8px;
+}
+
+.project-tracks-popover-title {
+  font-size: 12.5px;
+  font-weight: 700;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.project-tracks-popover-list {
+  margin: 0;
+  padding: 0;
+  list-style: none;
+  overflow-y: auto;
+  display: flex;
+  flex-direction: column;
+  gap: 4px;
+}
+
+.project-tracks-popover-list li {
+  padding: 6px 8px;
   border-radius: 8px;
-  background: rgba(var(--radar-accent-rgb), 0.16);
-  outline: 1.5px dashed var(--radar-accent);
-  outline-offset: -1.5px;
+  background: rgba(var(--ink-rgb), 0.05);
+  font-size: 12px;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
 }
 
 /* The floating drag preview — a track (or the current selection) being
@@ -1775,25 +1863,6 @@ h2 {
 .drag-dock-card.drag-over .drag-dock-card-icon {
   background: var(--radar-accent);
   color: #06202a;
-}
-
-.project-thumb {
-  display: inline-flex;
-  align-items: center;
-  justify-content: center;
-  width: 24px;
-  height: 24px;
-  flex: 0 0 auto;
-  border-radius: 8px;
-  background: var(--control-bg);
-  color: var(--text-secondary);
-}
-
-.project-chip-label {
-  min-width: 0;
-  overflow: hidden;
-  text-overflow: ellipsis;
-  white-space: nowrap;
 }
 
 .action-list {

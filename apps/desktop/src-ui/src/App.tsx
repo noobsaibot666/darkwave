@@ -24,7 +24,6 @@ import {
   FileText,
   FileWarning,
   Flag,
-  FolderCheck,
   FolderOpen,
   Footprints,
   Gauge,
@@ -1231,6 +1230,15 @@ export function App() {
   // drag is in progress. See the pointermove/pointerup effect further down.
   const [dragOverProjectId, setDragOverProjectId] = useState<string | null>(null);
   const [dragPreview, setDragPreview] = useState<{ label: string; count: number } | null>(null);
+  // The Projects grid's per-card count badge, clicked open — fetched fresh
+  // via assets_in_collection each time rather than kept in sync locally,
+  // since it's opened rarely enough that an extra round trip is cheaper
+  // than reasoning about staleness.
+  const [projectTracksPanel, setProjectTracksPanel] = useState<{
+    project: CollectionRecord;
+    position: { top: number; left: number };
+    assets: AssetRecord[] | null;
+  } | null>(null);
   // The last few projects a track was actually dropped/added into, most
   // recent first — persisted so the drag dock below has something useful
   // to show even on a fresh launch's first drag. Purely a convenience
@@ -1322,8 +1330,6 @@ export function App() {
   // Settings' Watched Folders panel uses.
   const [editProjectExportFolders, setEditProjectExportFolders] = useState<ProjectExportFolderRecord[]>([]);
   const [lastExportProjectId, setLastExportProjectId] = useState<string | null>(null);
-  const [drExportStatus, setDrExportStatus] = useState<string | null>(null);
-  const [projectAddToast, setProjectAddToast] = useState<{ projectId: string; message: string } | null>(null);
   const [trashModalOpen, setTrashModalOpen] = useState(false);
   const [editorWorkflowOpen, setEditorWorkflowOpen] = useState(false);
   const [editorActionStatus, setEditorActionStatus] = useState<string | null>(null);
@@ -1419,6 +1425,18 @@ export function App() {
       else map.set(membership.asset_id, [membership]);
     }
     return map;
+  }, [projectMemberships]);
+
+  // How many tracks have already been sent to each project — the Projects
+  // grid's count badge. Derived from the same library-wide membership list
+  // already kept fresh for the per-row "in a project" badges, so this is
+  // free: no extra fetch just to show a number.
+  const trackCountByProject = useMemo(() => {
+    const counts = new Map<string, number>();
+    for (const membership of projectMemberships) {
+      counts.set(membership.project_id, (counts.get(membership.project_id) ?? 0) + 1);
+    }
+    return counts;
   }, [projectMemberships]);
 
   const visibleAssets = useMemo(() => {
@@ -2585,18 +2603,12 @@ export function App() {
   const handleExportToProject = useCallback(
     (project: CollectionRecord, assetIds: string[]) => {
       if (assetIds.length === 0 || (!project.export_path && !project.sfx_export_path)) return;
-      setDrExportStatus(`Sending to ${project.name}…`);
       Promise.all(assetIds.map((assetId) => invoke<string>("export_asset_to_project", { assetId, projectId: project.id })))
-        .then((destinations) => {
+        .then(() => {
           setLastExportProjectId(project.id);
-          setDrExportStatus(
-            destinations.length === 1
-              ? `Sent to ${project.name}`
-              : `Sent ${destinations.length} sounds to ${project.name}`
-          );
           if (activeLibraryId) refreshProjectMemberships(activeLibraryId);
         })
-        .catch((error) => setDrExportStatus(`Send to ${project.name} failed: ${String(error)}`));
+        .catch(() => {});
     },
     [activeLibraryId, refreshProjectMemberships]
   );
@@ -2621,19 +2633,15 @@ export function App() {
       const targets = inCurrentProject ? [inCurrentProject] : memberships.filter(hasAnyFolder);
       if (targets.length === 0) return;
 
-      setDrExportStatus(`Sending ${asset.display_name}…`);
       Promise.all(
         targets.map((target) =>
           invoke<string>("export_asset_to_project", { assetId: asset.id, projectId: target.project_id })
         )
       )
         .then(() => {
-          setDrExportStatus(
-            targets.length === 1 ? `Sent to ${targets[0].project_name}` : `Sent to ${targets.length} projects`
-          );
           if (activeLibraryId) refreshProjectMemberships(activeLibraryId);
         })
-        .catch((error) => setDrExportStatus(`Send failed: ${String(error)}`));
+        .catch(() => {});
     },
     [activeFilter, activeLibraryId, refreshProjectMemberships]
   );
@@ -2688,8 +2696,22 @@ export function App() {
       }
       setSelectedAssetId(asset.id);
       const mode: SelectionMode = event.shiftKey ? "Range" : event.metaKey || event.ctrlKey ? "Toggle" : "Replace";
-      if (mode === "Replace" && playingAssetId !== asset.id) {
-        loadAssetForPlayback(asset, true);
+      if (mode === "Replace") {
+        if (playingAssetId !== asset.id) {
+          loadAssetForPlayback(asset, true);
+        } else if (audioRef.current?.paused) {
+          // Same track, but paused or finished (ended also leaves the
+          // element paused) — playingAssetId alone doesn't distinguish
+          // "already playing" from "already loaded but not moving", so a
+          // click here used to silently no-op. A user's own repro was
+          // exactly this: click plays once, pause it, click the same row
+          // again expecting it to resume, nothing happens — reads as
+          // "sometimes I have to click twice." Resuming directly instead
+          // of routing back through loadAssetForPlayback also skips a
+          // redundant asset_playback_path round trip and waveform-peaks
+          // lookup for a track that's already loaded.
+          audioRef.current.play().catch(() => setIsPlaying(false));
+        }
       }
       if (!browserState) return;
 
@@ -2739,6 +2761,42 @@ export function App() {
     },
     [bulkAssetIds, activeLibraryId, refreshProjectMemberships, markProjectUsed]
   );
+
+  // Opens (or closes, toggled from the same badge) the popover listing
+  // exactly which tracks are in a project — the count badge on the
+  // Projects grid card is otherwise just a number with no way to see what
+  // it's counting. Fetched fresh via assets_in_collection rather than
+  // reused from `assets` (which may be filtered/paginated and miss members
+  // outside the current view) or from projectMemberships (ids only, no
+  // display names).
+  const handleToggleProjectTracks = useCallback(
+    (project: CollectionRecord, anchor: HTMLElement) => {
+      setProjectTracksPanel((current) => {
+        if (current?.project.id === project.id) return null;
+        const rect = anchor.getBoundingClientRect();
+        return {
+          project,
+          position: { top: rect.bottom + 6, left: Math.max(8, rect.right - 260) },
+          assets: null
+        };
+      });
+    },
+    []
+  );
+
+  useEffect(() => {
+    if (!projectTracksPanel || projectTracksPanel.assets !== null) return;
+    const projectId = projectTracksPanel.project.id;
+    invoke<AssetRecord[]>("assets_in_collection", { collectionId: projectId })
+      .then((result) => {
+        setProjectTracksPanel((current) =>
+          current && current.project.id === projectId ? { ...current, assets: result } : current
+        );
+      })
+      .catch(() => {
+        setProjectTracksPanel((current) => (current && current.project.id === projectId ? { ...current, assets: [] } : current));
+      });
+  }, [projectTracksPanel]);
 
   // Drag a track (or, if the dragged row is part of the current selection,
   // every selected track) and drop it on a project name — in the left
@@ -2800,13 +2858,6 @@ export function App() {
           setUndoStack((previous) => [...previous, { id: undoId, label: `Add to "${project.name}"` }]);
           setRedoStack([]);
           if (activeLibraryId) refreshProjectMemberships(activeLibraryId);
-          setProjectAddToast({
-            projectId: project.id,
-            message: ids.length === 1 ? "Added" : `${ids.length} added`
-          });
-          window.setTimeout(() => {
-            setProjectAddToast((current) => (current?.projectId === project.id ? null : current));
-          }, 2000);
           markProjectUsed(project.id);
         })
         .catch(() => {});
@@ -2831,10 +2882,6 @@ export function App() {
           setUndoStack((previous) => [...previous, { id: undoId, label: `Add to "${project.name}"` }]);
           setRedoStack([]);
           if (activeLibraryId) refreshProjectMemberships(activeLibraryId);
-          setProjectAddToast({ projectId: project.id, message: "Music added" });
-          window.setTimeout(() => {
-            setProjectAddToast((current) => (current?.projectId === project.id ? null : current));
-          }, 2000);
           markProjectUsed(project.id);
         })
         .catch(() => {});
@@ -5187,9 +5234,6 @@ export function App() {
                       }}
                     >
                       <Plus size={14} />
-                      {projectAddToast?.projectId === project.id ? (
-                        <span className="project-add-toast">{projectAddToast.message}</span>
-                      ) : null}
                     </button>
                   ) : null}
                   <button
@@ -5654,7 +5698,7 @@ export function App() {
                         handleSendAssetToItsProjects(asset, memberships);
                       }}
                     >
-                      {anyExported ? <FolderCheck size={15} /> : <FolderOpen size={15} />}
+                      <Clapperboard size={15} />
                     </button>
                   );
                 })()}
@@ -6019,36 +6063,90 @@ export function App() {
           </div>
         </CollapsibleSection>
         <CollapsibleSection id="projects" title="Projects" collapsed={collapsedSections.has("projects")} onToggle={toggleSection}>
-          <div className="drop-target-grid">
+          <div className="project-grid">
             {collections
               .filter((project) => project.collection_type !== "Smart")
-              .map((project) => (
-                <button
-                  key={project.id}
-                  className={
-                    (dragOverProjectId === project.id ? "project-chip drag-over" : "project-chip") +
-                    (bulkAssetIds.length === 0 ? " no-selection" : "")
-                  }
-                  title={`Add selected to ${project.name} (or drag a track here)`}
-                  aria-label={`Add selected to ${project.name}`}
-                  onClick={() => handleAddSelectedToProject(project)}
-                  // Not a native `disabled` button: dragging an unselected
-                  // row here (nothing in bulkAssetIds) is exactly the case
-                  // this exists for, and a disabled control is invisible to
-                  // elementFromPoint's drop hit-testing. The click path
-                  // already no-ops on an empty selection; `.no-selection`
-                  // above just dims it to match.
-                  aria-disabled={bulkAssetIds.length === 0}
-                  data-drop-project-id={project.id}
-                >
-                  <span className="project-thumb">
-                    <Music size={12} />
-                  </span>
-                  <span className="project-chip-label">{project.name}</span>
-                </button>
-              ))}
+              .map((project) => {
+                const trackCount = trackCountByProject.get(project.id) ?? 0;
+                return (
+                  <div
+                    key={project.id}
+                    className={dragOverProjectId === project.id ? "project-card drag-over" : "project-card"}
+                    data-drop-project-id={project.id}
+                  >
+                    <button
+                      type="button"
+                      className={bulkAssetIds.length === 0 ? "project-card-add no-selection" : "project-card-add"}
+                      title={`Add selected to ${project.name} (or drag a track here)`}
+                      aria-label={`Add selected to ${project.name}`}
+                      onClick={() => handleAddSelectedToProject(project)}
+                      // Not a native `disabled` button: dragging an unselected
+                      // row here (nothing in bulkAssetIds) is exactly the case
+                      // this exists for, and a disabled control is invisible to
+                      // elementFromPoint's drop hit-testing. The click path
+                      // already no-ops on an empty selection; `.no-selection`
+                      // above just dims it to match.
+                      aria-disabled={bulkAssetIds.length === 0}
+                    >
+                      <span className="project-card-icon">
+                        <Clapperboard size={16} />
+                      </span>
+                      <span className="project-card-name">{project.name}</span>
+                    </button>
+                    {trackCount > 0 ? (
+                      <button
+                        type="button"
+                        className="project-card-count"
+                        aria-label={`${trackCount} track${trackCount === 1 ? "" : "s"} sent to ${project.name} — click to view`}
+                        title={`${trackCount} track${trackCount === 1 ? "" : "s"} sent to ${project.name} — click to view`}
+                        onClick={(event) => {
+                          event.stopPropagation();
+                          handleToggleProjectTracks(project, event.currentTarget);
+                        }}
+                      >
+                        {trackCount}
+                      </button>
+                    ) : null}
+                  </div>
+                );
+              })}
           </div>
         </CollapsibleSection>
+        <AnimatePresence>
+          {projectTracksPanel ? (
+            <motion.div
+              className="modal-card project-tracks-popover"
+              style={{ top: projectTracksPanel.position.top, left: projectTracksPanel.position.left }}
+              initial={{ opacity: 0, scale: 0.95, y: -6 }}
+              animate={{ opacity: 1, scale: 1, y: 0 }}
+              exit={{ opacity: 0, scale: 0.95, y: -6 }}
+              transition={{ duration: 0.16, ease: [0.4, 0, 0.2, 1] }}
+            >
+              <div className="project-tracks-popover-head">
+                <span className="project-tracks-popover-title">{projectTracksPanel.project.name}</span>
+                <button
+                  type="button"
+                  className="icon-button"
+                  aria-label="Close"
+                  onClick={() => setProjectTracksPanel(null)}
+                >
+                  <X size={14} />
+                </button>
+              </div>
+              {projectTracksPanel.assets === null ? (
+                <p className="empty-hint">Loading…</p>
+              ) : projectTracksPanel.assets.length === 0 ? (
+                <p className="empty-hint">No tracks yet.</p>
+              ) : (
+                <ul className="project-tracks-popover-list">
+                  {projectTracksPanel.assets.map((asset) => (
+                    <li key={asset.id}>{asset.display_name}</li>
+                  ))}
+                </ul>
+              )}
+            </motion.div>
+          ) : null}
+        </AnimatePresence>
         {selectedAsset && stemGroupMembers.length > 0 ? (
           <CollapsibleSection
             id="stems-track"
@@ -6573,7 +6671,6 @@ export function App() {
         >
           <Clapperboard size={16} />
         </button>
-        {drExportStatus ? <span className="dr-status">{drExportStatus}</span> : null}
       </footer>
       <AnimatePresence>
       {settingsOpen ? (
