@@ -5,7 +5,7 @@
     <key>ITSAppUsesNonExemptEncryption</key>
     <false/>
     <key>CFBundleVersion</key>
-    <string>12</string>
+    <string>13</string>
     <!--
       Tauri's own `bundle.fileAssociations` (tauri.conf.json) generates the
       CFBundleDocumentTypes/UTExportedTypeDeclarations entries that make
