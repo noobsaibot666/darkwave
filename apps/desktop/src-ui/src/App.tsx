@@ -250,6 +250,17 @@ type ProjectExportFolderRecord = {
   created_at: string;
 };
 
+/** Resolve Live Bridge structure-sync state for one project — see
+ * `storage::ResolveSyncStatus`. `approved_at` gates one-click
+ * send-to-timeline. */
+type ResolveSyncStatus = {
+  collection_id: string;
+  status: "not_synced" | "syncing" | "synced" | "failed";
+  error: string | null;
+  approved_at: string | null;
+  last_synced_at: string | null;
+};
+
 type AssetProjectMembership = {
   asset_id: string;
   project_id: string;
@@ -1309,6 +1320,10 @@ export function App() {
   const [newTagFacet, setNewTagFacet] = useState("action");
 
   const [collections, setCollections] = useState<CollectionRecord[]>([]);
+  // Keyed by project id — only ever has entries for projects that have
+  // actually attempted a Resolve sync (see get_resolve_sync_statuses_for_library's
+  // doc comment); a project absent from this map has simply never synced.
+  const [resolveSyncStatuses, setResolveSyncStatuses] = useState<Record<string, ResolveSyncStatus>>({});
   const [libraryFolders, setLibraryFolders] = useState<FolderRecord[]>([]);
   const [projectMemberships, setProjectMemberships] = useState<AssetProjectMembership[]>([]);
   const [newProjectName, setNewProjectName] = useState("");
@@ -2619,6 +2634,57 @@ export function App() {
     },
     [activeLibraryId, refreshProjectMemberships]
   );
+
+  // Structure sync runs invisibly in the backend (see spawn_resolve_structure_sync's
+  // doc comment) — this just polls the result. Only ever populates entries
+  // for projects that have actually attempted a sync.
+  const refreshResolveSyncStatuses = useCallback((libraryId: string) => {
+    invoke<ResolveSyncStatus[]>("get_resolve_sync_statuses_for_library", { libraryId })
+      .then((statuses) => {
+        setResolveSyncStatuses(Object.fromEntries(statuses.map((status) => [status.collection_id, status])));
+      })
+      .catch(() => {});
+  }, []);
+
+  const handleApproveResolveSync = useCallback((project: CollectionRecord) => {
+    invoke("approve_project_resolve_sync", { projectId: project.id })
+      .then(() => {
+        setResolveSyncStatuses((previous) => ({
+          ...previous,
+          [project.id]: { ...previous[project.id], approved_at: new Date().toISOString() }
+        }));
+      })
+      .catch((error) => setEditorActionStatus(`Could not approve: ${String(error)}`));
+  }, []);
+
+  const handleSendAssetsToResolveTimeline = useCallback((assetIds: string[], project: CollectionRecord) => {
+    if (assetIds.length === 0) return;
+    setEditorActionStatus(
+      assetIds.length === 1 ? "Sending to Resolve…" : `Sending ${assetIds.length} sounds to Resolve…`
+    );
+    // Sequential, not Promise.all — each one lands on the timeline at
+    // "the current playhead," so firing them concurrently would race for
+    // the same position instead of landing back-to-back.
+    (async () => {
+      let sent = 0;
+      let lastError: string | null = null;
+      for (const assetId of assetIds) {
+        try {
+          await invoke<string>("send_asset_to_resolve_timeline", { assetId, projectId: project.id });
+          sent += 1;
+        } catch (error) {
+          lastError = String(error);
+        }
+      }
+      if (lastError && sent === 0) {
+        setEditorActionStatus(`Send to Resolve failed: ${lastError}`);
+      } else if (lastError) {
+        setEditorActionStatus(`Sent ${sent}/${assetIds.length} — last error: ${lastError}`);
+      } else {
+        setEditorActionStatus(sent === 1 ? "Sent to Resolve" : `Sent ${sent} sounds to Resolve`);
+      }
+    })();
+  }, []);
 
   // Per-row "send to folder" — independent of the sidebar/bulk-selection
   // export buttons above: any track already associated with a project can
@@ -4091,11 +4157,21 @@ export function App() {
   // background rather than only right after Import/Refresh.
   useEffect(() => {
     if (!activeLibraryId) return;
-    const unlistenBackgroundTick = listen("background-tick", () => runJobDrain(activeLibraryId));
+    const unlistenBackgroundTick = listen("background-tick", () => {
+      runJobDrain(activeLibraryId);
+      refreshResolveSyncStatuses(activeLibraryId);
+    });
     return () => {
       unlistenBackgroundTick.then((dispose) => dispose());
     };
-  }, [activeLibraryId, runJobDrain]);
+  }, [activeLibraryId, runJobDrain, refreshResolveSyncStatuses]);
+
+  // Refresh on open rather than only relying on the next background-tick
+  // (up to ~20s away) — a project just created/edited should show its sync
+  // state promptly once the user actually opens the panel to look at it.
+  useEffect(() => {
+    if (editorWorkflowOpen && activeLibraryId) refreshResolveSyncStatuses(activeLibraryId);
+  }, [editorWorkflowOpen, activeLibraryId, refreshResolveSyncStatuses]);
 
   // A `.darkwave` library file opened from outside this window's own
   // Open Library/recent-libraries UI — a Finder double-click (macOS), or a
@@ -5860,45 +5936,76 @@ export function App() {
               {editorActionStatus ? <div className="editor-workflow-status">{editorActionStatus}</div> : null}
 
               <div className="editor-workflow-projects">
-                <h2>Send to project</h2>
+                <h2>Send to Resolve timeline</h2>
                 {collections.filter((project) => project.collection_type === "Project").length === 0 ? (
                   <p className="editor-workflow-empty">
-                    Create a project with an export folder to send sounds straight into it.
+                    Create a project with an export folder — its structure syncs into Resolve automatically.
                   </p>
                 ) : (
                   <div className="editor-project-list">
                     {collections
                       .filter((project) => project.collection_type === "Project")
-                      .map((project) => (
-                        <div className="editor-project-card" key={project.id}>
-                          <span className="editor-project-thumb">
-                            <Music size={14} />
-                          </span>
-                          <div className="editor-project-meta">
-                            <strong>{project.name}</strong>
-                            <small>
-                              {project.export_path || project.sfx_export_path
-                                ? [
-                                    project.export_path ? `Sound: ${project.export_path}` : null,
-                                    project.sfx_export_path ? `SFX: ${project.sfx_export_path}` : null
-                                  ]
-                                    .filter(Boolean)
-                                    .join(" · ")
-                                : "No export folder set"}
-                            </small>
+                      .map((project) => {
+                        const sync: ResolveSyncStatus = resolveSyncStatuses[project.id] ?? {
+                          collection_id: project.id,
+                          status: "not_synced",
+                          error: null,
+                          approved_at: null,
+                          last_synced_at: null
+                        };
+                        return (
+                          <div className="editor-project-card" key={project.id}>
+                            <span className="editor-project-thumb">
+                              <Music size={14} />
+                            </span>
+                            <div className="editor-project-meta">
+                              <strong>{project.name}</strong>
+                              <small>
+                                {sync.status === "syncing"
+                                  ? "Syncing structure to Resolve…"
+                                  : sync.status === "failed"
+                                  ? `Sync failed: ${sync.error ?? "unknown error"}`
+                                  : sync.status === "synced" && !sync.approved_at
+                                  ? "Structure synced — approve to enable sending"
+                                  : sync.status === "synced" && sync.approved_at
+                                  ? "Approved — ready to send"
+                                  : projectHasExportFolder(project)
+                                  ? "Not yet synced"
+                                  : "No export folder set"}
+                              </small>
+                            </div>
+                            {sync.status === "synced" && !sync.approved_at ? (
+                              <button
+                                type="button"
+                                className="dr-button"
+                                aria-label={`Approve Resolve structure for ${project.name}`}
+                                onClick={() => handleApproveResolveSync(project)}
+                              >
+                                <ShieldCheck size={15} />
+                                Approve
+                              </button>
+                            ) : (
+                              <button
+                                type="button"
+                                className={
+                                  sync.approved_at && bulkAssetIds.length > 0 ? "dr-button" : "dr-button disabled"
+                                }
+                                disabled={!sync.approved_at || bulkAssetIds.length === 0}
+                                aria-label={`Send selected to ${project.name}'s Resolve timeline`}
+                                title={
+                                  sync.approved_at
+                                    ? undefined
+                                    : "Structure must be synced and approved before sending to the timeline"
+                                }
+                                onClick={() => handleSendAssetsToResolveTimeline(bulkAssetIds, project)}
+                              >
+                                <Clapperboard size={15} />
+                                Send to Timeline
+                              </button>
+                            )}
                           </div>
-                          <button
-                            type="button"
-                            className={projectHasExportFolder(project) ? "dr-button" : "dr-button disabled"}
-                            disabled={!projectHasExportFolder(project) || bulkAssetIds.length === 0}
-                            aria-label={`Send selected to ${project.name}`}
-                            onClick={() => handleExportToProject(project, bulkAssetIds)}
-                          >
-                            <Clapperboard size={15} />
-                            Send
-                          </button>
-                        </div>
-                      ))}
+                        );
+                      })}
                   </div>
                 )}
               </div>
@@ -7284,16 +7391,56 @@ export function App() {
                 <X size={16} />
               </button>
             </div>
-            {jobProgress.length === 0 &&
-            !refreshStatus &&
-            !importStatus &&
-            !audioAnalysisPaused &&
-            !waveformGenerationPaused &&
-            Object.keys(jobCompletionSummaries).length === 0 ? (
-              <p className="empty-hint activity-empty-hint">All caught up — nothing running right now.</p>
-            ) : (
-              <div className="job-progress-panel" aria-label="Background work">
-                {importStatus ? (
+            {(() => {
+              const syncingProjects = collections.filter(
+                (project) => resolveSyncStatuses[project.id]?.status === "syncing"
+              );
+              const failedSyncProjects = collections.filter(
+                (project) => resolveSyncStatuses[project.id]?.status === "failed"
+              );
+              if (
+                jobProgress.length === 0 &&
+                !refreshStatus &&
+                !importStatus &&
+                !audioAnalysisPaused &&
+                !waveformGenerationPaused &&
+                syncingProjects.length === 0 &&
+                failedSyncProjects.length === 0 &&
+                Object.keys(jobCompletionSummaries).length === 0
+              ) {
+                return <p className="empty-hint activity-empty-hint">All caught up — nothing running right now.</p>;
+              }
+              return (
+                <div className="job-progress-panel" aria-label="Background work">
+                  {syncingProjects.map((project) => (
+                    <div className="job-progress-row" key={`resolve-sync-${project.id}`}>
+                      <span className="job-progress-icon">
+                        <Workflow size={15} />
+                      </span>
+                      <div className="job-progress-body">
+                        <div className="job-progress-head">
+                          <span className="job-progress-label">Resolve Sync</span>
+                        </div>
+                        <div className="status-line">Syncing "{project.name}" structure to Resolve…</div>
+                      </div>
+                    </div>
+                  ))}
+                  {failedSyncProjects.map((project) => (
+                    <div className="job-progress-row" key={`resolve-sync-failed-${project.id}`}>
+                      <span className="job-progress-icon">
+                        <Workflow size={15} />
+                      </span>
+                      <div className="job-progress-body">
+                        <div className="job-progress-head">
+                          <span className="job-progress-label">Resolve Sync</span>
+                        </div>
+                        <div className="status-line job-progress-failed">
+                          "{project.name}": {resolveSyncStatuses[project.id]?.error ?? "sync failed"}
+                        </div>
+                      </div>
+                    </div>
+                  ))}
+                  {importStatus ? (
                   <div className="job-progress-row">
                     <span className="job-progress-icon">
                       <Import size={15} />
@@ -7432,8 +7579,9 @@ export function App() {
                     </div>
                   );
                 })}
-              </div>
-            )}
+                </div>
+              );
+            })()}
             <p className="settings-hint activity-footnote">
               Analysis runs in the background, one file at a time — browsing and playback stay responsive.
             </p>

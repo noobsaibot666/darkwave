@@ -288,6 +288,20 @@ pub struct ProjectExportFolderRecord {
     pub created_at: String,
 }
 
+/// Resolve Live Bridge structure-sync state for one project. `status` is
+/// one of `"not_synced"`/`"syncing"`/`"synced"`/`"failed"` — see
+/// `Catalog::resolve_sync_status`'s doc comment for how a project that's
+/// never been synced still gets a well-formed value here (`"not_synced"`,
+/// no row needed). `approved_at` gates one-click send-to-timeline.
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+pub struct ResolveSyncStatus {
+    pub collection_id: Uuid,
+    pub status: String,
+    pub error: Option<String>,
+    pub approved_at: Option<String>,
+    pub last_synced_at: Option<String>,
+}
+
 /// One (asset, project) membership row — see `project_memberships_for_library`.
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 pub struct AssetProjectMembership {
@@ -2065,6 +2079,21 @@ impl Catalog {
         Ok(())
     }
 
+    /// The project a categorized export folder belongs to — used to clear a
+    /// project's Resolve-sync approval when one of its folders is removed
+    /// (the caller only has `folder_id` at that point, not `collection_id`).
+    pub fn export_folder_collection_id(&self, folder_id: Uuid) -> Result<Option<Uuid>, StorageError> {
+        let id = self
+            .connection
+            .query_row(
+                "SELECT collection_id FROM project_export_folders WHERE id = ?1",
+                params![folder_id.to_string()],
+                |row| row.get::<_, String>(0),
+            )
+            .optional()?;
+        Ok(id.map(parse_uuid))
+    }
+
     pub fn set_project_export_folder_role(
         &self,
         folder_id: Uuid,
@@ -2073,6 +2102,140 @@ impl Catalog {
         self.connection.execute(
             "UPDATE project_export_folders SET role = ?1 WHERE id = ?2",
             params![role.as_ref(), folder_id.to_string()],
+        )?;
+        Ok(())
+    }
+
+    /// Current Resolve Live Bridge structure-sync status for one project —
+    /// `not_synced` if the row doesn't exist yet (every project starts here,
+    /// no row is created until the first sync attempt).
+    pub fn resolve_sync_status(
+        &self,
+        collection_id: Uuid,
+    ) -> Result<ResolveSyncStatus, StorageError> {
+        self.connection
+            .query_row(
+                "SELECT status, error, approved_at, last_synced_at
+                 FROM project_resolve_sync WHERE collection_id = ?1",
+                params![collection_id.to_string()],
+                |row| {
+                    Ok(ResolveSyncStatus {
+                        collection_id,
+                        status: row.get(0)?,
+                        error: row.get(1)?,
+                        approved_at: row.get(2)?,
+                        last_synced_at: row.get(3)?,
+                    })
+                },
+            )
+            .optional()?
+            .map(Ok)
+            .unwrap_or_else(|| {
+                Ok(ResolveSyncStatus {
+                    collection_id,
+                    status: "not_synced".to_string(),
+                    error: None,
+                    approved_at: None,
+                    last_synced_at: None,
+                })
+            })
+    }
+
+    /// All projects in a library with a sync row at all — used by the
+    /// Background Activity panel to show only projects actually mid-sync or
+    /// previously failed, not every project (most have never been synced,
+    /// which isn't activity worth showing).
+    pub fn resolve_sync_statuses_for_library(
+        &self,
+        library_id: Uuid,
+    ) -> Result<Vec<ResolveSyncStatus>, StorageError> {
+        let mut statement = self.connection.prepare(
+            "SELECT s.collection_id, s.status, s.error, s.approved_at, s.last_synced_at
+             FROM project_resolve_sync s
+             INNER JOIN collections c ON c.id = s.collection_id
+             WHERE c.library_id = ?1",
+        )?;
+        let statuses = statement
+            .query_map(params![library_id.to_string()], |row| {
+                Ok(ResolveSyncStatus {
+                    collection_id: parse_uuid(row.get::<_, String>(0)?),
+                    status: row.get(1)?,
+                    error: row.get(2)?,
+                    approved_at: row.get(3)?,
+                    last_synced_at: row.get(4)?,
+                })
+            })?
+            .collect::<Result<Vec<_>, _>>()?;
+        Ok(statuses)
+    }
+
+    /// Marks a project's structure sync `'syncing'` — called right before
+    /// the Python bridge subprocess is spawned. Upserts, since the first
+    /// sync for a project has no existing row yet.
+    pub fn set_resolve_sync_syncing(&self, collection_id: Uuid) -> Result<(), StorageError> {
+        let now = Utc::now().to_rfc3339();
+        self.connection.execute(
+            "INSERT INTO project_resolve_sync (collection_id, status, updated_at)
+             VALUES (?1, 'syncing', ?2)
+             ON CONFLICT(collection_id) DO UPDATE SET status = 'syncing', error = NULL, updated_at = ?2",
+            params![collection_id.to_string(), now],
+        )?;
+        Ok(())
+    }
+
+    /// Records the outcome of a sync attempt — `error: None` means success
+    /// (`'synced'`, `last_synced_at` bumped); `Some(message)` means
+    /// `'failed'`, `last_synced_at` left untouched (it tracks the last time
+    /// sync actually *succeeded*, not the last attempt).
+    pub fn set_resolve_sync_result(
+        &self,
+        collection_id: Uuid,
+        error: Option<&str>,
+    ) -> Result<(), StorageError> {
+        let now = Utc::now().to_rfc3339();
+        match error {
+            None => self.connection.execute(
+                "UPDATE project_resolve_sync SET status = 'synced', error = NULL,
+                 last_synced_at = ?1, updated_at = ?1 WHERE collection_id = ?2",
+                params![now, collection_id.to_string()],
+            ),
+            Some(message) => self.connection.execute(
+                "UPDATE project_resolve_sync SET status = 'failed', error = ?1, updated_at = ?2
+                 WHERE collection_id = ?3",
+                params![message, now, collection_id.to_string()],
+            ),
+        }?;
+        Ok(())
+    }
+
+    /// Gates one-click send-to-timeline. Only takes effect from `'synced'` —
+    /// approving a stale or failed structure would defeat the point of the
+    /// gate. Returns an error rather than silently no-op'ing so the caller
+    /// (and the UI) can tell the difference between "approved" and
+    /// "nothing happened."
+    pub fn approve_resolve_sync(&self, collection_id: Uuid) -> Result<(), StorageError> {
+        let now = Utc::now().to_rfc3339();
+        let changed = self.connection.execute(
+            "UPDATE project_resolve_sync SET approved_at = ?1, updated_at = ?1
+             WHERE collection_id = ?2 AND status = 'synced'",
+            params![now, collection_id.to_string()],
+        )?;
+        if changed == 0 {
+            return Err(StorageError::InvalidInput(
+                "project structure must be synced before it can be approved".to_string(),
+            ));
+        }
+        Ok(())
+    }
+
+    /// Un-approves a project's Resolve structure — called whenever its
+    /// export folders/paths change after approval, since an approval covers
+    /// a specific structure, not "whatever the project currently has." A
+    /// no-op if there's no sync row yet or it was never approved.
+    pub fn clear_resolve_sync_approval(&self, collection_id: Uuid) -> Result<(), StorageError> {
+        self.connection.execute(
+            "UPDATE project_resolve_sync SET approved_at = NULL, updated_at = ?1 WHERE collection_id = ?2",
+            params![Utc::now().to_rfc3339(), collection_id.to_string()],
         )?;
         Ok(())
     }
@@ -3309,6 +3472,23 @@ impl Catalog {
               path TEXT NOT NULL,
               role TEXT NOT NULL,
               created_at TEXT NOT NULL
+            );
+
+            -- One row per project — current-state tracking for the Resolve
+            -- Live Bridge structure sync, not a job queue. Deliberately a
+            -- separate table from `background_jobs`: this is project-scoped
+            -- (that table's `asset_id` is NOT NULL) and it's a single
+            -- current status per project, not a high-volume retryable
+            -- queue. `approved_at` gates one-click send-to-timeline — see
+            -- `clear_resolve_sync_approval`'s callers for why it resets
+            -- whenever the structure changes after approval.
+            CREATE TABLE IF NOT EXISTS project_resolve_sync (
+              collection_id TEXT PRIMARY KEY REFERENCES collections(id) ON DELETE CASCADE,
+              status TEXT NOT NULL DEFAULT 'not_synced',
+              error TEXT,
+              approved_at TEXT,
+              last_synced_at TEXT,
+              updated_at TEXT NOT NULL
             );
 
             CREATE TABLE IF NOT EXISTS source_records (
@@ -5950,6 +6130,93 @@ mod tests {
             .expect("list folders");
         assert_eq!(remaining.len(), 1);
         assert_eq!(remaining[0].id, keep.id);
+    }
+
+    #[test]
+    fn resolve_sync_status_defaults_to_not_synced_without_a_row() {
+        let catalog_path = unique_catalog_path("resolve-sync-default");
+        let catalog = Catalog::open(&catalog_path).expect("open catalog");
+        let library = catalog.create_library("One", "/library").expect("library");
+        let project = catalog
+            .create_collection(library.id, "Trailer", CollectionType::Project)
+            .expect("project");
+
+        let status = catalog.resolve_sync_status(project.id).expect("status");
+        assert_eq!(status.status, "not_synced");
+        assert!(status.approved_at.is_none());
+        assert!(status.last_synced_at.is_none());
+    }
+
+    #[test]
+    fn resolve_sync_state_transitions_through_syncing_to_synced_and_failed() {
+        let catalog_path = unique_catalog_path("resolve-sync-transitions");
+        let catalog = Catalog::open(&catalog_path).expect("open catalog");
+        let library = catalog.create_library("One", "/library").expect("library");
+        let project = catalog
+            .create_collection(library.id, "Trailer", CollectionType::Project)
+            .expect("project");
+
+        catalog.set_resolve_sync_syncing(project.id).expect("mark syncing");
+        assert_eq!(catalog.resolve_sync_status(project.id).expect("status").status, "syncing");
+
+        catalog.set_resolve_sync_result(project.id, None).expect("mark synced");
+        let synced = catalog.resolve_sync_status(project.id).expect("status");
+        assert_eq!(synced.status, "synced");
+        assert!(synced.last_synced_at.is_some());
+
+        // A later failed attempt doesn't erase the last real success.
+        catalog.set_resolve_sync_syncing(project.id).expect("re-sync");
+        catalog
+            .set_resolve_sync_result(project.id, Some("Resolve is not running"))
+            .expect("mark failed");
+        let failed = catalog.resolve_sync_status(project.id).expect("status");
+        assert_eq!(failed.status, "failed");
+        assert_eq!(failed.error.as_deref(), Some("Resolve is not running"));
+        assert_eq!(failed.last_synced_at, synced.last_synced_at);
+    }
+
+    #[test]
+    fn approving_resolve_sync_requires_synced_status_first() {
+        let catalog_path = unique_catalog_path("resolve-sync-approve-gate");
+        let catalog = Catalog::open(&catalog_path).expect("open catalog");
+        let library = catalog.create_library("One", "/library").expect("library");
+        let project = catalog
+            .create_collection(library.id, "Trailer", CollectionType::Project)
+            .expect("project");
+
+        // Not synced yet — approval must be refused, not silently no-op.
+        assert!(catalog.approve_resolve_sync(project.id).is_err());
+
+        catalog.set_resolve_sync_syncing(project.id).expect("mark syncing");
+        catalog.set_resolve_sync_result(project.id, None).expect("mark synced");
+        catalog.approve_resolve_sync(project.id).expect("approve");
+        assert!(catalog.resolve_sync_status(project.id).expect("status").approved_at.is_some());
+
+        // Structure changes after approval invalidate it.
+        catalog.clear_resolve_sync_approval(project.id).expect("clear approval");
+        assert!(catalog.resolve_sync_status(project.id).expect("status").approved_at.is_none());
+    }
+
+    #[test]
+    fn resolve_sync_statuses_for_library_only_returns_projects_with_a_sync_row() {
+        let catalog_path = unique_catalog_path("resolve-sync-library-list");
+        let catalog = Catalog::open(&catalog_path).expect("open catalog");
+        let library = catalog.create_library("One", "/library").expect("library");
+        let synced_project = catalog
+            .create_collection(library.id, "Trailer", CollectionType::Project)
+            .expect("project");
+        let untouched_project = catalog
+            .create_collection(library.id, "Untouched", CollectionType::Project)
+            .expect("project");
+        let _ = untouched_project;
+
+        catalog.set_resolve_sync_syncing(synced_project.id).expect("mark syncing");
+
+        let statuses = catalog
+            .resolve_sync_statuses_for_library(library.id)
+            .expect("statuses");
+        assert_eq!(statuses.len(), 1);
+        assert_eq!(statuses[0].collection_id, synced_project.id);
     }
 
     #[test]

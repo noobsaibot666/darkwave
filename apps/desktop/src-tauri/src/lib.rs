@@ -13,8 +13,8 @@ use release_readiness::{
 };
 use storage::{
     AssetPath, AssetRecord, Catalog, CollectionRecord, CollectionType, FolderRecord, JobKind,
-    LibraryRecord, ProjectExportFolderRecord, SourceRecordDraft, StorageError, TagApprovalState,
-    TagOrigin, TagRecord,
+    LibraryRecord, ProjectExportFolderRecord, ResolveSyncStatus, SourceRecordDraft, StorageError,
+    TagApprovalState, TagOrigin, TagRecord,
 };
 use tauri::Manager;
 use uuid::Uuid;
@@ -4139,8 +4139,259 @@ fn project_memberships_for_library(
         .map_err(storage_error_message)
 }
 
+// --- Resolve Live Bridge ---------------------------------------------------
+//
+// Structure sync + one-click send-to-timeline for DaVinci Resolve, via the
+// on-demand Python bridge at apps/resolve-bridge/ (see its README — a fresh
+// process per call, not a resident worker like the similarity-worker
+// sidecar: Resolve's connection state can go stale the instant Resolve is
+// closed/reopened or its current project switches, and call volume here is
+// low/user-triggered, so residency's complexity buys nothing). See
+// docs/development/editor-workflow-section.md for where this fits.
+
+/// Same role vocabulary `project_export_folders.role` already uses
+/// (music/sound_effect/voiceover/foley/ambience/documents) — `documents` is
+/// skipped, same as everywhere else audio export routing happens.
+const RESOLVE_SYNC_ROLES: &[&str] = &["music", "sound_effect", "voiceover", "foley", "ambience"];
+
+/// Locates `resolve_bridge.py` — the bundled copy first (production, via
+/// the `resources` entry in tauri.conf.json), falling back to the source
+/// tree's own copy for `cargo run`/`tauri dev`. Mirrors
+/// `instrument_model_paths`'s app-data-then-bundled fallback shape, adapted
+/// since this file has no equivalent of a user-droppable override.
+fn resolve_bridge_script_path(app: &tauri::AppHandle) -> Result<PathBuf, String> {
+    if let Ok(resource_dir) = app.path().resource_dir() {
+        let bundled = resource_dir.join("resolve-bridge").join("resolve_bridge.py");
+        if bundled.is_file() {
+            return Ok(bundled);
+        }
+    }
+    let dev_path = PathBuf::from(concat!(
+        env!("CARGO_MANIFEST_DIR"),
+        "/../../resolve-bridge/resolve_bridge.py"
+    ));
+    if dev_path.is_file() {
+        return Ok(dev_path);
+    }
+    Err("could not locate resolve_bridge.py (checked bundled resources and the dev workspace path)".to_string())
+}
+
+/// Runs one action against `resolve_bridge.py`: spawns `python3 <script>`,
+/// writes the JSON request to its stdin, closes stdin (so the script's
+/// `json.load(sys.stdin)` sees EOF instead of blocking forever), then reads
+/// its JSON response from stdout. Plain `std::process::Command` inside
+/// `spawn_blocking`, not `tauri_plugin_shell` — the shell plugin's
+/// `CommandChild` has no way to close stdin without dropping the whole
+/// child, which this one-shot write-then-read-to-completion flow needs.
+async fn run_resolve_bridge_action(
+    app: &tauri::AppHandle,
+    request: serde_json::Value,
+) -> Result<serde_json::Value, String> {
+    let script_path = resolve_bridge_script_path(app)?;
+    let request_json = serde_json::to_string(&request)
+        .map_err(|error| format!("could not serialize resolve-bridge request: {error}"))?;
+
+    match tauri::async_runtime::spawn_blocking(move || -> Result<serde_json::Value, String> {
+        use std::io::Write;
+        use std::process::{Command, Stdio};
+
+        let mut child = Command::new("python3")
+            .arg(&script_path)
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .spawn()
+            .map_err(|error| format!("could not start python3 — is Python 3 installed and on PATH? ({error})"))?;
+
+        let mut stdin = child.stdin.take().expect("stdin was piped");
+        stdin
+            .write_all(request_json.as_bytes())
+            .map_err(|error| format!("failed writing to resolve-bridge stdin: {error}"))?;
+        drop(stdin); // closes the pipe — signals EOF to the script's json.load(sys.stdin)
+
+        let output = child
+            .wait_with_output()
+            .map_err(|error| format!("resolve-bridge process error: {error}"))?;
+
+        let stdout = String::from_utf8_lossy(&output.stdout);
+        let stdout = stdout.trim();
+        if stdout.is_empty() {
+            let stderr = String::from_utf8_lossy(&output.stderr);
+            return Err(format!("resolve-bridge produced no output (stderr: {stderr})"));
+        }
+        serde_json::from_str(stdout).map_err(|error| {
+            format!("could not parse resolve-bridge output as JSON: {error} (raw: {stdout})")
+        })
+    })
+    .await
+    {
+        Ok(result) => result,
+        Err(join_error) => Err(format!("resolve-bridge task panicked: {join_error}")),
+    }
+}
+
+/// Builds the role→present mapping for a project's current export
+/// configuration: every `project_export_folders` role, plus `music` if
+/// `export_path` is set and `sound_effect` if `sfx_export_path` is set (the
+/// same two built-in slots `export_asset_to_project` already falls back to)
+/// — a reasonable bin-structure approximation of that same destination
+/// logic, not a byte-for-byte reproduction of it (this only decides which
+/// *organizational bins* exist, not where a real export actually lands).
+fn resolve_sync_roles_for_project(catalog: &Catalog, project: &CollectionRecord) -> Vec<String> {
+    let mut roles: Vec<String> = catalog
+        .list_project_export_folders(project.id)
+        .unwrap_or_default()
+        .into_iter()
+        .map(|folder| folder.role)
+        .filter(|role| RESOLVE_SYNC_ROLES.contains(&role.as_str()))
+        .collect();
+    if project.export_path.is_some() && !roles.iter().any(|role| role == "music") {
+        roles.push("music".to_string());
+    }
+    if project.sfx_export_path.is_some() && !roles.iter().any(|role| role == "sound_effect") {
+        roles.push("sound_effect".to_string());
+    }
+    roles.sort();
+    roles.dedup();
+    roles
+}
+
+/// Fire-and-forget: marks the project `'syncing'`, runs `sync_structure`
+/// against the bridge, records the outcome. Called from `create_project`
+/// and every export-folder mutation command below — never awaited by its
+/// caller, so a slow or hung Resolve/Python call can't block the UI action
+/// that triggered it (matches the "smooth and invisible" design intent —
+/// see docs/development/editor-workflow-section.md).
+fn spawn_resolve_structure_sync(app: tauri::AppHandle, project_id: Uuid) {
+    tauri::async_runtime::spawn(async move {
+        let payload = {
+            let catalog_state = app.state::<CatalogState>();
+            let catalog = catalog_state.0.lock().expect("catalog mutex poisoned");
+            let Ok(Some(project)) = catalog.get_collection(project_id) else {
+                return;
+            };
+            let roles = resolve_sync_roles_for_project(&catalog, &project);
+            if roles.is_empty() {
+                // Nothing configured to organize yet — leave status at
+                // whatever it already is (likely 'not_synced') rather than
+                // recording a pointless sync attempt.
+                return;
+            }
+            if let Err(error) = catalog.set_resolve_sync_syncing(project_id) {
+                eprintln!("resolve-bridge: failed to mark project {project_id} syncing: {error:?}");
+                return;
+            }
+            serde_json::json!({ "action": "sync_structure", "project_name": project.name, "roles": roles })
+        };
+
+        let result = run_resolve_bridge_action(&app, payload).await;
+        let catalog_state = app.state::<CatalogState>();
+        let catalog = catalog_state.0.lock().expect("catalog mutex poisoned");
+        let error_message = result.as_ref().err().cloned().or_else(|| {
+            result.as_ref().ok().and_then(|value| {
+                (!value.get("success").and_then(|v| v.as_bool()).unwrap_or(false))
+                    .then(|| value.get("error").and_then(|e| e.as_str()).unwrap_or("unknown error").to_string())
+            })
+        });
+        if let Err(storage_error) = catalog.set_resolve_sync_result(project_id, error_message.as_deref()) {
+            eprintln!("resolve-bridge: failed to record sync result for project {project_id}: {storage_error:?}");
+        }
+    });
+}
+
+#[tauri::command]
+fn get_project_resolve_sync_status(
+    state: tauri::State<CatalogState>,
+    project_id: String,
+) -> Result<ResolveSyncStatus, String> {
+    let project_id = parse_uuid_field(&project_id, "project id")?;
+    let catalog = state.0.lock().expect("catalog mutex poisoned");
+    catalog.resolve_sync_status(project_id).map_err(storage_error_message)
+}
+
+/// Polled by the Background Activity panel — only returns projects that
+/// have ever been synced (or attempted), so a library full of ordinary
+/// projects that don't use the Resolve bridge at all doesn't show anything.
+#[tauri::command]
+fn get_resolve_sync_statuses_for_library(
+    state: tauri::State<CatalogState>,
+    library_id: String,
+) -> Result<Vec<ResolveSyncStatus>, String> {
+    let library_id = parse_uuid_field(&library_id, "library id")?;
+    let catalog = state.0.lock().expect("catalog mutex poisoned");
+    catalog
+        .resolve_sync_statuses_for_library(library_id)
+        .map_err(storage_error_message)
+}
+
+/// Gates one-click send-to-timeline — see `Catalog::approve_resolve_sync`'s
+/// doc comment for why this refuses anything but a `'synced'` project.
+#[tauri::command]
+fn approve_project_resolve_sync(state: tauri::State<CatalogState>, project_id: String) -> Result<(), String> {
+    let project_id = parse_uuid_field(&project_id, "project id")?;
+    let catalog = state.0.lock().expect("catalog mutex poisoned");
+    catalog.approve_resolve_sync(project_id).map_err(storage_error_message)
+}
+
+/// The one-click "send to timeline" action — refuses unless the target
+/// project's structure has been synced *and* approved (see
+/// `Catalog::approve_resolve_sync`). Unlike structure sync, this one is
+/// awaited by its caller (the user is waiting on this specific action to
+/// finish, unlike the invisible background sync), same pattern as the
+/// existing Reveal/Copy-Path actions' `editorActionStatus` feedback.
+#[tauri::command(async)]
+async fn send_asset_to_resolve_timeline(
+    app: tauri::AppHandle,
+    state: tauri::State<'_, CatalogState>,
+    asset_id: String,
+    project_id: String,
+) -> Result<String, String> {
+    let asset_id = parse_uuid_field(&asset_id, "asset id")?;
+    let project_id = parse_uuid_field(&project_id, "project id")?;
+
+    let (project_name, role, file_path) = {
+        let catalog = state.0.lock().expect("catalog mutex poisoned");
+        let sync_status = catalog.resolve_sync_status(project_id).map_err(storage_error_message)?;
+        if sync_status.approved_at.is_none() {
+            return Err(
+                "this project's Resolve structure hasn't been approved yet — sync and approve it first"
+                    .to_string(),
+            );
+        }
+        let project = catalog
+            .get_collection(project_id)
+            .map_err(storage_error_message)?
+            .ok_or_else(|| "project not found".to_string())?;
+        let asset = catalog
+            .get_asset(asset_id)
+            .map_err(storage_error_message)?
+            .ok_or_else(|| "asset not found".to_string())?;
+        let file_path = local_asset_path(&app, &catalog, &asset)?;
+        (project.name, asset.media_type, file_path)
+    };
+
+    let payload = serde_json::json!({
+        "action": "send_to_timeline",
+        "project_name": project_name,
+        "role": role,
+        "file_path": file_path,
+    });
+    let result = run_resolve_bridge_action(&app, payload).await?;
+    if !result.get("success").and_then(|v| v.as_bool()).unwrap_or(false) {
+        let message = result.get("error").and_then(|e| e.as_str()).unwrap_or("unknown error");
+        return Err(message.to_string());
+    }
+    let placed_at_playhead = result.get("placed_at_playhead").and_then(|v| v.as_bool()).unwrap_or(false);
+    Ok(if placed_at_playhead {
+        "Sent to Resolve at the playhead".to_string()
+    } else {
+        "Sent to Resolve (appended to timeline)".to_string()
+    })
+}
+
 #[tauri::command]
 fn create_project(
+    app: tauri::AppHandle,
     state: tauri::State<CatalogState>,
     library_id: String,
     name: String,
@@ -4166,14 +4417,17 @@ fn create_project(
             .set_collection_sfx_export_path(project.id, sfx_export_path.as_deref())
             .map_err(storage_error_message)?;
     }
-    catalog
+    let project = catalog
         .get_collection(project.id)
         .map_err(storage_error_message)?
-        .ok_or_else(|| "project not found after creation".to_string())
+        .ok_or_else(|| "project not found after creation".to_string())?;
+    spawn_resolve_structure_sync(app, project.id);
+    Ok(project)
 }
 
 #[tauri::command]
 fn set_project_export_path(
+    app: tauri::AppHandle,
     state: tauri::State<CatalogState>,
     project_id: String,
     export_path: Option<String>,
@@ -4183,14 +4437,18 @@ fn set_project_export_path(
     catalog
         .set_collection_export_path(project_id, export_path.as_deref())
         .map_err(storage_error_message)?;
-    catalog
+    let _ = catalog.clear_resolve_sync_approval(project_id);
+    let project = catalog
         .get_collection(project_id)
         .map_err(storage_error_message)?
-        .ok_or_else(|| "project not found".to_string())
+        .ok_or_else(|| "project not found".to_string())?;
+    spawn_resolve_structure_sync(app, project_id);
+    Ok(project)
 }
 
 #[tauri::command]
 fn set_project_sfx_export_path(
+    app: tauri::AppHandle,
     state: tauri::State<CatalogState>,
     project_id: String,
     sfx_export_path: Option<String>,
@@ -4200,10 +4458,13 @@ fn set_project_sfx_export_path(
     catalog
         .set_collection_sfx_export_path(project_id, sfx_export_path.as_deref())
         .map_err(storage_error_message)?;
-    catalog
+    let _ = catalog.clear_resolve_sync_approval(project_id);
+    let project = catalog
         .get_collection(project_id)
         .map_err(storage_error_message)?
-        .ok_or_else(|| "project not found".to_string())
+        .ok_or_else(|| "project not found".to_string())?;
+    spawn_resolve_structure_sync(app, project_id);
+    Ok(project)
 }
 
 /// The sidebar's hover-to-reveal edit icon: renames a project.
@@ -4232,6 +4493,7 @@ fn rename_project(
 /// built-in two-bucket split.
 #[tauri::command]
 fn add_project_export_folder(
+    app: tauri::AppHandle,
     state: tauri::State<CatalogState>,
     project_id: String,
     path: String,
@@ -4239,9 +4501,12 @@ fn add_project_export_folder(
 ) -> Result<ProjectExportFolderRecord, String> {
     let project_id = parse_uuid_field(&project_id, "project id")?;
     let catalog = state.0.lock().expect("catalog mutex poisoned");
-    catalog
+    let folder = catalog
         .add_project_export_folder(project_id, path, role)
-        .map_err(storage_error_message)
+        .map_err(storage_error_message)?;
+    let _ = catalog.clear_resolve_sync_approval(project_id);
+    spawn_resolve_structure_sync(app, project_id);
+    Ok(folder)
 }
 
 #[tauri::command]
@@ -4257,12 +4522,24 @@ fn list_project_export_folders(
 }
 
 #[tauri::command]
-fn remove_project_export_folder(state: tauri::State<CatalogState>, folder_id: String) -> Result<(), String> {
+fn remove_project_export_folder(
+    app: tauri::AppHandle,
+    state: tauri::State<CatalogState>,
+    folder_id: String,
+) -> Result<(), String> {
     let folder_id = parse_uuid_field(&folder_id, "folder id")?;
     let catalog = state.0.lock().expect("catalog mutex poisoned");
+    // Looked up before deleting — the row (and its collection_id) won't
+    // exist to look up afterward.
+    let project_id = catalog.export_folder_collection_id(folder_id).ok().flatten();
     catalog
         .remove_project_export_folder(folder_id)
-        .map_err(storage_error_message)
+        .map_err(storage_error_message)?;
+    if let Some(project_id) = project_id {
+        let _ = catalog.clear_resolve_sync_approval(project_id);
+        spawn_resolve_structure_sync(app, project_id);
+    }
+    Ok(())
 }
 
 #[tauri::command]
@@ -5416,6 +5693,10 @@ pub fn run() {
             remove_project_export_folder,
             set_project_export_folder_role,
             export_asset_to_project,
+            get_project_resolve_sync_status,
+            get_resolve_sync_statuses_for_library,
+            approve_project_resolve_sync,
+            send_asset_to_resolve_timeline,
             add_to_collection,
             assets_in_collection,
             search_assets_advanced,
@@ -5557,6 +5838,49 @@ mod tests {
             super::folder_role_for_path(&catalog, library.id, "/sounds/Unregistered"),
             None
         );
+    }
+
+    #[test]
+    fn resolve_sync_roles_combines_export_folders_with_the_two_built_in_slots() {
+        let catalog = storage::Catalog::open(":memory:").expect("open catalog");
+        let library = catalog.create_library("Home Studio", "/sounds").expect("library");
+        let project = catalog
+            .create_collection(library.id, "Trailer", storage::CollectionType::Project)
+            .expect("project");
+        catalog
+            .set_collection_export_path(project.id, Some("/Edit/Trailer/Sound"))
+            .expect("set export path");
+        catalog
+            .add_project_export_folder(project.id, "/Edit/Trailer/Foley", "foley")
+            .expect("add foley folder");
+        // A `documents` folder never becomes a Resolve bin, same as it's
+        // excluded from audio export routing everywhere else.
+        catalog
+            .add_project_export_folder(project.id, "/Edit/Trailer/Docs", "documents")
+            .expect("add documents folder");
+
+        let project = catalog
+            .get_collection(project.id)
+            .expect("get project")
+            .expect("project exists");
+        let roles = super::resolve_sync_roles_for_project(&catalog, &project);
+
+        // music: from export_path. foley: from the categorized folder.
+        // sound_effect: absent (sfx_export_path was never set). documents:
+        // never included.
+        assert_eq!(roles, vec!["foley".to_string(), "music".to_string()]);
+    }
+
+    #[test]
+    fn resolve_sync_roles_is_empty_for_a_project_with_no_export_configuration() {
+        let catalog = storage::Catalog::open(":memory:").expect("open catalog");
+        let library = catalog.create_library("Home Studio", "/sounds").expect("library");
+        let project = catalog
+            .create_collection(library.id, "Untouched", storage::CollectionType::Project)
+            .expect("project");
+
+        let roles = super::resolve_sync_roles_for_project(&catalog, &project);
+        assert!(roles.is_empty());
     }
 
     #[test]
