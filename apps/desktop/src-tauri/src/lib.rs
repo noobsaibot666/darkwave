@@ -2524,6 +2524,27 @@ async fn process_one_waveform_job(
         }
     };
 
+    // Already generated — complete the job without touching the file at
+    // all. Covers a job that's legitimately claimable again despite the
+    // asset already having a valid cache: an abandoned claim from before
+    // this app restarted (reset_stuck_processing_jobs reclaims it) whose
+    // prior run actually finished writing the cache but never got to mark
+    // the job itself completed, or simply a stale duplicate job row from
+    // before complete_pending_jobs_for_asset's 'processing' fix above.
+    // clear_waveform_cache (a relink invalidation) deletes the row outright,
+    // so this can't mask a genuinely-needed regeneration.
+    let already_cached = {
+        let catalog = state.0.lock().expect("catalog mutex poisoned");
+        catalog.get_waveform_cache(job.asset_id)
+    };
+    if matches!(already_cached, Ok(Some(_))) {
+        let catalog = state.0.lock().expect("catalog mutex poisoned");
+        if let Err(error) = catalog.complete_pending_jobs_for_asset(job.asset_id, JobKind::WaveformGeneration) {
+            eprintln!("waveform: failed to complete already-cached job {}: {error:?}", job.id);
+        }
+        return true;
+    }
+
     let local_path = {
         let catalog = state.0.lock().expect("catalog mutex poisoned");
         local_asset_path(app, &catalog, &asset)
