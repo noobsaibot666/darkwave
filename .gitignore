@@ -21,3 +21,6 @@ secrets/
 # Local test fixtures for the stems-detection feature — real sample audio,
 # not something to ship in the repo.
 docs/samples/
+
+__pycache__/
+*.pyc
