@@ -916,24 +916,49 @@ impl Catalog {
         Ok(())
     }
 
-    /// Puts a claimed (`processing`) job back to `pending` without counting
-    /// it as a failure — for "not actually wrong, just not ready yet" cases
-    /// like a Referenced/NAS asset whose file isn't reachable this attempt.
-    /// Several process_one_*_job functions used to just `return` here with
-    /// no DB write at all, leaving the row silently stuck at `processing`
-    /// (comments claimed "left pending" but nothing made that true) — which
-    /// starved job_state_counts_for_library's `pending` count, which starved
-    /// the frontend's "is there work to do" check, which is the only thing
-    /// that ever calls back in to let reset_stuck_processing_jobs self-heal
-    /// it. A kind whose entire remaining queue hit this path could get
-    /// stuck forever with no error and no result — this closes that loop
-    /// explicitly instead of hoping something else resets it later.
+    /// Puts a claimed (`processing`) job back to `pending` *immediately*
+    /// reclaimable — without counting it as a failure. Reserved for a
+    /// caller that knows the claim was abandoned for a specific, known
+    /// reason and wants it picked up again right away, such as the queue
+    /// being paused mid-batch (see `process_one_audio_analysis_job`'s pause
+    /// branch). Do **not** use this for "not actually wrong, just not ready
+    /// yet" cases like a Referenced/NAS asset whose file isn't reachable
+    /// this attempt — an immediate, uncapped requeue-to-pending is exactly
+    /// what turned that case into a tight, unbounded retry loop (the queue
+    /// re-claims a `'pending'` row on its very next tick, forever, for as
+    /// long as the file stays unreachable). That case wants
+    /// `mark_job_attempt` instead: leave the row `'processing'`, count the
+    /// attempt, and let `reset_stuck_processing_jobs`'s existing age-gated
+    /// threshold pace the retries.
     pub fn requeue_job_as_pending(&self, job_id: Uuid) -> Result<(), StorageError> {
         self.connection.execute(
             "UPDATE background_jobs SET state = 'pending', updated_at = ?1 WHERE id = ?2",
             params![Utc::now().to_rfc3339(), job_id.to_string()],
         )?;
         Ok(())
+    }
+
+    /// Records one more attempt at a job without touching its `state` —
+    /// unlike `fail_job` (always moves to `'failed'`) or
+    /// `requeue_job_as_pending` (always moves to `'pending'`, immediately
+    /// reclaimable). For a job left `'processing'` on purpose — an asset
+    /// file that isn't reachable locally this attempt, say — this is how a
+    /// caller counts silent retries toward a cap while still relying on
+    /// `reset_stuck_processing_jobs`'s existing age-gated threshold for
+    /// pacing (the job can't be re-claimed until that threshold flips it
+    /// back to `'pending'`, so this can't spin faster than that). Returns
+    /// the counter's new value so the caller can compare it against its own
+    /// cap and decide whether to finally call `fail_job` instead.
+    pub fn mark_job_attempt(&self, job_id: Uuid) -> Result<i64, StorageError> {
+        self.connection
+            .query_row(
+                "UPDATE background_jobs SET attempts = attempts + 1, updated_at = ?1
+                 WHERE id = ?2
+                 RETURNING attempts",
+                params![Utc::now().to_rfc3339(), job_id.to_string()],
+                |row| row.get(0),
+            )
+            .map_err(StorageError::from)
     }
 
     /// The single most recent job of `kind` for one asset — `(state,
@@ -4393,6 +4418,39 @@ mod tests {
             .reset_stuck_processing_jobs(JobKind::AudioAnalysis)
             .expect("reset stuck jobs");
         assert_eq!(reset, 0, "a claim only seconds old must not be treated as abandoned");
+    }
+
+    #[test]
+    fn mark_job_attempt_counts_up_without_changing_state() {
+        // Backs the fix for the "audio analysis loops forever" bug: an
+        // asset whose file isn't reachable locally must not be bounced
+        // straight back to 'pending' (immediately re-claimable, no
+        // backoff) — it should stay 'processing' and only accumulate
+        // attempts, relying on reset_stuck_processing_jobs's own age floor
+        // for pacing.
+        let catalog_path = unique_catalog_path("job-mark-attempt");
+        let catalog = Catalog::open(&catalog_path).expect("open catalog");
+        let library = catalog.create_library("Jobs", "/library").expect("library");
+        let asset = test_asset(&catalog, library.id, "tone.wav", "hash-job-mark-attempt");
+        let job = catalog
+            .enqueue_job(asset.id, JobKind::AudioAnalysis, 40)
+            .expect("enqueue");
+        catalog
+            .claim_pending_jobs(JobKind::AudioAnalysis, 10)
+            .expect("claim");
+
+        let first = catalog.mark_job_attempt(job.id).expect("mark attempt 1");
+        let second = catalog.mark_job_attempt(job.id).expect("mark attempt 2");
+        assert_eq!((first, second), (1, 2));
+
+        // Still 'processing' — an ordinary claim must not pick it back up.
+        let reclaimed = catalog
+            .claim_pending_jobs(JobKind::AudioAnalysis, 10)
+            .expect("claim again");
+        assert!(
+            reclaimed.is_empty(),
+            "marking an attempt must not move the job back to 'pending'"
+        );
     }
 
     #[test]

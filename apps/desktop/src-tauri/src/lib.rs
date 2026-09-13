@@ -2207,6 +2207,59 @@ fn asset_absolute_path(asset: &AssetRecord, media_root: &str) -> String {
     }
 }
 
+/// Ceiling on how many times `defer_unavailable_job` will silently retry a
+/// job whose asset file isn't reachable locally before finally calling
+/// `fail_job` on it. Paired with `reset_stuck_processing_jobs`'s existing
+/// 3-minute age floor (which paces how often a deferred job can even be
+/// reclaimed — see that function's doc comment), this caps *silent*
+/// retrying at roughly an hour of session time. Below the cap this is
+/// invisible to the user by design (the common, expected case: a NAS share
+/// or external drive that isn't mounted yet, or hasn't been warmed into the
+/// local cache). At the cap it becomes a real, visible failure — recoverable
+/// at any time afterward via the existing "Retry Failed Jobs" action, which
+/// resets `attempts` back to 0 — rather than retrying forever with no way
+/// for the user to know a file may simply be gone for good (a deleted
+/// external drive, a renamed NAS share, a broken asset row).
+const MAX_SILENT_AVAILABILITY_ATTEMPTS: i64 = 20;
+
+/// Handles a job whose asset file couldn't be resolved or found locally
+/// this attempt. Leaves the job `'processing'` and just counts the
+/// attempt — *not* `requeue_job_as_pending`, which puts the row straight
+/// back to `'pending'` and lets the very next claim cycle pick it right
+/// back up, with no backoff at all. Since the standing background worker
+/// (see `.setup()`) calls `process_{audio_analysis,waveform,instrument}_jobs`
+/// on a roughly 1-second cycle for as long as the app is open, an
+/// immediate requeue turned "file not reachable yet" into a tight,
+/// CPU-and-power-assertion-burning loop that never stopped for the
+/// lifetime of the session — the bug this replaced. Leaving the row
+/// `'processing'` means it can't be reclaimed until
+/// `reset_stuck_processing_jobs`'s own age-gated threshold judges the claim
+/// abandoned, which is exactly the pacing this relies on.
+///
+/// Returns `true` if this call pushed the job over
+/// `MAX_SILENT_AVAILABILITY_ATTEMPTS` and it was failed outright — the
+/// caller should treat that like any other real failure (emit a progress
+/// event, etc.); a `false` return means the job was deferred silently and
+/// nothing user-visible happened.
+fn defer_unavailable_job(catalog: &Catalog, job_id: Uuid, context: &str) -> bool {
+    match catalog.mark_job_attempt(job_id) {
+        Ok(attempts) if attempts >= MAX_SILENT_AVAILABILITY_ATTEMPTS => {
+            let message = format!(
+                "file still not reachable locally after {attempts} attempts — reconnect the drive/NAS share, then use Retry Failed Jobs"
+            );
+            if let Err(error) = catalog.fail_job(job_id, &message) {
+                eprintln!("{context}: failed to record unavailable-file failure for job {job_id}: {error:?}");
+            }
+            true
+        }
+        Ok(_) => false,
+        Err(error) => {
+            eprintln!("{context}: failed to record availability attempt for job {job_id}: {error:?}");
+            false
+        }
+    }
+}
+
 fn preview_cache_dir(app: &tauri::AppHandle) -> Result<PathBuf, String> {
     let dir = app
         .path()
@@ -2549,28 +2602,21 @@ async fn process_one_waveform_job(
         let catalog = state.0.lock().expect("catalog mutex poisoned");
         local_asset_path(app, &catalog, &asset)
     };
-    // Not warmed into the local cache yet — put it back to pending, same as
-    // analysis does, so a later warm+retry picks it up. This must be an
-    // explicit write, not just returning without touching the row: it was
-    // claimed (state='processing') before this function ran, and leaving
-    // it there un-reset drops it out of the pending count entirely
-    // (job_state_counts_for_library only reports 'pending'/'processing'
-    // combined as of the fix for this exact bug) — which starves the
-    // frontend's "is there work to do" check that's the only thing that
-    // ever calls back in here to retry it.
+    // Not warmed into the local cache yet — count the attempt and leave it
+    // 'processing' (same as analysis does) so a later warm+retry, or the
+    // standing worker's own next self-heal, picks it up. See
+    // defer_unavailable_job's doc comment for why this must not be an
+    // immediate requeue-to-pending: that turned a merely-unreachable NAS
+    // path into a tight retry loop that never stopped.
     let Ok(local_path) = local_path else {
         let catalog = state.0.lock().expect("catalog mutex poisoned");
-        if let Err(error) = catalog.requeue_job_as_pending(job.id) {
-            eprintln!("waveform: failed to requeue unavailable-file job {}: {error:?}", job.id);
-        }
-        return true;
+        defer_unavailable_job(&catalog, job.id, "waveform");
+        return false;
     };
     if !std::path::Path::new(&local_path).exists() {
         let catalog = state.0.lock().expect("catalog mutex poisoned");
-        if let Err(error) = catalog.requeue_job_as_pending(job.id) {
-            eprintln!("waveform: failed to requeue missing-file job {}: {error:?}", job.id);
-        }
-        return true;
+        defer_unavailable_job(&catalog, job.id, "waveform");
+        return false;
     }
 
     let decode_path = local_path.clone();
@@ -2720,19 +2766,16 @@ async fn process_one_instrument_job(
         let catalog = state.0.lock().expect("catalog mutex poisoned");
         local_asset_path(app, &catalog, &asset)
     };
+    // See defer_unavailable_job's doc comment: an immediate requeue-to-
+    // pending here is what turned an unreachable NAS/Referenced path into a
+    // tight retry loop that never stopped.
     let Ok(local_path) = local_path else {
         let catalog = state.0.lock().expect("catalog mutex poisoned");
-        if let Err(error) = catalog.requeue_job_as_pending(job.id) {
-            eprintln!("instrument-detection: failed to requeue unavailable-file job {}: {error:?}", job.id);
-        }
-        return true;
+        return defer_unavailable_job(&catalog, job.id, "instrument-detection");
     };
     if !std::path::Path::new(&local_path).exists() {
         let catalog = state.0.lock().expect("catalog mutex poisoned");
-        if let Err(error) = catalog.requeue_job_as_pending(job.id) {
-            eprintln!("instrument-detection: failed to requeue missing-file job {}: {error:?}", job.id);
-        }
-        return true;
+        return defer_unavailable_job(&catalog, job.id, "instrument-detection");
     }
 
     let model = model_state.model.clone();
@@ -3236,26 +3279,29 @@ async fn process_one_audio_analysis_job(
         let catalog = state.0.lock().expect("catalog mutex poisoned");
         local_asset_path(app, &catalog, &asset)
     };
-    // Referenced/NAS assets not yet warmed into the local cache: leave the
-    // job pending rather than failing it, so a later warm+retry can pick it
-    // up (mirrors how playback already treats an uncached path). Reported
-    // as "succeeded" to the UI since this isn't a real failure —
-    // reset_stuck_processing_jobs makes it claimable again next round.
+    // Referenced/NAS assets not yet warmed into the local cache: count the
+    // attempt and leave the job 'processing' rather than failing it (or
+    // bouncing it straight back to 'pending', which is what used to turn
+    // this into a tight, never-ending retry loop — see
+    // defer_unavailable_job's doc comment), so a later warm+retry, or the
+    // standing worker's own next self-heal, can pick it up. Only once
+    // MAX_SILENT_AVAILABILITY_ATTEMPTS is exceeded does this become a real,
+    // reported failure.
     let Ok(local_path) = local_path else {
         let catalog = state.0.lock().expect("catalog mutex poisoned");
-        if let Err(error) = catalog.requeue_job_as_pending(job.id) {
-            eprintln!("audio-analysis: failed to requeue unavailable-file job {}: {error:?}", job.id);
+        let failed = defer_unavailable_job(&catalog, job.id, "audio-analysis");
+        if failed {
+            let _ = app.emit("audio-analysis-progress", AudioAnalysisProgressEvent { succeeded: false });
         }
-        let _ = app.emit("audio-analysis-progress", AudioAnalysisProgressEvent { succeeded: true });
-        return true;
+        return failed;
     };
     if !std::path::Path::new(&local_path).exists() {
         let catalog = state.0.lock().expect("catalog mutex poisoned");
-        if let Err(error) = catalog.requeue_job_as_pending(job.id) {
-            eprintln!("audio-analysis: failed to requeue missing-file job {}: {error:?}", job.id);
+        let failed = defer_unavailable_job(&catalog, job.id, "audio-analysis");
+        if failed {
+            let _ = app.emit("audio-analysis-progress", AudioAnalysisProgressEvent { succeeded: false });
         }
-        let _ = app.emit("audio-analysis-progress", AudioAnalysisProgressEvent { succeeded: true });
-        return true;
+        return failed;
     }
 
     let library_before_analysis = active_library_snapshot(active_library_file);
