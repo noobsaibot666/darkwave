@@ -7,6 +7,21 @@ Newest entry on top. Add a new entry, don't edit old ones.
 
 ---
 
+## 2026-09-13 — critical fix: tracks vanishing from the canvas after a library swap — please pull and rebuild
+
+Pull `main` (commit `2fb8550` on top of your `RunEvent::Opened` fix, `4b59cd1`) before your next
+Windows build. Root cause: `process_one_audio_analysis_job` / `process_one_waveform_job` /
+`process_one_instrument_job` release the catalog mutex across their decode/DSP/model-inference
+`.await` (correct — holding it there blocks the whole app), then re-lock it afterward to persist
+the result. If the active library was swapped mid-job — via the new File > Open Library / Last
+Open menu items, or the autonomous overnight-drive loop — that re-lock silently grabbed a
+*different* `Catalog` than the one the job was claimed from. Storage's `UPDATE ... WHERE id = ?`
+matched zero rows there (never checked), so the result was dropped while the job still reported
+"succeeded", and the frontend then refreshed the canvas with a stale library ID against the new
+catalog — wiping already-imported tracks, not just the ones mid-analysis. Not platform-specific
+(pure Rust logic bug), so it affects Windows the same way; please rebuild and ship 0.3.1 build 13
+(or higher, following the ledger) once you've pulled this.
+
 ## 2026-09-13 — `deploy_direct_windows.ps1` now checks the version ledger before building
 
 Marketing version bumped `0.3.0` → `0.3.1` (all three: `tauri.conf.json`/`package.json`/`Cargo.toml`)
