@@ -4899,6 +4899,30 @@ pub fn run() {
                 .separator()
                 .quit()
                 .build()?;
+            let open_library_item = tauri::menu::MenuItem::with_id(
+                app,
+                "open-library",
+                "Open Library…",
+                true,
+                Some("CmdOrCtrl+O"),
+            )?;
+            // Reopens whichever library was open immediately before the
+            // current one (`recent_library_files[1]` — index 0 is always
+            // the current library itself, bumped to the front on every
+            // open) — a quick way to flip back and forth between two
+            // libraries without going through the Open Library dialog each
+            // time. A no-op if there's no second library to switch to.
+            let open_last_library_item = tauri::menu::MenuItem::with_id(
+                app,
+                "open-last-library",
+                "Last Open",
+                true,
+                Some("CmdOrCtrl+Shift+O"),
+            )?;
+            let file_menu = tauri::menu::SubmenuBuilder::new(app, "File")
+                .item(&open_library_item)
+                .item(&open_last_library_item)
+                .build()?;
             let license_report_item = tauri::menu::MenuItem::with_id(
                 app,
                 "export-license-report",
@@ -4925,6 +4949,7 @@ pub fn run() {
                 .build()?;
             let menu = tauri::menu::MenuBuilder::new(app)
                 .item(&app_menu)
+                .item(&file_menu)
                 .item(&edit_menu)
                 .item(&library_menu)
                 .item(&window_menu)
@@ -4948,6 +4973,32 @@ pub fn run() {
                 }
                 "keyboard-shortcuts" => {
                     let _ = app.emit("menu-keyboard-shortcuts", ());
+                }
+                "open-library" => {
+                    let _ = app.emit("menu-open-library", ());
+                }
+                "open-last-library" => {
+                    let Some(active_library_file) = app.try_state::<ActiveLibraryFileState>() else {
+                        return;
+                    };
+                    let current_path = active_library_file
+                        .0
+                        .lock()
+                        .expect("active library file mutex poisoned")
+                        .clone();
+                    let Ok(preferences_path) = preferences_path(app) else {
+                        return;
+                    };
+                    let Ok(preferences) = preferences::load_preferences(&preferences_path) else {
+                        return;
+                    };
+                    let previous = preferences
+                        .recent_library_files
+                        .into_iter()
+                        .find(|entry| Some(&entry.path) != current_path.as_ref());
+                    if let Some(entry) = previous {
+                        open_library_file_and_notify_frontend(app, &entry.path);
+                    }
                 }
                 _ => {}
             }

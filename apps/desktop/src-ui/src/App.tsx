@@ -3938,6 +3938,20 @@ export function App() {
     };
   }, [handleExportLicenseReport]);
 
+  // File > Open Library… — the dialog itself (and the follow-up
+  // open_library_file invoke) lives in handleOpenLibraryFile already, since
+  // it's the same "browse for a .darkwave file" flow the first-run screen
+  // uses; File > Last Open needs no round trip here at all — it's resolved
+  // entirely on the Rust side (see the "open-last-library" menu handler)
+  // and arrives as the same library-file-opened event a Finder double-click
+  // does.
+  useEffect(() => {
+    const unlistenMenuOpenLibrary = listen("menu-open-library", () => handleOpenLibraryFile());
+    return () => {
+      unlistenMenuOpenLibrary.then((dispose) => dispose());
+    };
+  }, [handleOpenLibraryFile]);
+
   // The Rust-side standing worker (apps/desktop/src-tauri) ticks roughly
   // every 20s, requeuing retryable failed jobs and emitting this event —
   // this is what makes job processing actually run continuously in the
