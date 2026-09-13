@@ -1254,6 +1254,20 @@ export function App() {
   const dragPreviewTop = useTransform(dragPreviewY, (value) => value + 18);
   const dragStartRef = useRef<{ x: number; y: number; asset: AssetRecord } | null>(null);
   const dragActiveRef = useRef(false);
+  // The ids captured for the in-progress drag. Must be a ref, not a plain
+  // local variable inside the pointermove/pointerup effect below: that
+  // effect depends on bulkAssetIds (among others), which gets a new array
+  // reference on essentially any background refresh — a completed analysis
+  // batch, a filter change, anything — even when the actual selection is
+  // unchanged. Each such change tears down and re-installs the effect's
+  // listeners from a fresh closure, and a plain local variable resets to
+  // [] on that remount; since it's only ever populated on the
+  // inactive->active transition (dragActiveRef, a ref, stays true across
+  // the remount), the new closure's copy never gets filled in again for
+  // the rest of the gesture. Dropping the track then silently no-ops on
+  // pointerup (ids.length === 0) with no error at all. A ref sidesteps
+  // this entirely by surviving the remount.
+  const draggedIdsRef = useRef<string[]>([]);
   const suppressNextRowClickRef = useRef(false);
   const [createLibraryModalOpen, setCreateLibraryModalOpen] = useState(false);
   const [shortcutsOpen, setShortcutsOpen] = useState(false);
@@ -2748,16 +2762,14 @@ export function App() {
   }, []);
 
   useEffect(() => {
-    let draggedIds: string[] = [];
-
     const handlePointerMove = (event: PointerEvent) => {
       const start = dragStartRef.current;
       if (!start) return;
       if (!dragActiveRef.current) {
         if (Math.hypot(event.clientX - start.x, event.clientY - start.y) < DRAG_ACTIVATE_DISTANCE_PX) return;
         dragActiveRef.current = true;
-        draggedIds = bulkAssetIds.includes(start.asset.id) ? bulkAssetIds : [start.asset.id];
-        setDragPreview({ label: start.asset.display_name, count: draggedIds.length });
+        draggedIdsRef.current = bulkAssetIds.includes(start.asset.id) ? bulkAssetIds : [start.asset.id];
+        setDragPreview({ label: start.asset.display_name, count: draggedIdsRef.current.length });
       }
       dragPreviewX.set(event.clientX);
       dragPreviewY.set(event.clientY);
@@ -2777,8 +2789,8 @@ export function App() {
       suppressNextRowClickRef.current = true;
       const hovered = document.elementFromPoint(event.clientX, event.clientY)?.closest<HTMLElement>("[data-drop-project-id]");
       const projectId = hovered?.dataset.dropProjectId;
-      const ids = draggedIds;
-      draggedIds = [];
+      const ids = draggedIdsRef.current;
+      draggedIdsRef.current = [];
       if (!projectId || ids.length === 0) return;
       const project = collections.find((entry) => entry.id === projectId);
       if (!project || project.collection_type !== "Project") return;
