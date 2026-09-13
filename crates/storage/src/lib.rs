@@ -1264,9 +1264,28 @@ impl Catalog {
             params![kind_db, library_id.to_string()],
         )?;
         let now = Utc::now().to_rfc3339();
+        // The `id` column has to come out formatted exactly like
+        // `Uuid::to_string()` (lowercase, hyphenated 8-4-4-4-12) — every
+        // later lookup by id (`complete_job`, `fail_job`, `mark_job_attempt`,
+        // `fail_job_exhausted`) binds `job_id.to_string()`, which always
+        // produces that exact form regardless of what string the id was
+        // originally parsed from. This used to be plain
+        // `lower(hex(randomblob(16)))` — a bare 32-char hex string, no
+        // hyphens. `claim_pending_jobs` parses that back into a `Uuid` just
+        // fine (`Uuid::parse_str` accepts either form), so the row gets
+        // claimed and genuinely processed — decoded, analyzed, everything —
+        // but the completion/failure `UPDATE ... WHERE id = ?` then compares
+        // the hyphenated form against the unhyphenated one stored here,
+        // matches zero rows, and silently no-ops (an `UPDATE` matching no
+        // rows is not a SQL error). The job just sits `'processing'`
+        // forever, real work quietly wasted every time it's reclaimed and
+        // retried. This is the actual cause of a real "3526 files, reanalyzes
+        // forever, never finishes" report on one library — not a NAS/
+        // availability issue and not platform-specific; `requeue_analysis_for_assets`
+        // below had the exact same bug.
         let queued = self.connection.execute(
             "INSERT INTO background_jobs (id, asset_id, kind, priority, state, attempts, created_at, updated_at)
-             SELECT lower(hex(randomblob(16))), a.id, ?1, ?2, 'pending', 0, ?3, ?3
+             SELECT lower(hex(randomblob(4)) || '-' || hex(randomblob(2)) || '-' || hex(randomblob(2)) || '-' || hex(randomblob(2)) || '-' || hex(randomblob(6))), a.id, ?1, ?2, 'pending', 0, ?3, ?3
              FROM assets a
              WHERE a.library_id = ?4
                AND NOT EXISTS (
@@ -1309,9 +1328,13 @@ impl Catalog {
             params_from_iter(delete_params.iter().map(|p| p.as_ref())),
         )?;
 
+        // Hyphenated to match `Uuid::to_string()` — see
+        // `requeue_analysis_for_library`'s doc comment on this same
+        // construct for why a bare `lower(hex(randomblob(16)))` here silently
+        // breaks every later `complete_job`/`fail_job` for these rows.
         let insert_sql = format!(
             "INSERT INTO background_jobs (id, asset_id, kind, priority, state, attempts, created_at, updated_at)
-             SELECT lower(hex(randomblob(16))), a.id, ?1, ?2, 'pending', 0, ?3, ?3
+             SELECT lower(hex(randomblob(4)) || '-' || hex(randomblob(2)) || '-' || hex(randomblob(2)) || '-' || hex(randomblob(2)) || '-' || hex(randomblob(6))), a.id, ?1, ?2, 'pending', 0, ?3, ?3
              FROM assets a
              WHERE a.id IN ({placeholders})
                AND NOT EXISTS (
@@ -5583,6 +5606,66 @@ mod tests {
                 .pending_job_count(JobKind::InstrumentDetection)
                 .expect("count"),
             2
+        );
+    }
+
+    /// The actual bug this pass fixed: `requeue_analysis_for_library`/
+    /// `requeue_analysis_for_assets` generated each job's `id` in raw SQL as
+    /// `lower(hex(randomblob(16)))` — a bare 32-char hex string, no hyphens.
+    /// `claim_pending_jobs` parses that back into a real `Uuid` just fine
+    /// (`Uuid::parse_str` accepts either form), so the row gets genuinely
+    /// claimed and processed, but `complete_job`/`fail_job` bind
+    /// `job_id.to_string()`, which is always the hyphenated 8-4-4-4-12 form
+    /// — so the `UPDATE ... WHERE id = ?` matched zero rows and silently
+    /// no-op'd (not a SQL error). The job just sat `'processing'` forever.
+    /// On one real library (3526 audio-analysis jobs, all queued through
+    /// this path) that meant real decode/DSP work ran repeatedly and never
+    /// once got recorded as done. Asserting the id's shape here, not just
+    /// that a later lookup happens to work, so a future revert back to a
+    /// bare `randomblob` hex string fails immediately instead of only
+    /// showing up as "audio analysis never finishes" on somebody's machine
+    /// weeks later.
+    #[test]
+    fn requeued_job_ids_round_trip_through_uuid_to_string() {
+        let catalog_path = unique_catalog_path("requeue-analysis-id-format");
+        let catalog = Catalog::open(&catalog_path).expect("open catalog");
+        let library = catalog.create_library("Lib", "/library").expect("library");
+        let asset = test_asset(&catalog, library.id, "track.wav", "hash-track");
+
+        catalog
+            .requeue_analysis_for_library(library.id, JobKind::AudioAnalysis, 40)
+            .expect("requeue for library");
+        let job = catalog
+            .claim_pending_jobs(JobKind::AudioAnalysis, 1)
+            .expect("claim")
+            .pop()
+            .expect("one job claimed");
+        // The real-world failure mode: this must actually match the claimed
+        // row, not just succeed as a well-formed but non-matching UPDATE.
+        catalog.complete_job(job.id).expect("complete");
+        assert_eq!(
+            catalog
+                .latest_job_state_for_asset(asset.id, JobKind::AudioAnalysis)
+                .expect("state")
+                .map(|(state, _)| state),
+            Some("completed".to_string())
+        );
+
+        catalog
+            .requeue_analysis_for_assets(&[asset.id], JobKind::InstrumentDetection, 50)
+            .expect("requeue for assets");
+        let job = catalog
+            .claim_pending_jobs(JobKind::InstrumentDetection, 1)
+            .expect("claim")
+            .pop()
+            .expect("one job claimed");
+        catalog.fail_job(job.id, "boom").expect("fail");
+        assert_eq!(
+            catalog
+                .latest_job_state_for_asset(asset.id, JobKind::InstrumentDetection)
+                .expect("state")
+                .map(|(state, _)| state),
+            Some("failed".to_string())
         );
     }
 
