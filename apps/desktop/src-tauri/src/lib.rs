@@ -5148,6 +5148,11 @@ pub fn run() {
             // is a fresh launch or the app was already running, unlike the
             // single-instance plugin's callback above, which only fires for
             // a *second* launch attempt (mainly the Windows path).
+            //
+            // `RunEvent::Opened` only exists on macOS/iOS/Android (see tauri's
+            // `app.rs`) — Windows has no such variant, so this arm has to be
+            // compiled out there entirely rather than just never matching.
+            #[cfg(any(target_os = "macos", target_os = "ios", target_os = "android"))]
             if let tauri::RunEvent::Opened { urls } = event {
                 for url in urls {
                     if let Ok(path) = url.to_file_path() {
@@ -5155,6 +5160,8 @@ pub fn run() {
                     }
                 }
             }
+            #[cfg(not(any(target_os = "macos", target_os = "ios", target_os = "android")))]
+            let _ = (app_handle, event);
         });
 }
 
