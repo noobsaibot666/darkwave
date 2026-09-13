@@ -7,6 +7,28 @@ Newest entry on top. Add a new entry, don't edit old ones.
 
 ---
 
+## 2026-09-13 — `deploy_direct_windows.ps1` now checks the version ledger before building
+
+Marketing version bumped `0.3.0` → `0.3.1` (all three: `tauri.conf.json`/`package.json`/`Cargo.toml`)
+— App Store Connect rejected a 0.3.0 resubmission (already approved). Not Windows-specific, just
+context for the version jump.
+
+The actual thing to know: `deploy_direct_windows.ps1` now dot-sources a new
+`scripts/check_version_ledger.ps1` as its first step, which reads `docs/macos/version-ledger.md`
+(same file the macOS scripts already check) and **throws before building anything** if the local
+`tauri.conf.json` version doesn't exceed the last row marked `Approved` there. This exists because
+the exact same "reused an already-approved version" mistake happened twice on the Mac side. Despite
+living under `docs/macos/`, that ledger is the one shared source of truth for the version every
+platform builds from — nothing Windows-specific needed here, just pull before your next build so
+you're not blocked by a stale local `tauri.conf.json` version the ledger already knows is unsafe.
+
+Please sanity-check on Windows after pulling: run `deploy_direct_windows.ps1` once and confirm
+`[0/4] Checking version against docs/macos/version-ledger.md...` prints and passes (or fails with
+a clear message, if you haven't pulled the version bump yet) before `[1/4]` starts — this is plain
+PowerShell (no new deps), but I can't execute `.ps1` from macOS to verify it directly.
+
+---
+
 ## 2026-09-12 (later) — new: license PDF attach/expiry tracking (new crate, needs your eyes); one correction below
 
 Added a new workspace crate, `crates/license-documents` (pure Rust, no system libraries — `pdf-extract`/`lopdf` for PDF text extraction, `regex` for date-keyword scanning, `chrono` for date math). Lets a user attach a track's bundled license PDF; the app copies it into `<library media_root>/License/`, best-effort extracts candidate expiry dates as suggestions (never auto-applied — the user always confirms), and shows a valid/expiring-soon/expired badge in the Source & License inspector panel plus a library-wide Maintenance finding.

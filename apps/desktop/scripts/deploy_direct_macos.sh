@@ -56,6 +56,16 @@ DMG_OUT="$DMG_DIR/$DMG_NAME"
 echo "▶  Darkwave v${VERSION} — Direct Distribution (macOS)"
 echo "────────────────────────────────────────────────────"
 
+# The direct-sale channel has no App Store Connect version-monotonicity
+# gate of its own, but it shares tauri.conf.json's version with the MAS
+# build and the Windows build (see the ledger's "must all move together"
+# note) — so it still shouldn't ship an old, already-approved version under
+# a newer listing. No build-number arg: CFBundleVersion uniqueness is an
+# App Store Connect-only requirement.
+echo "[0/5] Checking version against docs/macos/version-ledger.md..."
+source "$PROJECT_ROOT/scripts/check_version_ledger.sh"
+check_version_ledger "$VERSION"
+
 echo "[1/5] Building (direct-dist, unsandboxed, Developer ID identity)..."
 APPLE_SIGNING_IDENTITY="$IDENTITY" npx tauri build \
   --features direct-dist \

@@ -34,6 +34,12 @@ APP_ENTITLEMENTS="src-tauri/entitlements.mas.plist"
 echo "▶  Darkwave — Mac App Store package"
 echo "────────────────────────────────────"
 
+echo "[0/6] Checking version against docs/macos/version-ledger.md..."
+source "$PROJECT_ROOT/scripts/check_version_ledger.sh"
+CURRENT_VERSION=$(node -p "require('./src-tauri/tauri.conf.json').version")
+CURRENT_BUILD=$(/usr/libexec/PlistBuddy -c "Print :CFBundleVersion" src-tauri/Info.plist)
+check_version_ledger "$CURRENT_VERSION" "$CURRENT_BUILD"
+
 echo "[1/6] Building (sandboxed, MAS identity, no similarity-worker sidecar)..."
 APPLE_SIGNING_IDENTITY="$APP_IDENTITY" npx tauri build \
   --config src-tauri/tauri.mas.conf.json

@@ -31,6 +31,16 @@ $Version = (node -p "require('./src-tauri/tauri.conf.json').version").Trim()
 Write-Host "Darkwave v$Version - Direct Distribution (Windows)"
 Write-Host "----------------------------------------------------------"
 
+# Same version-ledger check the macOS scripts run -- this repo's version
+# fields (tauri.conf.json/package.json/Cargo.toml) are shared across every
+# machine once `git pull origin main` picks them up, so a stale Windows
+# checkout building an already-approved version is the same mistake as a
+# stale Mac one, just without Apple's 409 to catch it. No build-number
+# check here: that's an App Store Connect-only constraint.
+Write-Host "[0/4] Checking version against docs/macos/version-ledger.md..."
+. (Join-Path $PSScriptRoot "check_version_ledger.ps1")
+Test-VersionLedger -CurrentVersion $Version
+
 # -- 1. Rebuild the sidecar --------------------------------------------------
 # apps/desktop/src-tauri/binaries/ is gitignored (compiled, machine-specific),
 # so a pull never brings a copy along -- rebuild every run, matching
