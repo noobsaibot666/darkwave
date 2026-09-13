@@ -124,12 +124,19 @@ def _append_at_playhead(media_pool, timeline, media_pool_item):
     nice-to-have; a working append is not optional. Not yet verified against
     a live Resolve instance — see docs/development/editor-workflow-section.md
     and this file's own comment history for the fallback-first reasoning.
+
+    Verified live against a real Resolve instance: `GetCurrentTimecode()`
+    already returns an *absolute* timeline position (Resolve timelines
+    start at 01:00:00:00 by convention, not 00:00:00:00), and that absolute
+    value is exactly what `recordFrame` expects. An earlier version of this
+    function added `timeline.GetStartFrame()` on top of the converted
+    timecode, double-counting that hour offset — confirmed by a live test
+    that placed a clip at 02:00:00:00 instead of the actual playhead
+    position (01:00:00:00). Do not add `GetStartFrame()` back in.
     """
     try:
         frame_rate = float(str(timeline.GetSetting("timelineFrameRate")).split()[0])
-        record_frame = timeline.GetStartFrame() + _timecode_to_frame_offset(
-            timeline.GetCurrentTimecode(), frame_rate
-        )
+        record_frame = _timecode_to_frame_offset(timeline.GetCurrentTimecode(), frame_rate)
         result = media_pool.AppendToTimeline(
             [{"mediaPoolItem": media_pool_item, "recordFrame": record_frame}]
         )
@@ -142,6 +149,10 @@ def _append_at_playhead(media_pool, timeline, media_pool_item):
 
 
 def _timecode_to_frame_offset(timecode, frame_rate):
+    """Converts an absolute Resolve timecode string to an absolute frame
+    number — matches what `recordFrame` expects directly, no further
+    adjustment against the timeline's start frame needed (see
+    `_append_at_playhead`'s doc comment)."""
     hours, minutes, seconds, frames = (int(part) for part in timecode.replace(";", ":").split(":"))
     return int(round((hours * 3600 + minutes * 60 + seconds) * frame_rate)) + frames
 
