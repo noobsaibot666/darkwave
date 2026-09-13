@@ -7,6 +7,15 @@ Newest entry on top. Add a new entry, don't edit old ones.
 
 ---
 
+## 2026-09-13 — fifth fix, same pull as below — still haven't seen anything from you
+
+One more, small: `process_one_waveform_job` (`apps/desktop/src-tauri/src/lib.rs`) now checks
+`get_waveform_cache` before doing any decode/build work — if an asset already has a valid cache
+it completes the job directly instead of redoing it. Belt-and-suspenders on top of fix #3 below:
+catches an abandoned claim from before a restart whose prior run actually finished writing the
+cache but never marked the job completed, plus any stale duplicate job rows already sitting in a
+library from before fix #3 landed. Commit `aad3431` — pull `main` now to get all five fixes.
+
 ## 2026-09-13 — third and fourth fixes on top of the two below — still haven't seen a pull from you, please grab everything at once
 
 Two more critical fixes since the waveform-CPU one below. If you haven't pulled since the
