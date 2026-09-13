@@ -2247,7 +2247,7 @@ fn defer_unavailable_job(catalog: &Catalog, job_id: Uuid, context: &str) -> bool
             let message = format!(
                 "file still not reachable locally after {attempts} attempts — reconnect the drive/NAS share, then use Retry Failed Jobs"
             );
-            if let Err(error) = catalog.fail_job(job_id, &message) {
+            if let Err(error) = catalog.fail_job_exhausted(job_id, &message) {
                 eprintln!("{context}: failed to record unavailable-file failure for job {job_id}: {error:?}");
             }
             true
@@ -5049,17 +5049,33 @@ pub fn run() {
                     // skipped above) — a paused queue still has pending
                     // rows, but nothing is actually going to touch them
                     // until the user unpauses, so it shouldn't keep the
-                    // machine awake either.
+                    // machine awake either. Same reasoning for instrument
+                    // detection with no model installed: process_instrument_jobs
+                    // claims nothing and those jobs sit 'pending' forever
+                    // (see instrument_detection_available's doc comment,
+                    // which the frontend already checks for exactly this
+                    // reason) — without this guard, any library with
+                    // instrument-detection jobs queued (every import queues
+                    // one per asset, model or no model) would hold the sleep-
+                    // prevention power assertion engaged and this loop
+                    // pinned at its busy 1s cadence forever, even though
+                    // nothing is actually happening.
+                    let instrument_model_available = drive_app_handle
+                        .state::<InstrumentModelState>()
+                        .model
+                        .lock()
+                        .expect("instrument model mutex poisoned")
+                        .is_some();
                     let unpaused_pending = {
                         let job_control = drive_app_handle.state::<JobControlState>();
                         let catalog_state = drive_app_handle.state::<CatalogState>();
                         let catalog = catalog_state.0.lock().expect("catalog mutex poisoned");
-                        let mut total = catalog
-                            .pending_job_count(JobKind::MetadataExtraction)
-                            .unwrap_or(0)
-                            + catalog
+                        let mut total = catalog.pending_job_count(JobKind::MetadataExtraction).unwrap_or(0);
+                        if instrument_model_available {
+                            total += catalog
                                 .pending_job_count(JobKind::InstrumentDetection)
                                 .unwrap_or(0);
+                        }
                         if !job_control.audio_analysis_paused.load(Ordering::SeqCst) {
                             total += catalog.pending_job_count(JobKind::AudioAnalysis).unwrap_or(0);
                         }

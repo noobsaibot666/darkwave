@@ -916,6 +916,32 @@ impl Catalog {
         Ok(())
     }
 
+    /// Fails a job that has already had every automatic retry chance it
+    /// will ever get — currently just `defer_unavailable_job`'s
+    /// `MAX_SILENT_AVAILABILITY_ATTEMPTS` cap. Unlike `fail_job`, which only
+    /// increments `attempts` by one and leaves the job eligible for
+    /// `requeue_failed_jobs`'s generic auto-retry (3 tries, one every ~20s),
+    /// this jumps `attempts` straight past any cap that function is ever
+    /// called with, so the job stays `'failed'` and visible until a human
+    /// acts — `retry_failed_jobs_for_library` resets `attempts` back to 0
+    /// for a genuinely fresh shot.
+    ///
+    /// Without this, a job that `defer_unavailable_job` gave up on (its
+    /// `availability_attempts` counter, separate from `attempts`, starts
+    /// fresh at 0) still had `attempts < 3` on this counter, so
+    /// `requeue_failed_jobs` picked it back up automatically for two more
+    /// ~20s cycles before it actually settled — a much smaller echo of the
+    /// exact bug this whole retry path exists to prevent: a failure meant
+    /// to be the stable, final word kept quietly re-appearing on its own.
+    pub fn fail_job_exhausted(&self, job_id: Uuid, error: &str) -> Result<(), StorageError> {
+        const PAST_ANY_AUTO_RETRY_CAP: i64 = 1_000_000;
+        self.connection.execute(
+            "UPDATE background_jobs SET state = 'failed', attempts = ?1, error = ?2, updated_at = ?3 WHERE id = ?4",
+            params![PAST_ANY_AUTO_RETRY_CAP, error, Utc::now().to_rfc3339(), job_id.to_string()],
+        )?;
+        Ok(())
+    }
+
     /// Puts a claimed (`processing`) job back to `pending` *immediately*
     /// reclaimable — without counting it as a failure. Reserved for a
     /// caller that knows the claim was abandoned for a specific, known
@@ -4468,6 +4494,46 @@ mod tests {
             reclaimed.is_empty(),
             "marking an attempt must not move the job back to 'pending'"
         );
+    }
+
+    #[test]
+    fn fail_job_exhausted_is_not_picked_up_by_the_generic_auto_retry_cap() {
+        // Backs a hardening fix on top of the "audio analysis loops
+        // forever" bug: defer_unavailable_job's terminal failure (after
+        // MAX_SILENT_AVAILABILITY_ATTEMPTS) must not re-enter
+        // requeue_failed_jobs's generic 3-try auto-retry — that counter
+        // starts fresh at 0 on `attempts` (availability_attempts is a
+        // separate column), so an ordinary fail_job here would have let
+        // this "final, needs a human" failure get auto-requeued a couple
+        // more times, echoing the exact bug this whole path exists to
+        // prevent.
+        let catalog_path = unique_catalog_path("job-fail-exhausted");
+        let catalog = Catalog::open(&catalog_path).expect("open catalog");
+        let library = catalog.create_library("Jobs", "/library").expect("library");
+        let asset = test_asset(&catalog, library.id, "tone.wav", "hash-job-fail-exhausted");
+        let job = catalog
+            .enqueue_job(asset.id, JobKind::AudioAnalysis, 40)
+            .expect("enqueue");
+        catalog
+            .claim_pending_jobs(JobKind::AudioAnalysis, 10)
+            .expect("claim");
+
+        catalog
+            .fail_job_exhausted(job.id, "file still not reachable")
+            .expect("fail exhausted");
+
+        const MAX_JOB_ATTEMPTS: i64 = 3;
+        let changed = catalog
+            .requeue_failed_jobs(MAX_JOB_ATTEMPTS)
+            .expect("requeue failed jobs");
+        assert_eq!(changed, 0, "an exhausted job must not be auto-requeued");
+
+        // The library's own explicit "Retry Failed Jobs" action still
+        // works — it resets `attempts` back to 0, ignoring any cap.
+        let retried = catalog
+            .retry_failed_jobs_for_library(library.id, JobKind::AudioAnalysis)
+            .expect("manual retry");
+        assert_eq!(retried, 1, "manual retry must still reach an exhausted job");
     }
 
     #[test]
