@@ -963,6 +963,19 @@ impl Catalog {
             .map_err(StorageError::from)
     }
 
+    /// Completes whatever job of `kind` is outstanding for `asset_id` —
+    /// `'pending'` (the analyze-also-fills-the-waveform-cache path in
+    /// `save_audio_analysis_outcome`, where the WaveformGeneration job was
+    /// never claimed at all since `claim_pending_waveform_jobs` skips an
+    /// asset with an in-flight AudioAnalysis job) or `'processing'` (the
+    /// standalone waveform-job path in `process_one_waveform_job`, where
+    /// the job was already claimed before the decode/build ran). Matching
+    /// only `'pending'` here used to mean the standalone path's own job
+    /// was *never* actually completed by this call — it sat at
+    /// `'processing'` until `reset_stuck_processing_jobs`'s 3-minute
+    /// timeout flipped it back to `'pending'`, which made it claimable
+    /// (and decoded, and rebuilt) all over again, forever, for an asset
+    /// whose waveform had already been generated correctly the first time.
     pub fn complete_pending_jobs_for_asset(
         &self,
         asset_id: Uuid,
@@ -970,7 +983,7 @@ impl Catalog {
     ) -> Result<usize, StorageError> {
         let updated = self.connection.execute(
             "UPDATE background_jobs SET state = 'completed', updated_at = ?1
-             WHERE asset_id = ?2 AND kind = ?3 AND state = 'pending'",
+             WHERE asset_id = ?2 AND kind = ?3 AND state IN ('pending', 'processing')",
             params![
                 Utc::now().to_rfc3339(),
                 asset_id.to_string(),
@@ -4477,6 +4490,42 @@ mod tests {
                 .pending_job_count(JobKind::MetadataExtraction)
                 .expect("count"),
             1
+        );
+    }
+
+    #[test]
+    fn completing_pending_jobs_for_asset_also_completes_an_already_claimed_processing_job() {
+        // Regression for the standalone-waveform-job path: claim_pending_waveform_jobs
+        // marks a job 'processing' before process_one_waveform_job does the real
+        // decode/build work, so by the time persist_waveform_payload calls this to
+        // record success, the row is 'processing', not 'pending'. Matching only
+        // 'pending' meant that job was never actually completed — it sat
+        // 'processing' until reset_stuck_processing_jobs's timeout put it back to
+        // 'pending', making it claimable (and redecoded, and rebuilt) again, forever.
+        let catalog_path = unique_catalog_path("job-complete-processing");
+        let catalog = Catalog::open(&catalog_path).expect("open catalog");
+        let library = catalog.create_library("Jobs", "/library").expect("library");
+        let asset = test_asset(&catalog, library.id, "one.wav", "hash-complete-processing");
+
+        catalog
+            .enqueue_job(asset.id, JobKind::WaveformGeneration, 30)
+            .expect("enqueue waveform");
+        let claimed = catalog
+            .claim_pending_waveform_jobs(10)
+            .expect("claim waveform jobs");
+        assert_eq!(claimed.len(), 1, "job should be claimed into 'processing'");
+
+        let completed = catalog
+            .complete_pending_jobs_for_asset(asset.id, JobKind::WaveformGeneration)
+            .expect("complete");
+
+        assert_eq!(completed, 1);
+        assert_eq!(
+            catalog
+                .latest_job_state_for_asset(asset.id, JobKind::WaveformGeneration)
+                .expect("state")
+                .map(|(state, _)| state),
+            Some("completed".to_string())
         );
     }
 
