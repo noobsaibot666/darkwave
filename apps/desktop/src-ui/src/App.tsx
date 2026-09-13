@@ -708,7 +708,14 @@ const MEDIA_TYPE_CLASSIFY_COMMAND: Record<string, string> = {
   other: "ClassifyOther"
 };
 
-type JobProgress = { kind: string; label: string; pending: number; total: number; failed: number };
+type JobProgress = {
+  kind: string;
+  label: string;
+  pending: number;
+  total: number;
+  failed: number;
+  currentFile?: string;
+};
 type JobCompletionSummary = {
   kind: string;
   label: string;
@@ -4109,28 +4116,38 @@ export function App() {
     };
   }, [finishOnboardingWithLibrary]);
 
-  // process_audio_analysis_jobs claims and fully decodes/analyzes up to 20
-  // files per invoke — real per-file work, easily minutes for a batch — so
-  // without this, the progress bar only updates once the whole batch's
-  // invoke resolves and sits frozen at 0% the entire time despite real
-  // work happening. This event (emitted per job, not per batch) is what
-  // lets it move continuously instead.
+  // process_audio_analysis_jobs/process_waveform_jobs/process_instrument_jobs
+  // each claim and fully process a batch per invoke — real per-file work,
+  // easily minutes for a batch — so without this, a progress bar only
+  // updates once the whole batch's invoke resolves and sits frozen the
+  // entire time despite real work happening. These events (emitted per job,
+  // not per batch) are what let each bar move continuously instead, and
+  // what let the Background Activity panel show which file is currently
+  // being worked on under each kind.
   useEffect(() => {
-    const unlistenAnalysisProgress = listen<{ succeeded: boolean }>("audio-analysis-progress", (event) => {
-      setJobProgress((previous) =>
-        previous.map((entry) =>
-          entry.kind === "audio_analysis"
-            ? {
-                ...entry,
-                pending: Math.max(0, entry.pending - 1),
-                failed: event.payload.succeeded ? entry.failed : entry.failed + 1
-              }
-            : entry
-        )
-      );
-    });
+    type JobFileProgressEvent = { succeeded: boolean; asset_name: string };
+    const subscriptions = [
+      ["audio-analysis-progress", "audio_analysis"],
+      ["waveform-progress", "waveform_generation"],
+      ["instrument-detection-progress", "instrument_detection"]
+    ].map(([eventName, kind]) =>
+      listen<JobFileProgressEvent>(eventName, (event) => {
+        setJobProgress((previous) =>
+          previous.map((entry) =>
+            entry.kind === kind
+              ? {
+                  ...entry,
+                  pending: Math.max(0, entry.pending - 1),
+                  failed: event.payload.succeeded ? entry.failed : entry.failed + 1,
+                  currentFile: event.payload.asset_name
+                }
+              : entry
+          )
+        );
+      })
+    );
     return () => {
-      unlistenAnalysisProgress.then((dispose) => dispose());
+      subscriptions.forEach((subscription) => subscription.then((dispose) => dispose()));
     };
   }, []);
 
@@ -7320,6 +7337,11 @@ export function App() {
                         <div className="job-progress-track">
                           <div className="job-progress-fill" style={{ width: `${percent}%` }} />
                         </div>
+                        {job.currentFile && job.pending > 0 ? (
+                          <div className="job-progress-current-file" title={job.currentFile}>
+                            {job.currentFile}
+                          </div>
+                        ) : null}
                       </div>
                       {job.kind === "audio_analysis" ? (
                         <button

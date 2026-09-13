@@ -1023,6 +1023,15 @@ button.panel-handle-right:active:not(:disabled) {
   color: #f59e0b;
 }
 
+.job-progress-current-file {
+  margin-top: 4px;
+  color: var(--text-muted);
+  font-size: 11px;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
 /* A finished batch's summary row — same shape as an in-progress row, but
    a quieter background (no pulse, nothing left to show progress on) and a
    warning tint when something in the batch failed. Tint, border, and icon

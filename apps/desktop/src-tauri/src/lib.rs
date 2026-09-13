@@ -2558,6 +2558,8 @@ async fn process_one_waveform_job(
     active_library_file: &tauri::State<'_, ActiveLibraryFileState>,
     job: storage::JobRecord,
 ) -> bool {
+    use tauri::Emitter;
+
     let asset = {
         let catalog = state.0.lock().expect("catalog mutex poisoned");
         catalog.get_asset(job.asset_id)
@@ -2569,6 +2571,10 @@ async fn process_one_waveform_job(
             if let Err(error) = catalog.fail_job(job.id, "asset not found") {
                 eprintln!("waveform: failed to record missing-asset failure: {error:?}");
             }
+            let _ = app.emit(
+                "waveform-progress",
+                JobFileProgressEvent { succeeded: false, asset_name: format!("asset {}", job.asset_id) },
+            );
             return true;
         }
         Err(error) => {
@@ -2595,6 +2601,10 @@ async fn process_one_waveform_job(
         if let Err(error) = catalog.complete_pending_jobs_for_asset(job.asset_id, JobKind::WaveformGeneration) {
             eprintln!("waveform: failed to complete already-cached job {}: {error:?}", job.id);
         }
+        let _ = app.emit(
+            "waveform-progress",
+            JobFileProgressEvent { succeeded: true, asset_name: asset.display_name.clone() },
+        );
         return true;
     }
 
@@ -2610,13 +2620,25 @@ async fn process_one_waveform_job(
     // path into a tight retry loop that never stopped.
     let Ok(local_path) = local_path else {
         let catalog = state.0.lock().expect("catalog mutex poisoned");
-        defer_unavailable_job(&catalog, job.id, "waveform");
-        return false;
+        let failed = defer_unavailable_job(&catalog, job.id, "waveform");
+        if failed {
+            let _ = app.emit(
+                "waveform-progress",
+                JobFileProgressEvent { succeeded: false, asset_name: asset.display_name.clone() },
+            );
+        }
+        return failed;
     };
     if !std::path::Path::new(&local_path).exists() {
         let catalog = state.0.lock().expect("catalog mutex poisoned");
-        defer_unavailable_job(&catalog, job.id, "waveform");
-        return false;
+        let failed = defer_unavailable_job(&catalog, job.id, "waveform");
+        if failed {
+            let _ = app.emit(
+                "waveform-progress",
+                JobFileProgressEvent { succeeded: false, asset_name: asset.display_name.clone() },
+            );
+        }
+        return failed;
     }
 
     let decode_path = local_path.clone();
@@ -2635,23 +2657,29 @@ async fn process_one_waveform_job(
     }
 
     let catalog = state.0.lock().expect("catalog mutex poisoned");
-    match decoded {
+    let succeeded = match decoded {
         Ok(Ok(buffer)) => {
             let payload = build_waveform_payload(&buffer);
             if let Err(error) = persist_waveform_payload(&catalog, job.asset_id, &payload) {
                 eprintln!("waveform: failed to persist payload for job {}: {error}", job.id);
             }
+            true
         }
         Ok(Err(error)) => {
             if let Err(fail_error) = catalog.fail_job(job.id, &error) {
                 eprintln!("waveform: failed to record decode failure: {fail_error:?}");
             }
+            false
         }
         Err(join_error) => {
             eprintln!("waveform: decode task panicked: {join_error}");
             return false;
         }
-    }
+    };
+    let _ = app.emit(
+        "waveform-progress",
+        JobFileProgressEvent { succeeded, asset_name: asset.display_name.clone() },
+    );
     true
 }
 
@@ -2745,6 +2773,8 @@ async fn process_one_instrument_job(
     active_library_file: &tauri::State<'_, ActiveLibraryFileState>,
     job: storage::JobRecord,
 ) -> bool {
+    use tauri::Emitter;
+
     let asset = {
         let catalog = state.0.lock().expect("catalog mutex poisoned");
         catalog.get_asset(job.asset_id)
@@ -2754,6 +2784,10 @@ async fn process_one_instrument_job(
         Ok(None) => {
             let catalog = state.0.lock().expect("catalog mutex poisoned");
             let _ = catalog.fail_job(job.id, "asset not found");
+            let _ = app.emit(
+                "instrument-detection-progress",
+                JobFileProgressEvent { succeeded: false, asset_name: format!("asset {}", job.asset_id) },
+            );
             return true;
         }
         Err(error) => {
@@ -2771,11 +2805,25 @@ async fn process_one_instrument_job(
     // tight retry loop that never stopped.
     let Ok(local_path) = local_path else {
         let catalog = state.0.lock().expect("catalog mutex poisoned");
-        return defer_unavailable_job(&catalog, job.id, "instrument-detection");
+        let failed = defer_unavailable_job(&catalog, job.id, "instrument-detection");
+        if failed {
+            let _ = app.emit(
+                "instrument-detection-progress",
+                JobFileProgressEvent { succeeded: false, asset_name: asset.display_name.clone() },
+            );
+        }
+        return failed;
     };
     if !std::path::Path::new(&local_path).exists() {
         let catalog = state.0.lock().expect("catalog mutex poisoned");
-        return defer_unavailable_job(&catalog, job.id, "instrument-detection");
+        let failed = defer_unavailable_job(&catalog, job.id, "instrument-detection");
+        if failed {
+            let _ = app.emit(
+                "instrument-detection-progress",
+                JobFileProgressEvent { succeeded: false, asset_name: asset.display_name.clone() },
+            );
+        }
+        return failed;
     }
 
     let model = model_state.model.clone();
@@ -2803,10 +2851,11 @@ async fn process_one_instrument_job(
     }
 
     let catalog = state.0.lock().expect("catalog mutex poisoned");
-    match detected {
+    let succeeded = match detected {
         Ok(Ok(instruments)) => match catalog.set_asset_instruments(job.asset_id, &instruments) {
             Ok(()) => {
                 let _ = catalog.complete_job(job.id);
+                true
             }
             Err(error) => {
                 // Persist failed (transient DB error) — leave it failed so
@@ -2816,18 +2865,24 @@ async fn process_one_instrument_job(
                 if let Err(fail_error) = catalog.fail_job(job.id, &message) {
                     eprintln!("instrument-detection: failed to record persist failure: {fail_error:?}");
                 }
+                false
             }
         },
         Ok(Err(error)) => {
             if let Err(fail_error) = catalog.fail_job(job.id, &error) {
                 eprintln!("instrument-detection: failed to record failure: {fail_error:?}");
             }
+            false
         }
         Err(join_error) => {
             eprintln!("instrument-detection: task panicked: {join_error}");
             return false;
         }
-    }
+    };
+    let _ = app.emit(
+        "instrument-detection-progress",
+        JobFileProgressEvent { succeeded, asset_name: asset.display_name.clone() },
+    );
     true
 }
 
@@ -3142,9 +3197,21 @@ fn failed_job_extensions(
         .map_err(storage_error_message)
 }
 
-#[derive(Clone, Copy, serde::Serialize)]
-struct AudioAnalysisProgressEvent {
+/// Emitted per-job (not per-batch) by the audio-analysis, waveform, and
+/// instrument-detection processors under their own event names
+/// ("audio-analysis-progress", "waveform-progress",
+/// "instrument-detection-progress") — shared shape since all three just
+/// need "which file, did it work" so the Background Activity panel can show
+/// what's actually running under each kind's progress bar, not just its
+/// count. Only emitted for a job that reached a real, definitive outcome
+/// (succeeded, genuinely failed, or finally gave up after
+/// MAX_SILENT_AVAILABILITY_ATTEMPTS) — a silently-deferred retry for an
+/// unreachable file emits nothing, same as before, since that's not
+/// user-visible progress.
+#[derive(Clone, serde::Serialize)]
+struct JobFileProgressEvent {
     succeeded: bool,
+    asset_name: String,
 }
 
 /// Real, content-based needs-review detection, best-effort action-tag
@@ -3271,7 +3338,10 @@ async fn process_one_audio_analysis_job(
         if let Err(error) = catalog.fail_job(job.id, "asset not found") {
             eprintln!("audio-analysis: failed to record missing-asset failure: {error:?}");
         }
-        let _ = app.emit("audio-analysis-progress", AudioAnalysisProgressEvent { succeeded: false });
+        let _ = app.emit(
+            "audio-analysis-progress",
+            JobFileProgressEvent { succeeded: false, asset_name: format!("asset {}", job.asset_id) },
+        );
         return true;
     };
 
@@ -3291,7 +3361,10 @@ async fn process_one_audio_analysis_job(
         let catalog = state.0.lock().expect("catalog mutex poisoned");
         let failed = defer_unavailable_job(&catalog, job.id, "audio-analysis");
         if failed {
-            let _ = app.emit("audio-analysis-progress", AudioAnalysisProgressEvent { succeeded: false });
+            let _ = app.emit(
+                "audio-analysis-progress",
+                JobFileProgressEvent { succeeded: false, asset_name: asset.display_name.clone() },
+            );
         }
         return failed;
     };
@@ -3299,7 +3372,10 @@ async fn process_one_audio_analysis_job(
         let catalog = state.0.lock().expect("catalog mutex poisoned");
         let failed = defer_unavailable_job(&catalog, job.id, "audio-analysis");
         if failed {
-            let _ = app.emit("audio-analysis-progress", AudioAnalysisProgressEvent { succeeded: false });
+            let _ = app.emit(
+                "audio-analysis-progress",
+                JobFileProgressEvent { succeeded: false, asset_name: asset.display_name.clone() },
+            );
         }
         return failed;
     }
@@ -3339,7 +3415,10 @@ async fn process_one_audio_analysis_job(
         eprintln!("audio-analysis: failed to persist result for job {}: {error}", job.id);
     }
 
-    let _ = app.emit("audio-analysis-progress", AudioAnalysisProgressEvent { succeeded });
+    let _ = app.emit(
+        "audio-analysis-progress",
+        JobFileProgressEvent { succeeded, asset_name: asset.display_name.clone() },
+    );
     true
 }
 
