@@ -15,6 +15,15 @@ pub enum BrowserCommand {
     FocusRow { index: usize },
     SelectFocused { mode: SelectionMode },
     SelectAllVisible,
+    /// Replaces the selection outright with exactly these indices (silently
+    /// dropping any out of range) — for restoring a known selection in one
+    /// call instead of a Focus+Toggle round trip per index. Added for
+    /// re-applying a multi-selection across a fresh `BrowserState` (a new
+    /// `visible_asset_ids` after the underlying asset list refreshes), which
+    /// nothing before this could do — only the single focused/selected row
+    /// had a restore path, silently collapsing a real multi-selection down
+    /// to one row (or zero) on every refresh.
+    SelectIndices { indices: Vec<usize> },
 }
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
@@ -88,6 +97,16 @@ impl BrowserState {
             },
             BrowserCommand::SelectAllVisible => {
                 self.selected_indices = (0..self.visible_asset_ids.len()).collect();
+            }
+            BrowserCommand::SelectIndices { indices } => {
+                self.selected_indices = indices
+                    .into_iter()
+                    .filter(|index| *index < self.visible_asset_ids.len())
+                    .collect();
+                if let Some(&last) = self.selected_indices.iter().next_back() {
+                    self.focused_index = last;
+                    self.anchor_index = last;
+                }
             }
         }
     }
@@ -176,6 +195,31 @@ mod tests {
         browser.apply(BrowserCommand::SelectAllVisible);
 
         assert_eq!(browser.selected_asset_ids(), ids);
+    }
+
+    #[test]
+    fn select_indices_restores_a_multi_selection_in_one_call() {
+        let ids = asset_ids(5);
+        let mut browser = BrowserState::new(ids.clone());
+
+        browser.apply(BrowserCommand::SelectIndices {
+            indices: vec![1, 3, 4],
+        });
+
+        assert_eq!(browser.selected_asset_ids(), vec![ids[1], ids[3], ids[4]]);
+        assert_eq!(browser.focused_asset_id(), Some(ids[4]));
+    }
+
+    #[test]
+    fn select_indices_drops_out_of_range_entries_instead_of_panicking() {
+        let ids = asset_ids(3);
+        let mut browser = BrowserState::new(ids.clone());
+
+        browser.apply(BrowserCommand::SelectIndices {
+            indices: vec![0, 99, 2],
+        });
+
+        assert_eq!(browser.selected_asset_ids(), vec![ids[0], ids[2]]);
     }
 
     #[test]

@@ -1506,12 +1506,33 @@ export function App() {
   useEffect(() => {
     let cancelled = false;
     const ids = visibleAssets.map((asset) => asset.id);
+    // Captured from the *current* (about-to-be-replaced) browserState via
+    // closure — this is the real multi-selection (Toggle/Range can select
+    // many rows independently of `selectedAssetId`, which is only ever
+    // "whichever row was last clicked"). Previously this effect restored
+    // just `selectedAssetId` after a rebuild, silently collapsing a real
+    // multi-selection down to one row (or zero) on every `visibleAssets`
+    // change — which is any refreshAssets call: background analysis
+    // progress, a filter change, anything that gives `assets` a new array
+    // reference. That's what made "select several tracks, then Add to
+    // Project" only add a fraction of them, or none, whenever a refresh
+    // landed between selecting and acting on the selection.
+    const previouslySelectedIds = selectedAssetIds;
 
     (async () => {
       let next = await invoke<BrowserState>("create_browser_state", { visibleAssetIds: ids }).catch(() => null);
       if (!next) return;
 
-      if (selectedAssetId) {
+      const survivingIndices = previouslySelectedIds
+        .map((id) => ids.indexOf(id))
+        .filter((index) => index >= 0);
+
+      if (survivingIndices.length > 0) {
+        next = await invoke<BrowserState>("apply_browser_command", {
+          browserState: next,
+          command: { SelectIndices: { indices: survivingIndices } }
+        }).catch(() => next);
+      } else if (selectedAssetId) {
         const index = ids.indexOf(selectedAssetId);
         if (index >= 0) {
           next = await invoke<BrowserState>("apply_browser_command", {
