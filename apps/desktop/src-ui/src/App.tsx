@@ -1106,23 +1106,33 @@ export function App() {
   //
   // Step 0 is the New Setup / Open Library choice (plus a recent-libraries
   // list); step 1 names the new library file and picks its save location;
-  // steps 2/3 are the existing media-root/import-root folder setup, only
-  // reached via New Setup — Open Library (or a recent-file click) skips
-  // straight into the app since that library file is already configured.
-  const [onboardingStep, setOnboardingStep] = useState<0 | 1 | 2 | 3>(0);
+  // step 2 is the media-root + advanced-folders setup, which finishes the
+  // wizard directly on confirm — only reached via New Setup, since Open
+  // Library (or a recent-file click) skips straight into the app since
+  // that library file is already configured.
+  const [onboardingStep, setOnboardingStep] = useState<0 | 1 | 2>(0);
   const [onboardingLibrary, setOnboardingLibrary] = useState<LibraryRecord | null>(null);
   const [onboardingLibraryFilePath, setOnboardingLibraryFilePath] = useState("");
   const [onboardingMediaRoot, setOnboardingMediaRoot] = useState("");
+  // Step 2 asks up front which shape the user's files are in, then shows
+  // only the matching UI — a single field for "one main folder", or the
+  // per-type folder list for "already organized". Showing both at once
+  // (the old layout) read as "fill in this AND optionally that", which
+  // wasn't the actual choice being offered.
+  const [onboardingFolderMode, setOnboardingFolderMode] = useState<"single" | "advanced">("single");
   // Advanced setup: additional folders added on the media-root step, each
   // optionally tagged with the media type it's expected to hold — turned
   // into `folders` rows (kind "watched", or "documents" for the licence/PDF
   // case) alongside the implicit media_root folder once step 2 confirms.
   // The basic single-folder user never touches this — it stays empty and
-  // only the media_root folder itself gets registered.
+  // only the media_root folder itself gets registered. A client-side `id`
+  // (not a real folder id yet — nothing's been created server-side until
+  // step 2 confirms) keeps each row addressable while its path is still
+  // empty: pick a type first, then Browse fills in that same row's path,
+  // rather than a dialog opening the moment you add a row.
   const [onboardingAdvancedFolders, setOnboardingAdvancedFolders] = useState<
-    Array<{ path: string; role: string }>
+    Array<{ id: string; path: string; role: string }>
   >([]);
-  const [onboardingImportRoot, setOnboardingImportRoot] = useState("");
   const [onboardingBusy, setOnboardingBusy] = useState(false);
   const [onboardingError, setOnboardingError] = useState<string | null>(null);
   const [onboardingNetworkPathWarning, setOnboardingNetworkPathWarning] = useState<string | null>(null);
@@ -1271,9 +1281,12 @@ export function App() {
   const [newProjectSfxExportPath, setNewProjectSfxExportPath] = useState("");
   // Additional categorized export folders added while creating a project —
   // beyond the two built-in export_path/sfx_export_path slots — each
-  // becomes a project_export_folders row once the project is created.
+  // becomes a project_export_folders row once the project is created. A
+  // client-side `id` (nothing's created server-side until then) keeps each
+  // row addressable while its path is still empty, same as onboarding's
+  // advanced-folder rows.
   const [newProjectExportFolders, setNewProjectExportFolders] = useState<
-    Array<{ path: string; role: string }>
+    Array<{ id: string; path: string; role: string }>
   >([]);
   const [newImportSubfolderName, setNewImportSubfolderName] = useState("");
   // The sidebar's hover-to-reveal edit icon on a project row opens this —
@@ -2309,7 +2322,7 @@ export function App() {
         exportPath: newProjectExportPath.trim() || null,
         sfxExportPath: newProjectSfxExportPath.trim() || null
       });
-      for (const folder of newProjectExportFolders) {
+      for (const folder of newProjectExportFolders.filter((entry) => entry.path.trim())) {
         await invoke("add_project_export_folder", {
           projectId: project.id,
           path: folder.path,
@@ -2327,13 +2340,17 @@ export function App() {
     }
   }, [activeLibraryId, newProjectName, newProjectExportPath, newProjectSfxExportPath, newProjectExportFolders]);
 
-  // "+ Add export folder" on the New Project modal — lets a project be set
-  // up with more than the two built-in export slots right from creation,
-  // one folder + category at a time (a literal "how many folders do you
-  // need" numeric prompt would just mean pre-filling N blank rows the user
-  // has to configure anyway, so this is the same incremental pattern the
-  // onboarding advanced-folder step and Settings' Watched Folders use).
-  const handleAddNewProjectExportFolder = useCallback(async () => {
+  // "+" on the New Project modal adds a blank row (category first, path
+  // empty) — pick the category, then use that row's own Browse button to
+  // fill in its path. Same pattern as onboarding's advanced-folder step.
+  const handleAddNewProjectExportFolderRow = useCallback(() => {
+    setNewProjectExportFolders((previous) => [
+      ...previous,
+      { id: crypto.randomUUID(), path: "", role: PROJECT_EXPORT_FOLDER_ROLE_OPTIONS[0].value }
+    ]);
+  }, []);
+
+  const handleBrowseNewProjectExportFolderRow = useCallback(async (id: string) => {
     const selected = await openDialog({
       directory: true,
       multiple: false,
@@ -2341,20 +2358,18 @@ export function App() {
     });
     if (typeof selected !== "string") return;
     setNewProjectExportFolders((previous) =>
-      previous.some((folder) => folder.path === selected)
-        ? previous
-        : [...previous, { path: selected, role: "music" }]
+      previous.map((folder) => (folder.id === id ? { ...folder, path: selected } : folder))
     );
   }, []);
 
-  const handleSetNewProjectExportFolderRole = useCallback((path: string, role: string) => {
+  const handleSetNewProjectExportFolderRole = useCallback((id: string, role: string) => {
     setNewProjectExportFolders((previous) =>
-      previous.map((folder) => (folder.path === path ? { ...folder, role } : folder))
+      previous.map((folder) => (folder.id === id ? { ...folder, role } : folder))
     );
   }, []);
 
-  const handleRemoveNewProjectExportFolder = useCallback((path: string) => {
-    setNewProjectExportFolders((previous) => previous.filter((folder) => folder.path !== path));
+  const handleRemoveNewProjectExportFolderRow = useCallback((id: string) => {
+    setNewProjectExportFolders((previous) => previous.filter((folder) => folder.id !== id));
   }, []);
 
   const handleChooseProjectExportPath = useCallback(async () => {
@@ -3073,8 +3088,8 @@ export function App() {
     setOnboardingLibrary(null);
     setOnboardingLibraryFilePath("");
     setOnboardingMediaRoot("");
+    setOnboardingFolderMode("single");
     setOnboardingAdvancedFolders([]);
-    setOnboardingImportRoot("");
     setOnboardingNetworkPathWarning(null);
     setOnboardingError(null);
     setOnboardingStep(0);
@@ -3262,54 +3277,74 @@ export function App() {
     if (typeof selected === "string") setOnboardingMediaRoot(selected);
   }, []);
 
-  // Advanced setup: "+ Add another folder" — picks a folder, adds it to the
-  // list with no role yet (the row's own dropdown sets one). Silently
-  // ignores a folder already in the list rather than adding a duplicate.
-  const handleAddOnboardingFolder = useCallback(async () => {
+  // Advanced setup: "+" adds a blank row (type first, path empty) rather
+  // than immediately opening a folder dialog — pick the category, then use
+  // that row's own Browse button to fill in its path.
+  const handleAddOnboardingFolderRow = useCallback(() => {
+    setOnboardingAdvancedFolders((previous) => [
+      ...previous,
+      { id: crypto.randomUUID(), path: "", role: "" }
+    ]);
+  }, []);
+
+  const handleBrowseOnboardingFolderRow = useCallback(async (id: string) => {
     const selected = await openDialog({
       directory: true,
       multiple: false,
-      title: "Choose a folder to add (e.g. your Soundtracks, SFX, or Licence folder)"
+      title: "Choose a folder (e.g. your Soundtracks, SFX, or Licence folder)"
     });
     if (typeof selected !== "string") return;
     setOnboardingAdvancedFolders((previous) =>
-      previous.some((folder) => folder.path === selected) ? previous : [...previous, { path: selected, role: "" }]
+      previous.map((folder) => (folder.id === id ? { ...folder, path: selected } : folder))
     );
   }, []);
 
-  const handleSetOnboardingFolderRole = useCallback((path: string, role: string) => {
+  const handleSetOnboardingFolderRole = useCallback((id: string, role: string) => {
     setOnboardingAdvancedFolders((previous) =>
-      previous.map((folder) => (folder.path === path ? { ...folder, role } : folder))
+      previous.map((folder) => (folder.id === id ? { ...folder, role } : folder))
     );
   }, []);
 
-  const handleRemoveOnboardingFolder = useCallback((path: string) => {
-    setOnboardingAdvancedFolders((previous) => previous.filter((folder) => folder.path !== path));
+  const handleRemoveOnboardingFolderRow = useCallback((id: string) => {
+    setOnboardingAdvancedFolders((previous) => previous.filter((folder) => folder.id !== id));
   }, []);
 
   const handleOnboardingConfirmMediaRoot = useCallback(async () => {
-    if (!onboardingLibrary || !onboardingMediaRoot.trim()) return;
+    if (!onboardingLibrary) return;
+    const configuredAdvancedFolders = onboardingAdvancedFolders.filter((folder) => folder.path.trim());
+    // Single mode requires the one main folder; advanced mode requires at
+    // least one of the typed rows to actually have a path chosen — the two
+    // modes are mutually exclusive UI, so only the active one's requirement
+    // gates Finish.
+    if (onboardingFolderMode === "single" ? !onboardingMediaRoot.trim() : configuredAdvancedFolders.length === 0) {
+      return;
+    }
     setOnboardingBusy(true);
     setOnboardingError(null);
     try {
-      const updated = await invoke<LibraryRecord>("set_library_media_root", {
-        libraryId: onboardingLibrary.id,
-        mediaRoot: onboardingMediaRoot.trim()
-      });
-      setOnboardingLibrary(updated);
-      setLibraries((previous) => previous.map((library) => (library.id === updated.id ? updated : library)));
+      let updated = onboardingLibrary;
+      if (onboardingFolderMode === "single") {
+        updated = await invoke<LibraryRecord>("set_library_media_root", {
+          libraryId: onboardingLibrary.id,
+          mediaRoot: onboardingMediaRoot.trim()
+        });
+        setOnboardingLibrary(updated);
+        setLibraries((previous) => previous.map((library) => (library.id === updated.id ? updated : library)));
+      }
 
       // set_library_media_root already keeps a matching `folders` row
       // (role null, kind "media_root") in sync on the Rust side — see
       // sync_media_root_folder — so the basic single-folder user needs
-      // nothing further here. Only the advanced extra folders below need
-      // their own explicit add_folder calls.
+      // nothing further here. An advanced user's library keeps an empty
+      // media_root at this point — it self-heals to whichever configured
+      // folder gets imported into first (see import_folder), and the
+      // background poller watches the `folders` rows directly regardless.
       // Independent inserts (no shared ordering, no uniqueness constraint
       // between them) — run concurrently rather than one round trip at a
       // time, same as a user with several advanced folders configured
       // would expect a single "Continue" click to resolve quickly.
       await Promise.allSettled(
-        onboardingAdvancedFolders.map((folder) =>
+        configuredAdvancedFolders.map((folder) =>
           invoke("add_folder", {
             libraryId: updated.id,
             path: folder.path,
@@ -3319,57 +3354,25 @@ export function App() {
         )
       );
 
-      setOnboardingStep(3);
-    } catch (error) {
-      setOnboardingError(String(error));
-    } finally {
-      setOnboardingBusy(false);
-    }
-  }, [onboardingLibrary, onboardingMediaRoot, onboardingAdvancedFolders]);
-
-  const handleOnboardingChooseImportRoot = useCallback(async () => {
-    const selected = await openDialog({
-      directory: true,
-      multiple: false,
-      title: "Choose a folder to auto-import new sounds from"
-    });
-    if (typeof selected === "string") setOnboardingImportRoot(selected);
-  }, []);
-
-  // Finishes the wizard — called by both "Finish" and "Skip for now" on
-  // step 3, since set_library_import_root only actually sets anything when
-  // onboardingImportRoot is non-empty. On finish, an initial scan of the
-  // import folder (if one was set) runs once so anything already sitting
-  // there gets pulled in right away rather than waiting for the next
-  // launch/refresh.
-  const handleOnboardingFinish = useCallback(async () => {
-    if (!onboardingLibrary) return;
-    setOnboardingBusy(true);
-    setOnboardingError(null);
-    try {
-      let finalLibrary = onboardingLibrary;
-      if (onboardingImportRoot.trim()) {
-        finalLibrary = await invoke<LibraryRecord>("set_library_import_root", {
-          libraryId: onboardingLibrary.id,
-          importRoot: onboardingImportRoot.trim()
-        });
-        setLibraries((previous) => previous.map((library) => (library.id === finalLibrary.id ? finalLibrary : library)));
-        invoke<ImportFolderResult>("scan_import_folder", { libraryId: finalLibrary.id }).catch(() => {});
-      }
-      setActiveLibraryId(finalLibrary.id);
+      // The folders just registered above are the canonical watched
+      // folders — there's no separate "drop new sounds here" staging
+      // folder to configure any more (that's what the old, now-removed
+      // import-root wizard step asked for), so this step finishes the
+      // wizard directly instead of advancing to another one.
+      setActiveLibraryId(updated.id);
       setOnboardingLibrary(null);
       setOnboardingLibraryFilePath("");
       setOnboardingStep(0);
       setOnboardingMediaRoot("");
+      setOnboardingFolderMode("single");
       setOnboardingAdvancedFolders([]);
-      setOnboardingImportRoot("");
       setOnboardingNetworkPathWarning(null);
     } catch (error) {
       setOnboardingError(String(error));
     } finally {
       setOnboardingBusy(false);
     }
-  }, [onboardingLibrary, onboardingImportRoot]);
+  }, [onboardingLibrary, onboardingMediaRoot, onboardingFolderMode, onboardingAdvancedFolders]);
 
   // Settings → General → Library's "Import folder" row — sets or clears a
   // library's import folder after the fact, outside the first-run wizard.
@@ -4338,7 +4341,7 @@ export function App() {
       <main className="shell setup-shell">
         <section className="setup-card" aria-label="Set up Darkwave">
           <div className="brand">Darkwave</div>
-          {onboardingStep > 0 ? <p className="settings-hint">Step {onboardingStep} of 3</p> : null}
+          {onboardingStep > 0 ? <p className="settings-hint">Step {onboardingStep} of 2</p> : null}
           {onboardingStep === 0 ? (
             <>
               <h1>Welcome to Darkwave</h1>
@@ -4376,9 +4379,8 @@ export function App() {
             <>
               <h1>Name your library</h1>
               <p>
-                This creates a Darkwave library file (a <code>.darkwave</code> document) that holds your tags,
-                analysis, and settings — you'll pick where to save it next. It's separate from the folder your
-                actual sound files live in, which comes after.
+                Holds your tags, analysis, and settings — separate from where your sound files live, which you'll
+                set up next.
               </p>
               <label className="setup-field">
                 <span>Library name</span>
@@ -4403,105 +4405,103 @@ export function App() {
               </button>
               {onboardingNetworkPathWarning ? <p className="settings-hint">{onboardingNetworkPathWarning}</p> : null}
             </>
-          ) : onboardingStep === 2 ? (
+          ) : (
             <>
               <h1>Where do your actual sound files live?</h1>
-              <p>
-                This is a plain folder on disk (or a NAS/external drive) that holds your organized audio files —
-                not the library file you just saved. Darkwave keeps the two separate, the way a video editor keeps
-                its project file apart from the footage it references.
-              </p>
-              <label className="setup-field">
-                <span>Sound files folder</span>
-                <div className="setup-field-row">
-                  <input
-                    autoFocus
-                    placeholder="/Volumes/Sound Library"
-                    value={onboardingMediaRoot}
-                    onChange={(event) => setOnboardingMediaRoot(event.target.value)}
-                  />
-                  <button type="button" onClick={handleOnboardingChooseMediaRoot}>
-                    Browse
-                  </button>
-                </div>
-              </label>
-              <div className="setup-field">
-                <span>
-                  Already organized into folders? (optional — Soundtracks, SFX, Foley, Licence, etc.)
-                </span>
-                {onboardingAdvancedFolders.length > 0 ? (
-                  <ul className="setup-recent-list">
-                    {onboardingAdvancedFolders.map((folder) => (
-                      <li key={folder.path} className="setup-migration-row">
-                        <span className="settings-hint">{folder.path}</span>
-                        <select
-                          value={folder.role}
-                          onChange={(event) => handleSetOnboardingFolderRole(folder.path, event.target.value)}
-                        >
-                          {FOLDER_ROLE_OPTIONS.map((option) => (
-                            <option key={option.value} value={option.value}>
-                              {option.label}
-                            </option>
-                          ))}
-                        </select>
-                        <button
-                          type="button"
-                          className="text-button"
-                          onClick={() => handleRemoveOnboardingFolder(folder.path)}
-                        >
-                          Remove
-                        </button>
-                      </li>
-                    ))}
-                  </ul>
-                ) : null}
-                <button type="button" onClick={handleAddOnboardingFolder}>
-                  + Add another folder
+              <p>A plain folder on disk or a NAS — separate from the library file you just saved.</p>
+              <div className="setup-mode-toggle" role="radiogroup" aria-label="Sound files layout">
+                <button
+                  type="button"
+                  role="radio"
+                  aria-checked={onboardingFolderMode === "single"}
+                  className={onboardingFolderMode === "single" ? "setup-mode-option active" : "setup-mode-option"}
+                  onClick={() => setOnboardingFolderMode("single")}
+                >
+                  <strong>One main folder</strong>
+                  <span>Everything in one place.</span>
+                </button>
+                <button
+                  type="button"
+                  role="radio"
+                  aria-checked={onboardingFolderMode === "advanced"}
+                  className={onboardingFolderMode === "advanced" ? "setup-mode-option active" : "setup-mode-option"}
+                  onClick={() => setOnboardingFolderMode("advanced")}
+                >
+                  <strong>Already organized</strong>
+                  <span>Soundtracks, SFX, Foley, etc.</span>
                 </button>
               </div>
+              {onboardingFolderMode === "single" ? (
+                <label className="setup-field">
+                  <span>Sound files folder</span>
+                  <div className="setup-field-row">
+                    <input
+                      autoFocus
+                      placeholder="/Volumes/Sound Library"
+                      value={onboardingMediaRoot}
+                      onChange={(event) => setOnboardingMediaRoot(event.target.value)}
+                    />
+                    <button type="button" onClick={handleOnboardingChooseMediaRoot}>
+                      Browse
+                    </button>
+                  </div>
+                </label>
+              ) : (
+                <div className="setup-field">
+                  <span>Add each folder and what it holds</span>
+                  {onboardingAdvancedFolders.length > 0 ? (
+                    <ul className="setup-folder-list">
+                      {onboardingAdvancedFolders.map((folder) => (
+                        <li key={folder.id} className="setup-folder-row">
+                          <select
+                            value={folder.role}
+                            onChange={(event) => handleSetOnboardingFolderRole(folder.id, event.target.value)}
+                          >
+                            {FOLDER_ROLE_OPTIONS.map((option) => (
+                              <option key={option.value} value={option.value}>
+                                {option.label}
+                              </option>
+                            ))}
+                          </select>
+                          <span className="setup-folder-path" title={folder.path || undefined}>
+                            {folder.path || "No folder chosen"}
+                          </span>
+                          <button type="button" onClick={() => handleBrowseOnboardingFolderRow(folder.id)}>
+                            Browse
+                          </button>
+                          <button
+                            type="button"
+                            className="text-button"
+                            onClick={() => handleRemoveOnboardingFolderRow(folder.id)}
+                          >
+                            Remove
+                          </button>
+                        </li>
+                      ))}
+                    </ul>
+                  ) : null}
+                  <button
+                    type="button"
+                    className="text-button setup-add-folder-button"
+                    onClick={handleAddOnboardingFolderRow}
+                  >
+                    + Add folder
+                  </button>
+                </div>
+              )}
               <button
                 className="primary-action"
                 type="button"
                 onClick={handleOnboardingConfirmMediaRoot}
-                disabled={!onboardingMediaRoot.trim() || onboardingBusy}
+                disabled={
+                  onboardingBusy ||
+                  (onboardingFolderMode === "single"
+                    ? !onboardingMediaRoot.trim()
+                    : !onboardingAdvancedFolders.some((folder) => folder.path.trim()))
+                }
               >
-                Continue
+                Finish
               </button>
-            </>
-          ) : (
-            <>
-              <h1>Where do you drop new sounds to import?</h1>
-              <p>
-                Darkwave checks this folder for new files on launch and refresh, and copies anything new straight
-                into your library. Optional — you can set or change this later in Settings.
-              </p>
-              <label className="setup-field">
-                <span>Import folder</span>
-                <div className="setup-field-row">
-                  <input
-                    autoFocus
-                    placeholder="/Users/you/Downloads/New Sounds"
-                    value={onboardingImportRoot}
-                    onChange={(event) => setOnboardingImportRoot(event.target.value)}
-                  />
-                  <button type="button" onClick={handleOnboardingChooseImportRoot}>
-                    Browse
-                  </button>
-                </div>
-              </label>
-              <div className="setup-field-row">
-                <button className="text-button" type="button" onClick={handleOnboardingFinish} disabled={onboardingBusy}>
-                  Skip for now
-                </button>
-                <button
-                  className="primary-action"
-                  type="button"
-                  onClick={handleOnboardingFinish}
-                  disabled={onboardingBusy}
-                >
-                  Finish
-                </button>
-              </div>
             </>
           )}
           {onboardingError ? <p className="settings-hint">{onboardingError}</p> : null}
@@ -6677,14 +6677,11 @@ export function App() {
                           embedded metadata is already specific.
                         </div>
                         {libraryFolders.filter((folder) => folder.kind !== "media_root").length > 0 ? (
-                          <ul className="setup-recent-list">
+                          <ul className="setup-folder-list">
                             {libraryFolders
                               .filter((folder) => folder.kind !== "media_root")
                               .map((folder) => (
-                                <li key={folder.id} className="setup-migration-row">
-                                  <span className="settings-value-path" title={folder.path}>
-                                    {folder.path}
-                                  </span>
+                                <li key={folder.id} className="setup-folder-row">
                                   <select
                                     value={folder.role ?? ""}
                                     onChange={(event) => handleSetWatchedFolderRole(folder.id, event.target.value)}
@@ -6695,6 +6692,9 @@ export function App() {
                                       </option>
                                     ))}
                                   </select>
+                                  <span className="setup-folder-path" title={folder.path}>
+                                    {folder.path}
+                                  </span>
                                   <button
                                     type="button"
                                     className="text-button"
@@ -6706,7 +6706,12 @@ export function App() {
                               ))}
                           </ul>
                         ) : null}
-                        <button type="button" className="text-button" onClick={handleAddWatchedFolder} disabled={!activeLibraryId}>
+                        <button
+                          type="button"
+                          className="text-button setup-add-folder-button"
+                          onClick={handleAddWatchedFolder}
+                          disabled={!activeLibraryId}
+                        >
                           + Add Folder…
                         </button>
                       </div>
@@ -7290,13 +7295,12 @@ export function App() {
                   the sound/sound effects folders above.
                 </p>
                 {newProjectExportFolders.length > 0 ? (
-                  <ul className="setup-recent-list">
+                  <ul className="setup-folder-list">
                     {newProjectExportFolders.map((folder) => (
-                      <li key={folder.path} className="setup-migration-row">
-                        <span className="settings-hint">{folder.path}</span>
+                      <li key={folder.id} className="setup-folder-row">
                         <select
                           value={folder.role}
-                          onChange={(event) => handleSetNewProjectExportFolderRole(folder.path, event.target.value)}
+                          onChange={(event) => handleSetNewProjectExportFolderRole(folder.id, event.target.value)}
                         >
                           {PROJECT_EXPORT_FOLDER_ROLE_OPTIONS.map((option) => (
                             <option key={option.value} value={option.value}>
@@ -7304,10 +7308,16 @@ export function App() {
                             </option>
                           ))}
                         </select>
+                        <span className="setup-folder-path" title={folder.path || undefined}>
+                          {folder.path || "No folder chosen"}
+                        </span>
+                        <button type="button" onClick={() => handleBrowseNewProjectExportFolderRow(folder.id)}>
+                          Browse
+                        </button>
                         <button
                           type="button"
                           className="text-button"
-                          onClick={() => handleRemoveNewProjectExportFolder(folder.path)}
+                          onClick={() => handleRemoveNewProjectExportFolderRow(folder.id)}
                         >
                           Remove
                         </button>
@@ -7315,8 +7325,12 @@ export function App() {
                     ))}
                   </ul>
                 ) : null}
-                <button type="button" onClick={handleAddNewProjectExportFolder}>
-                  + Add Export Folder…
+                <button
+                  type="button"
+                  className="text-button setup-add-folder-button"
+                  onClick={handleAddNewProjectExportFolderRow}
+                >
+                  + Add Export Folder
                 </button>
               </div>
               <button
@@ -7466,10 +7480,9 @@ export function App() {
                   the sound/sound effects folders above. Changes here apply immediately.
                 </p>
                 {editProjectExportFolders.length > 0 ? (
-                  <ul className="setup-recent-list">
+                  <ul className="setup-folder-list">
                     {editProjectExportFolders.map((folder) => (
-                      <li key={folder.id} className="setup-migration-row">
-                        <span className="settings-hint">{folder.path}</span>
+                      <li key={folder.id} className="setup-folder-row">
                         <select
                           value={folder.role}
                           onChange={(event) => handleSetEditProjectExportFolderRole(folder.id, event.target.value)}
@@ -7480,6 +7493,9 @@ export function App() {
                             </option>
                           ))}
                         </select>
+                        <span className="setup-folder-path" title={folder.path}>
+                          {folder.path}
+                        </span>
                         <button
                           type="button"
                           className="text-button"
@@ -7491,7 +7507,11 @@ export function App() {
                     ))}
                   </ul>
                 ) : null}
-                <button type="button" onClick={handleAddEditProjectExportFolder}>
+                <button
+                  type="button"
+                  className="text-button setup-add-folder-button"
+                  onClick={handleAddEditProjectExportFolder}
+                >
                   + Add Export Folder…
                 </button>
               </div>
