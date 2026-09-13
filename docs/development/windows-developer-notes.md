@@ -7,6 +7,28 @@ Newest entry on top. Add a new entry, don't edit old ones.
 
 ---
 
+## 2026-09-13 — second fix on top of the one below: waveform generation was stealing CPU and disrupting selection
+
+Same day, one more before you build — pull `main` again (commit `7aaad82`, on top of the
+tracks-vanishing fix at `2fb8550` below) to get this too, so your rebuild carries both in one pass
+instead of needing a second round-trip.
+
+Two bugs compounded into "waveform generation never finishes and messes with the UI while it
+runs": `WaveformCache::from_samples` (`crates/waveform/src/lib.rs`) built a one-bucket-per-raw-
+sample intermediate array — tens of millions of entries for an ordinary track — just to downsample
+it three times and discard it. Fixed to generate each of the three needed resolutions directly from
+the sample buffer instead; this is the actual reason it was slow regardless of CPU/network. Separately,
+the frontend's `runJobDrain` (`apps/desktop/src-ui/src/App.tsx`) refreshed the whole asset list after
+every waveform batch even though waveform data isn't part of `AssetRecord` at all — since this job
+kind drains almost continuously on any real backlog, that churn kept re-triggering the "selection no
+longer in the list" effect, deselecting/reordering tracks out from under whoever was browsing.
+Waveform batches no longer trigger that refresh, and `refreshAssets` now guards against out-of-order
+responses generally.
+
+Not platform-specific — please ship whatever build follows this pull as 0.3.1 build 13 or higher
+(same version as the tracks-vanishing fix below, since neither has been Windows-built yet), and
+check `docs/macos/version-ledger.md` first per the usual rule.
+
 ## 2026-09-13 — critical fix: tracks vanishing from the canvas after a library swap — please pull and rebuild
 
 Pull `main` (commit `2fb8550` on top of your `RunEvent::Opened` fix, `4b59cd1`) before your next
