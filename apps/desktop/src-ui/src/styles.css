@@ -1778,14 +1778,21 @@ h2 {
   gap: 8px;
 }
 
-/* Icon-only — no name label. Dropping the label is what buys room for a
-   4th recent project without the dock outgrowing a comfortable width. */
+/* Every card uses the same generic icon, so during an actual drag they
+   used to be indistinguishable except by position (the name was a hover
+   tooltip only, and dragging doesn't reliably surface those) — the name
+   now sits below the icon so a target is identifiable without pausing the
+   drag. Fixed width + ellipsis keeps a long project name from outgrowing
+   a comfortable dock width, still capped at 4 recent projects. */
 .drag-dock-card {
   display: flex;
+  flex-direction: column;
   align-items: center;
   justify-content: center;
-  width: 56px;
-  height: 56px;
+  gap: 4px;
+  width: 68px;
+  height: 68px;
+  padding: 6px 4px;
   border-radius: 14px;
   background: var(--control-bg);
   border: 1px solid var(--control-border);
@@ -1797,11 +1804,21 @@ h2 {
   display: inline-flex;
   align-items: center;
   justify-content: center;
-  width: 38px;
-  height: 38px;
+  width: 34px;
+  height: 34px;
   border-radius: 10px;
   background: rgba(var(--radar-accent-rgb), 0.14);
   color: var(--radar-accent-strong);
+}
+
+.drag-dock-card-name {
+  max-width: 100%;
+  font-size: 10px;
+  line-height: 1.2;
+  color: var(--text-secondary);
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
 }
 
 .drag-dock-card.drag-over {

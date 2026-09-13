@@ -7929,6 +7929,7 @@ export function App() {
                       <span className="drag-dock-card-icon">
                         <Clapperboard size={20} />
                       </span>
+                      <span className="drag-dock-card-name">{project.name}</span>
                     </motion.div>
                   );
                 })}
