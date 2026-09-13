@@ -2831,14 +2831,7 @@ async fn process_one_instrument_job(
     let detected = tauri::async_runtime::spawn_blocking(move || -> Result<Vec<(String, f64)>, String> {
         let buffer = audio_metadata::decode_any_supported_audio(&local_path)
             .map_err(|error| format!("{error:?}"))?;
-        let mut guard = model.lock().expect("instrument model mutex poisoned");
-        let Some(model) = guard.as_mut() else {
-            return Err("instrument model unloaded".to_string());
-        };
-        Ok(audio_analysis::detect_instruments(model, &buffer)
-            .into_iter()
-            .map(|prediction| (prediction.instrument, prediction.confidence as f64))
-            .collect())
+        detect_instruments_with_timeout(model, buffer)
     })
     .await;
 
@@ -3561,6 +3554,63 @@ fn detect_vocal_ratio_with_timeout(mono: Vec<f32>, sample_rate: u32) -> Option<f
                  treating as no vocal data (see detect_vocal_ratio_with_timeout's doc comment)"
             );
             None
+        }
+    }
+}
+
+/// Same ceiling as `VOCAL_DETECTION_TIMEOUT`, for the same `ort`/ONNX
+/// Runtime failure mode in the instrument-detection model instead of Silero
+/// VAD — see `detect_instruments_with_timeout`'s doc comment.
+const INSTRUMENT_DETECTION_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(15);
+
+/// Runs YAMNet instrument detection on a detached thread and gives up after
+/// `INSTRUMENT_DETECTION_TIMEOUT` instead of waiting forever.
+///
+/// Instrument detection already runs its jobs one at a time, not
+/// concurrently (see `process_instrument_jobs`'s doc comment — the ONNX
+/// session isn't `Sync`) — which makes an unbounded hang here *worse* than
+/// the vocal-ratio case `detect_vocal_ratio_with_timeout` guards against,
+/// not just as bad: a single wedged `Session::run` wouldn't just queue
+/// concurrent work behind it, it would stop every instrument-detection job
+/// after it, forever, for the rest of the session. Same fix, same
+/// reasoning: bounding the wait on a detached thread can't un-stick that
+/// thread, but it stops one wedged native call from wedging every future
+/// job too.
+///
+/// A timeout degrades to `Ok(vec![])` — "nothing detected" is already a
+/// real, expected outcome this job kind handles, so a single flaky file
+/// shouldn't turn into a hard failure the ordinary retry path treats any
+/// differently. The model-unloaded case stays a real `Err`, though — that's
+/// an immediate, deterministic condition (not a flaky hang) worth
+/// surfacing distinctly, same as before this change.
+fn detect_instruments_with_timeout(
+    model: std::sync::Arc<Mutex<Option<audio_analysis::InstrumentModel>>>,
+    buffer: audio_metadata::DecodedAudioBuffer,
+) -> Result<Vec<(String, f64)>, String> {
+    let (tx, rx) = std::sync::mpsc::channel();
+    std::thread::spawn(move || {
+        // Errors are expected here if the receiving end already gave up
+        // and dropped `rx` after timing out — this thread may still be
+        // stuck in ONNX Runtime long after its job has moved on.
+        let mut guard = model.lock().expect("instrument model mutex poisoned");
+        let result = match guard.as_mut() {
+            Some(model) => Ok(audio_analysis::detect_instruments(model, &buffer)
+                .into_iter()
+                .map(|prediction| (prediction.instrument, prediction.confidence as f64))
+                .collect()),
+            None => Err("instrument model unloaded".to_string()),
+        };
+        let _ = tx.send(result);
+    });
+    match rx.recv_timeout(INSTRUMENT_DETECTION_TIMEOUT) {
+        Ok(result) => result,
+        Err(_) => {
+            eprintln!(
+                "instrument-detection: model inference did not return within \
+                 {INSTRUMENT_DETECTION_TIMEOUT:?} — treating as no instruments detected \
+                 (see detect_instruments_with_timeout's doc comment)"
+            );
+            Ok(Vec::new())
         }
     }
 }
