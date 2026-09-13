@@ -2333,10 +2333,27 @@ impl Catalog {
                 assets.stem_group_id, assets.stem_label, assets.stem_is_primary
              FROM assets",
         );
-        let mut query_params: Vec<rusqlite::types::Value> = vec![library_id.to_string().into()];
+        let mut query_params: Vec<rusqlite::types::Value> = Vec::new();
 
         if use_fts {
-            sql.push_str(" INNER JOIN assets_fts ON assets_fts.rowid = assets.rowid");
+            // LEFT JOIN, not INNER — a plain FTS5 MATCH only reaches
+            // display_name/original_filename/notes (the only columns
+            // assets_fts indexes), which is a real gap against what the
+            // search box's own placeholder promises ("tags, source,
+            // license") and against tag names, which live in a separate
+            // many-to-many table FTS was never told about. Broadening the
+            // FTS column set means dropping and rebuilding the index (FTS5
+            // tables can't ALTER TABLE ADD COLUMN), which is a bigger,
+            // riskier migration than this warrants right now — so instead,
+            // rows FTS doesn't match still get a chance via the plain
+            // substring OR-clause below, joined against fts_match.rowid
+            // being NULL. rank is only meaningful for rows that DID match
+            // FTS; the ORDER BY at the bottom accounts for that.
+            sql.push_str(
+                " LEFT JOIN (SELECT rowid, rank FROM assets_fts WHERE assets_fts MATCH ?) AS fts_match
+                    ON fts_match.rowid = assets.rowid",
+            );
+            query_params.push(fts_query(&text).into());
         }
 
         sql.push_str(
@@ -2346,10 +2363,39 @@ impl Catalog {
                  WHERE trash_items.asset_id = assets.id AND trash_items.state = 'in_trash'
                )",
         );
+        query_params.push(library_id.to_string().into());
 
         if use_fts {
-            sql.push_str(" AND assets_fts MATCH ?");
-            query_params.push(fts_query(&text).into());
+            let like_needle = format!("%{}%", text.replace('\\', "\\\\").replace('%', "\\%").replace('_', "\\_"));
+            sql.push_str(
+                " AND (
+                   fts_match.rowid IS NOT NULL
+                   OR assets.embedded_title LIKE ? ESCAPE '\\'
+                   OR assets.embedded_genre LIKE ? ESCAPE '\\'
+                   OR assets.embedded_comment LIKE ? ESCAPE '\\'
+                   OR EXISTS (
+                     SELECT 1 FROM asset_tags
+                     JOIN tags ON tags.id = asset_tags.tag_id
+                     WHERE asset_tags.asset_id = assets.id
+                       AND asset_tags.approval_state = 'accepted'
+                       AND tags.name LIKE ? ESCAPE '\\'
+                   )
+                   OR EXISTS (
+                     SELECT 1 FROM source_records
+                     WHERE source_records.asset_id = assets.id
+                       AND (
+                         source_records.provider LIKE ? ESCAPE '\\'
+                         OR source_records.license_type LIKE ? ESCAPE '\\'
+                         OR source_records.attribution LIKE ? ESCAPE '\\'
+                       )
+                   )
+                 )",
+            );
+            // One per LIKE placeholder above: embedded_title, embedded_genre,
+            // embedded_comment, tags.name, provider, license_type, attribution.
+            for _ in 0..7 {
+                query_params.push(like_needle.clone().into());
+            }
         }
 
         if let Some(media_type) = query.media_type {
@@ -2395,7 +2441,13 @@ impl Catalog {
         }
 
         if use_fts {
-            sql.push_str(" ORDER BY rank");
+            // fts_match.rank only exists for rows that actually matched FTS
+            // (the tag/source/embedded-metadata OR-branches can pull in
+            // rows where it's NULL) — put real FTS matches first, ranked
+            // best-first (rank is negative-is-better, same convention the
+            // old plain "ORDER BY rank" already relied on), then the rest
+            // by recency.
+            sql.push_str(" ORDER BY (fts_match.rowid IS NULL), fts_match.rank, assets.date_added ASC");
         } else {
             sql.push_str(" ORDER BY assets.date_added ASC");
         }
@@ -3282,6 +3334,11 @@ impl Catalog {
             CREATE INDEX IF NOT EXISTS idx_collection_assets_collection ON collection_assets(collection_id);
             CREATE INDEX IF NOT EXISTS idx_usage_events_project ON usage_events(project_id);
             CREATE INDEX IF NOT EXISTS idx_usage_events_asset ON usage_events(asset_id);
+            -- search_assets's source/license text match runs an EXISTS
+            -- against this table per candidate row — without this index
+            -- that's a full table scan of source_records for every asset a
+            -- text search considers, on every keystroke.
+            CREATE INDEX IF NOT EXISTS idx_source_records_asset ON source_records(asset_id);
             ",
         )?;
 
@@ -4859,6 +4916,113 @@ mod tests {
         );
         assert!(!results.iter().any(|asset| asset.id == wrong_media.id));
         assert!(!results.iter().any(|asset| asset.id == untagged.id));
+    }
+
+    #[test]
+    fn search_text_matches_a_tag_name_even_when_absent_from_filename() {
+        // The search box's own placeholder promises "sounds, tags, source,
+        // license" — a plain FTS5 MATCH never reached tag names at all
+        // (they live in a separate many-to-many table FTS wasn't told
+        // about), so a search for a tag word that isn't also part of the
+        // filename/display name used to silently return nothing.
+        let catalog_path = unique_catalog_path("search-by-tag-name");
+        let catalog = Catalog::open(&catalog_path).expect("open catalog");
+        let library = catalog.create_library("Search", "/library").expect("library");
+        let tagged = test_asset(&catalog, library.id, "sfx-01.wav", "hash-search-tag-1");
+        let untagged = test_asset(&catalog, library.id, "sfx-02.wav", "hash-search-tag-2");
+        let tag = catalog.create_tag("Whoosh", "action", true).expect("tag");
+        catalog
+            .apply_tag_to_assets(&[tagged.id], tag.id, TagOrigin::Manual)
+            .expect("tag");
+
+        let results = catalog
+            .search_assets(library.id, AssetSearchQuery::text("whoosh"))
+            .expect("search");
+
+        assert_eq!(
+            results.iter().map(|asset| asset.id).collect::<Vec<_>>(),
+            vec![tagged.id]
+        );
+        assert!(!results.iter().any(|asset| asset.id == untagged.id));
+    }
+
+    #[test]
+    fn search_text_ignores_a_tag_pending_approval() {
+        let catalog_path = unique_catalog_path("search-by-tag-pending");
+        let catalog = Catalog::open(&catalog_path).expect("open catalog");
+        let library = catalog.create_library("Search", "/library").expect("library");
+        let asset = test_asset(&catalog, library.id, "sfx-01.wav", "hash-search-tag-pending");
+        let tag = catalog.create_tag("Whoosh", "action", true).expect("tag");
+        catalog
+            .suggest_tag_for_asset(asset.id, tag.id, TagOrigin::AcousticModel, 0.4)
+            .expect("suggest");
+
+        let results = catalog
+            .search_assets(library.id, AssetSearchQuery::text("whoosh"))
+            .expect("search");
+
+        assert!(results.is_empty());
+    }
+
+    #[test]
+    fn search_text_matches_source_provider_and_license_type() {
+        let catalog_path = unique_catalog_path("search-by-source");
+        let catalog = Catalog::open(&catalog_path).expect("open catalog");
+        let library = catalog.create_library("Search", "/library").expect("library");
+        let licensed = test_asset(&catalog, library.id, "loop-01.wav", "hash-search-source-1");
+        let other = test_asset(&catalog, library.id, "loop-02.wav", "hash-search-source-2");
+        catalog
+            .set_source_record(SourceRecordDraft {
+                asset_id: licensed.id,
+                provider: Some("Epidemic Sound".to_string()),
+                license_type: Some("Subscription".to_string()),
+                ..Default::default()
+            })
+            .expect("source record");
+
+        let by_provider = catalog
+            .search_assets(library.id, AssetSearchQuery::text("epidemic"))
+            .expect("search by provider");
+        assert_eq!(
+            by_provider.iter().map(|asset| asset.id).collect::<Vec<_>>(),
+            vec![licensed.id]
+        );
+
+        let by_license = catalog
+            .search_assets(library.id, AssetSearchQuery::text("subscription"))
+            .expect("search by license type");
+        assert_eq!(
+            by_license.iter().map(|asset| asset.id).collect::<Vec<_>>(),
+            vec![licensed.id]
+        );
+        assert!(!by_license.iter().any(|asset| asset.id == other.id));
+    }
+
+    #[test]
+    fn search_text_matches_embedded_genre_and_title() {
+        let catalog_path = unique_catalog_path("search-by-embedded-metadata");
+        let catalog = Catalog::open(&catalog_path).expect("open catalog");
+        let library = catalog.create_library("Search", "/library").expect("library");
+        let asset = test_asset(&catalog, library.id, "track-01.wav", "hash-search-embedded");
+        let other = test_asset(&catalog, library.id, "track-02.wav", "hash-search-embedded-2");
+        catalog
+            .set_embedded_metadata(
+                asset.id,
+                Some("Neon Drift".to_string()),
+                Some("Synthwave".to_string()),
+                None,
+            )
+            .expect("embedded metadata");
+
+        let results = catalog
+            .search_assets(library.id, AssetSearchQuery::text("synthwave"))
+            .expect("search");
+
+        assert_eq!(
+            results.iter().map(|asset| asset.id).collect::<Vec<_>>(),
+            vec![asset.id]
+        );
+        assert!(!results.iter().any(|entry| entry.id == other.id));
     }
 
     #[test]
