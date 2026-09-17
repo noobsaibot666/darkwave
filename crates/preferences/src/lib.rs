@@ -128,6 +128,32 @@ pub struct AppPreferences {
     /// has ever been opened, or after the app is told to always ask.
     #[serde(default)]
     pub last_active_library_file_path: Option<String>,
+    /// "Remind me later" on the legacy-catalog migration screen, made
+    /// durable — without this the dismissal only lived in React state and
+    /// reset (re-nagging the user) on every relaunch, which is exactly the
+    /// "keeps asking me to convert my libraries" complaint this field
+    /// fixes. Does not weaken the safety gate on actually retiring the
+    /// legacy catalog (see `finish_legacy_migration`), which still requires
+    /// every library to be genuinely migrated — this only controls whether
+    /// the screen shows itself unprompted.
+    #[serde(default)]
+    pub legacy_migration_dismissed: bool,
+    /// Every legacy-catalog library id that has already been copied out to
+    /// its own `.darkwave` file, so the migration screen can tell a
+    /// genuinely-still-pending library apart from one that was already
+    /// migrated in an earlier session — without this, `migrationStatus` was
+    /// only ever session-local React state, so relaunching mid-migration
+    /// made every already-migrated library look pending again.
+    #[serde(default)]
+    pub migrated_legacy_libraries: Vec<MigratedLegacyLibraryEntry>,
+    /// Legacy-catalog library ids the user chose "Not now" for on the
+    /// migration screen. Purely cosmetic bookkeeping — it changes how a
+    /// library's row is presented (no nagging call-to-action) but never
+    /// counts toward the migration screen's Continue gate, since Continue
+    /// retires the shared legacy catalog file and a deferred library's data
+    /// still lives only there.
+    #[serde(default)]
+    pub deferred_legacy_library_ids: Vec<String>,
 }
 
 /// One entry in the recent-projects list shown on the first-run screen.
@@ -136,6 +162,17 @@ pub struct RecentLibraryFileEntry {
     pub path: String,
     pub name: String,
     pub last_opened_at_ms: u64,
+}
+
+/// Records that a legacy-catalog library (`legacy_library_id`, its id
+/// inside the old shared `catalog.sqlite`) now also exists as its own
+/// `.darkwave` file at `library_file_path` — see
+/// `AppPreferences::record_legacy_library_migrated`.
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+pub struct MigratedLegacyLibraryEntry {
+    pub legacy_library_id: String,
+    pub library_file_path: String,
+    pub name: String,
 }
 
 /// How many recent projects to remember — enough to be useful, small enough
@@ -187,6 +224,41 @@ impl AppPreferences {
         self.recent_library_files.retain(|entry| entry.path != path);
         if self.last_active_library_file_path.as_deref() == Some(path) {
             self.last_active_library_file_path = None;
+        }
+    }
+
+    /// Marks a legacy-catalog library as migrated to its own `.darkwave`
+    /// file, and clears any "Not now" deferral for it (an actual migration
+    /// supersedes a prior "not now" — see `set_legacy_library_deferred`).
+    /// Call this once per library, right after copying it out (see
+    /// `migrate_legacy_library`), so the migration screen still shows it as
+    /// done in a later session even though `migrationStatus` itself is only
+    /// ever session-local React state.
+    pub fn record_legacy_library_migrated(
+        &mut self,
+        legacy_library_id: impl AsRef<str>,
+        library_file_path: impl AsRef<str>,
+        name: impl AsRef<str>,
+    ) {
+        let legacy_library_id = legacy_library_id.as_ref().to_string();
+        self.migrated_legacy_libraries
+            .retain(|entry| entry.legacy_library_id != legacy_library_id);
+        self.migrated_legacy_libraries.push(MigratedLegacyLibraryEntry {
+            legacy_library_id: legacy_library_id.clone(),
+            library_file_path: library_file_path.as_ref().to_string(),
+            name: name.as_ref().to_string(),
+        });
+        self.deferred_legacy_library_ids.retain(|id| *id != legacy_library_id);
+    }
+
+    /// Sets or clears "Not now" for one legacy-catalog library on the
+    /// migration screen — see `deferred_legacy_library_ids`'s doc comment
+    /// for why this never affects the Continue/finish gate.
+    pub fn set_legacy_library_deferred(&mut self, legacy_library_id: impl AsRef<str>, deferred: bool) {
+        let legacy_library_id = legacy_library_id.as_ref().to_string();
+        self.deferred_legacy_library_ids.retain(|id| *id != legacy_library_id);
+        if deferred {
+            self.deferred_legacy_library_ids.push(legacy_library_id);
         }
     }
 }
@@ -352,6 +424,9 @@ impl AppPreferences {
             prevent_sleep_during_analysis: true,
             recent_library_files: Vec::new(),
             last_active_library_file_path: None,
+            legacy_migration_dismissed: false,
+            migrated_legacy_libraries: Vec::new(),
+            deferred_legacy_library_ids: Vec::new(),
         }
     }
 }
@@ -644,6 +719,41 @@ mod tests {
 
         assert!(preferences.recent_library_files.is_empty());
         assert_eq!(preferences.last_active_library_file_path, None);
+    }
+
+    #[test]
+    fn recording_a_migrated_legacy_library_clears_any_prior_deferral() {
+        let mut preferences = AppPreferences::default_for_editorial_audio();
+        preferences.set_legacy_library_deferred("legacy-1", true);
+        assert_eq!(preferences.deferred_legacy_library_ids, vec!["legacy-1".to_string()]);
+
+        preferences.record_legacy_library_migrated("legacy-1", "/a/One.darkwave", "One");
+
+        assert_eq!(preferences.migrated_legacy_libraries.len(), 1);
+        assert_eq!(preferences.migrated_legacy_libraries[0].legacy_library_id, "legacy-1");
+        assert_eq!(preferences.migrated_legacy_libraries[0].library_file_path, "/a/One.darkwave");
+        assert!(preferences.deferred_legacy_library_ids.is_empty());
+    }
+
+    #[test]
+    fn recording_the_same_legacy_library_migrated_twice_does_not_duplicate() {
+        let mut preferences = AppPreferences::default_for_editorial_audio();
+        preferences.record_legacy_library_migrated("legacy-1", "/a/One.darkwave", "One");
+        preferences.record_legacy_library_migrated("legacy-1", "/b/One-moved.darkwave", "One");
+
+        assert_eq!(preferences.migrated_legacy_libraries.len(), 1);
+        assert_eq!(preferences.migrated_legacy_libraries[0].library_file_path, "/b/One-moved.darkwave");
+    }
+
+    #[test]
+    fn deferring_a_legacy_library_toggles_membership_without_duplicating() {
+        let mut preferences = AppPreferences::default_for_editorial_audio();
+        preferences.set_legacy_library_deferred("legacy-1", true);
+        preferences.set_legacy_library_deferred("legacy-1", true);
+        assert_eq!(preferences.deferred_legacy_library_ids, vec!["legacy-1".to_string()]);
+
+        preferences.set_legacy_library_deferred("legacy-1", false);
+        assert!(preferences.deferred_legacy_library_ids.is_empty());
     }
 
     #[test]

@@ -62,6 +62,48 @@ auto-retry cap in `requeue_failed_jobs` checks against) — sharing one counter 
 a file to reappear" and "an actual attempt that failed" lets a merely-slow NAS mount burn through
 a file's real-failure retry budget before real processing ever runs once.
 
+## Canvas renders 0 rows despite tracks existing — check the viewport measurement, not the data
+
+This happened on 2026-09-17: after importing a batch of sounds, the browser (the main track list —
+"canvas" in commit messages/conversation) showed nothing at all, even though the import had fully
+succeeded. The asset rows were confirmed present and correctly saved by reading the `.darkwave`
+file directly with `sqlite3 <path>.darkwave "SELECT count(*) FROM assets WHERE library_id='<id>';"`
+— **do this first** whenever "tracks aren't showing up" is reported, to immediately split the
+problem into "backend/import actually failed" vs. "the frontend has the data but won't render it."
+The status bar under the browser (`apps/desktop/src-ui/src/App.tsx`, the `"{rows} rows"` /
+`"{rendered} rendered"` line) makes this same split visible at a glance: a real empty *filter*
+result shows `0 rows`; this bug class shows a nonzero row count with `0 rendered`.
+
+**Root cause:** the row-virtualization viewport height (`browserViewportHeight`) was tracked by a
+`ResizeObserver` set up inside a `useEffect(() => {...}, [])` — a one-time effect that captures
+whichever DOM node `browserScrollRef.current` happens to be at first mount and never re-runs. The
+browser `<section>` fully unmounts whenever the sidebar's Instrument Detection page is showing
+(`instrumentFilter?.instrumentPage`) and remounts as a **new** DOM node when the user navigates
+back to any other view. The one-time effect never reattaches to that new node, so the observer is
+left permanently watching a stale, detached element (WebKit fires one final resize event reporting
+0×0 when an observed node leaves the document) — `browserViewportHeight` gets stuck, and
+`computeVisibleRowRange` correctly computes zero visible rows for a viewport it now believes is
+0px tall, forever, for the rest of that session. This has nothing to do with import, search,
+filters, or the library-file model — any navigation that unmounts and remounts the browser section
+would trigger it.
+
+**The rule going forward:** never pair `useRef` + `useEffect(..., [])` to attach a `ResizeObserver`
+/ `IntersectionObserver` / any DOM measurement to a node that isn't guaranteed to share the owning
+component's mount lifecycle. Use a **callback ref** instead (see `attachBrowserScrollNode` in
+`App.tsx`) — it fires with the actual current node on every mount *and* unmount, so a disconnect
+followed by a fresh `observe()` happens automatically no matter what unmounted/remounted it or how
+many times.
+
+Two hardening layers now guard this specific spot against a recurrence from a *different* cause:
+
+1. The observer callback ignores a reported height of exactly `0` — a mounted, on-screen browser
+   section never legitimately has zero height in this layout (it's a flex-grow panel, never
+   `display:none`'d while mounted), so `0` is always a detach/measurement artifact, never a real
+   "the list is now 0px tall."
+2. A canary effect (`console.warn`, tagged `[browser]`, right after `browserVisibleRange` is
+   computed) fires whenever rows exist but the computed render range is empty — pointing straight
+   back at this section instead of leaving a silent blank canvas with no lead at all.
+
 ## Keep every dev machine on the same version — branch hygiene
 
 Development happens on more than one machine (this Mac, and a Windows machine — see

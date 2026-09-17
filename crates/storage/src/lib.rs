@@ -453,6 +453,32 @@ impl Catalog {
             .map_err(StorageError::from)
     }
 
+    /// Runs SQLite's own consistency check on this catalog file — the same
+    /// kind of "Verify database" action Capture One/Lightroom offer for
+    /// their own catalogs. Returns an empty list when healthy; a non-empty
+    /// result lists each problem SQLite found, which for a `.darkwave` file
+    /// means restoring from a backup (see `restore_library`/`.darkwavebak`)
+    /// rather than anything automatic — `PRAGMA integrity_check` reports
+    /// corruption, it doesn't fix it.
+    pub fn integrity_check(&self) -> Result<Vec<String>, StorageError> {
+        let mut statement = self.connection.prepare("PRAGMA integrity_check")?;
+        let rows: Vec<String> = statement
+            .query_map([], |row| row.get::<_, String>(0))?
+            .collect::<Result<Vec<_>, _>>()?;
+        Ok(if rows.len() == 1 && rows[0] == "ok" { Vec::new() } else { rows })
+    }
+
+    /// Reclaims space and defragments the catalog file — the equivalent of
+    /// Lightroom's "Optimize Catalog". Checkpoints the WAL first (same
+    /// mechanism `migrate_legacy_library` relies on before its own plain
+    /// file copy) so `VACUUM` operates against a fully up-to-date database
+    /// rather than one with recent writes still sitting only in `-wal`.
+    pub fn optimize(&self) -> Result<(), StorageError> {
+        self.checkpoint_wal()?;
+        self.connection.execute_batch("VACUUM")?;
+        Ok(())
+    }
+
     /// Opens (creating if needed) a standalone project file: a `.darkwave`
     /// catalog the user saves, moves, and reopens like any other document,
     /// as opposed to a row inside one shared app-data catalog. Each project
@@ -1218,9 +1244,13 @@ impl Catalog {
     }
 
     /// Requeues jobs abandoned after a failure, up to `max_attempts` tries
-    /// total. Run periodically by the standing background worker rather than
-    /// immediately on failure, so a transient error (e.g. a momentarily
-    /// unreachable NAS path) gets a real gap before retrying.
+    /// total. No longer called automatically by the standing background
+    /// worker (see the comment at its call site's former location in
+    /// `apps/desktop/src-tauri/src/lib.rs`'s watcher loop) — a deterministic
+    /// failure (e.g. an unsupported codec) can never succeed no matter how
+    /// many times it's requeued, so retrying a 'failed' job is now exclusively
+    /// user-initiated via `retry_failed_jobs_for_library`. Kept for tests and
+    /// as a building block, not wired into any periodic loop.
     pub fn requeue_failed_jobs(&self, max_attempts: i64) -> Result<usize, StorageError> {
         let changed = self.connection.execute(
             "UPDATE background_jobs SET state = 'pending', updated_at = ?1
@@ -2363,6 +2393,36 @@ impl Catalog {
         extensions.sort();
         extensions.dedup();
         Ok(extensions)
+    }
+
+    /// Asset id + last error message for every currently-failed job of one
+    /// kind — lets a failure summary point at the exact files (path shown by
+    /// the caller, which resolves `AssetRecord::path` against the library's
+    /// media_root) instead of only a count, so investigating a failure never
+    /// requires spelunking the catalog database by hand.
+    pub fn failed_job_details_for_library(
+        &self,
+        library_id: Uuid,
+        kind: JobKind,
+    ) -> Result<Vec<(Uuid, Option<String>)>, StorageError> {
+        let mut statement = self.connection.prepare(
+            "SELECT DISTINCT background_jobs.asset_id, background_jobs.error FROM background_jobs
+             INNER JOIN assets ON assets.id = background_jobs.asset_id
+             WHERE assets.library_id = ?1 AND background_jobs.kind = ?2 AND background_jobs.state = 'failed'",
+        )?;
+        let rows = statement
+            .query_map(params![library_id.to_string(), job_kind_to_db(&kind)], |row| {
+                Ok((row.get::<_, String>(0)?, row.get::<_, Option<String>>(1)?))
+            })?
+            .collect::<Result<Vec<_>, _>>()?;
+
+        rows.into_iter()
+            .map(|(asset_id, error)| {
+                Uuid::parse_str(&asset_id)
+                    .map(|id| (id, error))
+                    .map_err(|_| StorageError::InvalidInput("invalid asset id in background_jobs".to_string()))
+            })
+            .collect()
     }
 
     pub fn list_collections(
@@ -4060,6 +4120,28 @@ mod tests {
         fs::copy(&catalog_path, &copy_path).expect("copy main db file");
         let copied = Catalog::open(&copy_path).expect("open copied catalog");
         assert_eq!(copied.list_libraries().expect("list").len(), 1);
+    }
+
+    #[test]
+    fn integrity_check_reports_healthy_on_a_fresh_catalog() {
+        let catalog_path = unique_catalog_path("integrity-healthy");
+        let catalog = Catalog::open(&catalog_path).expect("open catalog");
+        catalog.create_library("Integrity Test", "").expect("create library");
+
+        assert_eq!(catalog.integrity_check().expect("integrity check"), Vec::<String>::new());
+    }
+
+    #[test]
+    fn optimize_leaves_the_catalog_readable_with_its_data_intact() {
+        let catalog_path = unique_catalog_path("optimize");
+        let catalog = Catalog::open(&catalog_path).expect("open catalog");
+        let library = catalog.create_library("Optimize Test", "").expect("create library");
+
+        catalog.optimize().expect("optimize");
+
+        let reopened = catalog.list_libraries().expect("list");
+        assert_eq!(reopened.len(), 1);
+        assert_eq!(reopened[0].id, library.id);
     }
 
     #[test]

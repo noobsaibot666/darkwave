@@ -398,7 +398,12 @@ type AppPreferences = {
   prevent_sleep_during_analysis: boolean;
   recent_library_files: RecentLibraryFileEntry[];
   last_active_library_file_path: string | null;
+  legacy_migration_dismissed: boolean;
+  migrated_legacy_libraries: MigratedLegacyLibraryEntry[];
+  deferred_legacy_library_ids: string[];
 };
+
+type MigratedLegacyLibraryEntry = { legacy_library_id: string; library_file_path: string; name: string };
 
 type SoundCategory = "music" | "voice" | "instrumental" | "sound_effect";
 
@@ -573,15 +578,30 @@ function describeJobCompletion(summary: JobCompletionSummary): { headline: strin
     };
   }
   const isAre = summary.failed === 1 ? "was" : "were";
+  const extensions = Array.from(
+    new Set(
+      summary.failedAssets
+        .map((asset) => {
+          const match = asset.name.match(/\.[^./\\]+$/);
+          return match ? match[0].toLowerCase() : null;
+        })
+        .filter((extension): extension is string => extension !== null)
+    )
+  ).sort();
   const what =
-    summary.failedExtensions.length === 1
-      ? `${summary.failed} ${summary.failedExtensions[0]} file${summary.failed === 1 ? "" : "s"} ${isAre}`
-      : summary.failedExtensions.length > 1
-        ? `${summary.failed} file${summary.failed === 1 ? "" : "s"} (${summary.failedExtensions.join(", ")}) ${isAre}`
+    extensions.length === 1
+      ? `${summary.failed} ${extensions[0]} file${summary.failed === 1 ? "" : "s"} ${isAre}`
+      : extensions.length > 1
+        ? `${summary.failed} file${summary.failed === 1 ? "" : "s"} (${extensions.join(", ")}) ${isAre}`
         : `${summary.failed} ${isAre}`;
+  // No claim of automatic retry here — a 'failed' job has already exhausted
+  // whatever silent retrying it was going to get (see the background
+  // worker's job-requeue comment in lib.rs); reaching this state means it
+  // stays put until Retry Now is clicked, deliberately, so a deterministic
+  // failure (e.g. an unsupported codec) doesn't loop forever unseen.
   return {
     headline,
-    detail: `${what} skipped, usually an unusual file encoding. They'll retry automatically for a while, or you can retry them now.`
+    detail: `${what} skipped, usually an unusual file encoding. See the files below, or click Retry Now to try again.`
   };
 }
 
@@ -727,12 +747,18 @@ type JobProgress = {
   failed: number;
   currentFile?: string;
 };
+type FailedJobAsset = {
+  asset_id: string;
+  name: string;
+  path: string;
+  error: string | null;
+};
 type JobCompletionSummary = {
   kind: string;
   label: string;
   completed: number;
   failed: number;
-  failedExtensions: string[];
+  failedAssets: FailedJobAsset[];
 };
 
 const JOB_KINDS: {
@@ -1169,13 +1195,14 @@ export function App() {
   // Library first-run screen (which only applies when `libraries` is also
   // empty).
   const [activeLibraryFilePath, setActiveLibraryFilePath] = useState<string | null | undefined>(undefined);
-  // "Remind me later" on the migration screen — a session-only dismissal
-  // (not persisted), so the app remains fully usable against the legacy
-  // catalog for the rest of this run, exactly as it already was before this
-  // feature existed. The prompt reappears next launch since nothing was
-  // actually migrated.
+  // "Remind me later" on the migration screen. Initialized from persisted
+  // preferences once they load (see the effect near where `preferences` is
+  // fetched) rather than defaulting to false forever — a plain useState
+  // here previously reset this to unset on every relaunch regardless of
+  // what the user chose, which is what made the migration screen reappear
+  // every launch even after being dismissed.
   const [migrationDismissed, setMigrationDismissed] = useState(false);
-  type MigrationRowStatus = "pending" | "migrating" | "done" | "failed";
+  type MigrationRowStatus = "pending" | "migrating" | "done" | "failed" | "deferred";
   const [migrationStatus, setMigrationStatus] = useState<Record<string, MigrationRowStatus>>({});
   const [migrationErrors, setMigrationErrors] = useState<Record<string, string>>({});
   const [migrationBusy, setMigrationBusy] = useState(false);
@@ -1214,6 +1241,19 @@ export function App() {
     importToastTimeoutRef.current = window.setTimeout(() => setImportToast(null), 3600);
   }, []);
   const [activeFilter, setActiveFilter] = useState<ActiveFilter>("all");
+  // The only correct way to change which library is active. A bare
+  // setActiveLibraryId left searchQuery/activeFilter/rangeFilters pointing
+  // at the previous library's search text and tag/project ids —
+  // refreshAssets threads those straight through regardless of which
+  // library they came from, so assets_for_tag/assets_in_collection would
+  // either error or legitimately return zero rows and the asset list would
+  // silently go empty ("tracks not showing up") right after switching.
+  const switchActiveLibrary = useCallback((id: string | null) => {
+    setSearchQuery("");
+    setActiveFilter("all");
+    setRangeFilters({});
+    setActiveLibraryId(id);
+  }, []);
   const [sidebarCollapsed, setSidebarCollapsed] = useState(false);
   const [inspectorCollapsed, setInspectorCollapsed] = useState(false);
   const [settingsOpen, setSettingsOpen] = useState(false);
@@ -1530,18 +1570,41 @@ export function App() {
   }, []);
 
   const browserScrollRef = useRef<HTMLElement | null>(null);
+  const browserResizeObserverRef = useRef<ResizeObserver | null>(null);
   const [browserScrollTop, setBrowserScrollTop] = useState(0);
   const [browserViewportHeight, setBrowserViewportHeight] = useState(600);
 
-  useEffect(() => {
-    const node = browserScrollRef.current;
+  // A callback ref, not a one-time effect keyed on `[]` — the browser
+  // <section> below unmounts entirely whenever the Instrument Detection
+  // page is showing (`instrumentFilter?.instrumentPage`) and remounts as a
+  // brand new DOM node when the user navigates back to any other view. A
+  // `useEffect(..., [])` only ever observes whichever node happened to
+  // exist at the very first mount — once the section unmounts, that node
+  // is detached and never resizes again, so `browserViewportHeight` gets
+  // stuck (WebKit reports a final 0-height resize on detach), which zeroes
+  // out computeVisibleRowRange and renders 0 rows forever after, even
+  // though the asset list itself is populated correctly. A callback ref
+  // fires on every mount/unmount with the actual current node, so it
+  // always disconnects the stale observer and attaches a fresh one.
+  const attachBrowserScrollNode = useCallback((node: HTMLElement | null) => {
+    browserResizeObserverRef.current?.disconnect();
+    browserResizeObserverRef.current = null;
+    browserScrollRef.current = node;
     if (!node || typeof ResizeObserver === "undefined") return;
     const observer = new ResizeObserver((entries) => {
       const entry = entries[0];
-      if (entry) setBrowserViewportHeight(entry.contentRect.height);
+      // Defense in depth, not just the reattachment above: a mounted,
+      // on-screen browser section never legitimately has zero height in
+      // this layout (it's a flex-grow panel, never display:none'd while
+      // mounted) — a 0 here is always a detach/measurement artifact (e.g.
+      // WebKit's final resize event when an observed node leaves the
+      // document), never a real "the list is now 0px tall." Ignoring it
+      // means even an unanticipated future source of a stray zero reading
+      // can't wedge the row list into rendering nothing again.
+      if (entry && entry.contentRect.height > 0) setBrowserViewportHeight(entry.contentRect.height);
     });
     observer.observe(node);
-    return () => observer.disconnect();
+    browserResizeObserverRef.current = observer;
   }, []);
 
   const browserRowHeightPx = ROW_HEIGHT_PX_BY_DENSITY[preferences?.browser_density ?? "Comfortable"] ?? 60;
@@ -1557,6 +1620,25 @@ export function App() {
       ),
     [visibleAssets.length, browserRowHeightPx, browserViewportHeight, browserScrollTop]
   );
+
+  // Canary for the whole "tracks exist but the canvas shows nothing" bug
+  // class (see CLAUDE.md's "Canvas renders 0 rows..." section) — rows
+  // existing but zero of them landing in the rendered range is never
+  // legitimate on its own (a real empty *filter* result means
+  // visibleAssets.length is already 0, which isn't this condition), so if
+  // this ever fires again from a cause other than the one already fixed
+  // (a stale ResizeObserver on a remounted browser section), this is the
+  // first thing that should show up in devtools instead of a silent blank
+  // canvas with no lead at all.
+  useEffect(() => {
+    if (visibleAssets.length > 0 && browserVisibleRange.endExclusive === browserVisibleRange.start) {
+      console.warn(
+        `[browser] ${visibleAssets.length} row(s) exist but 0 are rendered — ` +
+          `viewportHeight=${browserViewportHeight}px, rowHeight=${browserRowHeightPx}px, scrollTop=${browserScrollTop}px. ` +
+          "See CLAUDE.md: 'Canvas renders 0 rows despite tracks existing.'"
+      );
+    }
+  }, [visibleAssets.length, browserVisibleRange, browserViewportHeight, browserRowHeightPx, browserScrollTop]);
 
   useEffect(() => {
     let cancelled = false;
@@ -1772,9 +1854,9 @@ export function App() {
               const completedDelta = Math.max(0, finalStatus.completed - completedBefore);
               const failedDelta = Math.max(0, finalStatus.failed - failedBefore);
               if (completedDelta === 0 && failedDelta === 0) return;
-              const failedExtensions =
+              const failedAssets =
                 failedDelta > 0
-                  ? await invoke<string[]>("failed_job_extensions", { libraryId, kind: config.kind }).catch(() => [])
+                  ? await invoke<FailedJobAsset[]>("failed_job_assets", { libraryId, kind: config.kind }).catch(() => [])
                   : [];
               setJobCompletionSummaries((previous) => ({
                 ...previous,
@@ -1783,7 +1865,7 @@ export function App() {
                   label: config.label,
                   completed: completedDelta,
                   failed: failedDelta,
-                  failedExtensions
+                  failedAssets
                 }
               }));
             })();
@@ -1939,6 +2021,35 @@ export function App() {
       .catch(() => invoke<AppPreferences>("default_preferences").then(setPreferences));
   }, []);
 
+  // Seeds the migration screen's durable state from preferences once both
+  // are loaded: which legacy libraries are already migrated (so a relaunch
+  // mid-migration doesn't offer to migrate them again) and which were set
+  // to "Not now" (so their row doesn't nag). Merges rather than overwrites
+  // — a library already tracked this session (e.g. mid-"migrating") is left
+  // alone, and "Remind me later" now reads/writes here too, so it actually
+  // stays dismissed across relaunches instead of resetting every time.
+  useEffect(() => {
+    if (!preferences || libraries.length === 0) return;
+    setMigrationDismissed(preferences.legacy_migration_dismissed);
+    const migratedIds = new Set(preferences.migrated_legacy_libraries.map((entry) => entry.legacy_library_id));
+    const deferredIds = new Set(preferences.deferred_legacy_library_ids);
+    setMigrationStatus((previous) => {
+      const next = { ...previous };
+      let changed = false;
+      for (const library of libraries) {
+        if (next[library.id]) continue;
+        if (migratedIds.has(library.id)) {
+          next[library.id] = "done";
+          changed = true;
+        } else if (deferredIds.has(library.id)) {
+          next[library.id] = "deferred";
+          changed = true;
+        }
+      }
+      return changed ? next : previous;
+    });
+  }, [preferences, libraries]);
+
   useEffect(() => {
     invoke<number>("trash_retention_policy_days").then(setTrashRetentionDays).catch(() => {});
   }, []);
@@ -1947,7 +2058,7 @@ export function App() {
     invoke<LibraryRecord[]>("list_libraries")
       .then((loaded) => {
         setLibraries(loaded);
-        if (loaded.length > 0) setActiveLibraryId(loaded[0].id);
+        if (loaded.length > 0) switchActiveLibrary(loaded[0].id);
       })
       .catch(() => setLibraries([]))
       .finally(() => setLibrariesLoaded(true));
@@ -2008,9 +2119,18 @@ export function App() {
     if (importFolderScannedRef.current.has(activeLibraryId)) return;
     importFolderScannedRef.current.add(activeLibraryId);
 
+    // Labeled distinctly from "the library is loading" — opening a library
+    // itself is a pure DB read (list_assets shows tracks immediately,
+    // independent of this), but without a label here this folder walk was
+    // easy to mistake for the library rescanning everything on every open,
+    // when it's actually just this one configured import folder.
+    setImportStatus("Checking import folder for new sounds…");
     invoke<ImportFolderResult>("scan_import_folder", { libraryId: activeLibraryId })
       .then((result) => {
-        if (result.imported.length === 0) return;
+        if (result.imported.length === 0) {
+          setImportStatus(null);
+          return;
+        }
         runJobDrain(activeLibraryId);
         refreshAssets(activeLibraryId, searchQuery, activeFilter);
         refreshMaintenance(activeLibraryId);
@@ -2018,7 +2138,7 @@ export function App() {
           `Imported ${result.imported.length} new sound${result.imported.length === 1 ? "" : "s"} from the import folder`
         );
       })
-      .catch(() => {});
+      .catch(() => setImportStatus(null));
   }, [activeLibraryId, activeLibrary?.import_root, runJobDrain, refreshAssets, refreshMaintenance, searchQuery, activeFilter]);
 
   useEffect(() => {
@@ -3204,7 +3324,7 @@ export function App() {
       setBackupStatus(`Restored "${library.name}" from backup`);
       setSelectedAssetId(null);
       setLibraries([library]);
-      setActiveLibraryId(library.id);
+      switchActiveLibrary(library.id);
     } catch (error) {
       setBackupStatus(`Restore failed: ${String(error)}`);
     }
@@ -3221,6 +3341,35 @@ export function App() {
     invoke<number>("purge_library_cache", { libraryId: library.id })
       .then((removed) => setLibraryAdminStatus(`Cleared ${removed} cached file${removed === 1 ? "" : "s"} for ${library.name}`))
       .catch((error) => setLibraryAdminStatus(`Cache clean failed: ${String(error)}`));
+  }, []);
+
+  // "Check & Repair" — runs SQLite's own PRAGMA integrity_check against the
+  // library's .darkwave file (see storage::Catalog::integrity_check). A
+  // clean result is just reassurance; a non-empty one means real
+  // corruption, which this can only report — the fix is restoring from a
+  // .darkwavebak backup, not anything automatic.
+  const handleCheckLibraryIntegrity = useCallback((library: LibraryRecord) => {
+    setLibraryAdminStatus(`Checking ${library.name}…`);
+    invoke<string[]>("check_library_integrity", { libraryId: library.id })
+      .then((problems) => {
+        setLibraryAdminStatus(
+          problems.length === 0
+            ? `${library.name} passed its integrity check`
+            : `${library.name} failed its integrity check: ${problems.join("; ")} — restore from a backup rather than continuing to use this file`
+        );
+      })
+      .catch((error) => setLibraryAdminStatus(`Integrity check failed: ${String(error)}`));
+  }, []);
+
+  // "Optimize" — checkpoints the WAL and runs VACUUM (see
+  // storage::Catalog::optimize), the same idea as Lightroom's "Optimize
+  // Catalog". Reclaims space and defragments; not a fix for anything, just
+  // routine housekeeping.
+  const handleOptimizeLibrary = useCallback((library: LibraryRecord) => {
+    setLibraryAdminStatus(`Optimizing ${library.name}…`);
+    invoke("optimize_library", { libraryId: library.id })
+      .then(() => setLibraryAdminStatus(`Optimized ${library.name}`))
+      .catch((error) => setLibraryAdminStatus(`Optimize failed: ${String(error)}`));
   }, []);
 
   const handleEmptyLibraryTrash = useCallback(
@@ -3254,7 +3403,7 @@ export function App() {
         const loaded = await invoke<LibraryRecord[]>("list_libraries");
         setLibraries(loaded);
         if (library.id === activeLibraryId) {
-          setActiveLibraryId(loaded.length > 0 ? loaded[0].id : null);
+          switchActiveLibrary(loaded.length > 0 ? loaded[0].id : null);
         }
       } catch (error) {
         setLibraryAdminStatus(`Delete failed: ${String(error)}`);
@@ -3271,7 +3420,7 @@ export function App() {
       mediaRoot: ""
     });
     setLibraries((previous) => [...previous, library]);
-    setActiveLibraryId(library.id);
+    switchActiveLibrary(library.id);
     setLibraryName("");
     setCreateLibraryModalOpen(false);
   };
@@ -3282,7 +3431,7 @@ export function App() {
   // folder-configuration steps that follow library creation.
   const finishOnboardingWithLibrary = useCallback((library: LibraryRecord, libraryFilePath: string) => {
     setLibraries([library]);
-    setActiveLibraryId(library.id);
+    switchActiveLibrary(library.id);
     setActiveLibraryFilePath(libraryFilePath);
     setOnboardingLibrary(null);
     setOnboardingLibraryFilePath("");
@@ -3416,6 +3565,11 @@ export function App() {
     try {
       await invoke("migrate_legacy_library", { libraryId: library.id, libraryFilePath: savePath });
       setMigrationStatus((previous) => ({ ...previous, [library.id]: "done" }));
+      // The backend just recorded this id as migrated (and cleared any
+      // "Not now" deferral for it) in preferences.json — resync the local
+      // copy so a relaunch this same session or the "Not now" row styling
+      // reflects it immediately, without needing a full preferences reload.
+      invoke<AppPreferences>("load_app_preferences").then(setPreferences).catch(() => {});
       if (!tolerant) {
         setMigrationErrors((previous) => ({
           ...previous,
@@ -3428,11 +3582,47 @@ export function App() {
     }
   }, []);
 
-  // Only enabled once every legacy library shows "done" — closes the
-  // legacy catalog for good (renamed aside, never opened again) and lands
-  // back on the first-run screen, now with the migrated libraries in
-  // Recents so the user's next click opens one of them.
+  // "Not now" on one legacy library's row: durably remembers the choice
+  // (via preferences, same as handleDismissMigration) so this specific
+  // library stops looking like it needs action on future launches, without
+  // pretending it's actually migrated — it stays in the legacy catalog and
+  // Continue below stays correctly gated on every library being truly
+  // "done", since Continue retires that shared catalog file for good.
+  const handleDeferMigration = useCallback((library: LibraryRecord) => {
+    setMigrationStatus((previous) => ({ ...previous, [library.id]: "deferred" }));
+    setPreferences((previous) => {
+      if (!previous) return previous;
+      const next = {
+        ...previous,
+        deferred_legacy_library_ids: [
+          ...previous.deferred_legacy_library_ids.filter((id) => id !== library.id),
+          library.id
+        ]
+      };
+      invoke("save_app_preferences", { preferences: next }).catch(() => {});
+      return next;
+    });
+  }, []);
+
+  // Only enabled once every legacy library shows "done". Closes the legacy
+  // catalog for good (renamed aside, never opened again). When the legacy
+  // catalog held exactly one library, that's an unambiguous "the user just
+  // finished migrating the one thing they had" — open it directly instead
+  // of making them click it again from the first-run screen's Recents list.
+  // With more than one, which to open isn't obvious, so this falls back to
+  // the first-run screen exactly as before (it already lists all of them in
+  // Recents).
   const handleFinishMigration = useCallback(async () => {
+    // Captured before finish_legacy_migration clears migrationStatus below
+    // — every entry in `libraries` is already "done" by construction
+    // (that's what enables the Continue button in the first place), so
+    // this is really just "how many libraries did the legacy catalog have."
+    const singleMigratedPath =
+      libraries.length === 1
+        ? preferences?.migrated_legacy_libraries.find((entry) => entry.legacy_library_id === libraries[0].id)
+            ?.library_file_path
+        : undefined;
+
     setMigrationBusy(true);
     try {
       await invoke("finish_legacy_migration");
@@ -3449,22 +3639,54 @@ export function App() {
       // The legacy catalog these referred to is gone (retired by
       // finish_legacy_migration) — clear rather than leave stale ids
       // dangling until a later open/create overwrites them.
-      setActiveLibraryId(null);
+      switchActiveLibrary(null);
       setSelectedAssetId(null);
+
+      if (singleMigratedPath) {
+        try {
+          const library = await invoke<LibraryRecord>("open_library_file", { libraryFilePath: singleMigratedPath });
+          finishOnboardingWithLibrary(library, singleMigratedPath);
+        } catch {
+          // Leave the user on the first-run screen (Recents already lists
+          // it) rather than failing the whole migration over a follow-up
+          // open that didn't work.
+        }
+      }
     } catch (error) {
       setOnboardingError(String(error));
     } finally {
       setMigrationBusy(false);
     }
-  }, []);
+  }, [libraries, preferences, finishOnboardingWithLibrary]);
 
-  // "Remind me later" — a session-only dismissal, not a backend call: the
-  // legacy catalog is already the live one (see the Rust bootstrap's
-  // fallback order), so the app is already fully usable exactly as it was
-  // before this feature existed. Nothing was migrated, so the prompt
-  // reappears next launch.
+  // "Remind me later" — the legacy catalog is already the live one (see the
+  // Rust bootstrap's fallback order), so the app is already fully usable
+  // exactly as it was before this feature existed; nothing is migrated by
+  // dismissing. Persisted via preferences (not just local state) so this
+  // choice actually sticks across relaunches instead of re-nagging every
+  // launch — see the migrationDismissed/migrationStatus seeding effect.
   const handleDismissMigration = useCallback(() => {
     setMigrationDismissed(true);
+    setPreferences((previous) => {
+      if (!previous) return previous;
+      const next = { ...previous, legacy_migration_dismissed: true };
+      invoke("save_app_preferences", { preferences: next }).catch(() => {});
+      return next;
+    });
+  }, []);
+
+  // Reopens the migration screen from Settings — the only way back in once
+  // "Remind me later" is persisted (see handleDismissMigration): dismissal
+  // now actually sticks across relaunches, so there has to be a durable way
+  // to resume rather than waiting for the screen to reappear on its own.
+  const handleReopenMigration = useCallback(() => {
+    setMigrationDismissed(false);
+    setPreferences((previous) => {
+      if (!previous) return previous;
+      const next = { ...previous, legacy_migration_dismissed: false };
+      invoke("save_app_preferences", { preferences: next }).catch(() => {});
+      return next;
+    });
   }, []);
 
   const handleOnboardingChooseMediaRoot = useCallback(async () => {
@@ -3558,7 +3780,7 @@ export function App() {
       // folder to configure any more (that's what the old, now-removed
       // import-root wizard step asked for), so this step finishes the
       // wizard directly instead of advancing to another one.
-      setActiveLibraryId(updated.id);
+      switchActiveLibrary(updated.id);
       setOnboardingLibrary(null);
       setOnboardingLibraryFilePath("");
       setOnboardingStep(0);
@@ -4192,6 +4414,23 @@ export function App() {
     };
   }, [finishOnboardingWithLibrary]);
 
+  // The failure counterpart to library-file-opened above (a Finder
+  // double-click or a second launch pointed at a moved/deleted/corrupt
+  // `.darkwave` file) — previously this case was dropped entirely on the
+  // Rust side with no signal to the frontend at all, so nothing happened
+  // and there was no way to tell the attempt had even occurred.
+  useEffect(() => {
+    const unlistenLibraryFileOpenFailed = listen<{ path: string; error: string }>(
+      "library-file-open-failed",
+      (event) => {
+        showImportToast(`Couldn't open library at ${event.payload.path}: ${event.payload.error}`);
+      }
+    );
+    return () => {
+      unlistenLibraryFileOpenFailed.then((dispose) => dispose());
+    };
+  }, [showImportToast]);
+
   // process_audio_analysis_jobs/process_waveform_jobs/process_instrument_jobs
   // each claim and fully process a batch per invoke — real per-file work,
   // easily minutes for a batch — so without this, a progress bar only
@@ -4576,13 +4815,27 @@ export function App() {
                   {status === "done" ? (
                     <span className="settings-hint">Migrated</span>
                   ) : (
-                    <button
-                      type="button"
-                      onClick={() => handleMigrateLibrary(library)}
-                      disabled={status === "migrating"}
-                    >
-                      {status === "migrating" ? "Saving…" : status === "failed" ? "Retry…" : "Choose location…"}
-                    </button>
+                    <>
+                      <button
+                        type="button"
+                        onClick={() => handleMigrateLibrary(library)}
+                        disabled={status === "migrating"}
+                      >
+                        {status === "migrating"
+                          ? "Saving…"
+                          : status === "failed"
+                            ? "Retry…"
+                            : status === "deferred"
+                              ? "Migrate…"
+                              : "Choose location…"}
+                      </button>
+                      {status !== "migrating" && status !== "deferred" ? (
+                        <button type="button" className="text-button" onClick={() => handleDeferMigration(library)}>
+                          Not now
+                        </button>
+                      ) : null}
+                      {status === "deferred" ? <span className="settings-hint">Not now</span> : null}
+                    </>
                   )}
                   {migrationErrors[library.id] ? (
                     <p className="settings-hint">{migrationErrors[library.id]}</p>
@@ -4856,7 +5109,7 @@ export function App() {
               <select
                 className="library-select"
                 value={activeLibraryId ?? ""}
-                onChange={(event) => setActiveLibraryId(event.target.value)}
+                onChange={(event) => switchActiveLibrary(event.target.value)}
               >
                 {libraries.map((library) => (
                   <option key={library.id} value={library.id}>
@@ -5686,7 +5939,7 @@ export function App() {
           className="browser"
           aria-label="Sound browser"
           data-density={preferences?.browser_density ?? "Comfortable"}
-          ref={browserScrollRef}
+          ref={attachBrowserScrollNode}
           onScroll={(event) => setBrowserScrollTop(event.currentTarget.scrollTop)}
         >
           {instrumentFilter ? (
@@ -6940,6 +7193,23 @@ export function App() {
                       </p>
                     </div>
 
+                    {activeLibraryFilePath === null &&
+                    libraries.some((library) => migrationStatus[library.id] !== "done") ? (
+                      <div className="settings-section">
+                        <h2>Legacy library migration</h2>
+                        <p className="settings-hint">
+                          {libraries.filter((library) => migrationStatus[library.id] !== "done").length} librar
+                          {libraries.filter((library) => migrationStatus[library.id] !== "done").length === 1
+                            ? "y is"
+                            : "ies are"}{" "}
+                          still in the old shared catalog, not yet its own <code>.darkwave</code> file.
+                        </p>
+                        <button type="button" className="text-button" onClick={handleReopenMigration}>
+                          Continue migration…
+                        </button>
+                      </div>
+                    ) : null}
+
                     <div className="settings-section">
                       <div className="settings-section-head">
                         <h2>Manage Libraries</h2>
@@ -6971,6 +7241,16 @@ export function App() {
                               </button>
                               <button type="button" className="text-button" onClick={() => handleEmptyLibraryTrash(library)}>
                                 Empty Trash
+                              </button>
+                              <button
+                                type="button"
+                                className="text-button"
+                                onClick={() => handleCheckLibraryIntegrity(library)}
+                              >
+                                Check & Repair
+                              </button>
+                              <button type="button" className="text-button" onClick={() => handleOptimizeLibrary(library)}>
+                                Optimize
                               </button>
                               <button
                                 type="button"
@@ -7570,6 +7850,20 @@ export function App() {
                           <span className="job-progress-label">{headline}</span>
                         </div>
                         {detail ? <div className="status-line">{detail}</div> : null}
+                        {summary.failedAssets.length > 0 ? (
+                          <ul className="job-failed-file-list">
+                            {summary.failedAssets.map((asset) => (
+                              <li
+                                key={asset.asset_id}
+                                className="job-failed-file"
+                                title={asset.error ? `${asset.path}\n\n${asset.error}` : asset.path}
+                              >
+                                <span className="job-failed-file-name">{asset.name}</span>
+                                <span className="job-failed-file-path">{asset.path}</span>
+                              </li>
+                            ))}
+                          </ul>
+                        ) : null}
                       </div>
                       {summary.failed > 0 ? (
                         <button type="button" className="text-button" onClick={() => handleRetryFailedJobs(summary.kind)}>

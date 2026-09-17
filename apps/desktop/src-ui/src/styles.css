@@ -1032,6 +1032,54 @@ button.panel-handle-right:active:not(:disabled) {
   white-space: nowrap;
 }
 
+/* Per-file breakdown under a failed batch's summary — the whole point is
+   letting someone investigate without going to the database by hand, so
+   each row names the file *and* shows its full path (truncated with an
+   ellipsis; the row's title attribute carries the untruncated path plus
+   the recorded error, so hovering gets the rest). min-width: 0 on both the
+   list and the row is required, not decorative — without it a long
+   unbroken path forces this list wider than its fixed-width modal ancestor
+   instead of shrinking to fit (the same grid/flex "auto" blowout that hit
+   the New Project modal's export-folder rows). */
+.job-failed-file-list {
+  display: flex;
+  flex-direction: column;
+  gap: 2px;
+  min-width: 0;
+  margin: 6px 0 0;
+  padding: 0;
+  list-style: none;
+  max-height: 96px;
+  overflow-y: auto;
+}
+
+.job-failed-file {
+  display: flex;
+  align-items: baseline;
+  gap: 6px;
+  min-width: 0;
+  font-size: 11px;
+}
+
+.job-failed-file-name {
+  flex: 0 0 auto;
+  max-width: 45%;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  color: var(--text-primary);
+  font-weight: 600;
+}
+
+.job-failed-file-path {
+  flex: 1 1 auto;
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  color: var(--text-muted);
+}
+
 /* A finished batch's summary row — same shape as an in-progress row, but
    a quieter background (no pulse, nothing left to show progress on) and a
    warning tint when something in the batch failed. Tint, border, and icon
@@ -2088,6 +2136,7 @@ h2 {
 .maintenance-list {
   display: grid;
   gap: 7px;
+  min-width: 0;
 }
 
 .setting-row,
@@ -2388,6 +2437,7 @@ dd {
   display: flex;
   flex-direction: column;
   gap: 6px;
+  min-width: 0;
   font-size: 12px;
   color: var(--text-secondary);
 }
@@ -2491,6 +2541,7 @@ dd {
   display: flex;
   flex-direction: column;
   gap: 6px;
+  min-width: 0;
   margin: 0;
   padding: 0;
   list-style: none;

@@ -1115,6 +1115,19 @@ fn swap_active_catalog(
     library_file_path: &str,
     library_name: &str,
 ) -> Result<(), String> {
+    // Persist first, swap the live catalog only once that succeeds — the
+    // other order left a window where a failed preferences write returned
+    // Err to the frontend (which then leaves its own activeLibraryId/
+    // activeLibraryFilePath state untouched) while the backend had already
+    // swapped to the new catalog, desyncing frontend and backend state with
+    // no way to roll back.
+    let preferences_file = preferences_path(app)?;
+    let mut prefs = preferences::load_preferences(&preferences_file)
+        .map_err(|error| format!("{error:?}"))?;
+    prefs.record_library_file_opened(library_file_path, library_name, current_time_ms());
+    preferences::save_preferences(&preferences_file, &prefs)
+        .map_err(|error| format!("{error:?}"))?;
+
     {
         let mut guard = state.0.lock().expect("catalog mutex poisoned");
         drop(std::mem::replace(&mut *guard, catalog));
@@ -1123,13 +1136,6 @@ fn swap_active_catalog(
         .0
         .lock()
         .expect("active library file mutex poisoned") = Some(library_file_path.to_string());
-
-    let preferences_file = preferences_path(app)?;
-    let mut prefs = preferences::load_preferences(&preferences_file)
-        .map_err(|error| format!("{error:?}"))?;
-    prefs.record_library_file_opened(library_file_path, library_name, current_time_ms());
-    preferences::save_preferences(&preferences_file, &prefs)
-        .map_err(|error| format!("{error:?}"))?;
 
     Ok(())
 }
@@ -1193,12 +1199,24 @@ fn open_library_file_and_notify_frontend(app: &tauri::AppHandle, library_file_pa
             Ok(library)
         });
 
-    if let Ok(library) = opened {
-        use tauri::Emitter;
-        let _ = app.emit(
-            "library-file-opened",
-            serde_json::json!({ "library": library, "path": library_file_path }),
-        );
+    use tauri::Emitter;
+    match opened {
+        Ok(library) => {
+            let _ = app.emit(
+                "library-file-opened",
+                serde_json::json!({ "library": library, "path": library_file_path }),
+            );
+        }
+        // Previously silently dropped: a double-click or second-launch open
+        // that failed (moved/deleted file, corrupt catalog, permissions)
+        // left the app exactly as it was with no indication anything was
+        // even attempted. Surface it so the frontend can show an error.
+        Err(error) => {
+            let _ = app.emit(
+                "library-file-open-failed",
+                serde_json::json!({ "path": library_file_path, "error": error }),
+            );
+        }
     }
 }
 
@@ -1289,6 +1307,11 @@ fn migrate_legacy_library(
     let mut prefs = preferences::load_preferences(&preferences_file)
         .map_err(|error| format!("{error:?}"))?;
     prefs.add_recent_library_file(&library_file_path, &library.name, current_time_ms());
+    // Durable record that this legacy library id is done — without this the
+    // migration screen's status is only ever session-local React state, so
+    // relaunching mid-migration made an already-migrated library look
+    // pending again and re-offered "Choose location…" for it.
+    prefs.record_legacy_library_migrated(library_id.to_string(), &library_file_path, &library.name);
     preferences::save_preferences(&preferences_file, &prefs)
         .map_err(|error| format!("{error:?}"))?;
 
@@ -1371,6 +1394,46 @@ fn purge_library_cache(
     }
 
     Ok(removed)
+}
+
+/// Runs SQLite's own consistency check against the currently open catalog
+/// file (see `storage::Catalog::integrity_check`) — the "Check & Repair"
+/// action's check half. `library_id` only confirms the library is one this
+/// catalog actually knows about; the check itself runs against the whole
+/// file, same as `optimize_library` below, since a `.darkwave` file holds
+/// exactly one library in normal use. An empty result means healthy;
+/// anything else is a case for restoring from a `.darkwavebak` backup, not
+/// something this command can fix on its own.
+// (async): PRAGMA integrity_check walks every page of the database file,
+// real I/O that can take a while on a large catalog — same reasoning as
+// delete_library below for not running this on Tauri's main thread.
+#[tauri::command(async)]
+fn check_library_integrity(state: tauri::State<CatalogState>, library_id: String) -> Result<Vec<String>, String> {
+    let library_id = parse_uuid_field(&library_id, "library id")?;
+    let catalog = state.0.lock().expect("catalog mutex poisoned");
+    catalog
+        .get_library(library_id)
+        .map_err(storage_error_message)?
+        .ok_or_else(|| "library not found".to_string())?;
+    catalog.integrity_check().map_err(storage_error_message)
+}
+
+/// Reclaims space and defragments the currently open catalog file (see
+/// `storage::Catalog::optimize`) — the equivalent of Lightroom's "Optimize
+/// Catalog". Same one-library-per-file reasoning as `check_library_integrity`
+/// for why `library_id` only gates access rather than scoping the operation.
+// (async): VACUUM rewrites the entire database file — real, potentially
+// slow I/O, same reasoning as delete_library below for not running this on
+// Tauri's main thread.
+#[tauri::command(async)]
+fn optimize_library(state: tauri::State<CatalogState>, library_id: String) -> Result<(), String> {
+    let library_id = parse_uuid_field(&library_id, "library id")?;
+    let catalog = state.0.lock().expect("catalog mutex poisoned");
+    catalog
+        .get_library(library_id)
+        .map_err(storage_error_message)?
+        .ok_or_else(|| "library not found".to_string())?;
+    catalog.optimize().map_err(storage_error_message)
 }
 
 /// Permanently removes every currently-trashed asset in this library from
@@ -3172,22 +3235,48 @@ fn retry_failed_jobs(
         .map_err(storage_error_message)
 }
 
-/// Distinct file extensions currently failing for one library + kind — see
-/// `Catalog::failed_job_extensions_for_library`. Queried once when building
-/// a completion summary, not on every job_status poll, since it's only
-/// useful once there's actually something to report.
+#[derive(Debug, serde::Serialize)]
+struct FailedJobAsset {
+    asset_id: String,
+    name: String,
+    path: String,
+    error: Option<String>,
+}
+
+/// Name, resolved absolute path, and last error message for every
+/// currently-failed job of one kind — lets the Background Activity panel
+/// point at the exact files (and derive per-extension counts client-side)
+/// so a failure can actually be investigated, instead of only reporting a
+/// count. Supersedes the old extensions-only `failed_job_extensions`
+/// command. Queried once when building a completion summary, not on every
+/// job_status poll, since it's only useful once there's actually something
+/// to report.
 #[tauri::command]
-fn failed_job_extensions(
+fn failed_job_assets(
     state: tauri::State<CatalogState>,
     library_id: String,
     kind: String,
-) -> Result<Vec<String>, String> {
+) -> Result<Vec<FailedJobAsset>, String> {
     let library_id = parse_uuid_field(&library_id, "library id")?;
     let job_kind = parse_job_kind_field(&kind)?;
     let catalog = state.0.lock().expect("catalog mutex poisoned");
-    catalog
-        .failed_job_extensions_for_library(library_id, job_kind)
-        .map_err(storage_error_message)
+    let details = catalog
+        .failed_job_details_for_library(library_id, job_kind)
+        .map_err(storage_error_message)?;
+
+    Ok(details
+        .into_iter()
+        .filter_map(|(asset_id, error)| {
+            let asset = catalog.get_asset(asset_id).ok().flatten()?;
+            let path = resolve_asset_path(&catalog, &asset).unwrap_or_else(|_| asset.original_filename.clone());
+            Some(FailedJobAsset {
+                asset_id: asset_id.to_string(),
+                name: asset.original_filename,
+                path,
+                error,
+            })
+        })
+        .collect())
 }
 
 /// Emitted per-job (not per-batch) by the audio-analysis, waveform, and
@@ -5237,23 +5326,36 @@ pub fn run() {
                     std::thread::sleep(std::time::Duration::from_secs(20));
 
                     if let Some(state) = worker_app_handle.try_state::<CatalogState>() {
-                        // Brief lock: job requeue plus reading which
-                        // library/folders are currently configured. Every
-                        // filesystem poll, directory listing, and file hash
-                        // below runs with the lock released — a slow or
-                        // unresponsive folder (a stalled NAS/SMB mount, a
-                        // documents folder with hundreds of files) can then
-                        // only block this worker thread, never every
-                        // foreground command that shares this same mutex
-                        // (add_folder, list_libraries, any asset/tag query,
-                        // export_asset_to_project, etc.). The catalog is
-                        // re-locked only briefly, per file actually
-                        // committed — the same hash-outside/commit-inside
-                        // split `run_batch_import` already uses.
+                        // Brief lock: reading which library/folders are
+                        // currently configured. Every filesystem poll,
+                        // directory listing, and file hash below runs with
+                        // the lock released — a slow or unresponsive folder
+                        // (a stalled NAS/SMB mount, a documents folder with
+                        // hundreds of files) can then only block this worker
+                        // thread, never every foreground command that shares
+                        // this same mutex (add_folder, list_libraries, any
+                        // asset/tag query, export_asset_to_project, etc.).
+                        // The catalog is re-locked only briefly, per file
+                        // actually committed — the same hash-outside/
+                        // commit-inside split `run_batch_import` already
+                        // uses.
+                        //
+                        // Deliberately no automatic `requeue_failed_jobs`
+                        // here: a job that reaches 'failed' either exhausted
+                        // `defer_unavailable_job`'s own silent-retry budget
+                        // (a real NAS/availability problem, already retried
+                        // for ~an hour) or hit a genuine processing error
+                        // (e.g. an unsupported codec, which will never
+                        // succeed no matter how many times it's requeued —
+                        // an unsupported-codec asset burned real retry
+                        // cycles this way before this was removed). Retrying
+                        // a 'failed' job is now exclusively user-initiated
+                        // via `retry_failed_jobs` (the Background Activity
+                        // panel's "Retry Now"), so a deterministic failure
+                        // doesn't loop invisibly and a fix a user actually
+                        // asked for is the only thing that reclaims it.
                         let library_and_folders = {
                             let catalog = state.0.lock().expect("catalog mutex poisoned");
-                            const MAX_JOB_ATTEMPTS: i64 = 3;
-                            let _ = catalog.requeue_failed_jobs(MAX_JOB_ATTEMPTS);
 
                             // One project file = one library (see the
                             // project-file model) — the worker always
@@ -5657,6 +5759,8 @@ pub fn run() {
             detect_stem_groups,
             stem_group_members,
             purge_library_cache,
+            check_library_integrity,
+            optimize_library,
             empty_library_trash,
             delete_library,
             list_assets,
@@ -5734,7 +5838,7 @@ pub fn run() {
             waveform_generation_paused,
             job_status,
             retry_failed_jobs,
-            failed_job_extensions,
+            failed_job_assets,
             similar_assets,
             get_waveform,
             store_waveform_peaks,
