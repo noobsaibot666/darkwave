@@ -20,6 +20,7 @@ import {
   Contrast,
   Copy,
   Database,
+  Download,
   Eye,
   FileText,
   FileWarning,
@@ -188,6 +189,12 @@ type ImportFailure = {
 type ImportFolderResult = {
   imported: AssetRecord[];
   failed: ImportFailure[];
+  // Filenames skipped because they match a file the user already
+  // permanently deleted from this library (see
+  // storage::Catalog::record_deleted_fingerprint) — not a failure, so kept
+  // out of `failed`, but still worth surfacing rather than the file just
+  // silently not showing up with no explanation.
+  skipped_deleted: string[];
 };
 
 type DroppedImportResult = ImportFolderResult & {
@@ -1269,6 +1276,12 @@ export function App() {
   const [radarSyncMenuOpen, setRadarSyncMenuOpen] = useState(false);
   const [radarSyncMenuPosition, setRadarSyncMenuPosition] = useState<{ top: number; left: number } | null>(null);
   const radarSyncButtonRef = useRef<HTMLButtonElement | null>(null);
+  // Right-click on a row — position only; the menu's own content always
+  // reads live off bulkAssetIds/selectedAsset rather than a snapshot taken
+  // at open time, so it can't go stale relative to what's actually
+  // selected by the time an item is clicked.
+  const [rowContextMenuPosition, setRowContextMenuPosition] = useState<{ top: number; left: number } | null>(null);
+  const rowContextMenuRef = useRef<HTMLDivElement | null>(null);
   const [sfxSubcategoriesOpen, setSfxSubcategoriesOpen] = useState(false);
   const [favoritesCategoriesOpen, setFavoritesCategoriesOpen] = useState(false);
   const [unreviewedCategoriesOpen, setUnreviewedCategoriesOpen] = useState(false);
@@ -2130,14 +2143,22 @@ export function App() {
     invoke<ImportFolderResult>("scan_import_folder", { libraryId: activeLibraryId })
       .then((result) => {
         if (result.imported.length === 0) {
-          setImportStatus(null);
+          setImportStatus(
+            result.skipped_deleted.length > 0
+              ? `Skipped ${result.skipped_deleted.length} sound${result.skipped_deleted.length === 1 ? "" : "s"} previously deleted from this library`
+              : null
+          );
           return;
         }
         runJobDrain(activeLibraryId);
         refreshAssets(activeLibraryId, searchQuery, activeFilter);
         refreshMaintenance(activeLibraryId);
+        const skippedNote =
+          result.skipped_deleted.length > 0
+            ? ` · ${result.skipped_deleted.length} skipped (previously deleted from this library)`
+            : "";
         setImportStatus(
-          `Imported ${result.imported.length} new sound${result.imported.length === 1 ? "" : "s"} from the import folder`
+          `Imported ${result.imported.length} new sound${result.imported.length === 1 ? "" : "s"} from the import folder${skippedNote}`
         );
       })
       .catch(() => setImportStatus(null));
@@ -2926,6 +2947,71 @@ export function App() {
     [browserState, playingAssetId, loadAssetForPlayback]
   );
 
+  // Right-click a row for a context menu of the same actions already
+  // available elsewhere (Quick Actions/Bulk panel, keyboard shortcuts) —
+  // same standard file-manager convention every one of those already
+  // follows in spirit: right-clicking a row that's already part of the
+  // current multi-selection acts on the whole selection, but right-
+  // clicking one that isn't first replaces the selection with just that
+  // row, so the menu never silently acts on some unrelated previous
+  // selection the user has forgotten about.
+  const handleRowContextMenu = useCallback(
+    (asset: AssetRecord, index: number, event: MouseEvent) => {
+      event.preventDefault();
+      const alreadySelected = browserState
+        ? browserState.selected_indices.includes(index)
+        : asset.id === selectedAssetId;
+      if (!alreadySelected) {
+        setSelectedAssetId(asset.id);
+        if (browserState) {
+          invoke<BrowserState>("apply_browser_command", {
+            browserState,
+            command: { FocusRow: { index } }
+          })
+            .then((focused) =>
+              invoke<BrowserState>("apply_browser_command", {
+                browserState: focused,
+                command: { SelectFocused: { mode: "Replace" } }
+              })
+            )
+            .then(setBrowserState)
+            .catch(() => {});
+        }
+      }
+      // Clamped the same way the Sonic Radar/filter menus already are —
+      // near-100% width the menu itself needs, kept off the right/bottom
+      // edge rather than opening partway off-screen at the cursor.
+      const left = Math.min(event.clientX, window.innerWidth - 260 - 16);
+      const top = Math.min(event.clientY, window.innerHeight - 320 - 16);
+      setRowContextMenuPosition({ top: Math.max(16, top), left: Math.max(16, left) });
+    },
+    [browserState, selectedAssetId]
+  );
+
+  // Closes the row context menu on any click outside it or an Escape press
+  // — none of this app's other portaled dropdowns (Sonic Radar/filter menu)
+  // do this today since they close via their own toggle button instead, but
+  // a right-click menu with no such button needs the standard OS-level
+  // context-menu dismissal behavior or it would just sit open forever over
+  // whatever the user clicks next.
+  useEffect(() => {
+    if (!rowContextMenuPosition) return;
+    const closeOnOutsideInteraction = (event: PointerEvent) => {
+      if (rowContextMenuRef.current && !rowContextMenuRef.current.contains(event.target as Node)) {
+        setRowContextMenuPosition(null);
+      }
+    };
+    const closeOnEscape = (event: KeyboardEvent) => {
+      if (event.key === "Escape") setRowContextMenuPosition(null);
+    };
+    window.addEventListener("pointerdown", closeOnOutsideInteraction, true);
+    window.addEventListener("keydown", closeOnEscape);
+    return () => {
+      window.removeEventListener("pointerdown", closeOnOutsideInteraction, true);
+      window.removeEventListener("keydown", closeOnEscape);
+    };
+  }, [rowContextMenuPosition]);
+
   // Bumps a project to the front of recentProjectIds (used to rank the
   // drag dock and, incidentally, nothing else — the DB membership itself
   // is never derived from this).
@@ -3372,6 +3458,24 @@ export function App() {
     invoke("optimize_library", { libraryId: library.id })
       .then(() => setLibraryAdminStatus(`Optimized ${library.name}`))
       .catch((error) => setLibraryAdminStatus(`Optimize failed: ${String(error)}`));
+  }, []);
+
+  // The escape hatch for the "don't reimport a deleted file" tombstone
+  // (see storage::Catalog::record_deleted_fingerprint) — that block is
+  // otherwise permanent and invisible, so anyone who deliberately wants a
+  // previously-deleted file back the next time its folder is scanned needs
+  // a way to clear it.
+  const handleClearDeletedImportHistory = useCallback((library: LibraryRecord) => {
+    setLibraryAdminStatus(`Clearing ${library.name}'s deleted-file history…`);
+    invoke<number>("clear_deleted_import_history", { libraryId: library.id })
+      .then((cleared) =>
+        setLibraryAdminStatus(
+          cleared > 0
+            ? `Cleared ${cleared} deleted-file record${cleared === 1 ? "" : "s"} for ${library.name} — those files can be reimported again`
+            : `${library.name} has no deleted-file history to clear`
+        )
+      )
+      .catch((error) => setLibraryAdminStatus(`Clear failed: ${String(error)}`));
   }, []);
 
   const handleEmptyLibraryTrash = useCallback(
@@ -3915,10 +4019,14 @@ export function App() {
         folderPath,
         mode: "referenced"
       });
+      const skippedNote =
+        result.skipped_deleted.length > 0
+          ? ` · ${result.skipped_deleted.length} skipped (previously deleted from this library)`
+          : "";
       setImportStatus(
-        result.failed.length > 0
+        (result.failed.length > 0
           ? `Imported ${result.imported.length}, ${result.failed.length} failed`
-          : `Imported ${result.imported.length} sound${result.imported.length === 1 ? "" : "s"}`
+          : `Imported ${result.imported.length} sound${result.imported.length === 1 ? "" : "s"}`) + skippedNote
       );
       // The very first import into a library sets its media root
       // automatically (see import_folder) — re-fetching here is what
@@ -3952,10 +4060,16 @@ export function App() {
             result.stem_groups_detected > 0
               ? ` · ${result.stem_groups_detected} stem group${result.stem_groups_detected === 1 ? "" : "s"} organized`
               : "";
+          const skippedNote =
+            result.skipped_deleted.length > 0
+              ? ` · ${result.skipped_deleted.length} skipped (previously deleted from this library)`
+              : "";
           const summary =
-            result.failed.length > 0
-              ? `Imported ${result.imported.length}, ${result.failed.length} failed${stemsNote}`
-              : `Imported ${result.imported.length} sound${result.imported.length === 1 ? "" : "s"}${stemsNote}`;
+            (result.failed.length > 0
+              ? `Imported ${result.imported.length}, ${result.failed.length} failed`
+              : `Imported ${result.imported.length} sound${result.imported.length === 1 ? "" : "s"}`) +
+            stemsNote +
+            skippedNote;
           setImportStatus(summary);
           showImportToast(summary);
           if (libraryId === activeLibraryId) {
@@ -4259,24 +4373,37 @@ export function App() {
     ]
   );
 
+  // Bulk-aware once more than one row is selected — this backs the
+  // toolbar's "Export Selected" button, the Mod+E shortcut, the command
+  // palette's Export action, and File > Export Selected…, all of which
+  // previously only ever exported `selectedAssetId` (whichever row was
+  // last focused) even with several rows visibly selected, exactly the
+  // same silent-partial-action bug as the old single-target Move to Trash.
   const handleExportSelected = useCallback(
     async (format?: "wav24") => {
-      if (!selectedAssetId) return;
+      const ids = bulkAssetIds.length > 1 ? bulkAssetIds : selectedAssetId ? [selectedAssetId] : [];
+      if (ids.length === 0) return;
       const destination = await openDialog({ directory: true, multiple: false, title: "Choose export destination" });
       if (typeof destination !== "string") return;
 
       try {
-        const destinationPath = await invoke<string>("export_selected_asset", {
-          assetId: selectedAssetId,
-          destinationFolder: destination,
-          format: format ?? null
-        });
-        setExportStatus(`Exported to ${destinationPath}`);
+        const destinationPaths = await Promise.all(
+          ids.map((assetId) =>
+            invoke<string>("export_selected_asset", {
+              assetId,
+              destinationFolder: destination,
+              format: format ?? null
+            })
+          )
+        );
+        setExportStatus(
+          ids.length === 1 ? `Exported to ${destinationPaths[0]}` : `Exported ${ids.length} sounds to ${destination}`
+        );
       } catch (error) {
         setExportStatus(`Export failed: ${String(error)}`);
       }
     },
-    [selectedAssetId]
+    [bulkAssetIds, selectedAssetId]
   );
 
   useEffect(() => {
@@ -4355,26 +4482,26 @@ export function App() {
       .catch(() => {});
   }, [bulkAssetIds, activeLibraryId, searchQuery, activeFilter, refreshAssets, refreshTrashItems, refreshMaintenance]);
 
-  const handleBulkExport = useCallback(async () => {
-    if (bulkAssetIds.length === 0) return;
-    const destination = await openDialog({ directory: true, multiple: false, title: "Choose export destination" });
-    if (typeof destination !== "string") return;
+  // One-directional like handleBulkFavorite above (marks every selected
+  // sound Reviewed, rather than trying to define what "toggle" means for a
+  // mixed batch that's already partly reviewed) — the Quick Actions panel's
+  // own toggle stays available for the single-selection case.
+  const handleBulkMarkReviewed = useCallback(() => {
+    if (bulkAssetIds.length === 0 || !activeLibraryId) return;
+    Promise.all(bulkAssetIds.map((assetId) => invoke("set_reviewed", { assetId, reviewed: true })))
+      .then(() => refreshAssets(activeLibraryId, searchQuery, activeFilter))
+      .catch(() => {});
+  }, [bulkAssetIds, activeLibraryId, searchQuery, activeFilter, refreshAssets]);
 
-    try {
-      await Promise.all(
-        bulkAssetIds.map((assetId) =>
-          invoke<string>("export_selected_asset", {
-            assetId,
-            destinationFolder: destination,
-            format: null
-          })
-        )
-      );
-      setExportStatus(`Exported ${bulkAssetIds.length} sound${bulkAssetIds.length === 1 ? "" : "s"}`);
-    } catch (error) {
-      setExportStatus(`Export failed: ${String(error)}`);
-    }
-  }, [bulkAssetIds]);
+  const handleBulkSetMediaType = useCallback(
+    (mediaType: string) => {
+      if (bulkAssetIds.length === 0 || !activeLibraryId) return;
+      Promise.all(bulkAssetIds.map((assetId) => invoke("set_media_type", { assetId, mediaType })))
+        .then(() => refreshAssets(activeLibraryId, searchQuery, activeFilter))
+        .catch(() => {});
+    },
+    [bulkAssetIds, activeLibraryId, searchQuery, activeFilter, refreshAssets]
+  );
 
   const handleExportLicenseReport = useCallback(async () => {
     if (typeof activeFilter !== "object" || !("project" in activeFilter)) {
@@ -4774,7 +4901,14 @@ export function App() {
           playRelative(-1);
           break;
         case "ToggleFavorite":
-          if (selectedAsset) handleToggleFavorite(selectedAsset);
+          // Bulk-aware once more than one row is actually selected — a
+          // single-asset press still toggles (favorite/unfavorite back and
+          // forth), since "toggle" is unambiguous for exactly one asset;
+          // handleBulkFavorite is one-directional (marks every selected
+          // sound Reviewed/Favorite) since that's not well-defined for a
+          // mixed batch.
+          if (bulkAssetIds.length > 1) handleBulkFavorite();
+          else if (selectedAsset) handleToggleFavorite(selectedAsset);
           break;
         case "Import":
           event.preventDefault();
@@ -4802,7 +4936,8 @@ export function App() {
           // accelerator, and letting that through with nothing selected
           // would reload the whole app instead of doing nothing.
           event.preventDefault();
-          if (selectedAsset) handleToggleReviewed(selectedAsset);
+          if (bulkAssetIds.length > 1) handleBulkMarkReviewed();
+          else if (selectedAsset) handleToggleReviewed(selectedAsset);
           break;
         case "ClassifySoundtrack":
         case "ClassifyVoiceover":
@@ -4813,7 +4948,10 @@ export function App() {
           const mediaType = mediaTypeOptions.find(
             (option) => MEDIA_TYPE_CLASSIFY_COMMAND[option.value] === binding.command
           )?.value;
-          if (selectedAsset && mediaType) {
+          if (mediaType && bulkAssetIds.length > 1) {
+            event.preventDefault();
+            handleBulkSetMediaType(mediaType);
+          } else if (selectedAsset && mediaType) {
             event.preventDefault();
             handleSetMediaType(selectedAsset, mediaType);
           }
@@ -4837,6 +4975,9 @@ export function App() {
     handleSetMediaType,
     handleImportFolder,
     bulkAssetIds,
+    handleBulkFavorite,
+    handleBulkMarkReviewed,
+    handleBulkSetMediaType,
     handleCopyAssetPaths,
     handleExportSelected,
     browserState
@@ -6104,6 +6245,7 @@ export function App() {
                 key={asset.id}
                 data-asset-id={asset.id}
                 onClick={(event) => handleRowClick(asset, index, event)}
+                onContextMenu={(event) => handleRowContextMenu(asset, index, event)}
                 onPointerDown={(event) => handleAssetPointerDown(event, asset)}
               >
                 <button
@@ -6197,6 +6339,136 @@ export function App() {
             </>
           )}
         </section>
+        )}
+        {/* Portaled for the same reason the Sonic Radar menu already is —
+            see its own comment above — rather than left in place, so a
+            transformed/backdrop-filtered ancestor along the way from a
+            deeply nested row up to here can't clip it. */}
+        {createPortal(
+          <AnimatePresence>
+            {rowContextMenuPosition ? (
+              <motion.div
+                ref={rowContextMenuRef}
+                className="modal-card filter-menu row-context-menu"
+                style={{
+                  top: rowContextMenuPosition.top,
+                  left: rowContextMenuPosition.left,
+                  transformOrigin: "top left"
+                }}
+                initial={{ opacity: 0, scale: 0.92 }}
+                animate={{ opacity: 1, scale: 1 }}
+                exit={{ opacity: 0, scale: 0.92 }}
+                transition={{ duration: 0.12, ease: [0.16, 1, 0.3, 1] }}
+              >
+                <div className="row-context-menu-header">
+                  {bulkAssetIds.length > 1 ? `${bulkAssetIds.length} selected` : selectedAsset?.display_name ?? "Sound"}
+                </div>
+                <button
+                  type="button"
+                  className="row-context-menu-item"
+                  onClick={() => {
+                    if (bulkAssetIds.length > 1) handleBulkFavorite();
+                    else if (selectedAsset) handleToggleFavorite(selectedAsset);
+                    setRowContextMenuPosition(null);
+                  }}
+                >
+                  <Star size={15} />
+                  {bulkAssetIds.length > 1
+                    ? "Favorite All"
+                    : selectedAsset?.favorite
+                      ? "Remove from Favorites"
+                      : "Add to Favorites"}
+                </button>
+                <button
+                  type="button"
+                  className="row-context-menu-item bulk-action-success"
+                  onClick={() => {
+                    if (bulkAssetIds.length > 1) handleBulkMarkReviewed();
+                    else if (selectedAsset) handleToggleReviewed(selectedAsset);
+                    setRowContextMenuPosition(null);
+                  }}
+                >
+                  <ShieldCheck size={15} />
+                  {bulkAssetIds.length > 1
+                    ? "Mark All Reviewed"
+                    : selectedAsset?.review_state === "Reviewed"
+                      ? "Mark Unreviewed"
+                      : "Mark Reviewed"}
+                </button>
+                <div className="row-context-menu-separator" />
+                <div className="row-context-menu-classify-row">
+                  {mediaTypeOptions.map(({ value, label, Icon, color }) => (
+                    <button
+                      key={value}
+                      type="button"
+                      className="classification-chip"
+                      style={{ "--classification-color": color } as CSSProperties}
+                      title={label}
+                      onClick={() => {
+                        if (bulkAssetIds.length > 1) handleBulkSetMediaType(value);
+                        else if (selectedAsset) handleSetMediaType(selectedAsset, value);
+                        setRowContextMenuPosition(null);
+                      }}
+                    >
+                      <Icon size={14} style={{ color }} />
+                    </button>
+                  ))}
+                </div>
+                <div className="row-context-menu-separator" />
+                <button
+                  type="button"
+                  className="row-context-menu-item"
+                  disabled={bulkAssetIds.length === 0}
+                  onClick={() => {
+                    handleExportSelected();
+                    setRowContextMenuPosition(null);
+                  }}
+                >
+                  <Download size={15} />
+                  {bulkAssetIds.length > 1 ? "Export All…" : "Export…"}
+                </button>
+                <button
+                  type="button"
+                  className="row-context-menu-item"
+                  disabled={bulkAssetIds.length === 0}
+                  onClick={() => {
+                    handleRevealAssets(bulkAssetIds);
+                    setRowContextMenuPosition(null);
+                  }}
+                >
+                  <FolderOpen size={15} />
+                  {isMacPlatform ? "Reveal in Finder" : "Reveal in Explorer"}
+                </button>
+                <button
+                  type="button"
+                  className="row-context-menu-item"
+                  disabled={bulkAssetIds.length === 0}
+                  onClick={() => {
+                    handleCopyAssetPaths(bulkAssetIds);
+                    setRowContextMenuPosition(null);
+                  }}
+                >
+                  <Copy size={15} />
+                  {bulkAssetIds.length > 1 ? "Copy Paths" : "Copy Path"}
+                </button>
+                <div className="row-context-menu-separator" />
+                <button
+                  type="button"
+                  className="row-context-menu-item bulk-action-danger"
+                  disabled={bulkAssetIds.length === 0}
+                  onClick={() => {
+                    if (bulkAssetIds.length > 1) handleBulkTrash();
+                    else handleMoveToTrash();
+                    setRowContextMenuPosition(null);
+                  }}
+                >
+                  <Trash2 size={15} />
+                  {bulkAssetIds.length > 1 ? "Move All to Trash" : "Move to Trash"}
+                </button>
+              </motion.div>
+            ) : null}
+          </AnimatePresence>,
+          document.body
         )}
         <AnimatePresence>
           {editorWorkflowOpen ? (
@@ -6383,20 +6655,50 @@ export function App() {
             onToggle={toggleSection}
             aria-label="Bulk actions"
           >
-            <div className="drop-target-grid">
-              <button type="button" onClick={handleBulkFavorite}>
+            <div className="drop-target-grid bulk-action-grid">
+              <button type="button" className="bulk-action-button" onClick={handleBulkFavorite}>
+                <Star size={15} />
                 Favorite All
               </button>
-              <button type="button" onClick={handleBulkExport}>
+              <button type="button" className="bulk-action-button" onClick={() => handleExportSelected()}>
+                <Download size={15} />
                 Export All
               </button>
-              <button type="button" className="text-button" onClick={handleBulkTrash}>
+              <button type="button" className="bulk-action-button bulk-action-success" onClick={handleBulkMarkReviewed}>
+                <ShieldCheck size={15} />
+                Mark All Reviewed
+              </button>
+              <button type="button" className="bulk-action-button bulk-action-danger" onClick={handleBulkTrash}>
+                <Trash2 size={15} />
                 Move All to Trash
               </button>
             </div>
+            <h2>Classify All</h2>
+            <div className="classification-row">
+              {mediaTypeOptions.map(({ value, label, Icon, color }) => (
+                <button
+                  key={value}
+                  type="button"
+                  className="classification-chip"
+                  style={{ "--classification-color": color } as CSSProperties}
+                  title={label}
+                  onClick={() => handleBulkSetMediaType(value)}
+                >
+                  <Icon size={14} style={{ color }} />
+                  {label}
+                </button>
+              ))}
+            </div>
           </CollapsibleSection>
         ) : null}
-        {selectedAsset ? (
+        {/* Single-target detail actions — hidden once there's a real
+            multi-selection (selectedCount > 1) rather than left showing
+            alongside the panel above. selectedAsset is just "whichever row
+            was last focused," independent of the multi-selection, so
+            without this guard both panels rendered at once and Move to
+            Trash here silently deleted only that one row while several
+            others stayed selected and looked (but weren't) included. */}
+        {selectedAsset && selectedCount <= 1 ? (
           <CollapsibleSection
             id="quick"
             title="Quick Actions"
@@ -7358,6 +7660,14 @@ export function App() {
                               </button>
                               <button type="button" className="text-button" onClick={() => handleOptimizeLibrary(library)}>
                                 Optimize
+                              </button>
+                              <button
+                                type="button"
+                                className="text-button"
+                                title="Allow previously-deleted files to be reimported again the next time their folder is scanned"
+                                onClick={() => handleClearDeletedImportHistory(library)}
+                              >
+                                Clear Deleted-File History
                               </button>
                               <button
                                 type="button"

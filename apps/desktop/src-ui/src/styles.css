@@ -1635,6 +1635,159 @@ h2 {
   min-width: 0;
 }
 
+/* The Inspector's "N Selected" bulk-actions row — grew from 2 buttons to 4
+   (Favorite All/Export All/Mark All Reviewed/Move All to Trash) without
+   this, the fixed 2-column .drop-target-grid above kept every button's
+   text on one line via text-overflow: ellipsis, which truncated "Mark All
+   Reviewed" and, worse, "Move All to Trash" down to unreadable fragments
+   — looking like the delete action had disappeared entirely rather than
+   just having its label cut off. One column gives every button the full
+   panel width, the same fix .project-grid's own comment already applied
+   for this exact truncation problem elsewhere. */
+.bulk-action-grid {
+  grid-template-columns: 1fr;
+}
+
+.bulk-action-button {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  gap: 8px;
+}
+
+/* Reuses the exact same semantic hues the single-asset Quick Actions panel
+   already established for these two concepts — .icon-button.reviewed.active's
+   green and .icon-button.danger's red — rather than inventing new ones. The
+   brand orange (--accent) is deliberately not used here: see its own comment
+   above, it's reserved for the player/playback mood system only. Favorite
+   and Export stay plain chrome (matching the per-row favorite star, which
+   has never had a distinct accent color of its own either — just filled vs
+   outline in the same neutral ink).
+
+   Qualified with .bulk-action-button, not left as bare single-class
+   selectors: .tag-grid button/.drop-target-grid button's shared base rule
+   is class+element (0,0,1,1), which beats a bare .bulk-action-success/
+   .bulk-action-danger (0,0,1,0) regardless of source order, silently
+   overriding both the color and the background and leaving the button
+   looking like plain uncolored chrome. Two classes together (0,0,2,0)
+   wins outright. */
+.bulk-action-button.bulk-action-success {
+  border-color: rgba(52, 211, 153, 0.3);
+  background: rgba(52, 211, 153, 0.1);
+  color: #059669;
+}
+
+.bulk-action-button.bulk-action-success:hover:not(:disabled) {
+  background: rgba(52, 211, 153, 0.18);
+}
+
+.bulk-action-button.bulk-action-danger {
+  border-color: rgba(220, 38, 38, 0.3);
+  background: rgba(220, 38, 38, 0.1);
+  color: #f87171;
+}
+
+.bulk-action-button.bulk-action-danger:hover:not(:disabled) {
+  background: rgba(220, 38, 38, 0.18);
+}
+
+/* Right-click row menu — same .modal-card/.filter-menu fixed-position card
+   chrome every other dropdown already uses (see .filter-menu's own comment
+   on why position: fixed, not absolute), sized for compact single-line
+   items rather than .radar-sync-menu-item's two-line icon+description
+   layout. */
+.row-context-menu {
+  width: 220px;
+  padding: 6px;
+  display: flex;
+  flex-direction: column;
+  gap: 2px;
+}
+
+/* A full display_name here could run to 40+ characters and, at this
+   menu's compact 220px width, wrapped onto two or three lines — bulking
+   the menu out well past every other item and reading as broken rather
+   than a menu header. Single line, hard-clipped with an ellipsis, so a
+   long name never grows the menu itself. */
+.row-context-menu-header {
+  padding: 8px 10px 6px;
+  overflow: hidden;
+  font-size: 11px;
+  font-weight: 600;
+  letter-spacing: 0.02em;
+  text-transform: uppercase;
+  color: var(--text-muted);
+  white-space: nowrap;
+  text-overflow: ellipsis;
+}
+
+.row-context-menu-item {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  width: 100%;
+  padding: 8px 10px;
+  border: 0;
+  border-radius: var(--radius-sm);
+  background: transparent;
+  color: var(--text-primary);
+  font-size: 13px;
+  text-align: left;
+  cursor: pointer;
+  white-space: nowrap;
+}
+
+.row-context-menu-item:hover:not(:disabled) {
+  background: var(--surface-hover);
+}
+
+.row-context-menu-item:disabled {
+  opacity: 0.5;
+  cursor: default;
+}
+
+/* Reuses .bulk-action-success/.bulk-action-danger's exact hues (see their
+   own comment) rather than a third set of context-menu-specific colors —
+   the same action should look the same regardless of which of the three
+   entry points (Quick Actions, Bulk panel, this menu) it's clicked from.
+   Restates color/background explicitly rather than relying on cascade
+   order: .row-context-menu-item's own color/background rule has the same
+   specificity (one class) and is declared later in the file, so it was
+   silently winning over .bulk-action-success/.bulk-action-danger and
+   leaving both items looking like plain, uncolored rows. */
+.row-context-menu-item.bulk-action-success {
+  border: 0;
+  background: rgba(52, 211, 153, 0.1);
+  color: #059669;
+}
+
+.row-context-menu-item.bulk-action-danger {
+  border: 0;
+  background: rgba(220, 38, 38, 0.1);
+  color: #f87171;
+}
+
+.row-context-menu-item.bulk-action-success:hover:not(:disabled) {
+  background: rgba(52, 211, 153, 0.18);
+}
+
+.row-context-menu-item.bulk-action-danger:hover:not(:disabled) {
+  background: rgba(220, 38, 38, 0.18);
+}
+
+.row-context-menu-separator {
+  height: 1px;
+  margin: 4px 6px;
+  background: rgba(var(--ink-rgb), 0.08);
+}
+
+.row-context-menu-classify-row {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 6px;
+  padding: 4px 10px 8px;
+}
+
 /* The Projects grid in the inspector — one card per project, both a drop
    target (the whole card, via data-drop-project-id) and a click target
    (the .project-card-add button inside it). Two independent columns on a

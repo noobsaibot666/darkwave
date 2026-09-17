@@ -92,6 +92,22 @@ pub enum AssetPath {
     Referenced(String),
 }
 
+/// What `register_asset` actually did — three distinct outcomes, not just
+/// "new or not": `Created`/`AlreadyExists` behave exactly as before
+/// (`AlreadyExists` idempotently returns the existing row, e.g. a rescan
+/// finding a file it already has), while `PreviouslyDeleted` means nothing
+/// was written at all, because this exact content hash + size matches a
+/// `deleted_asset_fingerprints` tombstone — the file was deliberately
+/// removed before and a rescan shouldn't quietly bring it back. Callers
+/// must handle this case explicitly rather than assuming a `NewAssetRecord`
+/// always produces some `AssetRecord`.
+#[derive(Debug)]
+pub enum RegisterAssetOutcome {
+    Created(AssetRecord),
+    AlreadyExists(AssetRecord),
+    PreviouslyDeleted,
+}
+
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct NewAssetRecord {
     pub library_id: Uuid,
@@ -813,22 +829,25 @@ impl Catalog {
         Ok(())
     }
 
-    /// Registers a new asset, or returns the existing one unchanged if its
-    /// content hash + size already match a row in this library — imports
-    /// are idempotent by content, not just by path. The `bool` tells the
-    /// caller which happened: `true` for a genuinely new row, `false` for
-    /// an existing match. Callers that enqueue analysis jobs or write
-    /// source/license metadata on import must check this — re-running
-    /// those for an asset that's already fully analyzed re-does real,
-    /// expensive work (decode + DSP + VAD) for nothing, and re-writing
-    /// source metadata over a user's existing edits is a data-loss bug,
-    /// not a no-op.
-    pub fn register_asset(&self, asset: NewAssetRecord) -> Result<(AssetRecord, bool), StorageError> {
+    /// Registers a new asset, returns the existing one unchanged if its
+    /// content hash + size already match a row in this library (imports are
+    /// idempotent by content, not just by path), or declines entirely if
+    /// that same hash + size matches a `deleted_asset_fingerprints`
+    /// tombstone — see `RegisterAssetOutcome`. Callers that enqueue analysis
+    /// jobs or write source/license metadata on import must check which
+    /// outcome they got — re-running those for an asset that's already
+    /// fully analyzed re-does real, expensive work (decode + DSP + VAD) for
+    /// nothing, and re-writing source metadata over a user's existing edits
+    /// is a data-loss bug, not a no-op.
+    pub fn register_asset(&self, asset: NewAssetRecord) -> Result<RegisterAssetOutcome, StorageError> {
         if let Some(content_hash) = &asset.content_hash {
             if let Some(existing) =
                 self.find_asset_by_hash(asset.library_id, content_hash, asset.file_size)?
             {
-                return Ok((existing, false));
+                return Ok(RegisterAssetOutcome::AlreadyExists(existing));
+            }
+            if self.is_previously_deleted(asset.library_id, content_hash, asset.file_size)? {
+                return Ok(RegisterAssetOutcome::PreviouslyDeleted);
             }
         }
 
@@ -862,7 +881,7 @@ impl Catalog {
             ],
         )?;
         self.get_asset(id)
-            .map(|asset| (asset.expect("inserted asset exists"), true))
+            .map(|asset| RegisterAssetOutcome::Created(asset.expect("inserted asset exists")))
     }
 
     pub fn list_assets(&self, library_id: Uuid) -> Result<Vec<AssetRecord>, StorageError> {
@@ -3304,6 +3323,73 @@ impl Catalog {
         Ok(())
     }
 
+    /// Leaves a tombstone for `asset_id` in `deleted_asset_fingerprints`
+    /// (if it has a content hash — a hashless asset can't be matched
+    /// against later anyway) so `register_asset` can recognize and skip a
+    /// future re-import of the exact same file. Call this immediately
+    /// before every real `DELETE FROM assets` — never on a plain
+    /// move-to-trash, which is still meant to be reversible via
+    /// `restore_asset_from_trash`. Best-effort: a missing asset (already
+    /// gone, or never existed) is silently a no-op rather than an error,
+    /// since every caller is already about to delete-or-has-deleted the
+    /// row regardless.
+    fn record_deleted_fingerprint(&self, asset_id: Uuid) -> Result<(), StorageError> {
+        let Some(asset) = self.get_asset(asset_id)? else {
+            return Ok(());
+        };
+        let Some(content_hash) = asset.content_hash else {
+            return Ok(());
+        };
+
+        self.connection.execute(
+            "INSERT OR IGNORE INTO deleted_asset_fingerprints
+                (library_id, content_hash, file_size, original_filename, deleted_at)
+             VALUES (?1, ?2, ?3, ?4, ?5)",
+            params![
+                asset.library_id.to_string(),
+                content_hash,
+                asset.file_size as i64,
+                asset.original_filename,
+                Utc::now().to_rfc3339(),
+            ],
+        )?;
+
+        Ok(())
+    }
+
+    /// True if `content_hash`/`file_size` matches a fingerprint left behind
+    /// by a previous permanent deletion in this library — see
+    /// `record_deleted_fingerprint`. `register_asset` checks this before
+    /// creating a new row so a rescan doesn't quietly bring back a file the
+    /// user already deliberately removed.
+    pub fn is_previously_deleted(
+        &self,
+        library_id: Uuid,
+        content_hash: &str,
+        file_size: u64,
+    ) -> Result<bool, StorageError> {
+        let count: i64 = self.connection.query_row(
+            "SELECT COUNT(*) FROM deleted_asset_fingerprints
+             WHERE library_id = ?1 AND content_hash = ?2 AND file_size = ?3",
+            params![library_id.to_string(), content_hash, file_size as i64],
+            |row| row.get(0),
+        )?;
+        Ok(count > 0)
+    }
+
+    /// Clears every "don't re-import this" fingerprint for one library —
+    /// the escape hatch for `is_previously_deleted`, since that block is
+    /// otherwise permanent and silent. Exposed as a library-admin action
+    /// (alongside Clean Cache/Empty Trash) for anyone who deliberately
+    /// wants a previously-deleted file back the next time it's scanned.
+    pub fn clear_deleted_fingerprints(&self, library_id: Uuid) -> Result<usize, StorageError> {
+        let changed = self.connection.execute(
+            "DELETE FROM deleted_asset_fingerprints WHERE library_id = ?1",
+            params![library_id.to_string()],
+        )?;
+        Ok(changed)
+    }
+
     /// Permanently removes every currently-trashed asset's catalog row for
     /// one library, bypassing the normal retention wait — an explicit,
     /// user-initiated "empty trash" action, not the automatic timed purge.
@@ -3322,6 +3408,9 @@ impl Catalog {
         drop(statement);
 
         for asset_id in &asset_ids {
+            let uuid = Uuid::parse_str(asset_id)
+                .map_err(|_| StorageError::InvalidInput("invalid asset id in trash_items".to_string()))?;
+            self.record_deleted_fingerprint(uuid)?;
             self.connection.execute(
                 "UPDATE trash_items SET state = 'purged' WHERE asset_id = ?1",
                 params![asset_id],
@@ -3357,6 +3446,7 @@ impl Catalog {
             return Ok(false);
         }
 
+        self.record_deleted_fingerprint(asset_id)?;
         self.connection.execute(
             "UPDATE trash_items SET state = 'purged' WHERE asset_id = ?1",
             params![asset_id.to_string()],
@@ -3380,6 +3470,7 @@ impl Catalog {
     /// on — actual filesystem deletion belongs one layer up, next to the
     /// asset-path resolution logic it needs.
     pub fn finalize_permanent_deletion(&self, asset_id: Uuid) -> Result<(), StorageError> {
+        self.record_deleted_fingerprint(asset_id)?;
         self.connection.execute(
             "UPDATE trash_items SET state = 'purged', file_deleted = 1 WHERE asset_id = ?1",
             params![asset_id.to_string()],
@@ -3499,6 +3590,27 @@ impl Catalog {
               state TEXT NOT NULL DEFAULT 'in_trash',
               file_deleted INTEGER NOT NULL DEFAULT 0
             );
+
+            -- A tombstone left behind once an asset's row is actually gone
+            -- (purge_trash_item/empty_trash_for_library/
+            -- finalize_permanent_deletion — never on a plain move-to-trash,
+            -- which is still reversible) so a later rescan of the same
+            -- media_root/import folder doesn't quietly re-add the exact
+            -- file the user already deliberately removed. Deliberately NOT
+            -- a foreign key to assets(id): the whole point is to outlive
+            -- that row's deletion, unlike trash_items above which cascades
+            -- away with it.
+            CREATE TABLE IF NOT EXISTS deleted_asset_fingerprints (
+              id INTEGER PRIMARY KEY AUTOINCREMENT,
+              library_id TEXT NOT NULL REFERENCES libraries(id) ON DELETE CASCADE,
+              content_hash TEXT NOT NULL,
+              file_size INTEGER NOT NULL,
+              original_filename TEXT NOT NULL,
+              deleted_at TEXT NOT NULL
+            );
+
+            CREATE UNIQUE INDEX IF NOT EXISTS idx_deleted_asset_fingerprints_unique
+              ON deleted_asset_fingerprints(library_id, content_hash, file_size);
 
             CREATE TABLE IF NOT EXISTS collections (
               id TEXT PRIMARY KEY,
@@ -4440,12 +4552,16 @@ mod tests {
             availability_state: AvailabilityState::Local,
         };
 
-        let (first_asset, first_is_new) = catalog.register_asset(first.clone()).expect("first import");
-        let (duplicate_asset, duplicate_is_new) =
-            catalog.register_asset(first).expect("duplicate import");
-
-        assert!(first_is_new);
-        assert!(!duplicate_is_new, "a content-hash duplicate must not report itself as new");
+        let RegisterAssetOutcome::Created(first_asset) =
+            catalog.register_asset(first.clone()).expect("first import")
+        else {
+            panic!("registering a genuinely new asset must report Created");
+        };
+        let RegisterAssetOutcome::AlreadyExists(duplicate_asset) =
+            catalog.register_asset(first).expect("duplicate import")
+        else {
+            panic!("a content-hash duplicate must report AlreadyExists, not re-create a row");
+        };
         assert_eq!(first_asset.id, duplicate_asset.id);
         assert_eq!(catalog.list_assets(library.id).expect("assets").len(), 1);
     }
@@ -4455,19 +4571,21 @@ mod tests {
         let catalog_path = unique_catalog_path("jobs");
         let catalog = Catalog::open(&catalog_path).expect("open catalog");
         let library = catalog.create_library("Jobs", "/library").expect("library");
-        let (asset, _) = catalog
-            .register_asset(NewAssetRecord {
-                library_id: library.id,
-                original_filename: "tone.wav".to_string(),
-                display_name: "tone".to_string(),
-                path: AssetPath::Managed("Media/00/tone.wav".to_string()),
-                storage_mode: StorageMode::Managed,
-                content_hash: Some("hash-2".to_string()),
-                media_type: "sound_effect".to_string(),
-                file_size: 12,
-                availability_state: AvailabilityState::Local,
-            })
-            .expect("asset");
+        let asset = expect_registered_asset(
+            catalog
+                .register_asset(NewAssetRecord {
+                    library_id: library.id,
+                    original_filename: "tone.wav".to_string(),
+                    display_name: "tone".to_string(),
+                    path: AssetPath::Managed("Media/00/tone.wav".to_string()),
+                    storage_mode: StorageMode::Managed,
+                    content_hash: Some("hash-2".to_string()),
+                    media_type: "sound_effect".to_string(),
+                    file_size: 12,
+                    availability_state: AvailabilityState::Local,
+                })
+                .expect("asset"),
+        );
 
         catalog
             .enqueue_job(asset.id, JobKind::MetadataExtraction, 10)
@@ -5239,21 +5357,35 @@ mod tests {
         );
     }
 
+    /// Unwraps a `RegisterAssetOutcome` down to its `AssetRecord` for test
+    /// fixtures that only ever expect `Created`/`AlreadyExists` — panics on
+    /// `PreviouslyDeleted`, which no fixture-building call site should ever
+    /// actually hit.
+    fn expect_registered_asset(outcome: RegisterAssetOutcome) -> AssetRecord {
+        match outcome {
+            RegisterAssetOutcome::Created(asset) | RegisterAssetOutcome::AlreadyExists(asset) => asset,
+            RegisterAssetOutcome::PreviouslyDeleted => {
+                panic!("expected a registered asset, got PreviouslyDeleted")
+            }
+        }
+    }
+
     fn test_asset(catalog: &Catalog, library_id: Uuid, filename: &str, hash: &str) -> AssetRecord {
-        catalog
-            .register_asset(NewAssetRecord {
-                library_id,
-                original_filename: filename.to_string(),
-                display_name: filename.trim_end_matches(".wav").to_string(),
-                path: AssetPath::Referenced(format!("/fixtures/{filename}")),
-                storage_mode: StorageMode::Referenced,
-                content_hash: Some(hash.to_string()),
-                media_type: "sound_effect".to_string(),
-                file_size: 10,
-                availability_state: AvailabilityState::Local,
-            })
-            .expect("asset")
-            .0
+        expect_registered_asset(
+            catalog
+                .register_asset(NewAssetRecord {
+                    library_id,
+                    original_filename: filename.to_string(),
+                    display_name: filename.trim_end_matches(".wav").to_string(),
+                    path: AssetPath::Referenced(format!("/fixtures/{filename}")),
+                    storage_mode: StorageMode::Referenced,
+                    content_hash: Some(hash.to_string()),
+                    media_type: "sound_effect".to_string(),
+                    file_size: 10,
+                    availability_state: AvailabilityState::Local,
+                })
+                .expect("asset"),
+        )
     }
 
     #[test]
@@ -5302,20 +5434,21 @@ mod tests {
             .create_library("Search", "/library")
             .expect("library");
         let matching = test_asset(&catalog, library.id, "dark-impact.wav", "hash-dark-impact");
-        let wrong_media = catalog
-            .register_asset(NewAssetRecord {
-                library_id: library.id,
-                original_filename: "dark-loop.wav".to_string(),
-                display_name: "dark-loop".to_string(),
-                path: AssetPath::Referenced("/fixtures/dark-loop.wav".to_string()),
-                storage_mode: StorageMode::Referenced,
-                content_hash: Some("hash-dark-loop".to_string()),
-                media_type: "music_loop".to_string(),
-                file_size: 10,
-                availability_state: AvailabilityState::Local,
-            })
-            .expect("asset")
-            .0;
+        let wrong_media = expect_registered_asset(
+            catalog
+                .register_asset(NewAssetRecord {
+                    library_id: library.id,
+                    original_filename: "dark-loop.wav".to_string(),
+                    display_name: "dark-loop".to_string(),
+                    path: AssetPath::Referenced("/fixtures/dark-loop.wav".to_string()),
+                    storage_mode: StorageMode::Referenced,
+                    content_hash: Some("hash-dark-loop".to_string()),
+                    media_type: "music_loop".to_string(),
+                    file_size: 10,
+                    availability_state: AvailabilityState::Local,
+                })
+                .expect("asset"),
+        );
         let untagged = test_asset(
             &catalog,
             library.id,
@@ -6973,6 +7106,126 @@ mod tests {
             .list_trash_items(library.id)
             .expect("list trash items")
             .is_empty());
+    }
+
+    #[test]
+    fn purging_a_trash_item_leaves_a_fingerprint_that_blocks_reimport() {
+        let catalog_path = unique_catalog_path("fingerprint-purge-blocks-reimport");
+        let catalog = Catalog::open(&catalog_path).expect("open catalog");
+        let library = catalog
+            .create_library("Fingerprint", "/library")
+            .expect("library");
+        let asset = test_asset(&catalog, library.id, "old.wav", "hash-fingerprint-purge");
+
+        catalog
+            .move_asset_to_trash(asset.id, "cleanup", 1_000)
+            .expect("trash asset");
+        assert!(catalog
+            .purge_trash_item(asset.id, 1_000 + 7_000, 7_000)
+            .expect("purge"));
+
+        assert!(catalog
+            .is_previously_deleted(library.id, "hash-fingerprint-purge", 10)
+            .expect("lookup"));
+
+        // The exact reimport path: register_asset must decline, not
+        // silently recreate the row a rescan would otherwise bring back.
+        let outcome = catalog
+            .register_asset(NewAssetRecord {
+                library_id: library.id,
+                original_filename: "old.wav".to_string(),
+                display_name: "old".to_string(),
+                path: AssetPath::Referenced("/fixtures/old.wav".to_string()),
+                storage_mode: StorageMode::Referenced,
+                content_hash: Some("hash-fingerprint-purge".to_string()),
+                media_type: "sound_effect".to_string(),
+                file_size: 10,
+                availability_state: AvailabilityState::Local,
+            })
+            .expect("register");
+        assert!(matches!(outcome, RegisterAssetOutcome::PreviouslyDeleted));
+        assert_eq!(catalog.list_assets(library.id).expect("assets").len(), 0);
+    }
+
+    #[test]
+    fn finalize_permanent_deletion_also_leaves_a_fingerprint() {
+        let catalog_path = unique_catalog_path("fingerprint-finalize");
+        let catalog = Catalog::open(&catalog_path).expect("open catalog");
+        let library = catalog
+            .create_library("Fingerprint", "/library")
+            .expect("library");
+        let asset = test_asset(&catalog, library.id, "old.wav", "hash-fingerprint-finalize");
+
+        catalog
+            .move_asset_to_trash(asset.id, "manual", 1_000)
+            .expect("trash asset");
+        catalog
+            .finalize_permanent_deletion(asset.id)
+            .expect("finalize");
+
+        assert!(catalog
+            .is_previously_deleted(library.id, "hash-fingerprint-finalize", 10)
+            .expect("lookup"));
+    }
+
+    #[test]
+    fn a_plain_move_to_trash_does_not_leave_a_fingerprint() {
+        // Only a real, permanent deletion should ever block a future
+        // reimport — a trashed-but-not-yet-purged asset is still meant to
+        // be reversible via restore_asset_from_trash, and a rescan
+        // encountering the same file on disk while it's merely sitting in
+        // trash isn't the same thing as the user having deleted it.
+        let catalog_path = unique_catalog_path("fingerprint-not-on-plain-trash");
+        let catalog = Catalog::open(&catalog_path).expect("open catalog");
+        let library = catalog
+            .create_library("Fingerprint", "/library")
+            .expect("library");
+        let asset = test_asset(&catalog, library.id, "old.wav", "hash-fingerprint-plain-trash");
+
+        catalog
+            .move_asset_to_trash(asset.id, "manual", 1_000)
+            .expect("trash asset");
+
+        assert!(!catalog
+            .is_previously_deleted(library.id, "hash-fingerprint-plain-trash", 10)
+            .expect("lookup"));
+    }
+
+    #[test]
+    fn clear_deleted_fingerprints_unblocks_reimport_for_that_library_only() {
+        let catalog_path = unique_catalog_path("fingerprint-clear");
+        let catalog = Catalog::open(&catalog_path).expect("open catalog");
+        let library = catalog
+            .create_library("Fingerprint", "/library")
+            .expect("library");
+        let other_library = catalog
+            .create_library("Other", "/other")
+            .expect("other library");
+        let asset = test_asset(&catalog, library.id, "old.wav", "hash-fingerprint-clear");
+        let other_asset = test_asset(&catalog, other_library.id, "old.wav", "hash-fingerprint-clear-other");
+
+        catalog.move_asset_to_trash(asset.id, "cleanup", 1_000).expect("trash");
+        catalog
+            .purge_trash_item(asset.id, 1_000 + 7_000, 7_000)
+            .expect("purge");
+        catalog
+            .move_asset_to_trash(other_asset.id, "cleanup", 1_000)
+            .expect("trash other");
+        catalog
+            .purge_trash_item(other_asset.id, 1_000 + 7_000, 7_000)
+            .expect("purge other");
+
+        let cleared = catalog.clear_deleted_fingerprints(library.id).expect("clear");
+        assert_eq!(cleared, 1);
+        assert!(!catalog
+            .is_previously_deleted(library.id, "hash-fingerprint-clear", 10)
+            .expect("lookup"));
+        assert!(
+            catalog
+                .is_previously_deleted(other_library.id, "hash-fingerprint-clear-other", 10)
+                .expect("lookup"),
+            "clearing one library's fingerprints must not touch another library's"
+        );
     }
 
     #[test]

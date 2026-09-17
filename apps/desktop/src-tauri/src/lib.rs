@@ -135,6 +135,12 @@ struct ImportFailure {
 struct ImportFolderResult {
     imported: Vec<AssetRecord>,
     failed: Vec<ImportFailure>,
+    /// Filenames skipped because they match a `deleted_asset_fingerprints`
+    /// tombstone — a file the user already permanently deleted from this
+    /// library, found again by a rescan. Not a failure, so kept separate
+    /// from `failed`, but still reported rather than silently vanishing.
+    #[serde(default)]
+    skipped_deleted: Vec<String>,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq, serde::Serialize)]
@@ -1461,6 +1467,24 @@ fn optimize_library(state: tauri::State<CatalogState>, library_id: String) -> Re
     catalog.optimize().map_err(storage_error_message)
 }
 
+/// Clears this library's "don't re-import this" tombstones (see
+/// `storage::Catalog::record_deleted_fingerprint`) — the escape hatch for
+/// anyone who deliberately wants a previously-deleted file to come back
+/// the next time its folder is scanned, since that block is otherwise
+/// permanent and invisible. Returns how many were cleared.
+#[tauri::command]
+fn clear_deleted_import_history(state: tauri::State<CatalogState>, library_id: String) -> Result<usize, String> {
+    let library_id = parse_uuid_field(&library_id, "library id")?;
+    let catalog = state.0.lock().expect("catalog mutex poisoned");
+    catalog
+        .get_library(library_id)
+        .map_err(storage_error_message)?
+        .ok_or_else(|| "library not found".to_string())?;
+    catalog
+        .clear_deleted_fingerprints(library_id)
+        .map_err(storage_error_message)
+}
+
 /// Permanently removes every currently-trashed asset in this library from
 /// the catalog, bypassing the normal retention wait. Same guarantee as the
 /// rest of the trash system for the *real* file: only ever deletes catalog
@@ -1782,14 +1806,15 @@ async fn import_folder(
         let catalog = state.0.lock().expect("catalog mutex poisoned");
         folder_role_for_path(&catalog, library_id, &folder_path)
     };
-    let (imported, failed) = run_batch_import(&state, library_id, import_mode, paths, folder_role).await;
+    let (imported, failed, skipped_deleted) =
+        run_batch_import(&state, library_id, import_mode, paths, folder_role).await;
 
     {
         let catalog = state.0.lock().expect("catalog mutex poisoned");
         let _ = detect_and_persist_stem_groups(&catalog, library_id);
     }
 
-    Ok(ImportFolderResult { imported, failed })
+    Ok(ImportFolderResult { imported, failed, skipped_deleted })
 }
 
 /// Recursively collects every recognized audio file under `root`, including nested
@@ -1845,7 +1870,7 @@ async fn run_batch_import(
     mode: ImportMode,
     paths: Vec<PathBuf>,
     folder_role: Option<String>,
-) -> (Vec<AssetRecord>, Vec<ImportFailure>) {
+) -> (Vec<AssetRecord>, Vec<ImportFailure>, Vec<String>) {
     use futures::stream::{self, StreamExt};
 
     // Matches AUDIO_ANALYSIS_CONCURRENCY: enough to use several cores on
@@ -1878,6 +1903,7 @@ async fn run_batch_import(
 
     let mut imported = Vec::new();
     let mut failed = Vec::new();
+    let mut skipped_deleted = Vec::new();
     for (path, result) in prepared {
         let filename = path
             .file_name()
@@ -1898,7 +1924,14 @@ async fn run_batch_import(
 
         let catalog = state.0.lock().expect("catalog mutex poisoned");
         match import_pipeline::commit_prepared_import(&catalog, library_id, prepared, None) {
-            Ok(asset) => imported.push(asset),
+            Ok(import_pipeline::CommitOutcome::Imported(asset)) => imported.push(asset),
+            // Not a failure — a rescan finding the exact file (by content
+            // hash + size) a user already permanently deleted from this
+            // library. See storage::Catalog::record_deleted_fingerprint.
+            // Reported separately so it doesn't read as an error, but
+            // still visibly, rather than the file just silently not
+            // appearing with no explanation.
+            Ok(import_pipeline::CommitOutcome::PreviouslyDeleted) => skipped_deleted.push(filename),
             Err(ImportError::UnsupportedFormat(_)) => {}
             Err(error) => failed.push(ImportFailure {
                 filename,
@@ -1907,13 +1940,19 @@ async fn run_batch_import(
         }
     }
 
-    (imported, failed)
+    (imported, failed, skipped_deleted)
 }
 
 #[derive(Debug, serde::Serialize)]
 struct DroppedImportResult {
     imported: Vec<AssetRecord>,
     failed: Vec<ImportFailure>,
+    /// See `ImportFolderResult::skipped_deleted` — same meaning. For a
+    /// drop, the file was already copied into the library's own folder
+    /// before this is known (Managed mode has no in-place option), so that
+    /// orphaned copy is removed again rather than left behind uncataloged.
+    #[serde(default)]
+    skipped_deleted: Vec<String>,
     /// How many stem groups (this drop's own STEMS-pattern files, plus any
     /// previously-ungrouped ones elsewhere in the library) got linked as a
     /// side effect — surfaced so the frontend can say something like "3
@@ -1998,15 +2037,26 @@ async fn import_dropped_paths(
     // No folder-role signal here: a drop onto the app window has no
     // associated `folders` row to attribute it to (unlike a folder the
     // user explicitly imports or that the background poller watches).
-    let (imported, failed) =
+    let (imported, failed, skipped_deleted) =
         run_batch_import(&state, library_id, ImportMode::Referenced, copied_paths, None).await;
+
+    // A skipped-deleted file was already copied into the library's own
+    // folder above (Managed mode's copy-first step, before
+    // run_batch_import — and therefore commit_prepared_import — ever gets
+    // to decide it shouldn't be cataloged). Left in place, it would sit in
+    // the media folder as an uncataloged duplicate of a file the user
+    // deliberately removed — remove the copy again rather than leave that
+    // behind.
+    for filename in &skipped_deleted {
+        let _ = std::fs::remove_file(destination_dir.join(filename));
+    }
 
     let stem_groups_detected = {
         let catalog = state.0.lock().expect("catalog mutex poisoned");
         detect_and_persist_stem_groups(&catalog, library_id).unwrap_or(0)
     };
 
-    Ok(DroppedImportResult { imported, failed, stem_groups_detected })
+    Ok(DroppedImportResult { imported, failed, skipped_deleted, stem_groups_detected })
 }
 
 /// Appends " (2)", " (3)"... before the extension until the result doesn't
@@ -2150,7 +2200,7 @@ async fn refresh_library(
         let catalog = state.0.lock().expect("catalog mutex poisoned");
         folder_role_for_path(&catalog, library_id, &media_root)
     };
-    let (imported, failed) =
+    let (imported, failed, skipped_deleted) =
         run_batch_import(&state, library_id, ImportMode::Referenced, paths, folder_role).await;
 
     {
@@ -2158,7 +2208,7 @@ async fn refresh_library(
         let _ = detect_and_persist_stem_groups(&catalog, library_id);
     }
 
-    Ok(ImportFolderResult { imported, failed })
+    Ok(ImportFolderResult { imported, failed, skipped_deleted })
 }
 
 /// Scans a library's configured import folder — a staging drop zone,
@@ -2192,6 +2242,7 @@ async fn scan_import_folder(
         return Ok(ImportFolderResult {
             imported: Vec::new(),
             failed: Vec::new(),
+            skipped_deleted: Vec::new(),
         });
     };
 
@@ -2202,7 +2253,7 @@ async fn scan_import_folder(
         let catalog = state.0.lock().expect("catalog mutex poisoned");
         folder_role_for_path(&catalog, library_id, &import_root)
     };
-    let (imported, failed) =
+    let (imported, failed, skipped_deleted) =
         run_batch_import(&state, library_id, ImportMode::Managed, paths, folder_role).await;
 
     {
@@ -2210,7 +2261,7 @@ async fn scan_import_folder(
         let _ = detect_and_persist_stem_groups(&catalog, library_id);
     }
 
-    Ok(ImportFolderResult { imported, failed })
+    Ok(ImportFolderResult { imported, failed, skipped_deleted })
 }
 
 #[tauri::command]
@@ -6012,6 +6063,7 @@ pub fn run() {
             purge_library_cache,
             check_library_integrity,
             optimize_library,
+            clear_deleted_import_history,
             empty_library_trash,
             delete_library,
             list_assets,
@@ -6469,7 +6521,7 @@ mod tests {
         let library = catalog
             .create_library("Test Library", media_root.to_string_lossy())
             .expect("create library");
-        let (asset, _created) = catalog
+        let storage::RegisterAssetOutcome::Created(asset) = catalog
             .register_asset(storage::NewAssetRecord {
                 library_id: library.id,
                 original_filename: "track.wav".to_string(),
@@ -6481,7 +6533,10 @@ mod tests {
                 file_size: 0,
                 availability_state: shared_types::AvailabilityState::Local,
             })
-            .expect("register asset");
+            .expect("register asset")
+        else {
+            panic!("expected a freshly registered asset");
+        };
         (catalog, asset.id)
     }
 

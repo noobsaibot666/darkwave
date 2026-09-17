@@ -7,7 +7,7 @@ grow into several distinct capabilities over time, starting with the ones below.
 Each entry stays 2-3 lines. This file is a fast index, not a design doc — if an
 idea needs more than 2-3 lines, it needs its own ADR instead.
 
-## Resolve Live Bridge — Planned
+## Resolve Live Bridge — Shipped (Phase 1)
 One-click send-to-timeline for DaVinci Resolve, built on Resolve's scripting API
 (not an Electron Workflow Integration plugin — keeps it working on free Resolve,
 not just Studio). No raw drop-to-timeline: each Darkwave project first mirrors

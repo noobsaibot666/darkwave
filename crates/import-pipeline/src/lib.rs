@@ -9,8 +9,8 @@ use std::fs;
 use std::io::Read;
 use std::path::{Path, PathBuf};
 use storage::{
-    AssetPath, AssetRecord, Catalog, JobKind, NewAssetRecord, SourceRecordDraft, StorageError,
-    TagOrigin,
+    AssetPath, AssetRecord, Catalog, JobKind, NewAssetRecord, RegisterAssetOutcome, SourceRecordDraft,
+    StorageError, TagOrigin,
 };
 use thiserror::Error;
 use uuid::Uuid;
@@ -112,6 +112,8 @@ pub enum ImportError {
     Storage(#[from] StorageError),
     #[error("file read failed: {0}")]
     Io(#[from] std::io::Error),
+    #[error("this file was previously deleted from this library and was not re-imported")]
+    PreviouslyDeleted,
 }
 
 pub fn should_ignore_watched_file(filename: &str) -> bool {
@@ -236,6 +238,14 @@ impl Default for FilesystemNotificationBuffer {
     }
 }
 
+/// Thin convenience wrapper over `commit_prepared_import` for a caller that
+/// just wants "the asset, or an error" — collapses `CommitOutcome::Imported`
+/// down to its `AssetRecord` and turns `PreviouslyDeleted` into
+/// `ImportError::PreviouslyDeleted`, since this signature has no other way
+/// to represent "nothing was imported, but that's not exactly a failure
+/// either." `commit_prepared_import` itself is what the desktop app's real
+/// batch-import path uses, since it needs to tell that case apart from a
+/// real failure to report it separately, not lump it in with either.
 pub fn import_file(
     catalog: &Catalog,
     library_id: Uuid,
@@ -244,7 +254,10 @@ pub fn import_file(
     folder_role: Option<&str>,
 ) -> Result<AssetRecord, ImportError> {
     let prepared = prepare_import(path, mode, folder_role)?;
-    commit_prepared_import(catalog, library_id, prepared, None)
+    match commit_prepared_import(catalog, library_id, prepared, None)? {
+        CommitOutcome::Imported(asset) => Ok(asset),
+        CommitOutcome::PreviouslyDeleted => Err(ImportError::PreviouslyDeleted),
+    }
 }
 
 pub fn import_file_with_source_context(
@@ -256,7 +269,10 @@ pub fn import_file_with_source_context(
     folder_role: Option<&str>,
 ) -> Result<AssetRecord, ImportError> {
     let prepared = prepare_import(path, mode, folder_role)?;
-    commit_prepared_import(catalog, library_id, prepared, Some(source_context))
+    match commit_prepared_import(catalog, library_id, prepared, Some(source_context))? {
+        CommitOutcome::Imported(asset) => Ok(asset),
+        CommitOutcome::PreviouslyDeleted => Err(ImportError::PreviouslyDeleted),
+    }
 }
 
 /// Everything `import_file` computes about a candidate file *before* it
@@ -348,6 +364,21 @@ pub fn prepare_import(
     })
 }
 
+/// What committing a [`PreparedImport`] actually did — mirrors
+/// `storage::RegisterAssetOutcome`'s `Created`/`AlreadyExists` as one
+/// `Imported` case (both already return a usable `AssetRecord` and both
+/// were already treated identically by every caller before this type
+/// existed), plus `PreviouslyDeleted` for a file whose content hash + size
+/// matches a tombstone left by an earlier permanent deletion — see
+/// `storage::Catalog::record_deleted_fingerprint`. Callers must handle this
+/// case explicitly (typically: report it separately from a real import,
+/// not as a failure) rather than assuming a `PreparedImport` always yields
+/// an `AssetRecord`.
+pub enum CommitOutcome {
+    Imported(AssetRecord),
+    PreviouslyDeleted,
+}
+
 /// Registers a [`PreparedImport`] in the catalog and, for a genuinely new
 /// asset, enqueues its background jobs, seeds tag suggestions, records
 /// source context, and (Managed mode) copies the file into the library.
@@ -357,7 +388,7 @@ pub fn commit_prepared_import(
     library_id: Uuid,
     prepared: PreparedImport,
     source_context: Option<ImportSourceContext>,
-) -> Result<AssetRecord, ImportError> {
+) -> Result<CommitOutcome, ImportError> {
     let PreparedImport {
         source_path,
         mode,
@@ -371,7 +402,7 @@ pub fn commit_prepared_import(
         tag_suggestions,
     } = prepared;
 
-    let (asset, is_new) = catalog.register_asset(NewAssetRecord {
+    let (asset, is_new) = match catalog.register_asset(NewAssetRecord {
         library_id,
         original_filename,
         display_name,
@@ -381,7 +412,11 @@ pub fn commit_prepared_import(
         media_type,
         file_size,
         availability_state: AvailabilityState::Local,
-    })?;
+    })? {
+        RegisterAssetOutcome::Created(asset) => (asset, true),
+        RegisterAssetOutcome::AlreadyExists(asset) => (asset, false),
+        RegisterAssetOutcome::PreviouslyDeleted => return Ok(CommitOutcome::PreviouslyDeleted),
+    };
 
     // register_asset is idempotent by content hash + size: a rescan that
     // encounters a file already in the catalog (moved, re-scanned, seen by
@@ -423,7 +458,7 @@ pub fn commit_prepared_import(
         }
     }
 
-    Ok(asset)
+    Ok(CommitOutcome::Imported(asset))
 }
 
 fn snapshot_file_sizes(folder: &Path) -> Result<BTreeMap<PathBuf, u64>, ImportError> {
@@ -802,7 +837,11 @@ mod tests {
         let library = catalog
             .create_library("Split", "/library")
             .expect("library");
-        let asset = commit_prepared_import(&catalog, library.id, prepared, None).expect("commit");
+        let CommitOutcome::Imported(asset) =
+            commit_prepared_import(&catalog, library.id, prepared, None).expect("commit")
+        else {
+            panic!("expected a fresh import to report Imported");
+        };
 
         assert_eq!(asset.original_filename, "prepare-commit-impact.wav");
         assert_eq!(catalog.list_assets(library.id).expect("assets").len(), 1);
@@ -861,6 +900,35 @@ mod tests {
             "re-importing an already-known file must not enqueue a second analysis job"
         );
         assert_eq!(catalog.list_assets(library.id).expect("assets").len(), 1);
+    }
+
+    #[test]
+    fn reimporting_a_permanently_deleted_file_is_declined_not_recreated() {
+        let catalog_path = unique_catalog_path("reimport-after-delete");
+        let audio_path = unique_audio_path("deleted-then-rescanned.wav");
+        fs::write(&audio_path, b"deleted then rescanned").expect("fixture");
+
+        let catalog = Catalog::open(&catalog_path).expect("catalog");
+        let library = catalog
+            .create_library("Reimport After Delete", "/library")
+            .expect("library");
+
+        let first =
+            import_file(&catalog, library.id, &audio_path, ImportMode::Referenced, None).expect("first import");
+        catalog
+            .move_asset_to_trash(first.id, "manual", 1_000)
+            .expect("trash");
+        catalog
+            .purge_trash_item(first.id, 1_000 + 7_000, 7_000)
+            .expect("purge");
+        assert_eq!(catalog.list_assets(library.id).expect("assets").len(), 0);
+
+        // The file is still sitting on disk at the same path with the same
+        // content — a folder rescan would see it exactly as it did the
+        // first time. It must not come back.
+        let second = import_file(&catalog, library.id, &audio_path, ImportMode::Referenced, None);
+        assert!(matches!(second, Err(ImportError::PreviouslyDeleted)));
+        assert_eq!(catalog.list_assets(library.id).expect("assets").len(), 0);
     }
 
     #[test]
