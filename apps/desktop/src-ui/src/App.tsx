@@ -1336,6 +1336,8 @@ export function App() {
   const draggedIdsRef = useRef<string[]>([]);
   const suppressNextRowClickRef = useRef(false);
   const [createLibraryModalOpen, setCreateLibraryModalOpen] = useState(false);
+  const [createLibraryBusy, setCreateLibraryBusy] = useState(false);
+  const [createLibraryError, setCreateLibraryError] = useState<string | null>(null);
   const [shortcutsOpen, setShortcutsOpen] = useState(false);
   const toggleSection = useCallback((id: string) => {
     setCollapsedSections((previous) => {
@@ -3373,7 +3375,19 @@ export function App() {
   }, []);
 
   const handleEmptyLibraryTrash = useCallback(
-    (library: LibraryRecord) => {
+    async (library: LibraryRecord) => {
+      // Previously had no confirmation at all, even from its own Settings
+      // button — fine while it was a couple of clicks deep, but this is now
+      // also reachable as Library > Empty Trash… in the menu bar, and this
+      // bypasses the normal trash retention wait entirely (unlike letting
+      // items age out on their own), so a stray click deserves the same
+      // confirm-before-destroying pattern handleDeleteLibrary already uses.
+      const confirmed = await confirmDialog(
+        `This permanently removes everything currently in ${library.name}'s trash, skipping the normal retention wait. This can't be undone.`,
+        { title: `Empty ${library.name}'s trash?`, kind: "warning" }
+      );
+      if (!confirmed) return;
+
       setLibraryAdminStatus(`Emptying ${library.name}'s trash…`);
       invoke<number>("empty_library_trash", { libraryId: library.id })
         .then((purged) => {
@@ -3412,18 +3426,52 @@ export function App() {
     [activeLibraryId]
   );
 
-  const handleCreateLibrary = async () => {
+  // "New Library" (sidebar "+" or Settings → Manage Libraries) — every
+  // library is its own `.darkwave` file (see `open_or_init_library_file`'s
+  // doc comment: "each project file owns exactly one library"), so this
+  // has to ask where to save one exactly like the New Setup wizard's own
+  // library-creation step does, via `create_library_file`. It previously
+  // called the older `create_library` instead, which inserts a second
+  // library row into whatever catalog happens to be open right now — for
+  // anyone who already had a library open, that silently trapped a second
+  // library inside the *same* physical file with no file of its own, no
+  // way to move or back it up independently, and no way to separate it out
+  // later (the migration flow only handles the legacy shared-catalog case,
+  // not this).
+  const handleCreateLibrary = useCallback(async () => {
     if (!libraryName.trim()) return;
 
-    const library = await invoke<LibraryRecord>("create_library", {
-      name: libraryName.trim(),
-      mediaRoot: ""
+    const savePath = await saveDialog({
+      title: "Save your Darkwave library",
+      defaultPath: `${libraryName.trim()}.darkwave`,
+      filters: [{ name: "Darkwave Library", extensions: ["darkwave"] }]
     });
-    setLibraries((previous) => [...previous, library]);
-    switchActiveLibrary(library.id);
-    setLibraryName("");
-    setCreateLibraryModalOpen(false);
-  };
+    if (typeof savePath !== "string") return;
+
+    setCreateLibraryBusy(true);
+    setCreateLibraryError(null);
+    try {
+      const tolerant = await invoke<boolean>("is_path_network_tolerant", { path: savePath }).catch(() => true);
+      const library = await invoke<LibraryRecord>("create_library_file", {
+        libraryFilePath: savePath,
+        name: libraryName.trim()
+      });
+      setLibraries([library]);
+      switchActiveLibrary(library.id);
+      setActiveLibraryFilePath(savePath);
+      setLibraryName("");
+      setCreateLibraryModalOpen(false);
+      if (!tolerant) {
+        showImportToast(
+          "That location looks like a network drive — keeping library files on local disk is safer, a dropped connection mid-save risks corrupting it."
+        );
+      }
+    } catch (error) {
+      setCreateLibraryError(String(error));
+    } finally {
+      setCreateLibraryBusy(false);
+    }
+  }, [libraryName, switchActiveLibrary, showImportToast]);
 
   // Resets all onboarding state and lands directly in the app with the
   // given (already fully-configured) library — the path both Open Library
@@ -4362,16 +4410,75 @@ export function App() {
   // File > Open Library… — the dialog itself (and the follow-up
   // open_library_file invoke) lives in handleOpenLibraryFile already, since
   // it's the same "browse for a .darkwave file" flow the first-run screen
-  // uses; File > Last Open needs no round trip here at all — it's resolved
-  // entirely on the Rust side (see the "open-last-library" menu handler)
-  // and arrives as the same library-file-opened event a Finder double-click
-  // does.
+  // uses; File > Open Recent needs no round trip here at all — each entry
+  // is resolved entirely on the Rust side (see the "open-recent:<path>"
+  // menu handler, which reuses open_library_file_and_notify_frontend) and
+  // arrives as the same library-file-opened/library-file-open-failed
+  // events a Finder double-click already produces.
   useEffect(() => {
     const unlistenMenuOpenLibrary = listen("menu-open-library", () => handleOpenLibraryFile());
     return () => {
       unlistenMenuOpenLibrary.then((dispose) => dispose());
     };
   }, [handleOpenLibraryFile]);
+
+  // Every other native menu item added for menu-bar discoverability of
+  // existing features — each one just does whatever its matching in-app
+  // button/shortcut already does, following the same "menu emits an event,
+  // the frontend does the real work" pattern as menu-open-library above.
+  // Grouped into one effect (matching the job-progress events' own
+  // multi-subscription pattern) rather than N separate effects, since
+  // these are all the same shape: listen, call an existing handler, done.
+  useEffect(() => {
+    const subscriptions: Array<Promise<() => void>> = [
+      listen("menu-new-library", () => setCreateLibraryModalOpen(true)),
+      listen("menu-preferences", () => setSettingsOpen(true)),
+      listen("menu-import-folder", () => handleImportFolder()),
+      listen("menu-export-selected", () => handleExportSelected()),
+      listen("menu-refresh-library", () => handleRefreshLibrary()),
+      listen("menu-backup-library", () => handleBackupLibrary()),
+      listen("menu-restore-library", () => handleRestoreLibrary()),
+      listen("menu-find", () => {
+        searchInputRef.current?.focus();
+        searchInputRef.current?.select();
+      }),
+      listen("menu-command-palette", () => setCommandPaletteOpen((previous) => !previous)),
+      listen("menu-toggle-sidebar", () => setSidebarCollapsed((previous) => !previous)),
+      listen("menu-toggle-inspector", () => setInspectorCollapsed((previous) => !previous)),
+      listen("menu-toggle-editor-workflow", () => setEditorWorkflowOpen((previous) => !previous)),
+      listen("menu-new-project", () => setNewProjectModalOpen(true)),
+      listen("menu-sonic-radar-resync-all", () => handleResyncSonicRadar()),
+      listen("menu-sonic-radar-backfill", () => handleBackfillAudioAnalysis()),
+      listen("menu-check-library-integrity", () => {
+        if (activeLibrary) handleCheckLibraryIntegrity(activeLibrary);
+      }),
+      listen("menu-optimize-library", () => {
+        if (activeLibrary) handleOptimizeLibrary(activeLibrary);
+      }),
+      listen("menu-empty-trash", () => {
+        if (activeLibrary) handleEmptyLibraryTrash(activeLibrary);
+      }),
+      listen("menu-release-readiness", () => {
+        setSettingsCategory("release");
+        setSettingsOpen(true);
+      })
+    ];
+    return () => {
+      subscriptions.forEach((subscription) => subscription.then((dispose) => dispose()));
+    };
+  }, [
+    handleImportFolder,
+    handleExportSelected,
+    handleRefreshLibrary,
+    handleBackupLibrary,
+    handleRestoreLibrary,
+    handleResyncSonicRadar,
+    handleBackfillAudioAnalysis,
+    handleCheckLibraryIntegrity,
+    handleOptimizeLibrary,
+    handleEmptyLibraryTrash,
+    activeLibrary
+  ]);
 
   // The Rust-side standing worker (apps/desktop/src-tauri) ticks roughly
   // every 20s, requeuing retryable failed jobs and emitting this event —
@@ -8223,18 +8330,22 @@ export function App() {
                   onChange={(event) => setLibraryName(event.target.value)}
                   placeholder="Home Studio"
                   onKeyDown={(event) => {
-                    if (event.key === "Enter" && libraryName.trim()) handleCreateLibrary();
+                    if (event.key === "Enter" && libraryName.trim() && !createLibraryBusy) handleCreateLibrary();
                   }}
                 />
               </label>
-              <p className="settings-hint">The first folder you import becomes this library's media location automatically.</p>
+              <p className="settings-hint">
+                The first folder you import becomes this library's media location automatically. You'll be asked
+                where to save the library file itself next.
+              </p>
+              {createLibraryError ? <p className="settings-hint">{createLibraryError}</p> : null}
               <button
                 className="primary-action"
                 type="button"
                 onClick={handleCreateLibrary}
-                disabled={!libraryName.trim()}
+                disabled={!libraryName.trim() || createLibraryBusy}
               >
-                Create Library
+                {createLibraryBusy ? "Saving…" : "Choose location…"}
               </button>
             </div>
           </motion.div>

@@ -40,6 +40,17 @@ struct CatalogState(Mutex<Catalog>);
 /// (`CollectionType::Project`, an editorial export destination).
 struct ActiveLibraryFileState(Mutex<Option<String>>);
 
+/// A live handle to the File menu's "Open Recent" submenu, kept around so
+/// its contents can be rebuilt in place (see `refresh_open_recent_menu`)
+/// whenever the recent-library-files list changes — `Submenu` wraps an
+/// `Arc` internally (cheap to clone, safe to hold outside the `.setup()`
+/// closure that first builds the menu) and its mutation methods
+/// (`append`/`remove`/`items`) take `&self`, unlike `App::set_menu` (only
+/// available on `App`, not `AppHandle`, so it can't be called again from an
+/// arbitrary command handler) which would require rebuilding the entire
+/// menu bar just to reflect one changed submenu.
+struct OpenRecentMenuState(tauri::menu::Submenu<tauri::Wry>);
+
 /// Snapshot of which library file is active right now, for comparing across
 /// a long `.await` (decode/DSP/model inference) that doesn't hold the
 /// catalog mutex. See `active_library_changed_since` for why this matters.
@@ -865,29 +876,6 @@ fn store_library_bookmark_for_freshly_picked_folder(
 ) {
 }
 
-#[tauri::command]
-fn create_library(
-    state: tauri::State<CatalogState>,
-    name: String,
-    media_root: String,
-) -> Result<LibraryRecord, String> {
-    library_core::validate_library_draft(&library_core::LibraryDraft {
-        name: name.clone(),
-        media_root: media_root.clone(),
-    })
-    .map_err(|error| error.to_string())?;
-
-    let catalog = state.0.lock().expect("catalog mutex poisoned");
-    let library = catalog
-        .create_library(name, media_root)
-        .map_err(storage_error_message)?;
-    catalog
-        .seed_starter_taxonomy()
-        .map_err(storage_error_message)?;
-
-    Ok(library)
-}
-
 /// Explicitly sets a library's media root — used by the first-run wizard's
 /// "root folder" step, as an alternative to the older implicit path (the
 /// first folder someone imports into an empty-media_root library becomes
@@ -1102,6 +1090,41 @@ fn open_library_file(
     Ok(library)
 }
 
+/// Rebuilds the File menu's "Open Recent" submenu in place from the current
+/// recent-library-files list — clears every existing item, appends a fresh
+/// `MenuItem` per entry (newest first, matching the list's own order), and
+/// disables the submenu entirely when there's nothing to show rather than
+/// leaving stale entries or an empty-but-enabled menu behind. Best-effort:
+/// a missing `OpenRecentMenuState` (shouldn't happen once `.setup()` has
+/// run) or a failed menu mutation is silently skipped rather than failing
+/// whatever caller triggered the refresh — an out-of-date recents submenu
+/// is a cosmetic problem, not a reason to fail a library open/create.
+fn refresh_open_recent_menu(app: &tauri::AppHandle, recents: &[preferences::RecentLibraryFileEntry]) {
+    let Some(state) = app.try_state::<OpenRecentMenuState>() else {
+        return;
+    };
+    let submenu = &state.0;
+
+    if let Ok(items) = submenu.items() {
+        for item in items {
+            let _ = submenu.remove(&item);
+        }
+    }
+
+    let _ = submenu.set_enabled(!recents.is_empty());
+    for entry in recents {
+        if let Ok(item) = tauri::menu::MenuItem::with_id(
+            app,
+            format!("open-recent:{}", entry.path),
+            &entry.name,
+            true,
+            None::<&str>,
+        ) {
+            let _ = submenu.append(&item);
+        }
+    }
+}
+
 /// Shared tail end of `create_library_file`/`open_library_file`: swaps the
 /// new catalog into the same mutex `restore_library` already uses for a
 /// live catalog replacement, records the active library-file path, and
@@ -1127,6 +1150,7 @@ fn swap_active_catalog(
     prefs.record_library_file_opened(library_file_path, library_name, current_time_ms());
     preferences::save_preferences(&preferences_file, &prefs)
         .map_err(|error| format!("{error:?}"))?;
+    refresh_open_recent_menu(app, &prefs.recent_library_files);
 
     {
         let mut guard = state.0.lock().expect("catalog mutex poisoned");
@@ -1314,6 +1338,7 @@ fn migrate_legacy_library(
     prefs.record_legacy_library_migrated(library_id.to_string(), &library_file_path, &library.name);
     preferences::save_preferences(&preferences_file, &prefs)
         .map_err(|error| format!("{error:?}"))?;
+    refresh_open_recent_menu(&app, &prefs.recent_library_files);
 
     Ok(library)
 }
@@ -5593,6 +5618,19 @@ pub fn run() {
                 true,
                 Some("CmdOrCtrl+Shift+Z"),
             )?;
+            let find_item =
+                tauri::menu::MenuItem::with_id(app, "find", "Find", true, Some("CmdOrCtrl+F"))?;
+            // Same accelerator as the in-app keyboard shortcut
+            // (ShortcutMap::default_audio_workspace's Mod+K) so the menu
+            // item's hint always matches what actually happens — both paths
+            // just toggle the same palette.
+            let command_palette_item = tauri::menu::MenuItem::with_id(
+                app,
+                "command-palette",
+                "Command Palette",
+                true,
+                Some("CmdOrCtrl+K"),
+            )?;
             let edit_menu = tauri::menu::SubmenuBuilder::new(app, "Edit")
                 .item(&undo_item)
                 .item(&redo_item)
@@ -5601,12 +5639,37 @@ pub fn run() {
                 .copy()
                 .paste()
                 .select_all()
+                .separator()
+                .item(&find_item)
+                .item(&command_palette_item)
                 .build()?;
+
+            let preferences_item = tauri::menu::MenuItem::with_id(
+                app,
+                "preferences",
+                "Preferences…",
+                true,
+                Some("CmdOrCtrl+,"),
+            )?;
             let app_menu = tauri::menu::SubmenuBuilder::new(app, "Darkwave")
                 .about(None)
                 .separator()
+                .item(&preferences_item)
+                .separator()
+                .hide()
+                .hide_others()
+                .show_all()
+                .separator()
                 .quit()
                 .build()?;
+
+            let new_library_item = tauri::menu::MenuItem::with_id(
+                app,
+                "new-library",
+                "New Library…",
+                true,
+                Some("CmdOrCtrl+N"),
+            )?;
             let open_library_item = tauri::menu::MenuItem::with_id(
                 app,
                 "open-library",
@@ -5614,23 +5677,25 @@ pub fn run() {
                 true,
                 Some("CmdOrCtrl+O"),
             )?;
-            // Reopens whichever library was open immediately before the
-            // current one (`recent_library_files[1]` — index 0 is always
-            // the current library itself, bumped to the front on every
-            // open) — a quick way to flip back and forth between two
-            // libraries without going through the Open Library dialog each
-            // time. A no-op if there's no second library to switch to.
-            let open_last_library_item = tauri::menu::MenuItem::with_id(
+            // Populated below via refresh_open_recent_menu once its handle
+            // is registered in app state — every recent library, not just a
+            // single fixed "second most recent" entry (the old "Last Open"
+            // item this replaces).
+            let open_recent_submenu = tauri::menu::SubmenuBuilder::new(app, "Open Recent").build()?;
+            let import_item = tauri::menu::MenuItem::with_id(
                 app,
-                "open-last-library",
-                "Last Open",
+                "import-folder",
+                "Import Folder…",
                 true,
-                Some("CmdOrCtrl+Shift+O"),
+                Some("CmdOrCtrl+I"),
             )?;
-            let file_menu = tauri::menu::SubmenuBuilder::new(app, "File")
-                .item(&open_library_item)
-                .item(&open_last_library_item)
-                .build()?;
+            let export_selected_item = tauri::menu::MenuItem::with_id(
+                app,
+                "export-selected",
+                "Export Selected…",
+                true,
+                Some("CmdOrCtrl+E"),
+            )?;
             let license_report_item = tauri::menu::MenuItem::with_id(
                 app,
                 "export-license-report",
@@ -5638,9 +5703,148 @@ pub fn run() {
                 true,
                 None::<&str>,
             )?;
-            let library_menu = tauri::menu::SubmenuBuilder::new(app, "Library")
+            // Deliberately not CmdOrCtrl+R — the in-app ShortcutMap already
+            // binds that to Toggle Reviewed, and a native menu accelerator
+            // would win the keystroke before the webview ever saw it.
+            let refresh_library_item = tauri::menu::MenuItem::with_id(
+                app,
+                "refresh-library",
+                "Refresh Library",
+                true,
+                Some("CmdOrCtrl+Shift+R"),
+            )?;
+            let backup_library_item = tauri::menu::MenuItem::with_id(
+                app,
+                "backup-library",
+                "Backup Library…",
+                true,
+                None::<&str>,
+            )?;
+            let restore_library_item = tauri::menu::MenuItem::with_id(
+                app,
+                "restore-library",
+                "Restore Library from Backup…",
+                true,
+                None::<&str>,
+            )?;
+            let file_menu = tauri::menu::SubmenuBuilder::new(app, "File")
+                .item(&new_library_item)
+                .item(&open_library_item)
+                .item(&open_recent_submenu)
+                .separator()
+                .item(&import_item)
+                .item(&export_selected_item)
                 .item(&license_report_item)
+                .separator()
+                .item(&refresh_library_item)
+                .separator()
+                .item(&backup_library_item)
+                .item(&restore_library_item)
                 .build()?;
+
+            let toggle_sidebar_item = tauri::menu::MenuItem::with_id(
+                app,
+                "toggle-sidebar",
+                "Toggle Sidebar",
+                true,
+                None::<&str>,
+            )?;
+            let toggle_inspector_item = tauri::menu::MenuItem::with_id(
+                app,
+                "toggle-inspector",
+                "Toggle Inspector",
+                true,
+                None::<&str>,
+            )?;
+            let toggle_editor_workflow_item = tauri::menu::MenuItem::with_id(
+                app,
+                "toggle-editor-workflow",
+                "Editor Workflow",
+                true,
+                None::<&str>,
+            )?;
+            let view_menu = tauri::menu::SubmenuBuilder::new(app, "View")
+                .item(&toggle_sidebar_item)
+                .item(&toggle_inspector_item)
+                .separator()
+                .item(&toggle_editor_workflow_item)
+                .separator()
+                .fullscreen()
+                .build()?;
+
+            let new_project_item = tauri::menu::MenuItem::with_id(
+                app,
+                "new-project",
+                "New Project…",
+                true,
+                Some("CmdOrCtrl+Shift+N"),
+            )?;
+            let sonic_radar_resync_item = tauri::menu::MenuItem::with_id(
+                app,
+                "sonic-radar-resync-all",
+                "Re-analyse Everything",
+                true,
+                None::<&str>,
+            )?;
+            let sonic_radar_backfill_item = tauri::menu::MenuItem::with_id(
+                app,
+                "sonic-radar-backfill",
+                "Backfill Tempo/Key/Pitch/Vocals",
+                true,
+                None::<&str>,
+            )?;
+            let sonic_radar_menu = tauri::menu::SubmenuBuilder::new(app, "Sonic Radar")
+                .item(&sonic_radar_resync_item)
+                .item(&sonic_radar_backfill_item)
+                .build()?;
+            let check_integrity_item = tauri::menu::MenuItem::with_id(
+                app,
+                "check-library-integrity",
+                "Check and Repair…",
+                true,
+                None::<&str>,
+            )?;
+            let optimize_item = tauri::menu::MenuItem::with_id(
+                app,
+                "optimize-library",
+                "Optimize…",
+                true,
+                None::<&str>,
+            )?;
+            // No accelerator, deliberately: handleEmptyLibraryTrash bypasses
+            // the normal trash retention wait entirely, so this shouldn't be
+            // one accidental keystroke away — click + its own confirm
+            // dialog only.
+            let empty_trash_item = tauri::menu::MenuItem::with_id(
+                app,
+                "empty-trash",
+                "Empty Trash…",
+                true,
+                None::<&str>,
+            )?;
+            let library_menu = tauri::menu::SubmenuBuilder::new(app, "Library")
+                .item(&new_project_item)
+                .separator()
+                .item(&sonic_radar_menu)
+                .separator()
+                .item(&check_integrity_item)
+                .item(&optimize_item)
+                .separator()
+                .item(&empty_trash_item)
+                .build()?;
+
+            let zoom_item = tauri::menu::PredefinedMenuItem::maximize(app, Some("Zoom"))?;
+            let bring_all_to_front_item =
+                tauri::menu::PredefinedMenuItem::bring_all_to_front(app, Some("Bring All to Front"))?;
+            let window_menu = tauri::menu::SubmenuBuilder::new(app, "Window")
+                .minimize()
+                .close_window()
+                .separator()
+                .item(&zoom_item)
+                .separator()
+                .item(&bring_all_to_front_item)
+                .build()?;
+
             let shortcuts_item = tauri::menu::MenuItem::with_id(
                 app,
                 "keyboard-shortcuts",
@@ -5648,65 +5852,113 @@ pub fn run() {
                 true,
                 Some("CmdOrCtrl+/"),
             )?;
+            let release_readiness_item = tauri::menu::MenuItem::with_id(
+                app,
+                "release-readiness",
+                "Release Readiness",
+                true,
+                None::<&str>,
+            )?;
             let help_menu = tauri::menu::SubmenuBuilder::new(app, "Help")
                 .item(&shortcuts_item)
+                .item(&release_readiness_item)
                 .build()?;
-            let window_menu = tauri::menu::SubmenuBuilder::new(app, "Window")
-                .minimize()
-                .close_window()
-                .build()?;
+
             let menu = tauri::menu::MenuBuilder::new(app)
                 .item(&app_menu)
                 .item(&file_menu)
                 .item(&edit_menu)
+                .item(&view_menu)
                 .item(&library_menu)
                 .item(&window_menu)
                 .item(&help_menu)
                 .build()?;
             app.set_menu(menu)?;
 
+            app.manage(OpenRecentMenuState(open_recent_submenu));
+            refresh_open_recent_menu(app.handle(), &startup_preferences.recent_library_files);
+
             Ok(())
         })
         .on_menu_event(|app, event| {
             use tauri::Emitter;
-            match event.id().as_ref() {
+            let id = event.id().as_ref();
+            if let Some(path) = id.strip_prefix("open-recent:") {
+                open_library_file_and_notify_frontend(app, path);
+                return;
+            }
+            match id {
                 "undo" => {
                     let _ = app.emit("menu-undo", ());
                 }
                 "redo" => {
                     let _ = app.emit("menu-redo", ());
                 }
-                "export-license-report" => {
-                    let _ = app.emit("menu-export-license-report", ());
-                }
-                "keyboard-shortcuts" => {
-                    let _ = app.emit("menu-keyboard-shortcuts", ());
+                "new-library" => {
+                    let _ = app.emit("menu-new-library", ());
                 }
                 "open-library" => {
                     let _ = app.emit("menu-open-library", ());
                 }
-                "open-last-library" => {
-                    let Some(active_library_file) = app.try_state::<ActiveLibraryFileState>() else {
-                        return;
-                    };
-                    let current_path = active_library_file
-                        .0
-                        .lock()
-                        .expect("active library file mutex poisoned")
-                        .clone();
-                    let Ok(preferences_path) = preferences_path(app) else {
-                        return;
-                    };
-                    let Ok(preferences) = preferences::load_preferences(&preferences_path) else {
-                        return;
-                    };
-                    let previous = preferences
-                        .recent_library_files
-                        .into_iter()
-                        .find(|entry| Some(&entry.path) != current_path.as_ref());
-                    if let Some(entry) = previous {
-                        open_library_file_and_notify_frontend(app, &entry.path);
-                    }
+                "import-folder" => {
+                    let _ = app.emit("menu-import-folder", ());
+                }
+                "export-selected" => {
+                    let _ = app.emit("menu-export-selected", ());
+                }
+                "export-license-report" => {
+                    let _ = app.emit("menu-export-license-report", ());
+                }
+                "refresh-library" => {
+                    let _ = app.emit("menu-refresh-library", ());
+                }
+                "backup-library" => {
+                    let _ = app.emit("menu-backup-library", ());
+                }
+                "restore-library" => {
+                    let _ = app.emit("menu-restore-library", ());
+                }
+                "preferences" => {
+                    let _ = app.emit("menu-preferences", ());
+                }
+                "find" => {
+                    let _ = app.emit("menu-find", ());
+                }
+                "command-palette" => {
+                    let _ = app.emit("menu-command-palette", ());
+                }
+                "toggle-sidebar" => {
+                    let _ = app.emit("menu-toggle-sidebar", ());
+                }
+                "toggle-inspector" => {
+                    let _ = app.emit("menu-toggle-inspector", ());
+                }
+                "toggle-editor-workflow" => {
+                    let _ = app.emit("menu-toggle-editor-workflow", ());
+                }
+                "new-project" => {
+                    let _ = app.emit("menu-new-project", ());
+                }
+                "sonic-radar-resync-all" => {
+                    let _ = app.emit("menu-sonic-radar-resync-all", ());
+                }
+                "sonic-radar-backfill" => {
+                    let _ = app.emit("menu-sonic-radar-backfill", ());
+                }
+                "check-library-integrity" => {
+                    let _ = app.emit("menu-check-library-integrity", ());
+                }
+                "optimize-library" => {
+                    let _ = app.emit("menu-optimize-library", ());
+                }
+                "empty-trash" => {
+                    let _ = app.emit("menu-empty-trash", ());
+                }
+                "release-readiness" => {
+                    let _ = app.emit("menu-release-readiness", ());
+                }
+                "keyboard-shortcuts" => {
+                    let _ = app.emit("menu-keyboard-shortcuts", ());
                 }
                 _ => {}
             }
@@ -5740,7 +5992,6 @@ pub fn run() {
             backup_restore_requirements,
             media_root_status,
             list_libraries,
-            create_library,
             set_library_media_root,
             set_library_import_root,
             set_library_import_subfolders,
