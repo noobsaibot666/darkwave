@@ -39,6 +39,29 @@ clicking "Similar Sounds" on an analyzed track actually returns results.
 
 ---
 
+## 2026-09-17 — version bumped to 0.3.2 (build 14) — pull before your next build, and a heads-up on the Mac toolchain (not your side, but explains a gap)
+
+Marketing version bumped `0.3.1` → `0.3.2` (`tauri.conf.json`/`package.json`/`Cargo.toml`, all
+three) — 0.3.1 build 13 was approved on the App Store. `deploy_direct_windows.ps1`'s
+`check_version_ledger.ps1` step will refuse to build against your local files until you pull this;
+no code changes came with it on the Rust/TS side, just the version files plus a new ledger row
+(`docs/macos/version-ledger.md`).
+
+Not something you need to act on, but worth knowing in case it explains a lag in fixes reaching
+you: this Mac's Xcode install got reinstalled/updated to Xcode 27.0 recently, and every `cargo
+build --release` on this repo's workspace started failing with proc-macro `dlopen` crashes
+(`mis-aligned LINKEDIT string pool`) — a from-scratch `cargo clean`, wiped `~/.cargo/registry`,
+disabling LTO/strip, `CARGO_BUILD_JOBS=1`, and an older rustc all made no difference. Downgrading
+to Xcode 26.4 fixed it outright. This is macOS/Xcode-linker-specific (release-profile proc-macro
+compilation), nothing about the actual crate code or Cargo.toml — your MSVC toolchain isn't
+affected and there's no reason to expect the same thing on Windows. Flagging only because if a
+past macOS pull was slow to land, this multi-hour detour on my end was why, not a code issue on
+your side.
+
+Both the MAS `.pkg` (build 14) and the direct-sale `.dmg` (notarized/stapled) were built
+successfully today with Xcode 26.4 — no code differences from build 13 beyond the version bump.
+
+---
 
 ## 2026-09-13 — merged your audio-analysis-retry-loop fix, plus two corrections on top — pull main
 
