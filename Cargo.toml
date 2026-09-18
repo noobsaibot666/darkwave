@@ -30,6 +30,11 @@ edition = "2021"
 license = "Proprietary"
 repository = "https://github.com/noobsaibot666/darkwave"
 rust-version = "1.80"
+# None of these crates are ever meant to be published to crates.io — this
+# also lets `cargo about`'s `private.ignore` (see about.toml) correctly
+# exclude them from the third-party license report, instead of erroring on
+# "Proprietary" not being a real SPDX identifier.
+publish = false
 
 [workspace.dependencies]
 chrono = { version = "0.4", default-features = false, features = ["clock", "serde"] }

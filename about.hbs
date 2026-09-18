@@ -1,0 +1,76 @@
+<html>
+
+<head>
+    <style>
+        @media (prefers-color-scheme: dark) {
+            body {
+                background: #333;
+                color: white;
+            }
+            a {
+                color: skyblue;
+            }
+        }
+        .container {
+            font-family: sans-serif;
+            max-width: 800px;
+            margin: 0 auto;
+        }
+        .intro {
+            text-align: center;
+        }
+        .licenses-list {
+            list-style-type: none;
+            margin: 0;
+            padding: 0;
+        }
+        .license-used-by {
+            margin-top: -10px;
+        }
+        .license-text {
+            max-height: 200px;
+            overflow-y: scroll;
+            white-space: pre-wrap;
+        }
+    </style>
+</head>
+
+<body>
+    <main class="container">
+        <div class="intro">
+            <h1>Third-Party Licenses — Darkwave</h1>
+            <p>Every open-source dependency compiled or bundled into this application, and the
+               license terms it's used under. Generated from <code>about.toml</code> via
+               <code>scripts/generate-third-party-notices.sh</code> — see that script before
+               editing this file by hand, since a manual edit will just be overwritten by the
+               next regeneration.</p>
+        </div>
+
+        <h2>Rust (compiled into the application binary)</h2>
+
+        <h3>Overview of licenses:</h3>
+        <ul class="licenses-overview">
+            {{#each overview}}
+            <li><a href="#{{id}}">{{name}}</a> ({{count}})</li>
+            {{/each}}
+        </ul>
+
+        <h3>All license text:</h3>
+        <ul class="licenses-list" id="rust-licenses-list">
+            {{#each licenses}}
+            <li class="license">
+                <h4 id="{{id}}">{{name}}</h4>
+                <h4>Used by:</h4>
+                <ul class="license-used-by">
+                    {{#each used_by}}
+                    <li><a href="{{#if crate.repository}} {{crate.repository}} {{else}} https://crates.io/crates/{{crate.name}} {{/if}}">{{crate.name}} {{crate.version}}</a></li>
+                    {{/each}}
+                </ul>
+                <pre class="license-text">{{text}}</pre>
+            </li>
+            {{/each}}
+        </ul>
+    </main>
+</body>
+
+</html>
