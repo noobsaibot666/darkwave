@@ -20,6 +20,33 @@ app's first native ML inference dependency. The crate wraps the Silero VAD
 ONNX model and depends transitively on `ort` (`ort`/`ort-sys`, Apache-2.0),
 the Rust ONNX Runtime binding.
 
+**Model license — verified separately from the wrapping crate, added
+2026-09-18.** This originally only checked the Rust crate's own MIT
+license, not the bundled model weights themselves — the same distinction
+ADR 0031 (instrument detection) was careful to draw for YAMNet (runtime
+license vs. weights license vs. dataset-ontology license, three separate
+checks), and the exact category of oversight that let a GPL-3.0 dependency
+(bliss-rs, ADR 0025) ship unnoticed for a while before ADR 0033 caught it.
+Closing that gap here: `voice_activity_detector` embeds the model directly
+into the compiled binary via `include_bytes!("silero_vad.onnx")`
+(`src/vad.rs` in the crate — unlike the instrument-detection model, which
+ships inert until a file is manually dropped in, this one is baked into
+every build unconditionally) and its own README states it's "the [Silero
+VAD V5 model](https://github.com/snakers4/silero-vad/releases/tag/v5.0)."
+Checked the upstream `snakers4/silero-vad` repository's own `LICENSE`
+directly, both on `master` and pinned at the `v5.0` tag specifically (the
+exact version bundled): MIT, `Copyright (c) 2020-present Silero Team`,
+identical at both. One blanket license for the whole repository — unlike
+YAMNet, there's no separately-sourced dataset/ontology file with its own
+different license to track here, since the Silero team trained and
+published the model themselves under their own single license.
+
+Silero VAD is not the crate author's own model — `voice_activity_detector`
+(Copyright Nicholas Keenan, per its own `LICENSE`) is a wrapper the crate
+author wrote around it, so this repo now correctly carries two separate,
+independently-verified MIT attributions where it previously only
+documented one.
+
 **Resampling: hand-rolled, not a new dependency.** Silero only accepts 8kHz
 or 16kHz mono input. `crates/audio-analysis::resample_linear` does a plain
 linear-interpolation resample of a downmixed copy of the decoded buffer
