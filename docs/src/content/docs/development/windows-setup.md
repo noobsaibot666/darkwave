@@ -14,22 +14,21 @@ it running in the first place.
 cd darkwave
 git pull origin main
 npm install
-cargo build -p similarity-worker --release --manifest-path .\Cargo.toml
-$triple = (rustc -vV | Select-String '^host:').Line.Split(' ')[1]
-Copy-Item "target\release\similarity-worker.exe" "apps\desktop\src-tauri\binaries\similarity-worker-$triple.exe" -Force
 cd apps\desktop
 npm run tauri dev
 ```
 
 - `npm install` picks up any new/changed JS dependencies. Safe to run even
   when nothing changed.
-- The sidecar rebuild is required, not optional: `apps\desktop\src-tauri\binaries\`
-  is gitignored (it's a compiled, machine-specific artifact), so `git pull`
-  never brings a copy along. Skipping it produces
-  `resource path ...similarity-worker-x86_64-pc-windows-msvc.exe doesn't exist`
-  the moment you try to launch.
-- If only `crates/similarity-worker` changed, you can skip straight to just
-  the sidecar-rebuild lines rather than the full sequence.
+- No sidecar rebuild step anymore. Until 2026-09-18 this pull sequence
+  included building a `similarity-worker` sidecar binary first (a GPL-3.0
+  bliss-rs subprocess "Similar Sounds" depended on) — that crate is gone.
+  Its replacement (`crates/audio-analysis::compute_fingerprint`, see
+  `docs/adr/0033-drop-bliss-rs-similarity-sidecar.md`) is plain Rust that
+  links straight into `darkwave-desktop` like everything else, so "Similar
+  Sounds" now works on this Windows build too — it never actually worked
+  here before, since a Windows-triple sidecar build was still open work
+  (see ADR 0025's own consequences section) that never got done.
 
 Want to confirm nothing broke before opening the UI?
 
@@ -123,7 +122,6 @@ failure:**
 
 | Symptom | Cause | Fix |
 |---|---|---|
-| `resource path ...similarity-worker-x86_64-pc-windows-msvc.exe doesn't exist` | Sidecar not rebuilt after the last pull (or built for the wrong triple) | Re-run the sidecar-rebuild lines above |
 | Linker error mentioning `link.exe` or `LINK : fatal error` | VS Build Tools / C++ workload got removed or is out of date | `winget install --id Microsoft.VisualStudio.2022.BuildTools -e --override "--quiet --add Microsoft.VisualStudio.Workload.VCTools --includeRecommended"` |
 | Blank/black window on launch, or a webview-related panic | WebView2 Runtime missing or corrupted | Install from `https://developer.microsoft.com/microsoft-edge/webview2/`, then relaunch |
 | `audio-analysis` (or `ort`/`ort-sys`) fails to build, mentioning a download error | No network access at build time for the ONNX Runtime prebuilt binary | Check firewall/proxy/VPN; result is cached in `target\` once it succeeds |

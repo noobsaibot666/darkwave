@@ -27,7 +27,7 @@ Two real features landed since the plan was last annotated (`80531ab` → `HEAD`
 - **Bug found and fixed this pass:** the per-selection `asset_vocal_ratio` fetch (`App.tsx`, in the `useEffect` keyed on `selectedAssetId`) had no protection against out-of-order async responses — rapidly changing the selected track could let a stale response overwrite the vocal ratio (and therefore the player's accent color) for whatever is actually selected by the time it resolves. Fixed by adding a monotonic request-id guard, mirroring the identical, already-existing pattern used for waveform peaks (`peakRequestId`). No cargo/tsc changes required beyond the guard itself; `tsc --noEmit` is clean.
 - **Graceful degradation confirmed by direct code reading, not assumed:** `detect_vocal_ratio` (`crates/audio-analysis/src/lib.rs:245-283`) returns `None` at every failure point — clip too short, `VoiceActivityDetector::builder().build().ok()?` failing (i.e. the ONNX runtime not loading), zero usable chunks. Nothing panics or propagates an error that could crash playback. Worst case on a broken environment: the player quietly falls back to its tag-only mood guess.
 - **Real risk, not yet exercised:** `voice_activity_detector` pulls in `ort`/`ort-sys`, which downloads a prebuilt ONNX Runtime binary over the network the first time `cargo build`/`cargo test` touches `audio-analysis` (see `Cargo.lock`). This dependency was added after the last push to `origin/main` — CI's `windows-latest` job has never actually built it. **This is the single most important thing to check before or alongside the Windows trial** (see the pre-flight checklist at the bottom of this document).
-- **Packaging not yet solved, but not a regression:** there's no `bundle.resources` entry for the ONNX Runtime shared library, and `tauri.conf.json` still has `bundle.active: false` — consistent with the fact that no installer pipeline exists for anything yet (Milestone 7). Tracked in ADR 0027 as a Milestone 7 prerequisite alongside the existing `similarity-worker` sidecar bundling problem, not fixed here.
+- **Packaging not yet solved, but not a regression:** there's no `bundle.resources` entry for the ONNX Runtime shared library, and `tauri.conf.json` still has `bundle.active: false` — consistent with the fact that no installer pipeline exists for anything yet (Milestone 7). Tracked in ADR 0027 as a Milestone 7 prerequisite. (This used to also cover a `similarity-worker` sidecar bundling problem — that's gone entirely as of ADR 0033, which replaced the GPL sidecar with an in-process implementation, so ONNX Runtime is now the only piece of this left.)
 - **Scope is intentionally narrow:** `vocal_ratio` only feeds the player's mood color today. It's stored per-asset and easy to surface further (a real "quick win," see Missing Features below).
 
 ---
@@ -221,7 +221,7 @@ Deliberately **not** recommending: instrument/ambience ML classifiers, a full 3-
 
 ## Architecture Improvements
 
-- Solve ONNX Runtime + `similarity-worker` sidecar bundling together as one Milestone-7 packaging task before `bundle.active` flips to `true` — both need the same kind of `bundle.resources`/`externalBin` treatment and are cheaper to solve as one pass than two.
+- Solve ONNX Runtime bundling as a Milestone-7 packaging task before `bundle.active` flips to `true`. (This used to be paired with a `similarity-worker` sidecar bundling problem — that half is gone as of ADR 0033, which replaced the GPL sidecar with an in-process implementation with nothing to bundle at all.)
 - Continuously maintain the portable library manifest beside the media (§9.3) instead of building it on demand, and wire the already-built, already-tested writer-lease functions to it — this is the real remaining piece of the "multi-computer/NAS" story, not a documentation gap.
 - ~~Decide deliberately on light mode~~ — **decided and built**: dark stays the default, light and system are real options.
 
@@ -229,7 +229,7 @@ Deliberately **not** recommending: instrument/ambience ML classifiers, a full 3-
 
 **P0 — before/with the Windows trial (verification, not development):**
 1. Push this branch and check the `windows-latest` CI run — first real signal on whether `ort`/`voice_activity_detector` builds on Windows at all.
-2. Build a Windows-triple `similarity-worker` sidecar (`scripts/build-similarity-worker-sidecar.sh`, run on the Windows machine itself) before the first `tauri dev`/`tauri build` there — without it, Tauri won't even launch.
+2. ~~Build a Windows-triple `similarity-worker` sidecar before the first `tauri dev`/`tauri build` there~~ — **no longer needed**: ADR 0033 replaced that GPL sidecar with an in-process implementation, so there's nothing to build or bundle per-platform anymore.
 
 **Built since this review (formerly P1/P2/P3 items 3, 7, 8, 11):** copy file path + reveal in Finder/Explorer, arrow-key row navigation (already existed), command-palette frontend, and row virtualization.
 

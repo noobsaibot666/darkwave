@@ -1,8 +1,9 @@
 # Resolve Bridge
 
 External Python scripts, invoked on demand by the Darkwave desktop app's
-Rust backend (subprocess, same pattern as the existing GPL similarity-worker
-isolation) — not a persistent process, not an Electron Workflow Integration
+Rust backend (subprocess isolation — the same pattern `crates/similarity-worker`
+used before ADR 0033 replaced it with an in-process implementation) — not a
+persistent process, not an Electron Workflow Integration
 plugin, not Studio-only. See `docs/development/editor-workflow-section.md`
 for where this fits in the app.
 

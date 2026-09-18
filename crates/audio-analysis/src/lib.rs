@@ -569,6 +569,257 @@ fn pearson_correlation(a: &[f32; 12], b: &[f32; 12]) -> f32 {
     }
 }
 
+// --- Perceptual fingerprint ("Similar Sounds") -------------------------------
+//
+// This app's own replacement for what used to be a bliss-rs (GPL-3.0)
+// sidecar subprocess — see docs/adr/0033-drop-bliss-rs-similarity-sidecar.md
+// for the full reasoning. Short version: bliss-rs being GPL-3.0 meant
+// "Similar Sounds" had to be excluded from the Mac App Store build
+// entirely — a real distribution-terms conflict (GPL-3.0 combined with the
+// App Store's additional terms), not something the old sidecar-subprocess
+// isolation actually solved. Plain, dependency-free DSP that links
+// directly into the main binary sidesteps the question rather than working
+// around it: there's no GPL code anywhere, so it works identically on
+// every build (MAS included) and every platform (including Windows, which
+// never had a working sidecar for this at all — see ADR 0025's own
+// "remain future work" note on cross-platform sidecar builds).
+//
+// Not a claim of matching bliss-rs's tuned accuracy — like this crate's
+// tempo/pitch estimators, it's an honest, tunable heuristic: a 12-bin
+// chroma profile (harmonic/tonal content, reusing the exact same analysis
+// window and frequency-to-pitch-class mapping as `estimate_key` above, so
+// two tracks in a similar key naturally end up close together) plus
+// spectral centroid (brightness), rolloff (how much of the spectrum is
+// low vs. high), flatness (tonal vs. noisy), zero-crossing rate, and the
+// already-computed peak/transient-density/low-frequency/tempo
+// measurements — every dimension normalized to a comparable 0..1-ish
+// range so no one dimension dominates a Euclidean distance just from
+// having a bigger raw scale. `similar_assets` (the consumer, in
+// apps/desktop/src-tauri) does plain Euclidean distance between two of
+// these vectors, unchanged from how it compared bliss-rs vectors before.
+
+/// Number of dimensions in a fingerprint vector. Fixed, since a stored
+/// fingerprint only means anything compared against another one of the
+/// same length — `similar_assets` already guards against comparing
+/// mismatched lengths, but nothing here migrates an old bliss-rs-shaped
+/// vector into this shape, so existing libraries need a re-analysis pass
+/// (see the ADR) rather than a silent, wrong comparison.
+pub const FINGERPRINT_DIMENSIONS: usize = 20;
+
+/// Soft half-saturation point for compressing an unbounded per-second onset
+/// count into 0..1 (`x / (x + K)`) — never needs a hard ceiling, and a
+/// clip with roughly this many onsets/sec lands near the middle of the
+/// range. Picked to sit comfortably above typical music (a few onsets/sec)
+/// without being so high that busy sound effects (tens of onsets/sec)
+/// still all read as "maximally transient" and lose their distinction.
+const FINGERPRINT_TRANSIENT_SATURATION: f32 = 5.0;
+
+/// Frequency below which this fraction of a frame's spectral energy sits —
+/// the standard spectral-rolloff definition.
+const FINGERPRINT_ROLLOFF_ENERGY_FRACTION: f64 = 0.85;
+
+/// Computes a perceptual similarity fingerprint from a decoded buffer.
+pub fn compute_fingerprint(
+    buffer: &DecodedAudioBuffer,
+    measurements: AudioMeasurements,
+    tempo: Option<TempoEstimate>,
+) -> Vec<f32> {
+    compute_fingerprint_from_mono(&mono_samples(buffer), buffer.sample_rate, measurements, tempo)
+}
+
+/// Same as `compute_fingerprint`, given an already-downmixed buffer and the
+/// measurements/tempo the caller already computed for the same clip — see
+/// `measure_from_mono`'s doc comment for why the real pipeline shares one
+/// downmix (and, here, one set of measurements) across every analysis pass
+/// instead of each one repeating the same O(n) work.
+pub fn compute_fingerprint_from_mono(
+    mono: &[f32],
+    sample_rate: u32,
+    measurements: AudioMeasurements,
+    tempo: Option<TempoEstimate>,
+) -> Vec<f32> {
+    let spectral = compute_spectral_profile(mono, sample_rate);
+
+    let mut vector = Vec::with_capacity(FINGERPRINT_DIMENSIONS);
+    vector.extend_from_slice(&spectral.chroma);
+    vector.push(spectral.centroid);
+    vector.push(spectral.rolloff);
+    vector.push(spectral.flatness);
+    vector.push(spectral.zero_crossing_rate);
+    vector.push(((measurements.peak_db - SILENT_PEAK_DB_FLOOR) / -SILENT_PEAK_DB_FLOOR).clamp(0.0, 1.0));
+    vector.push(measurements.transient_density / (measurements.transient_density + FINGERPRINT_TRANSIENT_SATURATION));
+    vector.push(measurements.low_frequency_energy.clamp(0.0, 1.0));
+    // No confident tempo (most sound effects, ambience, atonal material) is
+    // deliberately mapped to the middle of the range rather than 0 — 0 would
+    // read as "confidently very slow," which is a claim this doesn't make,
+    // and would falsely pull every untempoed clip toward each other.
+    vector.push(tempo.map_or(0.5, |estimate| {
+        ((estimate.bpm - MIN_BPM as f32) / (MAX_BPM - MIN_BPM) as f32).clamp(0.0, 1.0)
+    }));
+
+    debug_assert_eq!(vector.len(), FINGERPRINT_DIMENSIONS);
+    vector
+}
+
+struct SpectralProfile {
+    chroma: [f32; 12],
+    centroid: f32,
+    rolloff: f32,
+    flatness: f32,
+    zero_crossing_rate: f32,
+}
+
+fn silent_spectral_profile() -> SpectralProfile {
+    SpectralProfile {
+        chroma: [0.0; 12],
+        centroid: 0.0,
+        rolloff: 0.0,
+        flatness: 0.0,
+        zero_crossing_rate: 0.0,
+    }
+}
+
+/// One windowed FFT pass shared by every spectral dimension — reuses
+/// `estimate_key`'s own FFT size/hop/frame cap/frequency band/pitch-class
+/// mapping for the chroma portion (KEY_* constants above) so this doesn't
+/// introduce a second, differently-tuned chroma computation to keep in
+/// sync with the one `estimate_key` already relies on.
+fn compute_spectral_profile(mono: &[f32], sample_rate: u32) -> SpectralProfile {
+    let sample_rate_f = sample_rate.max(1) as f32;
+    if mono.len() < KEY_MIN_SAMPLES {
+        return silent_spectral_profile();
+    }
+
+    let max_span = KEY_MAX_FRAMES * KEY_HOP_SIZE + KEY_FFT_SIZE;
+    let (window_start, window_end) = if mono.len() > max_span {
+        let start = (mono.len() - max_span) / 2;
+        (start, start + max_span)
+    } else {
+        (0, mono.len())
+    };
+    let region = &mono[window_start..window_end];
+
+    let zero_crossing_rate = {
+        let crossings = region
+            .windows(2)
+            .filter(|pair| (pair[0] >= 0.0) != (pair[1] >= 0.0))
+            .count();
+        (crossings as f32 / region.len().max(1) as f32).clamp(0.0, 1.0)
+    };
+
+    let hann: Vec<f32> = (0..KEY_FFT_SIZE)
+        .map(|n| 0.5 - 0.5 * (2.0 * std::f32::consts::PI * n as f32 / (KEY_FFT_SIZE as f32 - 1.0)).cos())
+        .collect();
+
+    let nyquist_bin = KEY_FFT_SIZE / 2;
+    let nyquist_hz = sample_rate_f / 2.0;
+    let bin_pitch_class: Vec<Option<usize>> = (0..nyquist_bin)
+        .map(|bin| {
+            let freq = bin as f32 * sample_rate_f / KEY_FFT_SIZE as f32;
+            if !(KEY_MIN_HZ..=KEY_MAX_HZ).contains(&freq) {
+                return None;
+            }
+            let pc = (12.0 * (freq / KEY_REFERENCE_C0_HZ).log2()).round() as i64;
+            Some(pc.rem_euclid(12) as usize)
+        })
+        .collect();
+
+    let fft = FftPlanner::<f32>::new().plan_fft_forward(KEY_FFT_SIZE);
+    let mut spectrum = vec![Complex::new(0.0_f32, 0.0); KEY_FFT_SIZE];
+    let mut chroma = [0.0_f32; 12];
+    let mut centroid_sum = 0.0_f64;
+    let mut rolloff_sum = 0.0_f64;
+    let mut flatness_sum = 0.0_f64;
+    let mut frames = 0usize;
+
+    let mut offset = 0usize;
+    while offset + KEY_FFT_SIZE <= region.len() && frames < KEY_MAX_FRAMES {
+        for (i, slot) in spectrum.iter_mut().enumerate() {
+            *slot = Complex::new(region[offset + i] * hann[i], 0.0);
+        }
+        fft.process(&mut spectrum);
+
+        // Magnitude spectrum, bins 1..nyquist_bin — DC (bin 0) carries no
+        // frequency information and would only ever drag the centroid down.
+        let magnitudes: Vec<f64> = (1..nyquist_bin).map(|bin| spectrum[bin].norm() as f64).collect();
+        let frame_total: f64 = magnitudes.iter().sum();
+
+        for (index, &magnitude) in magnitudes.iter().enumerate() {
+            let bin = index + 1;
+            if let Some(pc) = bin_pitch_class[bin] {
+                chroma[pc] += magnitude as f32;
+            }
+        }
+
+        if frame_total > 1e-9 {
+            let weighted_freq_sum: f64 = magnitudes
+                .iter()
+                .enumerate()
+                .map(|(index, &magnitude)| {
+                    let bin = index + 1;
+                    let freq = bin as f32 * sample_rate_f / KEY_FFT_SIZE as f32;
+                    magnitude * freq as f64
+                })
+                .sum();
+            centroid_sum += weighted_freq_sum / frame_total;
+
+            let target = frame_total * FINGERPRINT_ROLLOFF_ENERGY_FRACTION;
+            let mut cumulative = 0.0_f64;
+            let mut rolloff_bin = magnitudes.len();
+            for (index, &magnitude) in magnitudes.iter().enumerate() {
+                cumulative += magnitude;
+                if cumulative >= target {
+                    rolloff_bin = index + 1;
+                    break;
+                }
+            }
+            rolloff_sum += rolloff_bin as f64 * sample_rate_f as f64 / KEY_FFT_SIZE as f64;
+
+            let log_sum: f64 = magnitudes.iter().map(|magnitude| (magnitude + 1e-9).ln()).sum();
+            let geometric_mean = (log_sum / magnitudes.len() as f64).exp();
+            let arithmetic_mean = frame_total / magnitudes.len() as f64;
+            if arithmetic_mean > 1e-9 {
+                flatness_sum += geometric_mean / arithmetic_mean;
+            }
+        }
+
+        frames += 1;
+        offset += KEY_HOP_SIZE;
+    }
+
+    if frames == 0 {
+        return silent_spectral_profile();
+    }
+
+    let chroma_sum: f32 = chroma.iter().sum();
+    let chroma = if chroma_sum > f32::EPSILON {
+        chroma.map(|value| value / chroma_sum)
+    } else {
+        [0.0; 12]
+    };
+
+    SpectralProfile {
+        chroma,
+        centroid: ((centroid_sum / frames as f64) as f32 / nyquist_hz).clamp(0.0, 1.0),
+        rolloff: ((rolloff_sum / frames as f64) as f32 / nyquist_hz).clamp(0.0, 1.0),
+        flatness: (flatness_sum / frames as f64) as f32,
+        zero_crossing_rate,
+    }
+}
+
+/// Plain Euclidean distance between two fingerprint vectors of equal
+/// length — shared so the main app doesn't need its own copy of the exact
+/// formula `similar_assets` ranks by (was previously duplicated: the app
+/// already implemented this itself for the bliss-rs vectors, since the
+/// vector's shape was opaque to it before this crate defined one at all).
+pub fn fingerprint_distance(a: &[f32], b: &[f32]) -> f32 {
+    a.iter()
+        .zip(b.iter())
+        .map(|(x, y)| (x - y).powi(2))
+        .sum::<f32>()
+        .sqrt()
+}
+
 const VAD_SAMPLE_RATE: u32 = 16_000;
 const VAD_CHUNK_SIZE: usize = 512;
 const VAD_SPEECH_PROBABILITY_THRESHOLD: f32 = 0.5;
@@ -874,6 +1125,119 @@ mod tests {
             channels: 1,
             samples,
         }
+    }
+
+    /// Deterministic (fixed seed, no external `rand` dependency) white
+    /// noise — flat spectrum, no dominant pitch — as the "clearly not
+    /// tonal" counterpart to `sine_wave` in the fingerprint tests below.
+    fn white_noise(duration_secs: f32, sample_rate: u32, amplitude: f32) -> DecodedAudioBuffer {
+        let sample_count = (duration_secs * sample_rate as f32) as usize;
+        let mut state: u32 = 0x2545F491;
+        let samples = (0..sample_count)
+            .map(|_| {
+                // xorshift32 — fast, deterministic, good enough spectral
+                // flatness for this test's purpose.
+                state ^= state << 13;
+                state ^= state >> 17;
+                state ^= state << 5;
+                let unit = (state as f32 / u32::MAX as f32) * 2.0 - 1.0;
+                unit * amplitude
+            })
+            .collect();
+
+        DecodedAudioBuffer {
+            sample_rate,
+            channels: 1,
+            samples,
+        }
+    }
+
+    fn fingerprint_of(buffer: &DecodedAudioBuffer) -> Vec<f32> {
+        let mono = mono_samples(buffer);
+        let measurements = measure_from_mono(&mono, buffer.sample_rate);
+        let tempo = estimate_tempo_from_mono(&mono, buffer.sample_rate);
+        compute_fingerprint_from_mono(&mono, buffer.sample_rate, measurements, tempo)
+    }
+
+    #[test]
+    fn fingerprint_always_has_the_declared_dimension_count() {
+        assert_eq!(fingerprint_of(&sine_wave(440.0, 3.0, 44_100, 0.8)).len(), FINGERPRINT_DIMENSIONS);
+        // Too short to run the FFT window at all — must still degrade to a
+        // valid-length neutral vector, not panic or return something
+        // shorter that would silently corrupt a Euclidean distance against
+        // a real fingerprint.
+        assert_eq!(fingerprint_of(&sine_wave(440.0, 0.05, 44_100, 0.8)).len(), FINGERPRINT_DIMENSIONS);
+        assert_eq!(
+            fingerprint_of(&DecodedAudioBuffer { sample_rate: 44_100, channels: 1, samples: vec![] }).len(),
+            FINGERPRINT_DIMENSIONS
+        );
+    }
+
+    #[test]
+    fn identical_tones_are_essentially_the_same_fingerprint() {
+        let a = fingerprint_of(&sine_wave(440.0, 3.0, 44_100, 0.8));
+        let b = fingerprint_of(&sine_wave(440.0, 3.0, 44_100, 0.8));
+
+        assert!(fingerprint_distance(&a, &b) < 0.01, "identical audio should be ~0 apart, got {}", fingerprint_distance(&a, &b));
+    }
+
+    #[test]
+    fn tones_sharing_a_pitch_class_are_far_closer_than_tones_in_a_different_one() {
+        // Chroma folds octaves together by design (same as estimate_key,
+        // which this reuses) — A3/A4/A5 are the same pitch class three
+        // octaves apart, and should cluster together despite being
+        // acoustically quite different tones (very different brightness/
+        // centroid). A pitch class that isn't A (C4, G#4) should land
+        // clearly farther away than any same-pitch-class pair does,
+        // despite G#4 (415.3Hz) being almost the same raw frequency as A4
+        // (440Hz) — this is the concrete check that chroma, not just raw
+        // frequency proximity, is driving the result.
+        let a3 = fingerprint_of(&sine_wave(220.0, 3.0, 44_100, 0.8));
+        let a4 = fingerprint_of(&sine_wave(440.0, 3.0, 44_100, 0.8));
+        let a5 = fingerprint_of(&sine_wave(880.0, 3.0, 44_100, 0.8));
+        let g_sharp4 = fingerprint_of(&sine_wave(415.30, 3.0, 44_100, 0.8));
+        let c4 = fingerprint_of(&sine_wave(261.63, 3.0, 44_100, 0.8));
+
+        let same_pitch_class_distances = [
+            fingerprint_distance(&a3, &a4),
+            fingerprint_distance(&a4, &a5),
+            fingerprint_distance(&a3, &a5),
+        ];
+        let different_pitch_class_distances = [
+            fingerprint_distance(&a4, &g_sharp4),
+            fingerprint_distance(&a4, &c4),
+            fingerprint_distance(&a3, &c4),
+        ];
+
+        let worst_same_class = same_pitch_class_distances.iter().cloned().fold(0.0f32, f32::max);
+        let best_different_class = different_pitch_class_distances.iter().cloned().fold(f32::MAX, f32::min);
+
+        assert!(
+            worst_same_class < best_different_class,
+            "every same-pitch-class pair ({same_pitch_class_distances:?}) should be closer than every \
+             different-pitch-class pair ({different_pitch_class_distances:?})"
+        );
+    }
+
+    #[test]
+    fn a_pure_tone_and_white_noise_are_clearly_distant() {
+        let tone = fingerprint_of(&sine_wave(440.0, 3.0, 44_100, 0.5));
+        let noise = fingerprint_of(&white_noise(3.0, 44_100, 0.5));
+        let tone_again = fingerprint_of(&sine_wave(440.0, 3.0, 44_100, 0.5));
+
+        let tone_vs_noise = fingerprint_distance(&tone, &noise);
+        let tone_vs_tone = fingerprint_distance(&tone, &tone_again);
+
+        assert!(
+            tone_vs_noise > tone_vs_tone * 2.0,
+            "a tonal sound and noise ({tone_vs_noise}) should be far more distant than two takes of the same tone ({tone_vs_tone})"
+        );
+    }
+
+    #[test]
+    fn fingerprint_distance_to_self_is_zero() {
+        let vector = fingerprint_of(&sine_wave(523.25, 2.0, 44_100, 0.7));
+        assert_eq!(fingerprint_distance(&vector, &vector), 0.0);
     }
 
     #[test]

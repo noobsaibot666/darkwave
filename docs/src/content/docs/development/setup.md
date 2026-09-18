@@ -10,15 +10,7 @@ npm install
 npm run check
 ```
 
-**Before the desktop app will build on any platform**, build the `similarity-worker` sidecar Tauri's `externalBin` config expects — this is not optional, and skipping it fails with `resource path ... doesn't exist`:
-
-```sh
-./scripts/build-similarity-worker-sidecar.sh
-```
-
-Re-run it whenever `crates/similarity-worker` changes, or on a fresh machine/checkout (the built binary lives in a gitignored directory, so cloning or pulling never brings a copy with it).
-
-Use `npm run dev` for the desktop UI development server and `npm run tauri` for Tauri commands.
+Use `npm run dev` for the desktop UI development server and `npm run tauri` for Tauri commands. There's no separate sidecar to build first — "Similar Sounds" (`crates/audio-analysis`'s perceptual fingerprint, see `docs/adr/0033-drop-bliss-rs-similarity-sidecar.md`) is plain Rust that links straight into the main binary, same as everything else here. (This used to require building a `similarity-worker` sidecar binary first, on every machine, before any build — that step no longer exists, on any platform.)
 
 Useful targeted Rust checks:
 

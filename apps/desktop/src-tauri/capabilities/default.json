@@ -8,16 +8,6 @@
     "clipboard-manager:allow-write-text",
     "dialog:default",
     "fs:default",
-    "opener:default",
-    {
-      "identifier": "shell:allow-execute",
-      "allow": [
-        {
-          "name": "binaries/similarity-worker",
-          "sidecar": true,
-          "args": true
-        }
-      ]
-    }
+    "opener:default"
   ]
 }

@@ -746,6 +746,45 @@ const MEDIA_TYPE_CLASSIFY_COMMAND: Record<string, string> = {
   other: "ClassifyOther"
 };
 
+// Human-readable label for every CommandId the Rust ShortcutMap can send
+// (crates/preferences::CommandId) — the Keyboard Shortcuts modal used to
+// print the raw enum name ("ClassifySoundtrack"), which doesn't tell a
+// user what pressing the key actually does. The classify entries reuse
+// mediaTypeOptions' own labels so this reads as the same taxonomy, not a
+// second, differently-worded one.
+const COMMAND_LABELS: Record<string, string> = {
+  TogglePlayback: "Play / Pause",
+  PreviewSelected: "Preview Selected",
+  NextAsset: "Next Track",
+  PreviousAsset: "Previous Track",
+  ToggleFavorite: "Toggle Favorite",
+  CommandPalette: "Command Palette",
+  Import: "Import",
+  ExportSelected: "Export Selected",
+  ToggleLoop: "Toggle Loop",
+  CopyPath: "Copy Path",
+  ToggleReviewed: "Toggle Reviewed",
+  ClassifySoundtrack: "Classify as Soundtrack",
+  ClassifyVoiceover: "Classify as Voiceover",
+  ClassifySoundEffect: "Classify as Sound Effect",
+  ClassifyFoley: "Classify as Foley",
+  ClassifyAmbience: "Classify as Ambience",
+  ClassifyOther: "Classify as Other"
+};
+
+function commandLabel(command: string): string {
+  return COMMAND_LABELS[command] ?? command;
+}
+
+/** A key's own name reads better than the raw accelerator string this app
+ * uses internally for matching ("Mod" is Cmd on macOS / Ctrl on Windows). */
+function formatAccelerator(accelerator: string): string {
+  return accelerator
+    .split("+")
+    .map((part) => (part === "Mod" ? "Cmd/Ctrl" : part.startsWith("Numpad") ? `Num ${part.slice(6)}` : part))
+    .join(" + ");
+}
+
 type JobProgress = {
   kind: string;
   label: string;
@@ -1410,6 +1449,10 @@ export function App() {
   const [trashModalOpen, setTrashModalOpen] = useState(false);
   const [editorWorkflowOpen, setEditorWorkflowOpen] = useState(false);
   const [editorActionStatus, setEditorActionStatus] = useState<string | null>(null);
+  // Which project's card is expanded in the Editor Workflow's "Send to
+  // Resolve timeline" list — clicking a project's name shows its export
+  // folders, track count, and sync detail underneath that same card.
+  const [expandedEditorProjectId, setExpandedEditorProjectId] = useState<string | null>(null);
   const [commandPaletteOpen, setCommandPaletteOpen] = useState(false);
   const [commandPaletteQuery, setCommandPaletteQuery] = useState("");
   const [commandPaletteResults, setCommandPaletteResults] = useState<PaletteCommand[]>([]);
@@ -1428,6 +1471,14 @@ export function App() {
   const [exportStatus, setExportStatus] = useState<string | null>(null);
   const [formatFilter, setFormatFilter] = useState<AudioFormat | null>(null);
   const [similarStatus, setSimilarStatus] = useState<string | null>(null);
+  // "Similar Sounds" filter: which asset's perceptual fingerprint the
+  // browser is currently ranked against. similarToLabel is a snapshot of
+  // that asset's name taken at click time — the source asset can scroll
+  // out of `assets` (a fresh selection, or the fingerprint match itself
+  // returning results that don't include it) without losing the chip's
+  // label.
+  const [similarToAssetId, setSimilarToAssetId] = useState<string | null>(null);
+  const [similarToLabel, setSimilarToLabel] = useState<string | null>(null);
   const [jobProgress, setJobProgress] = useState<JobProgress[]>([]);
   const [jobCompletionSummaries, setJobCompletionSummaries] = useState<Record<string, JobCompletionSummary>>({});
   const [audioAnalysisPaused, setAudioAnalysisPaused] = useState(false);
@@ -1555,6 +1606,32 @@ export function App() {
     if (formatFilter) {
       base = base.filter((asset) => detectAudioFormat(asset) === formatFilter);
     }
+    // Duration/BPM range filters are also sent server-side by refreshAssets
+    // (search_assets_advanced) — but only on the plain library/search view.
+    // Project, tag, and instrument-detection views fetch through their own
+    // dedicated commands (assets_in_collection / assets_for_tag /
+    // assets_by_instruments) that don't accept range filters at all, so
+    // without this, the min/max fields silently did nothing whenever the
+    // user was inside one of those views. Re-applying here client-side
+    // makes duration/BPM actually filter every view, not just the default
+    // one; it's a harmless no-op re-check on the view that already got
+    // server-side filtering.
+    if (rangeFilters.durationMinSec != null) {
+      const minMs = rangeFilters.durationMinSec * 1000;
+      base = base.filter((asset) => asset.duration_ms != null && asset.duration_ms >= minMs);
+    }
+    if (rangeFilters.durationMaxSec != null) {
+      const maxMs = rangeFilters.durationMaxSec * 1000;
+      base = base.filter((asset) => asset.duration_ms != null && asset.duration_ms <= maxMs);
+    }
+    if (rangeFilters.bpmMin != null) {
+      const minBpm = rangeFilters.bpmMin;
+      base = base.filter((asset) => asset.bpm != null && asset.bpm >= minBpm);
+    }
+    if (rangeFilters.bpmMax != null) {
+      const maxBpm = rangeFilters.bpmMax;
+      base = base.filter((asset) => asset.bpm != null && asset.bpm <= maxBpm);
+    }
     // A stem group's non-primary members (the individual instrument
     // parts) never show up as their own row in the main browser — only
     // the primary (the full mix, or a stand-in when no full mix exists)
@@ -1562,7 +1639,7 @@ export function App() {
     // last, after every other filter, so this holds no matter how the
     // list is currently filtered.
     return base.filter((asset) => !asset.stem_group_id || asset.stem_is_primary);
-  }, [assets, activeFilter, formatFilter]);
+  }, [assets, activeFilter, formatFilter, rangeFilters]);
 
   const instrumentFilter =
     typeof activeFilter === "object" && "instrumentPage" in activeFilter ? activeFilter : null;
@@ -1718,6 +1795,37 @@ export function App() {
         if (isCurrent()) setAssets([]);
       };
 
+      // "Similar Sounds" takes priority over every other view — it's a
+      // one-off lens onto a specific track's perceptual fingerprint
+      // (crates/similarity-worker, bliss-rs), not a predicate that composes
+      // with a Project/Tag/instrument view the way duration/BPM/format do.
+      // Cleared automatically when the user changes the active filter or
+      // types a search query (see the effect that resets it).
+      if (similarToAssetId) {
+        setSimilarStatus("Finding similar sounds…");
+        invoke<AssetRecord[]>("similar_assets", {
+          libraryId,
+          assetId: similarToAssetId,
+          limit: 100000
+        })
+          .then((results) => {
+            applyResult(results);
+            if (!isCurrent()) return;
+            setSimilarStatus(
+              results.length > 0
+                ? `Showing ${results.length} similar sound${results.length === 1 ? "" : "s"}`
+                : "No other analyzed sounds to compare yet"
+            );
+          })
+          .catch(() => {
+            applyEmpty();
+            if (isCurrent()) {
+              setSimilarStatus("This sound hasn't been analyzed yet — try again once import finishes processing");
+            }
+          });
+        return;
+      }
+
       if (typeof filter === "object" && "project" in filter) {
         const command = filter.smart ? "assets_in_smart_collection" : "assets_in_collection";
         invoke<AssetRecord[]>(command, { collectionId: filter.project }).then(applyResult).catch(applyEmpty);
@@ -1759,7 +1867,7 @@ export function App() {
 
       request.then(applyResult).catch(applyEmpty);
     },
-    [rangeFilters]
+    [rangeFilters, similarToAssetId]
   );
 
   // Repeatedly drives process_pending_jobs/process_audio_analysis_jobs to
@@ -2202,6 +2310,16 @@ export function App() {
     return () => clearTimeout(timeout);
   }, [activeLibraryId, searchQuery, activeFilter, refreshAssets]);
 
+  // Navigating to a different smart filter/project/tag or typing a search
+  // query means leaving "Similar Sounds" mode — otherwise the browser would
+  // silently keep showing similarity results while every other control
+  // implies the view has changed.
+  useEffect(() => {
+    setSimilarToAssetId(null);
+    setSimilarToLabel(null);
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [activeFilter, searchQuery]);
+
   useEffect(() => {
     if (!searchQuery.trim()) {
       setQueryFilters([]);
@@ -2441,26 +2559,16 @@ export function App() {
       .catch(() => {});
   }, []);
 
+  // Toggles the "Similar Sounds" filter (see refreshAssets) against
+  // whichever track is currently selected — shared by the inspector's
+  // shortcut button and the filter-panel button next to Format. A second
+  // click on an already-active target turns it back off, same as any other
+  // filter toggle.
   const handleFindSimilar = useCallback(() => {
-    if (!selectedAssetId || !activeLibraryId) return;
-    setSimilarStatus("Finding similar sounds…");
-    invoke<AssetRecord[]>("similar_assets", {
-      libraryId: activeLibraryId,
-      assetId: selectedAssetId,
-      limit: 24
-    })
-      .then((results) => {
-        setAssets(results);
-        setSimilarStatus(
-          results.length > 0
-            ? `Showing ${results.length} similar sound${results.length === 1 ? "" : "s"}`
-            : "No other analyzed sounds to compare yet"
-        );
-      })
-      .catch(() =>
-        setSimilarStatus("This sound hasn't been analyzed yet — try again once import finishes processing")
-      );
-  }, [selectedAssetId, activeLibraryId]);
+    if (!selectedAssetId) return;
+    setSimilarToAssetId((previous) => (previous === selectedAssetId ? null : selectedAssetId));
+    setSimilarToLabel(selectedAsset?.display_name || selectedAsset?.original_filename || null);
+  }, [selectedAssetId, selectedAsset]);
 
   const handleApplyTag = useCallback(
     (tag: TagRecord) => {
@@ -2891,7 +2999,8 @@ export function App() {
         duration_min_ms: rangeFilters.durationMinSec != null ? rangeFilters.durationMinSec * 1000 : null,
         duration_max_ms: rangeFilters.durationMaxSec != null ? rangeFilters.durationMaxSec * 1000 : null,
         bpm_min: rangeFilters.bpmMin ?? null,
-        bpm_max: rangeFilters.bpmMax ?? null
+        bpm_max: rangeFilters.bpmMax ?? null,
+        format: formatFilter ?? null
       }
     })
       .then((collection) => {
@@ -2899,7 +3008,7 @@ export function App() {
         setSmartCollectionName("");
       })
       .catch(() => {});
-  }, [activeLibraryId, smartCollectionName, searchQuery, rangeFilters]);
+  }, [activeLibraryId, smartCollectionName, searchQuery, rangeFilters, formatFilter]);
 
   const handleRowClick = useCallback(
     (asset: AssetRecord, index: number, event: MouseEvent) => {
@@ -6153,7 +6262,41 @@ export function App() {
               ))}
             </select>
           </label>
-          {hasActiveRangeFilters(rangeFilters) || formatFilter ? (
+          {similarToAssetId ? (
+            <button
+              type="button"
+              className="text-button active"
+              title="Showing sounds similar to this track — click to turn off"
+              onClick={() => {
+                setSimilarToAssetId(null);
+                setSimilarToLabel(null);
+              }}
+            >
+              <Sparkles size={13} />
+              Similar to {similarToLabel ?? "track"}
+              <X size={12} />
+            </button>
+          ) : (
+            <button
+              type="button"
+              className="text-button"
+              disabled={!selectedAssetId}
+              title={
+                selectedAssetId
+                  ? "Find tracks with a similar sound to the selected track"
+                  : "Select a track first"
+              }
+              onClick={() => {
+                if (!selectedAssetId) return;
+                setSimilarToAssetId(selectedAssetId);
+                setSimilarToLabel(selectedAsset?.display_name || selectedAsset?.original_filename || null);
+              }}
+            >
+              <Sparkles size={13} />
+              Similar Sounds
+            </button>
+          )}
+          {hasActiveRangeFilters(rangeFilters) || formatFilter || similarToAssetId ? (
             <>
               <button
                 type="button"
@@ -6161,16 +6304,21 @@ export function App() {
                 onClick={() => {
                   setRangeFilters({});
                   setFormatFilter(null);
+                  setSimilarToAssetId(null);
+                  setSimilarToLabel(null);
                 }}
               >
                 Clear
               </button>
-              <button type="button" className="text-button" onClick={() => setSmartCollectionModalOpen(true)}>
-                <Zap size={13} />
-                Save as Smart Collection
-              </button>
+              {hasActiveRangeFilters(rangeFilters) || formatFilter ? (
+                <button type="button" className="text-button" onClick={() => setSmartCollectionModalOpen(true)}>
+                  <Zap size={13} />
+                  Save as Smart Collection
+                </button>
+              ) : null}
             </>
           ) : null}
+          {similarToAssetId && similarStatus ? <span className="filter-panel-status">{similarStatus}</span> : null}
         </section>
         {instrumentFilter?.instrumentPage ? (
           <InstrumentDetectionPage
@@ -6585,56 +6733,101 @@ export function App() {
                           approved_at: null,
                           last_synced_at: null
                         };
+                        const isExpanded = expandedEditorProjectId === project.id;
                         return (
-                          <div className="editor-project-card" key={project.id}>
-                            <span className="editor-project-thumb">
-                              <Music size={14} />
-                            </span>
-                            <div className="editor-project-meta">
-                              <strong>{project.name}</strong>
-                              <small>
-                                {sync.status === "syncing"
-                                  ? "Syncing structure to Resolve…"
-                                  : sync.status === "failed"
-                                  ? `Sync failed: ${sync.error ?? "unknown error"}`
-                                  : sync.status === "synced" && !sync.approved_at
-                                  ? "Structure synced — approve to enable sending"
-                                  : sync.status === "synced" && sync.approved_at
-                                  ? "Approved — ready to send"
-                                  : projectHasExportFolder(project)
-                                  ? "Not yet synced"
-                                  : "No export folder set"}
-                              </small>
+                          <div className="editor-project-card-wrap" key={project.id}>
+                            <div className="editor-project-card">
+                              <span className="editor-project-thumb">
+                                <Music size={14} />
+                              </span>
+                              <button
+                                type="button"
+                                className="editor-project-meta editor-project-meta-button"
+                                aria-expanded={isExpanded}
+                                aria-label={`${isExpanded ? "Hide" : "Show"} details for ${project.name}`}
+                                onClick={() =>
+                                  setExpandedEditorProjectId((previous) => (previous === project.id ? null : project.id))
+                                }
+                              >
+                                <strong>{project.name}</strong>
+                                <small>
+                                  {sync.status === "syncing"
+                                    ? "Syncing structure to Resolve…"
+                                    : sync.status === "failed"
+                                    ? `Sync failed: ${sync.error ?? "unknown error"}`
+                                    : sync.status === "synced" && !sync.approved_at
+                                    ? "Structure synced — approve to enable sending"
+                                    : sync.status === "synced" && sync.approved_at
+                                    ? "Approved — ready to send"
+                                    : projectHasExportFolder(project)
+                                    ? "Not yet synced"
+                                    : "No export folder set"}
+                                </small>
+                              </button>
+                              {sync.status === "synced" && !sync.approved_at ? (
+                                <button
+                                  type="button"
+                                  className="dr-button"
+                                  aria-label={`Approve Resolve structure for ${project.name}`}
+                                  onClick={() => handleApproveResolveSync(project)}
+                                >
+                                  <ShieldCheck size={15} />
+                                  Approve
+                                </button>
+                              ) : (
+                                <button
+                                  type="button"
+                                  className={
+                                    sync.approved_at && bulkAssetIds.length > 0 ? "dr-button" : "dr-button disabled"
+                                  }
+                                  disabled={!sync.approved_at || bulkAssetIds.length === 0}
+                                  aria-label={`Send selected to ${project.name}'s Resolve timeline`}
+                                  title={
+                                    sync.approved_at
+                                      ? undefined
+                                      : "Structure must be synced and approved before sending to the timeline"
+                                  }
+                                  onClick={() => handleSendAssetsToResolveTimeline(bulkAssetIds, project)}
+                                >
+                                  <Clapperboard size={15} />
+                                  Send to Timeline
+                                </button>
+                              )}
                             </div>
-                            {sync.status === "synced" && !sync.approved_at ? (
-                              <button
-                                type="button"
-                                className="dr-button"
-                                aria-label={`Approve Resolve structure for ${project.name}`}
-                                onClick={() => handleApproveResolveSync(project)}
-                              >
-                                <ShieldCheck size={15} />
-                                Approve
-                              </button>
-                            ) : (
-                              <button
-                                type="button"
-                                className={
-                                  sync.approved_at && bulkAssetIds.length > 0 ? "dr-button" : "dr-button disabled"
-                                }
-                                disabled={!sync.approved_at || bulkAssetIds.length === 0}
-                                aria-label={`Send selected to ${project.name}'s Resolve timeline`}
-                                title={
-                                  sync.approved_at
-                                    ? undefined
-                                    : "Structure must be synced and approved before sending to the timeline"
-                                }
-                                onClick={() => handleSendAssetsToResolveTimeline(bulkAssetIds, project)}
-                              >
-                                <Clapperboard size={15} />
-                                Send to Timeline
-                              </button>
-                            )}
+                            {isExpanded ? (
+                              <div className="editor-project-details">
+                                <div className="editor-project-detail-row">
+                                  <span>Tracks</span>
+                                  <strong>{trackCountByProject.get(project.id) ?? 0}</strong>
+                                </div>
+                                <div className="editor-project-detail-row">
+                                  <span>Music export folder</span>
+                                  <strong>{project.export_path ?? "Not set"}</strong>
+                                </div>
+                                <div className="editor-project-detail-row">
+                                  <span>SFX export folder</span>
+                                  <strong>{project.sfx_export_path ?? "Not set"}</strong>
+                                </div>
+                                {sync.last_synced_at ? (
+                                  <div className="editor-project-detail-row">
+                                    <span>Last synced</span>
+                                    <strong>{new Date(sync.last_synced_at).toLocaleString()}</strong>
+                                  </div>
+                                ) : null}
+                                {sync.approved_at ? (
+                                  <div className="editor-project-detail-row">
+                                    <span>Approved</span>
+                                    <strong>{new Date(sync.approved_at).toLocaleString()}</strong>
+                                  </div>
+                                ) : null}
+                                {sync.status === "failed" && sync.error ? (
+                                  <div className="editor-project-detail-row editor-project-detail-error">
+                                    <span>Error</span>
+                                    <strong>{sync.error}</strong>
+                                  </div>
+                                ) : null}
+                              </div>
+                            ) : null}
                           </div>
                         );
                       })}
@@ -8752,10 +8945,19 @@ export function App() {
               </button>
             </div>
             <div className="shortcut-list">
-              {(preferences?.shortcuts.bindings ?? []).map((item) => (
-                <div className="shortcut-row" key={`${item.command}-${item.accelerator}`}>
-                  <span>{item.command}</span>
-                  <kbd>{item.accelerator}</kbd>
+              {Object.entries(
+                (preferences?.shortcuts.bindings ?? []).reduce<Record<string, string[]>>((byCommand, item) => {
+                  (byCommand[item.command] ??= []).push(item.accelerator);
+                  return byCommand;
+                }, {})
+              ).map(([command, accelerators]) => (
+                <div className="shortcut-row" key={command}>
+                  <span>{commandLabel(command)}</span>
+                  <span className="shortcut-row-keys">
+                    {accelerators.map((accelerator) => (
+                      <kbd key={accelerator}>{formatAccelerator(accelerator)}</kbd>
+                    ))}
+                  </span>
                 </div>
               ))}
               <div className="shortcut-row">

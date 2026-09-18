@@ -31,7 +31,10 @@ before export, same DSP layer as trim/normalize.
 
 ## Voice isolation / stem separation — Planned
 Fork Demucs (Meta, MIT license) for voice/stem isolation, run as an isolated
-subprocess — same pattern the GPL similarity-worker already uses. The biggest
+subprocess — the same sidecar-subprocess pattern `crates/similarity-worker`
+used before it was replaced by an in-process implementation (see ADR 0033);
+worth revisiting for Demucs too if MIT ever turns out not to need the
+isolation at all. The biggest
 build in this list; a real ML dependency, not just DSP.
 
 ## Auto-mixing — Not recommended yet

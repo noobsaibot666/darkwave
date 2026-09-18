@@ -2,7 +2,12 @@
 
 ## Status
 
-Accepted.
+Accepted. **The similarity portion specifically is superseded by
+[ADR 0033](0033-drop-bliss-rs-similarity-sidecar.md)**: bliss-rs and
+`crates/similarity-worker` (the "Similarity: bliss-rs..." decision and the
+"License boundary" section below) are gone, replaced by an in-process
+fingerprint in `crates/audio-analysis`. The rest of this ADR — decode,
+needs-review, auto-tagging, tempo, pitch — is unaffected and still accurate.
 
 ## Context
 

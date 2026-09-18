@@ -406,6 +406,14 @@ pub struct AssetSearchQuery {
     /// wouldn't be meaningful, so pitch has no range filter.
     pub peak_db_min: Option<f64>,
     pub peak_db_max: Option<f64>,
+    /// File-extension facet (matches the frontend's `detectAudioFormat`:
+    /// lowercased `original_filename` extension, "aif" folded into
+    /// "aiff"). There's no dedicated format column — assets are matched by
+    /// filename suffix, same as the browser's own client-side filter, so a
+    /// saved Smart Collection actually persists this criterion instead of
+    /// silently dropping it (the bug this field fixes: the frontend's
+    /// Format dropdown used to never reach the backend at all).
+    pub format: Option<String>,
 }
 
 impl AssetSearchQuery {
@@ -1428,26 +1436,6 @@ impl Catalog {
         self.connection.execute(
             "UPDATE assets SET embedded_title = ?1, embedded_genre = ?2, embedded_comment = ?3 WHERE id = ?4",
             params![title, genre, comment, asset_id.to_string()],
-        )?;
-        Ok(())
-    }
-
-    /// Sets just the perceptual fingerprint, leaving every other analysis
-    /// field untouched — for the similarity-worker's fingerprint, which
-    /// now finishes on its own detached timeline well after
-    /// `set_audio_analysis` already completed the job (see
-    /// `analyze_asset_audio`'s doc comment for why): a full
-    /// `set_audio_analysis` call here would blindly overwrite tempo/key/
-    /// pitch/vocal-ratio with whatever this call happened to be given,
-    /// which for a detached late-arriving write is nothing meaningful.
-    pub fn set_perceptual_fingerprint(
-        &self,
-        asset_id: Uuid,
-        fingerprint: Option<String>,
-    ) -> Result<(), StorageError> {
-        self.connection.execute(
-            "UPDATE assets SET perceptual_fingerprint = ?1 WHERE id = ?2",
-            params![fingerprint, asset_id.to_string()],
         )?;
         Ok(())
     }
@@ -2766,6 +2754,22 @@ impl Catalog {
         if let Some(max) = query.peak_db_max {
             sql.push_str(" AND assets.peak_db <= ?");
             query_params.push(max.into());
+        }
+
+        if let Some(format) = query.format {
+            // ".aif" is a real, still-common extension for the same format
+            // as ".aiff" — the frontend's detectAudioFormat() folds both
+            // into "aiff", so this has to match that or a saved Smart
+            // Collection would behave differently than the live filter it
+            // was saved from.
+            if format.eq_ignore_ascii_case("aiff") {
+                sql.push_str(" AND (LOWER(assets.original_filename) LIKE ? OR LOWER(assets.original_filename) LIKE ?)");
+                query_params.push("%.aiff".to_string().into());
+                query_params.push("%.aif".to_string().into());
+            } else {
+                sql.push_str(" AND LOWER(assets.original_filename) LIKE ?");
+                query_params.push(format!("%.{}", format.to_ascii_lowercase()).into());
+            }
         }
 
         if use_fts {
@@ -5909,12 +5913,13 @@ mod tests {
     }
 
     #[test]
-    fn set_perceptual_fingerprint_leaves_the_rest_of_the_analysis_alone() {
-        // The similarity-worker's fingerprint now arrives on its own
-        // detached timeline, well after set_audio_analysis already
-        // completed the job — this must be a narrow, single-column write,
-        // not something that could stomp tempo/key/pitch/vocal-ratio with
-        // whatever a late write happens to carry.
+    fn set_audio_analysis_persists_the_perceptual_fingerprint_alongside_the_rest() {
+        // The fingerprint is computed in-process now (crates/audio-analysis,
+        // see docs/adr/0033) as part of the same analysis pass as tempo/
+        // key/pitch, so it's just another field on the one
+        // set_audio_analysis call — no separate late-arriving write to
+        // keep isolated from the rest of the row the way the old detached
+        // bliss-rs-sidecar version needed.
         let catalog_path = unique_catalog_path("perceptual-fingerprint");
         let catalog = Catalog::open(&catalog_path).expect("open catalog");
         let library = catalog.create_library("Fingerprints", "/library").expect("library");
@@ -5927,14 +5932,11 @@ mod tests {
                     detected_key: Some("A minor".to_string()),
                     key_strength: Some(0.83),
                     bpm: Some(120.0),
+                    perceptual_fingerprint: Some("[0.1,0.2,0.3]".to_string()),
                     ..Default::default()
                 },
             )
             .expect("analysis");
-
-        catalog
-            .set_perceptual_fingerprint(asset.id, Some("[0.1,0.2,0.3]".to_string()))
-            .expect("fingerprint");
 
         let loaded = catalog.get_asset(asset.id).expect("get").expect("exists");
         assert_eq!(loaded.detected_key.as_deref(), Some("A minor"));

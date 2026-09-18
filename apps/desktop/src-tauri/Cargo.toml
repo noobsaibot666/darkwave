@@ -1,6 +1,6 @@
 [package]
 name = "darkwave-desktop"
-version = "0.3.1"
+version = "0.3.2"
 description = "Darkwave desktop shell"
 edition.workspace = true
 license.workspace = true
@@ -47,8 +47,7 @@ tauri-plugin-single-instance = "2"
 serde.workspace = true
 serde_json.workspace = true
 trash = { path = "../../../crates/trash" }
-tauri-plugin-shell = "2.3.5"
-tokio = { version = "1", default-features = false, features = ["time", "sync"] }
+tokio = { version = "1", default-features = false, features = ["time"] }
 futures = { version = "0.3", default-features = false, features = ["std"] }
 base64 = "0.22"
 

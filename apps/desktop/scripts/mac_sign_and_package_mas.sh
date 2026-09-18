@@ -1,7 +1,10 @@
 #!/usr/bin/env bash
-# Mac App Store build: build (sandboxed, no similarity-worker sidecar per
-# the still-open GPL question — see docs/development/release-readiness.md)
-# → sign → package .pkg → ready for App Store Connect upload.
+# Mac App Store build: build (sandboxed) → sign → package .pkg → ready for
+# App Store Connect upload. "Similar Sounds" fingerprinting used to be
+# excluded from this build entirely (a GPL-3.0 bliss-rs sidecar, incompatible
+# with App Store distribution terms) — see docs/adr/0033-drop-bliss-rs-similarity-sidecar.md.
+# It's now plain in-process DSP with no GPL dependency, so this build no
+# longer needs any special-casing for it.
 # Mirrors exposeu_wrapkit's scripts/production/mac_sign_and_package.sh,
 # simplified: no bundled frameworks/dylibs/extra sidecars to sign
 # individually (see apps/desktop/src-tauri/Cargo.toml — no Qt/ffmpeg).
@@ -40,7 +43,7 @@ CURRENT_VERSION=$(node -p "require('./src-tauri/tauri.conf.json').version")
 CURRENT_BUILD=$(/usr/libexec/PlistBuddy -c "Print :CFBundleVersion" src-tauri/Info.plist)
 check_version_ledger "$CURRENT_VERSION" "$CURRENT_BUILD"
 
-echo "[1/6] Building (sandboxed, MAS identity, no similarity-worker sidecar)..."
+echo "[1/6] Building (sandboxed, MAS identity)..."
 APPLE_SIGNING_IDENTITY="$APP_IDENTITY" npx tauri build \
   --config src-tauri/tauri.mas.conf.json
 

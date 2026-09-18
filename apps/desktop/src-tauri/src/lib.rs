@@ -113,18 +113,6 @@ struct InstrumentModelState {
     tried: std::sync::atomic::AtomicBool,
 }
 
-/// A resident similarity-worker subprocess, spawned once and reused across
-/// every analysis job instead of respawning (and re-paying process-start
-/// cost) per file. See `run_similarity_worker` for the request/response
-/// protocol and why a single `tokio::sync::Mutex` around it is enough to
-/// serialize concurrent callers correctly.
-struct ResidentSimilarityWorker {
-    child: tauri_plugin_shell::process::CommandChild,
-    events: tauri::async_runtime::Receiver<tauri_plugin_shell::process::CommandEvent>,
-}
-
-struct SimilarityWorkerState(tokio::sync::Mutex<Option<ResidentSimilarityWorker>>);
-
 #[derive(Debug, serde::Serialize)]
 struct ImportFailure {
     filename: String,
@@ -1635,6 +1623,7 @@ struct AssetSearchFilters {
     bpm_max: Option<f64>,
     peak_db_min: Option<f64>,
     peak_db_max: Option<f64>,
+    format: Option<String>,
 }
 
 fn build_search_query(filters: AssetSearchFilters) -> Result<storage::AssetSearchQuery, String> {
@@ -1643,16 +1632,34 @@ fn build_search_query(filters: AssetSearchFilters) -> Result<storage::AssetSearc
         .map(|id| parse_uuid_field(&id, "tag id"))
         .transpose()?;
 
+    // search_assets (plain text search) runs the query through
+    // parse_natural_language_query, so typing "sound effect explosion"
+    // narrows to media_type=sound_effect + text "explosion". This command
+    // (and create_smart_collection, which shares this builder) used to skip
+    // that entirely and pass the raw text straight through — so the moment
+    // a user also set a duration/BPM range, or saved a Smart Collection,
+    // that same typed query silently stopped being media-type-aware. Only
+    // parse when the caller hasn't already supplied an explicit media_type
+    // (nothing does today, but a future caller reasonably could).
+    let (text, media_type) = match filters.media_type {
+        Some(media_type) => (filters.text.unwrap_or_default(), Some(media_type)),
+        None => {
+            let parsed = search::parse_natural_language_query(&filters.text.unwrap_or_default());
+            (parsed.text, parsed.media_type)
+        }
+    };
+
     Ok(storage::AssetSearchQuery {
-        text: filters.text.unwrap_or_default(),
+        text,
         tag_id,
-        media_type: filters.media_type,
+        media_type,
         duration_min_ms: filters.duration_min_ms,
         duration_max_ms: filters.duration_max_ms,
         bpm_min: filters.bpm_min,
         bpm_max: filters.bpm_max,
         peak_db_min: filters.peak_db_min,
         peak_db_max: filters.peak_db_max,
+        format: filters.format,
     })
 }
 
@@ -3539,7 +3546,7 @@ async fn process_one_audio_analysis_job(
     }
 
     let library_before_analysis = active_library_snapshot(active_library_file);
-    let outcome = analyze_asset_audio(app, job.asset_id, &local_path).await;
+    let outcome = analyze_asset_audio(&local_path).await;
     let succeeded = outcome.is_ok();
 
     if active_library_changed_since(&library_before_analysis, active_library_file) {
@@ -3792,11 +3799,7 @@ struct AudioAnalysisOutcome {
     waveform: StoredWaveform,
 }
 
-async fn analyze_asset_audio(
-    app: &tauri::AppHandle,
-    asset_id: Uuid,
-    path: &str,
-) -> Result<AudioAnalysisOutcome, String> {
+async fn analyze_asset_audio(path: &str) -> Result<AudioAnalysisOutcome, String> {
     // Decode + DSP + VAD inference are all synchronous, CPU-bound Rust —
     // running them inline in this async fn would occupy one of Tauri's
     // async-runtime worker threads for the whole duration. Those same
@@ -3833,6 +3836,15 @@ async fn analyze_asset_audio(
             let pitch = audio_analysis::estimate_pitch_from_mono(&mono, sample_rate);
             let key = audio_analysis::estimate_key_from_mono(&mono, sample_rate);
             let vocal_ratio = detect_vocal_ratio_with_timeout(mono.clone(), sample_rate);
+            // In-process DSP (see crates/audio-analysis's "Perceptual
+            // fingerprint" section and docs/adr/0033 for why this replaced
+            // a bliss-rs sidecar subprocess) — cheap enough, and reuses
+            // `mono`/`measurements` already computed above, to just be part
+            // of this same synchronous pass instead of needing its own
+            // detached task and follow-up database write the way the old
+            // subprocess-based version did.
+            let fingerprint = audio_analysis::compute_fingerprint_from_mono(&mono, sample_rate, measurements, tempo);
+            let fingerprint_json = serde_json::to_string(&fingerprint).ok();
 
             let channels = buffer.channels.max(1) as u64;
             let duration_ms = if buffer.sample_rate > 0 {
@@ -3852,7 +3864,7 @@ async fn analyze_asset_audio(
                 bpm_confidence: tempo.map(|estimate| estimate.confidence as f64),
                 musical_key: pitch.as_ref().map(|estimate| estimate.note_name.clone()),
                 key_confidence: pitch.as_ref().map(|estimate| estimate.clarity as f64),
-                perceptual_fingerprint: None,
+                perceptual_fingerprint: fingerprint_json,
                 detected_key: key.as_ref().map(|estimate| estimate.key.clone()),
                 key_strength: key.as_ref().map(|estimate| estimate.strength as f64),
             };
@@ -3862,30 +3874,6 @@ async fn analyze_asset_audio(
         .await
         .map_err(|error| format!("audio analysis task panicked: {error}"))??;
 
-    // Fingerprinting runs fully detached from job completion — see the
-    // module note on run_similarity_worker for why. A full song can
-    // legitimately take longer to fingerprint than any timeout worth
-    // gating a job's completion on (bliss-audio's own feature extraction
-    // over several minutes of audio is real, CPU-bound work, not a
-    // hang), and this analysis job's *real* results — tempo, key, pitch,
-    // vocal ratio, the waveform — are already known at this point and
-    // shouldn't wait on a nice-to-have. When (if) the fingerprint
-    // arrives, it's written on its own via set_perceptual_fingerprint,
-    // which touches only that one column.
-    let app_owned = app.clone();
-    let path_owned = path.to_string();
-    tauri::async_runtime::spawn(async move {
-        let worker_state = app_owned.state::<SimilarityWorkerState>();
-        let Some(fingerprint) = run_similarity_worker(&app_owned, worker_state.inner(), &path_owned).await else {
-            return;
-        };
-        let catalog_state = app_owned.state::<CatalogState>();
-        let catalog = catalog_state.0.lock().expect("catalog mutex poisoned");
-        if let Err(error) = catalog.set_perceptual_fingerprint(asset_id, Some(fingerprint)) {
-            eprintln!("similarity-worker: failed to persist fingerprint for {asset_id}: {error:?}");
-        }
-    });
-
     Ok(AudioAnalysisOutcome {
         needs_review,
         suggested_tags,
@@ -3893,131 +3881,6 @@ async fn analyze_asset_audio(
         update,
         waveform,
     })
-}
-
-/// Sends one file path to the resident similarity-worker subprocess
-/// (spawning it on first use, or respawning it if a previous call left it
-/// dead) and returns its parsed fingerprint. Returns `None` on any failure
-/// (missing sidecar, decode error, malformed output, or timeout) —
-/// similarity is a nice-to-have, never a reason to fail or indefinitely
-/// stall the whole analysis job.
-///
-/// A single subprocess, reused across every call, replaces the previous
-/// spawn-a-fresh-process-per-file approach (see docs/.../bug-log.md's
-/// OPEN-3): every file used to pay a full process-start cost on top of its
-/// actual analysis time. Holding `worker_state`'s mutex for the whole
-/// "write request, read its one response line" round trip is enough to
-/// serialize concurrent callers correctly — the worker processes requests
-/// one at a time, in the order it receives them (see
-/// `crates/similarity-worker`'s `--stdin-loop` mode), so whoever holds the
-/// lock is guaranteed to read back its own response, never someone else's.
-///
-/// This does mean concurrent analysis jobs take turns at the fingerprint
-/// step specifically, even though their much heavier decode/DSP/VAD work
-/// runs fully in parallel — that used to matter more than it should have:
-/// `analyze_asset_audio` called this inline as its last step, so one file
-/// that made the sidecar hang or crawl (a real, repeatedly observed case —
-/// a handful of full-length songs in one real library, not a hang bug;
-/// bliss-audio's own feature extraction over several minutes of audio is
-/// genuine CPU-bound work) blocked every *other* concurrently-decoding
-/// job's completion behind this same lock, not just its own. Fingerprinting
-/// is now detached entirely from job completion (see `analyze_asset_audio`),
-/// so a slow or stuck sidecar only delays when a fingerprint shows up, if
-/// ever — it can no longer delay the job itself. The timeout below (and the
-/// one around acquiring the lock in the first place) still bounds how long
-/// one bad file can tie up the *fingerprint* pipeline specifically; a small
-/// pool of resident workers would remove the serialization point entirely,
-/// but isn't implemented here.
-async fn run_similarity_worker(
-    app: &tauri::AppHandle,
-    worker_state: &SimilarityWorkerState,
-    path: &str,
-) -> Option<String> {
-    use tauri_plugin_shell::process::CommandEvent;
-    use tauri_plugin_shell::ShellExt;
-
-    // Bounded even at the lock-acquisition step, not just the response
-    // wait below: if whatever's currently holding this mutex is itself
-    // stuck — the write to the child's stdin, the spawn, anywhere before
-    // it reaches its own timeout — every later caller queuing behind it
-    // would otherwise wait forever too, turning one hang into a
-    // permanent stall for every audio-analysis job from then on rather
-    // than just the one file that triggered it. Fingerprinting is
-    // explicitly a nice-to-have (see the module-level doc comment); this
-    // caller gives up its own turn instead of waiting indefinitely for a
-    // lock that may never come free.
-    let mut guard = match tokio::time::timeout(std::time::Duration::from_secs(20), worker_state.0.lock()).await {
-        Ok(guard) => guard,
-        Err(_) => return None,
-    };
-
-    if guard.is_none() {
-        let sidecar = app.shell().sidecar("similarity-worker").ok()?;
-        let (events, child) = sidecar.args(["--stdin-loop"]).spawn().ok()?;
-        *guard = Some(ResidentSimilarityWorker { child, events });
-    }
-
-    let worker = guard.as_mut().expect("just ensured it's Some");
-    let wrote_request =
-        worker.child.write(path.as_bytes()).is_ok() && worker.child.write(b"\n").is_ok();
-    if !wrote_request {
-        if let Some(dead_worker) = guard.take() {
-            let _ = dead_worker.child.kill();
-        }
-        return None;
-    }
-
-    let worker = guard.as_mut().expect("just ensured it's Some");
-    // This used to be 90s — "generous headroom" for a slow debug-build
-    // sidecar. In practice that generosity is what let a handful of
-    // pathological files (real library content the resident bliss-audio
-    // worker chokes or hangs on) turn into multi-minute stalls: this lock
-    // is held for the whole wait, so every *other* concurrently-decoding
-    // job's completion is serialized behind it too (see the fn doc
-    // comment). 20s is still well above the ordinary case this was sized
-    // for, but caps how much one bad file can cost the jobs waiting
-    // behind it — fingerprinting is explicitly a nice-to-have, not worth
-    // trading a whole batch's throughput for.
-    let response = tokio::time::timeout(std::time::Duration::from_secs(20), async {
-        loop {
-            match worker.events.recv().await {
-                Some(CommandEvent::Stdout(bytes)) => return Some(bytes),
-                // Surfaced to the terminal rather than silently dropped: a
-                // Rust panic in the worker (e.g. bliss-audio choking on a
-                // pathological file) prints here, which is the only signal
-                // that would otherwise explain an unexpected respawn below.
-                Some(CommandEvent::Stderr(bytes)) => {
-                    eprintln!("similarity-worker stderr: {}", String::from_utf8_lossy(&bytes));
-                    continue;
-                }
-                // Error/Terminated, any future non-exhaustive variant, or
-                // the channel closing (None) all mean "no usable response
-                // is coming" — treat them the same as a hard failure.
-                _ => return None,
-            }
-        }
-    })
-    .await;
-
-    let stdout_bytes = match response {
-        Ok(Some(bytes)) => bytes,
-        _ => {
-            // Timed out, the worker errored/exited, or the event channel
-            // closed — drop it so the next call spawns a fresh one instead
-            // of writing into a dead or desynced pipe.
-            if let Some(dead_worker) = guard.take() {
-                let _ = dead_worker.child.kill();
-            }
-            return None;
-        }
-    };
-
-    let stdout = String::from_utf8_lossy(&stdout_bytes);
-    let parsed: serde_json::Value = serde_json::from_str(stdout.trim()).ok()?;
-    parsed
-        .get("analysis")
-        .filter(|value| value.is_array())
-        .map(|value| value.to_string())
 }
 
 /// Loads every non-trashed asset in the library with a stored similarity
@@ -4053,7 +3916,7 @@ fn similar_assets(
             if vector.len() != target_vector.len() {
                 return None;
             }
-            let distance = euclidean_distance(&target_vector, &vector);
+            let distance = audio_analysis::fingerprint_distance(&target_vector, &vector);
             Some((id, distance))
         })
         .collect();
@@ -4065,14 +3928,6 @@ fn similar_assets(
         .into_iter()
         .filter_map(|(id, _)| catalog.get_asset(id).ok().flatten())
         .collect())
-}
-
-fn euclidean_distance(a: &[f32], b: &[f32]) -> f32 {
-    a.iter()
-        .zip(b.iter())
-        .map(|(x, y)| (x - y).powi(2))
-        .sum::<f32>()
-        .sqrt()
 }
 
 #[tauri::command]
@@ -5249,8 +5104,7 @@ pub fn run() {
         .plugin(tauri_plugin_clipboard_manager::init())
         .plugin(tauri_plugin_dialog::init())
         .plugin(tauri_plugin_fs::init())
-        .plugin(tauri_plugin_opener::init())
-        .plugin(tauri_plugin_shell::init());
+        .plugin(tauri_plugin_opener::init());
 
     // MAS build relies entirely on Apple's own updater (see
     // docs/development/release-readiness.md) — this plugin only makes
@@ -5352,7 +5206,6 @@ pub fn run() {
                 waveform_generation_paused: std::sync::atomic::AtomicBool::new(false),
             });
             app.manage(power::PowerAssertionState::new());
-            app.manage(SimilarityWorkerState(tokio::sync::Mutex::new(None)));
             app.manage(InstrumentModelState {
                 model: std::sync::Arc::new(Mutex::new(None)),
                 tried: std::sync::atomic::AtomicBool::new(false),

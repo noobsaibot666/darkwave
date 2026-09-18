@@ -8,7 +8,7 @@ Staging folder for macOS store assets (icons, screenshots) before they move to
 - [x] Dual-build: MAS (sandboxed) + direct-sale (unsandboxed), signed with correct identities
 - [x] Security-scoped bookmarks wired for NAS/external libraries under the MAS sandbox
 - [x] AAC codec question closed — decoder dropped, ADR 0028
-- [x] GPL/MAS question mitigated — `similarity-worker` excluded from MAS build
+- [x] GPL/MAS question resolved for real (not just mitigated) — the GPL-3.0 `similarity-worker` sidecar is gone, replaced with an in-process fingerprint (`crates/audio-analysis`); "Similar Sounds" now works on MAS too, see ADR 0033
 - [x] Real notarized direct-sale DMG (Developer ID, stapled, Gatekeeper-verified)
 - [x] Real signed MAS `.pkg` (3rd Party Mac Developer certs)
 - [x] Self-hosted update endpoint live, verified end to end

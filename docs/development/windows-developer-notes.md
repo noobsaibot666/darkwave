@@ -7,6 +7,39 @@ Newest entry on top. Add a new entry, don't edit old ones.
 
 ---
 
+## 2026-09-18 — "Similar Sounds" now actually works on Windows (it never did before) — pull main
+
+Pull `main` before your next build. `crates/similarity-worker` (a GPL-3.0 `bliss-rs` sidecar
+subprocess "Find Similar Sounds" depended on) is deleted entirely — see
+`docs/adr/0033-drop-bliss-rs-similarity-sidecar.md`. It's replaced with an in-process fingerprint
+in `crates/audio-analysis` (`compute_fingerprint`/`compute_fingerprint_from_mono`) that links
+straight into `darkwave-desktop` like everything else, no subprocess, no per-platform sidecar
+binary to build.
+
+Two things worth knowing:
+
+1. **This feature never actually worked on your machine before** — a Windows-triple
+   `similarity-worker.exe` sidecar build was still open work (see ADR 0025's own consequences
+   section) that never got done, so "Find Similar Sounds" silently did nothing on every Windows
+   build so far. It should now work correctly the first time you try it after this pull.
+2. **`windows-setup.md`'s "after every pull" sequence lost a step** — the
+   `cargo build -p similarity-worker` + `Copy-Item` lines are gone from that doc; there's no sidecar
+   to rebuild anymore, on any platform. If your own local workflow/scripts still reference building
+   or copying a `similarity-worker` binary, that step is now dead and safe to delete.
+
+No other code changes came with this — `similar_assets` (the Tauri command that ranks results)
+is unchanged, only what produces the stored fingerprint changed. An existing library needs one
+re-analysis pass (Sonic Radar's "Backfill" action, or a fresh import) before there's anything
+current to compare against — a fingerprint from the old sidecar is a different shape and is never
+matched against a new one (harmless: `similar_assets` already skips comparing mismatched lengths).
+
+`cargo test --workspace` passes on macOS; I can't verify the Windows build directly from here —
+please confirm `cargo build`/`cargo test -p audio-analysis` succeed on your machine and that
+clicking "Similar Sounds" on an analyzed track actually returns results.
+
+---
+
+
 ## 2026-09-13 — merged your audio-analysis-retry-loop fix, plus two corrections on top — pull main
 
 Your `fix/audio-analysis-retry-loop` branch (`fb893f6`) was the right fix for the "3526 files,

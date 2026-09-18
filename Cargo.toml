@@ -18,7 +18,6 @@ members = [
   "crates/library-sync",
   "crates/search",
   "crates/shared-types",
-  "crates/similarity-worker",
   "crates/storage",
   "crates/trash",
   "crates/waveform",
