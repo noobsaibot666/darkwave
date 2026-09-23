@@ -916,6 +916,49 @@ impl Catalog {
         Ok(assets)
     }
 
+    /// The `limit` most recently imported assets, newest first — what the
+    /// browser's "Recently Added" view shows.
+    ///
+    /// `date_added` is a TEXT column holding `Utc::now().to_rfc3339()`, so
+    /// it's always UTC with a fixed-width date/time prefix: SQLite's
+    /// lexicographic TEXT ordering is chronological ordering here. `rowid`
+    /// breaks ties in insert order, which matters for a bulk import where
+    /// a whole folder can share a timestamp — without it the rows within
+    /// one import batch would come back in an arbitrary, unstable order
+    /// that changes between calls.
+    ///
+    /// Note this deliberately returns newest-first, the opposite of
+    /// `list_assets` — the ordering *is* the feature, so it must not be
+    /// re-sorted by the caller.
+    pub fn list_recent_assets(
+        &self,
+        library_id: Uuid,
+        limit: u32,
+    ) -> Result<Vec<AssetRecord>, StorageError> {
+        let mut statement = self.connection.prepare(
+            "SELECT id, library_id, original_filename, display_name, relative_path, referenced_path,
+                storage_mode, content_hash, media_type, file_size, availability_state, review_state, favorite,
+                    embedded_title, embedded_genre, embedded_comment,
+                    duration_ms, sample_rate, bit_depth, channels, loudness_lufs, peak_db,
+                    bpm, bpm_confidence, musical_key, key_confidence, vocal_ratio, detected_key, key_strength,
+                    stem_group_id, stem_label, stem_is_primary
+             FROM assets
+             WHERE library_id = ?1
+               AND NOT EXISTS (
+                 SELECT 1 FROM trash_items
+                 WHERE trash_items.asset_id = assets.id AND trash_items.state = 'in_trash'
+               )
+             ORDER BY date_added DESC, rowid DESC
+             LIMIT ?2",
+        )?;
+
+        let assets = statement
+            .query_map(params![library_id.to_string(), limit as i64], asset_from_row)?
+            .collect::<Result<Vec<_>, _>>()?;
+
+        Ok(assets)
+    }
+
     pub fn enqueue_job(
         &self,
         asset_id: Uuid,
@@ -2469,6 +2512,34 @@ impl Catalog {
         )
     }
 
+    /// Takes assets back out of a project/collection — the counterpart to
+    /// `add_assets_to_collection`, and the "clean up" half of managing a
+    /// project's contents.
+    ///
+    /// Only the membership row goes away. The asset itself, its tags, and
+    /// its `usage_events` history (including any `exported` events for this
+    /// project) are all left intact: the record that a file *was* once sent
+    /// to this project's folder stays true even after the track is dropped
+    /// from the project, and any file already written into the project
+    /// folder on disk is never touched from here.
+    pub fn remove_assets_from_collection(
+        &self,
+        collection_id: Uuid,
+        asset_ids: &[Uuid],
+    ) -> Result<Uuid, StorageError> {
+        for asset_id in asset_ids {
+            self.connection.execute(
+                "DELETE FROM collection_assets WHERE collection_id = ?1 AND asset_id = ?2",
+                params![collection_id.to_string(), asset_id.to_string()],
+            )?;
+        }
+
+        self.record_undo(
+            "readd_collection_assets",
+            &format!("{}|{}", collection_id, join_uuids(asset_ids)),
+        )
+    }
+
     pub fn assets_in_collection(
         &self,
         collection_id: Uuid,
@@ -3097,6 +3168,17 @@ impl Catalog {
                     )?;
                 }
             }
+            "readd_collection_assets" => {
+                let (owner_id, asset_ids) = split_owner_and_assets(&payload);
+                let now = Utc::now().to_rfc3339();
+                for asset_id in asset_ids {
+                    self.connection.execute(
+                        "INSERT OR IGNORE INTO collection_assets (collection_id, asset_id, created_at)
+                         VALUES (?1, ?2, ?3)",
+                        params![owner_id.to_string(), asset_id.to_string(), now],
+                    )?;
+                }
+            }
             "readd_asset_tags" => {
                 let (tag_id, origin, asset_ids) = split_tag_owner_origin_and_assets(&payload);
                 for asset_id in asset_ids {
@@ -3160,6 +3242,15 @@ impl Catalog {
                     self.connection.execute(
                         "DELETE FROM asset_tags WHERE tag_id = ?1 AND asset_id = ?2",
                         params![tag_id.to_string(), asset_id.to_string()],
+                    )?;
+                }
+            }
+            "readd_collection_assets" => {
+                let (owner_id, asset_ids) = split_owner_and_assets(&payload);
+                for asset_id in asset_ids {
+                    self.connection.execute(
+                        "DELETE FROM collection_assets WHERE collection_id = ?1 AND asset_id = ?2",
+                        params![owner_id.to_string(), asset_id.to_string()],
                     )?;
                 }
             }
@@ -5358,6 +5449,162 @@ mod tests {
                 .map(|asset| asset.id)
                 .collect::<Vec<_>>(),
             vec![asset.id]
+        );
+    }
+
+    #[test]
+    fn recent_assets_come_back_newest_first_and_capped_at_the_limit() {
+        let catalog_path = unique_catalog_path("recent-assets");
+        let catalog = Catalog::open(&catalog_path).expect("open catalog");
+        let library = catalog.create_library("Recent", "/library").expect("library");
+
+        // Registered oldest-to-newest; list_assets returns that order, so
+        // Recently Added has to hand back the exact reverse.
+        let assets: Vec<_> = (0..5)
+            .map(|index| {
+                test_asset(
+                    &catalog,
+                    library.id,
+                    &format!("take-{index}.wav"),
+                    &format!("hash-{index}"),
+                )
+            })
+            .collect();
+
+        let recent = catalog
+            .list_recent_assets(library.id, 3)
+            .expect("recent assets");
+
+        assert_eq!(
+            recent.iter().map(|asset| asset.id).collect::<Vec<_>>(),
+            vec![assets[4].id, assets[3].id, assets[2].id]
+        );
+
+        // A limit past the end of the library is not an error, it just
+        // returns everything there is.
+        assert_eq!(
+            catalog
+                .list_recent_assets(library.id, 500)
+                .expect("recent assets")
+                .len(),
+            5
+        );
+    }
+
+    #[test]
+    fn recent_assets_exclude_trashed_tracks_and_other_libraries() {
+        let catalog_path = unique_catalog_path("recent-assets-scope");
+        let catalog = Catalog::open(&catalog_path).expect("open catalog");
+        let library = catalog.create_library("Mine", "/library").expect("library");
+        let other = catalog.create_library("Theirs", "/other").expect("library");
+
+        let kept = test_asset(&catalog, library.id, "kept.wav", "hash-kept");
+        let trashed = test_asset(&catalog, library.id, "trashed.wav", "hash-trashed");
+        // Registered last, so an unscoped query would put it first.
+        test_asset(&catalog, other.id, "elsewhere.wav", "hash-elsewhere");
+
+        catalog
+            .move_asset_to_trash(trashed.id, "manual", 0)
+            .expect("trash");
+
+        assert_eq!(
+            catalog
+                .list_recent_assets(library.id, 100)
+                .expect("recent assets")
+                .iter()
+                .map(|asset| asset.id)
+                .collect::<Vec<_>>(),
+            vec![kept.id]
+        );
+    }
+
+    #[test]
+    fn removing_a_track_from_a_project_is_undoable_and_redoable() {
+        let catalog_path = unique_catalog_path("collection-remove");
+        let catalog = Catalog::open(&catalog_path).expect("open catalog");
+        let library = catalog.create_library("Org", "/library").expect("library");
+        let kept = test_asset(&catalog, library.id, "kept.wav", "hash-kept");
+        let dropped = test_asset(&catalog, library.id, "dropped.wav", "hash-dropped");
+        let project = catalog
+            .create_collection(library.id, "Film Trailer", CollectionType::Project)
+            .expect("project");
+        catalog
+            .add_assets_to_collection(project.id, &[kept.id, dropped.id])
+            .expect("membership");
+
+        let removal_undo = catalog
+            .remove_assets_from_collection(project.id, &[dropped.id])
+            .expect("removal");
+
+        assert_eq!(
+            catalog
+                .assets_in_collection(project.id)
+                .expect("collection assets")
+                .iter()
+                .map(|asset| asset.id)
+                .collect::<Vec<_>>(),
+            vec![kept.id]
+        );
+
+        catalog.undo(removal_undo).expect("undo removal");
+        assert_eq!(
+            catalog
+                .assets_in_collection(project.id)
+                .expect("collection assets")
+                .len(),
+            2
+        );
+
+        catalog.redo(removal_undo).expect("redo removal");
+        assert_eq!(
+            catalog
+                .assets_in_collection(project.id)
+                .expect("collection assets")
+                .iter()
+                .map(|asset| asset.id)
+                .collect::<Vec<_>>(),
+            vec![kept.id]
+        );
+    }
+
+    #[test]
+    fn removing_a_track_from_a_project_keeps_its_export_history() {
+        let catalog_path = unique_catalog_path("collection-remove-history");
+        let catalog = Catalog::open(&catalog_path).expect("open catalog");
+        let library = catalog.create_library("Org", "/library").expect("library");
+        let asset = test_asset(&catalog, library.id, "hit.wav", "hash-hit");
+        let project = catalog
+            .create_collection(library.id, "Film Trailer", CollectionType::Project)
+            .expect("project");
+        catalog
+            .add_assets_to_collection(project.id, &[asset.id])
+            .expect("membership");
+        catalog
+            .record_usage_event(
+                asset.id,
+                Some(project.id),
+                UsageEventType::Exported,
+                "/projects/trailer/audio/Dark Hit.wav",
+            )
+            .expect("usage event");
+
+        catalog
+            .remove_assets_from_collection(project.id, &[asset.id])
+            .expect("removal");
+
+        // The membership is gone, but "this file was sent there" stays
+        // true — the license/source report for the project is built from
+        // usage_events and must not lose rows when a track is tidied out.
+        assert!(catalog
+            .assets_in_collection(project.id)
+            .expect("collection assets")
+            .is_empty());
+        assert_eq!(
+            catalog
+                .project_source_report(project.id)
+                .expect("source report")
+                .len(),
+            1
         );
     }
 

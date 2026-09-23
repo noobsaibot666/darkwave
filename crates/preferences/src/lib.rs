@@ -154,6 +154,27 @@ pub struct AppPreferences {
     /// still lives only there.
     #[serde(default)]
     pub deferred_legacy_library_ids: Vec<String>,
+    /// How many tracks the browser's "Recently Added" view shows, newest
+    /// first. Clamped to [`MIN_RECENT_IMPORTS_LIMIT`]..=[`MAX_RECENT_IMPORTS_LIMIT`]
+    /// by [`AppPreferences::set_recent_imports_limit`] — the view is a
+    /// "what did I just bring in" glance, so an unbounded value would just
+    /// be All Sounds in a different order.
+    #[serde(default = "default_recent_imports_limit")]
+    pub recent_imports_limit: u32,
+    /// The project each library currently exports to, keyed by library id
+    /// (both as strings — this file is written by serde_json, which has no
+    /// `Uuid` map-key support, and it's read back as an opaque id anyway).
+    ///
+    /// This is the disambiguator for the multi-project export problem: a
+    /// track can belong to any number of projects, so "send this to its
+    /// project folder" is ambiguous the moment more than one of them has a
+    /// folder configured. Whichever project is active here wins, and the
+    /// caller only has to fall back to asking when the track isn't in it.
+    /// Lives in preferences rather than the `.darkwave` file because it's
+    /// per-user working state ("what am I cutting today"), not library
+    /// data that should travel with the library to another machine.
+    #[serde(default)]
+    pub active_project_by_library: BTreeMap<String, String>,
 }
 
 /// One entry in the recent-projects list shown on the first-run screen.
@@ -179,8 +200,20 @@ pub struct MigratedLegacyLibraryEntry {
 /// to stay a quick glance rather than its own scrollable archive.
 pub const MAX_RECENT_LIBRARY_FILES: usize = 10;
 
+/// Bounds for `recent_imports_limit`. The floor keeps the view from being
+/// configured into uselessness; the ceiling keeps it a genuinely *recent*
+/// slice rather than a second All Sounds — the browser is virtualized, so
+/// this is about what the view means, not about what it can render.
+pub const MIN_RECENT_IMPORTS_LIMIT: u32 = 10;
+pub const MAX_RECENT_IMPORTS_LIMIT: u32 = 5_000;
+pub const DEFAULT_RECENT_IMPORTS_LIMIT: u32 = 100;
+
 fn default_prevent_sleep_during_analysis() -> bool {
     true
+}
+
+fn default_recent_imports_limit() -> u32 {
+    DEFAULT_RECENT_IMPORTS_LIMIT
 }
 
 impl AppPreferences {
@@ -427,12 +460,62 @@ impl AppPreferences {
             legacy_migration_dismissed: false,
             migrated_legacy_libraries: Vec::new(),
             deferred_legacy_library_ids: Vec::new(),
+            recent_imports_limit: DEFAULT_RECENT_IMPORTS_LIMIT,
+            active_project_by_library: BTreeMap::new(),
         }
+    }
+
+    /// Sets the Recently Added view's size, clamped to the supported
+    /// range. Clamping here (rather than only in the settings input) keeps
+    /// a hand-edited or older `preferences.json` from producing a view that
+    /// shows nothing or shows everything.
+    pub fn set_recent_imports_limit(&mut self, limit: u32) {
+        self.recent_imports_limit = normalize_recent_imports_limit(limit);
+    }
+
+    /// The project this library currently exports to, if one is set.
+    pub fn active_project_for_library(&self, library_id: impl AsRef<str>) -> Option<&str> {
+        self.active_project_by_library
+            .get(library_id.as_ref())
+            .map(String::as_str)
+    }
+
+    /// Points a library at a project as its export target, or clears the
+    /// target with `None`. Per library, so switching libraries doesn't
+    /// carry a now-meaningless project id across with it.
+    pub fn set_active_project_for_library(
+        &mut self,
+        library_id: impl AsRef<str>,
+        project_id: Option<impl AsRef<str>>,
+    ) {
+        let library_id = library_id.as_ref().to_string();
+        match project_id {
+            Some(project_id) => {
+                self.active_project_by_library
+                    .insert(library_id, project_id.as_ref().to_string());
+            }
+            None => {
+                self.active_project_by_library.remove(&library_id);
+            }
+        }
+    }
+
+    /// Drops a project from every library's active-target slot — call this
+    /// when a project is deleted, so a dangling id can't keep claiming to
+    /// be the export target of a project that no longer exists.
+    pub fn forget_active_project(&mut self, project_id: impl AsRef<str>) {
+        let project_id = project_id.as_ref();
+        self.active_project_by_library
+            .retain(|_, active| active != project_id);
     }
 }
 
 pub fn normalize_preview_cache_limit_mb(limit_mb: u32) -> u32 {
     limit_mb.max(MIN_PREVIEW_CACHE_LIMIT_MB)
+}
+
+pub fn normalize_recent_imports_limit(limit: u32) -> u32 {
+    limit.clamp(MIN_RECENT_IMPORTS_LIMIT, MAX_RECENT_IMPORTS_LIMIT)
 }
 
 pub fn load_preferences(path: impl AsRef<Path>) -> Result<AppPreferences, PreferenceStoreError> {
@@ -445,6 +528,8 @@ pub fn load_preferences(path: impl AsRef<Path>) -> Result<AppPreferences, Prefer
     let mut preferences: AppPreferences = serde_json::from_str(&contents)?;
     preferences.preview_cache_limit_mb =
         normalize_preview_cache_limit_mb(preferences.preview_cache_limit_mb);
+    preferences.recent_imports_limit =
+        normalize_recent_imports_limit(preferences.recent_imports_limit);
     preferences.shortcuts.validate()?;
 
     Ok(preferences)
@@ -458,6 +543,8 @@ pub fn save_preferences(
     let mut normalized = preferences.clone();
     normalized.preview_cache_limit_mb =
         normalize_preview_cache_limit_mb(normalized.preview_cache_limit_mb);
+    normalized.recent_imports_limit =
+        normalize_recent_imports_limit(normalized.recent_imports_limit);
 
     let path = path.as_ref();
     if let Some(parent) = path.parent() {
@@ -662,6 +749,89 @@ mod tests {
         assert_eq!(loaded.theme, ThemePreference::Dark);
         assert!(loaded.recent_library_files.is_empty());
         assert_eq!(loaded.last_active_library_file_path, None);
+        // A preferences file written before Recently Added existed has no
+        // `recent_imports_limit` at all — it must land on the default, not
+        // on serde's `0`, which would render the view permanently empty.
+        assert_eq!(loaded.recent_imports_limit, DEFAULT_RECENT_IMPORTS_LIMIT);
+        assert!(loaded.active_project_by_library.is_empty());
+    }
+
+    #[test]
+    fn recent_imports_limit_is_clamped_to_a_usable_range() {
+        let mut preferences = AppPreferences::default_for_editorial_audio();
+
+        assert_eq!(preferences.recent_imports_limit, DEFAULT_RECENT_IMPORTS_LIMIT);
+
+        preferences.set_recent_imports_limit(0);
+        assert_eq!(preferences.recent_imports_limit, MIN_RECENT_IMPORTS_LIMIT);
+
+        preferences.set_recent_imports_limit(u32::MAX);
+        assert_eq!(preferences.recent_imports_limit, MAX_RECENT_IMPORTS_LIMIT);
+
+        preferences.set_recent_imports_limit(250);
+        assert_eq!(preferences.recent_imports_limit, 250);
+    }
+
+    #[test]
+    fn an_out_of_range_recent_imports_limit_is_clamped_on_load() {
+        let path = unique_preferences_path("recent-limit-out-of-range");
+        let mut preferences = AppPreferences::default_for_editorial_audio();
+        // Bypasses the setter the way a hand-edited preferences.json does.
+        preferences.recent_imports_limit = 0;
+
+        save_preferences(&path, &preferences).expect("save");
+        let loaded = load_preferences(&path).expect("load");
+
+        assert_eq!(loaded.recent_imports_limit, MIN_RECENT_IMPORTS_LIMIT);
+    }
+
+    #[test]
+    fn the_active_export_project_is_tracked_per_library() {
+        let mut preferences = AppPreferences::default_for_editorial_audio();
+
+        preferences.set_active_project_for_library("lib-a", Some("project-1"));
+        preferences.set_active_project_for_library("lib-b", Some("project-2"));
+
+        assert_eq!(preferences.active_project_for_library("lib-a"), Some("project-1"));
+        assert_eq!(preferences.active_project_for_library("lib-b"), Some("project-2"));
+        assert_eq!(preferences.active_project_for_library("lib-c"), None);
+
+        // Re-targeting replaces rather than accumulating.
+        preferences.set_active_project_for_library("lib-a", Some("project-3"));
+        assert_eq!(preferences.active_project_for_library("lib-a"), Some("project-3"));
+
+        preferences.set_active_project_for_library("lib-a", None::<&str>);
+        assert_eq!(preferences.active_project_for_library("lib-a"), None);
+        // Clearing one library leaves the others alone.
+        assert_eq!(preferences.active_project_for_library("lib-b"), Some("project-2"));
+    }
+
+    #[test]
+    fn deleting_a_project_clears_it_from_every_librarys_export_target() {
+        let mut preferences = AppPreferences::default_for_editorial_audio();
+        preferences.set_active_project_for_library("lib-a", Some("shared-project"));
+        preferences.set_active_project_for_library("lib-b", Some("shared-project"));
+        preferences.set_active_project_for_library("lib-c", Some("other-project"));
+
+        preferences.forget_active_project("shared-project");
+
+        assert_eq!(preferences.active_project_for_library("lib-a"), None);
+        assert_eq!(preferences.active_project_for_library("lib-b"), None);
+        assert_eq!(preferences.active_project_for_library("lib-c"), Some("other-project"));
+    }
+
+    #[test]
+    fn the_active_export_project_round_trips_through_saved_preferences() {
+        let path = unique_preferences_path("active-project");
+        let mut preferences = AppPreferences::default_for_editorial_audio();
+        preferences.set_active_project_for_library("lib-a", Some("project-1"));
+        preferences.set_recent_imports_limit(250);
+
+        save_preferences(&path, &preferences).expect("save");
+        let loaded = load_preferences(&path).expect("load");
+
+        assert_eq!(loaded.active_project_for_library("lib-a"), Some("project-1"));
+        assert_eq!(loaded.recent_imports_limit, 250);
     }
 
     #[test]

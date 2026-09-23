@@ -1314,6 +1314,118 @@ button.panel-handle-right:active:not(:disabled) {
   cursor: default;
 }
 
+/* The third state: the track is in several projects and nothing in the
+   current context picks one, so clicking opens the picker. Deliberately
+   neither the neutral "pending" nor the green "exported" chip — claiming
+   either would be a lie, since there is no single project to be sent to
+   or already sent to yet. */
+.icon-button.project-status.choose {
+  border-color: rgba(234, 179, 8, 0.38);
+  background: rgba(234, 179, 8, 0.14);
+  color: #ca8a04;
+}
+
+.icon-button.project-status.choose:hover:not(:disabled) {
+  background: rgba(234, 179, 8, 0.22);
+}
+
+.send-target-picker {
+  min-width: 264px;
+}
+
+.send-target-option {
+  justify-content: flex-start;
+}
+
+.send-target-name {
+  flex: 1;
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.send-target-state {
+  flex: 0 0 auto;
+  font-size: 10px;
+  letter-spacing: 0.02em;
+  color: var(--text-muted);
+}
+
+.send-target-state.sent {
+  color: #059669;
+}
+
+/* Sidebar crosshair — marks a project as the active export target. Sits
+   quiet until hovered or set, like the neighbouring quick-add and edit
+   affordances, so an ordinary project row doesn't gain a third loud icon. */
+.project-target-toggle {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  width: 22px;
+  height: 22px;
+  padding: 0;
+  flex: 0 0 auto;
+  border: none;
+  border-radius: 6px;
+  background: transparent;
+  color: var(--text-muted);
+  opacity: 0.45;
+  transition: background-color 140ms var(--ease-soft), color 140ms var(--ease-soft),
+    opacity 140ms var(--ease-soft);
+}
+
+.nav-item-row:hover .project-target-toggle {
+  opacity: 1;
+}
+
+.project-target-toggle:hover {
+  background: var(--surface-hover);
+  color: var(--text-primary);
+}
+
+.project-target-toggle.active {
+  opacity: 1;
+  background: rgba(var(--ink-rgb), 0.1);
+  color: var(--text-primary);
+}
+
+/* The count chip on the Recently Added nav item — it's the configured
+   limit, not a live row count, so it reads as a setting at a glance. */
+.nav-item-count {
+  margin-left: auto;
+  padding: 0 6px;
+  border-radius: 5px;
+  background: rgba(var(--ink-rgb), 0.1);
+  color: var(--text-muted);
+  font-size: 10px;
+  line-height: 16px;
+}
+
+/* .bulk-action-danger is otherwise scoped to .bulk-action-button; the
+   project view's Remove action is a .text-button, so it needs its own
+   two-class rule to win the same way (see the specificity note above). */
+.text-button.bulk-action-danger {
+  border-color: rgba(220, 38, 38, 0.3);
+  background: rgba(220, 38, 38, 0.1);
+  color: #f87171;
+}
+
+.text-button.bulk-action-danger:hover:not(:disabled) {
+  background: rgba(220, 38, 38, 0.18);
+}
+
+/* The project-view bulk bar's buttons sit inline with the "N selected"
+   chip, so they match its height rather than the taller standalone
+   .text-button. */
+.selection-bar .text-button {
+  height: 26px;
+  padding: 0 10px;
+  gap: 6px;
+  font-size: 11px;
+}
+
 .primary-action {
   gap: 7px;
   height: 34px;
