@@ -7,6 +7,28 @@ Newest entry on top. Add a new entry, don't edit old ones.
 
 ---
 
+## 2026-09-23 — Recently Added view + sends now target one project, not all of them — pull main
+
+Two changes, no new deps, no build-step changes. `cargo test --workspace` and
+`npm run check` both pass.
+
+1. **New "Recently Added" sidebar entry** under All Sounds — the N newest imports, newest
+   first. N is set in Settings → General → Browser (default 100, range 10–5000), stored as
+   `AppPreferences::recent_imports_limit`. Backed by `list_recent_assets` (new Tauri command +
+   `Catalog::list_recent_assets`).
+
+2. **Sending a track to a project folder no longer fans out.** If a track was in three projects,
+   the per-row send button used to copy it into all three folders at once. It now resolves to
+   exactly one project (browsed project → active project → the only candidate) and opens a
+   picker when it can't. Set an "active export target" from the crosshair that appears on a
+   project row in the sidebar. Read `docs/adr/0035-single-project-export-targeting.md` and the
+   new CLAUDE.md section before touching export code — the one-project rule is structural, not
+   a style preference.
+
+Worth a look on your side: the picker is a portaled popover positioned from
+`getBoundingClientRect`, same pattern as the row context menu. If that menu has ever mispositioned
+on Windows, this will too.
+
 ## 2026-09-18 — "Similar Sounds" now actually works on Windows (it never did before) — pull main
 
 Pull `main` before your next build. `crates/similarity-worker` (a GPL-3.0 `bliss-rs` sidecar

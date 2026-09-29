@@ -1584,6 +1584,24 @@ fn list_assets(
         .map_err(storage_error_message)
 }
 
+/// Backs the browser's "Recently Added" view: the newest `limit` imports,
+/// newest first. `limit` comes from `AppPreferences::recent_imports_limit`
+/// and is re-clamped here rather than trusted, since the frontend's number
+/// input is not the only possible caller.
+#[tauri::command(async)]
+fn list_recent_assets(
+    state: tauri::State<CatalogState>,
+    library_id: String,
+    limit: u32,
+) -> Result<Vec<AssetRecord>, String> {
+    let library_id = parse_uuid_field(&library_id, "library id")?;
+    let limit = preferences::normalize_recent_imports_limit(limit);
+    let catalog = state.0.lock().expect("catalog mutex poisoned");
+    catalog
+        .list_recent_assets(library_id, limit)
+        .map_err(storage_error_message)
+}
+
 #[tauri::command(async)]
 fn search_assets(
     state: tauri::State<CatalogState>,
@@ -4738,6 +4756,32 @@ fn add_to_collection(
     Ok(undo_id.to_string())
 }
 
+/// Takes tracks back out of a project — the "clean up" action in the
+/// project view's bulk bar. Membership only: nothing is deleted from the
+/// library, and any file already copied into the project's export folder
+/// stays exactly where it is on disk (Darkwave never reaches into an
+/// editor's working folder to remove media it might already be cut with).
+/// Returns an undo id, same as `add_to_collection`.
+#[tauri::command]
+fn remove_from_collection(
+    state: tauri::State<CatalogState>,
+    collection_id: String,
+    asset_ids: Vec<String>,
+) -> Result<String, String> {
+    let collection_id = parse_uuid_field(&collection_id, "collection id")?;
+    let asset_ids = asset_ids
+        .iter()
+        .map(|id| parse_uuid_field(id, "asset id"))
+        .collect::<Result<Vec<_>, _>>()?;
+
+    let catalog = state.0.lock().expect("catalog mutex poisoned");
+    let undo_id = catalog
+        .remove_assets_from_collection(collection_id, &asset_ids)
+        .map_err(storage_error_message)?;
+
+    Ok(undo_id.to_string())
+}
+
 #[tauri::command]
 fn assets_in_collection(
     state: tauri::State<CatalogState>,
@@ -5961,6 +6005,7 @@ pub fn run() {
             empty_library_trash,
             delete_library,
             list_assets,
+            list_recent_assets,
             search_assets,
             import_folder,
             refresh_library,
@@ -5999,6 +6044,7 @@ pub fn run() {
             approve_project_resolve_sync,
             send_asset_to_resolve_timeline,
             add_to_collection,
+            remove_from_collection,
             assets_in_collection,
             search_assets_advanced,
             create_smart_collection,

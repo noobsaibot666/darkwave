@@ -104,6 +104,37 @@ Two hardening layers now guard this specific spot against a recurrence from a *d
    computed) fires whenever rows exist but the computed render range is empty — pointing straight
    back at this section instead of leaving a silent blank canvas with no lead at all.
 
+## Exporting to a project folder — never fan out across a track's projects
+
+A track can be in any number of projects (`collection_assets` has no per-asset uniqueness, on
+purpose — one cue really does get used in a trailer, a director's cut, and a social edit). So
+"send this to its project folder" has no single answer, and until 2026-09-23 the per-row send
+button answered it by sending to *all* of them: outside a project view it did
+`Promise.all(memberships.filter(hasAnyFolder).map(export…))`, copying one file into every
+project's export folder in a single click. Those are live watch folders for Resolve/Premiere —
+an unexpected file there may be on someone's timeline before anyone notices it shouldn't be.
+
+**The rule going forward:** every send names exactly one project. `sendAssetsToProject`
+(`App.tsx`) is the only frontend caller of `export_asset_to_project` and takes a single project,
+never a list — keep it that way, so fan-out stays structurally impossible rather than merely
+avoided. `resolveSendTarget` picks the target by precedence (browsed project → active project →
+the only candidate with a folder) and returns `choose` when none of those settles it; `choose`
+opens the picker. Fanning out survives only as an explicitly labelled "Send to all N projects"
+item inside that picker. See `docs/adr/0035-single-project-export-targeting.md`.
+
+Two things that follow from this and are easy to get wrong again:
+
+- **Per-project export state is per project.** `usage_events.project_id` has always recorded
+  exactly which project a file went to, and `project_memberships_for_library` returns `exported`
+  per membership — but the row badge used to collapse it with `memberships.some(m => m.exported)`,
+  so sending to one project marked the track green in all of them. Any UI showing "already sent"
+  must name the project it means.
+- **The active export target lives in preferences, not the library file.**
+  `AppPreferences::active_project_by_library` is per-user working state ("what am I cutting
+  today"), not library data that should travel to another machine with the `.darkwave` file.
+  Resolve it against the live `collections` list rather than trusting the stored id, and call
+  `forget_active_project` if a project-deletion command is ever added.
+
 ## Keep every dev machine on the same version — branch hygiene
 
 Development happens on more than one machine (this Mac, and a Windows machine — see

@@ -16,9 +16,11 @@ import {
   ChevronRight,
   Circle,
   Clapperboard,
+  Clock,
   Coffee,
   Contrast,
   Copy,
+  Crosshair,
   Database,
   Download,
   Eye,
@@ -408,7 +410,18 @@ type AppPreferences = {
   legacy_migration_dismissed: boolean;
   migrated_legacy_libraries: MigratedLegacyLibraryEntry[];
   deferred_legacy_library_ids: string[];
+  recent_imports_limit: number;
+  /** library id -> project id. The export target for the multi-project
+   * disambiguation — see `resolveSendTarget`. */
+  active_project_by_library: Record<string, string>;
 };
+
+/** Mirrors crates/preferences' MIN/MAX/DEFAULT_RECENT_IMPORTS_LIMIT — the
+ * Rust side re-clamps whatever it's given, this just keeps the settings
+ * input from offering values that would silently be rewritten. */
+const MIN_RECENT_IMPORTS_LIMIT = 10;
+const MAX_RECENT_IMPORTS_LIMIT = 5000;
+const DEFAULT_RECENT_IMPORTS_LIMIT = 100;
 
 type MigratedLegacyLibraryEntry = { legacy_library_id: string; library_file_path: string; name: string };
 
@@ -416,6 +429,12 @@ type SoundCategory = "music" | "voice" | "instrumental" | "sound_effect";
 
 type ActiveFilter =
   | "all"
+  // The N most recently imported tracks, newest first (N =
+  // preferences.recent_imports_limit). Unlike every other entry here this
+  // is a *slice*, not a predicate — it's fetched already ordered and
+  // already capped by list_recent_assets, so visibleAssets must leave its
+  // order alone.
+  | "recent"
   | "favorites"
   | "unreviewed"
   | "missing"
@@ -1321,6 +1340,18 @@ export function App() {
   // selected by the time an item is clicked.
   const [rowContextMenuPosition, setRowContextMenuPosition] = useState<{ top: number; left: number } | null>(null);
   const rowContextMenuRef = useRef<HTMLDivElement | null>(null);
+  // The "which project does this go to?" picker — only ever opened when a
+  // send is genuinely ambiguous (see resolveSendTarget). Holds the asset
+  // and its candidate projects captured at open time, because the menu is
+  // about one specific row, not about the current selection.
+  const [sendTargetPicker, setSendTargetPicker] = useState<{
+    top: number;
+    left: number;
+    assetIds: string[];
+    label: string;
+    candidates: AssetProjectMembership[];
+  } | null>(null);
+  const sendTargetPickerRef = useRef<HTMLDivElement | null>(null);
   const [sfxSubcategoriesOpen, setSfxSubcategoriesOpen] = useState(false);
   const [favoritesCategoriesOpen, setFavoritesCategoriesOpen] = useState(false);
   const [unreviewedCategoriesOpen, setUnreviewedCategoriesOpen] = useState(false);
@@ -1522,6 +1553,9 @@ export function App() {
   const [libraryAdminStatus, setLibraryAdminStatus] = useState<string | null>(null);
 
   const [preferences, setPreferences] = useState<AppPreferences | null>(null);
+  // In-progress text of the Recently Added count field; null means "not
+  // being edited, show the stored value."
+  const [recentImportsLimitDraft, setRecentImportsLimitDraft] = useState<string | null>(null);
   const [trashRetentionDays, setTrashRetentionDays] = useState(30);
 
   const audioRef = useRef<HTMLAudioElement | null>(null);
@@ -1554,6 +1588,91 @@ export function App() {
     }
     return map;
   }, [projectMemberships]);
+
+  // --- Export targeting -----------------------------------------------
+  //
+  // A track can belong to any number of projects, so "send this to its
+  // project folder" has no single answer on its own. Sending to all of
+  // them (which this used to do) is never what's wanted: it scatters the
+  // same file across several editors' working folders at once, and the
+  // per-project "already sent" state stops meaning anything. Instead the
+  // target is resolved down to exactly one project, and when it genuinely
+  // can't be, the user is asked rather than guessed at.
+
+  /** The project the current library exports to, if one is set and still
+   * resolves. Stale ids (a project from another library, or one that's
+   * since been removed) resolve to null rather than sticking around. */
+  const activeProject = useMemo(() => {
+    if (!activeLibraryId || !preferences) return null;
+    const projectId = preferences.active_project_by_library[activeLibraryId];
+    if (!projectId) return null;
+    return (
+      collections.find(
+        (collection) => collection.id === projectId && collection.collection_type === "Project"
+      ) ?? null
+    );
+  }, [activeLibraryId, preferences, collections]);
+
+  const handleSetActiveProject = useCallback(
+    (projectId: string | null) => {
+      if (!activeLibraryId) return;
+      setPreferences((previous) => {
+        if (!previous) return previous;
+        const next = { ...previous, active_project_by_library: { ...previous.active_project_by_library } };
+        if (projectId) next.active_project_by_library[activeLibraryId] = projectId;
+        else delete next.active_project_by_library[activeLibraryId];
+        invoke("save_app_preferences", { preferences: next }).catch(() => {});
+        return next;
+      });
+    },
+    [activeLibraryId]
+  );
+
+  /** The project currently being browsed, if the browser is in a project
+   * view. This is what makes the per-project export status in that view
+   * meaningful — inside a project, "sent" means sent *here*. */
+  const browsingProjectId =
+    typeof activeFilter === "object" && "project" in activeFilter && !activeFilter.smart
+      ? activeFilter.project
+      : null;
+
+  /** Where a one-click send should go, given a track's memberships.
+   *
+   * Precedence, most specific first:
+   *   1. The project being browsed — you asked for this project's view, a
+   *      send from inside it means this project.
+   *   2. The active project — the standing "what I'm cutting today" target.
+   *   3. The only candidate, when there's exactly one.
+   * Anything else is genuinely ambiguous and has to be asked ("choose").
+   *
+   * Only projects with an export folder configured are candidates; a
+   * project with no folder has nowhere to receive the file. */
+  const resolveSendTarget = useCallback(
+    (
+      memberships: AssetProjectMembership[]
+    ):
+      | { kind: "none" }
+      | { kind: "resolved"; target: AssetProjectMembership; reason: "browsing" | "active" | "only" }
+      | { kind: "choose"; candidates: AssetProjectMembership[] } => {
+      const candidates = memberships.filter(projectHasExportFolder);
+      if (candidates.length === 0) return { kind: "none" };
+
+      const browsed = browsingProjectId
+        ? candidates.find((candidate) => candidate.project_id === browsingProjectId)
+        : undefined;
+      if (browsed) return { kind: "resolved", target: browsed, reason: "browsing" };
+
+      const active = activeProject
+        ? candidates.find((candidate) => candidate.project_id === activeProject.id)
+        : undefined;
+      if (active) return { kind: "resolved", target: active, reason: "active" };
+
+      if (candidates.length === 1) return { kind: "resolved", target: candidates[0], reason: "only" };
+
+      return { kind: "choose", candidates };
+    },
+    [browsingProjectId, activeProject]
+  );
 
   // How many tracks have already been sent to each project — the Projects
   // grid's count badge. Derived from the same library-wide membership list
@@ -1701,6 +1820,11 @@ export function App() {
 
   const browserRowHeightPx = ROW_HEIGHT_PX_BY_DENSITY[preferences?.browser_density ?? "Comfortable"] ?? 60;
 
+  // How many tracks the Recently Added view asks for. Falls back to the
+  // default while preferences are still loading rather than to 0, which
+  // would make the view flash empty on every launch.
+  const recentImportsLimit = preferences?.recent_imports_limit ?? DEFAULT_RECENT_IMPORTS_LIMIT;
+
   const browserVisibleRange = useMemo(
     () =>
       computeVisibleRowRange(
@@ -1826,6 +1950,16 @@ export function App() {
         return;
       }
 
+      // Fetched pre-sorted and pre-capped by the backend, so it bypasses
+      // search/range filtering entirely: "the last N things I imported" is
+      // a fixed slice of the library, not a query that composes with one.
+      if (filter === "recent") {
+        invoke<AssetRecord[]>("list_recent_assets", { libraryId, limit: recentImportsLimit })
+          .then(applyResult)
+          .catch(applyEmpty);
+        return;
+      }
+
       if (typeof filter === "object" && "project" in filter) {
         const command = filter.smart ? "assets_in_smart_collection" : "assets_in_collection";
         invoke<AssetRecord[]>(command, { collectionId: filter.project }).then(applyResult).catch(applyEmpty);
@@ -1867,7 +2001,7 @@ export function App() {
 
       request.then(applyResult).catch(applyEmpty);
     },
-    [rangeFilters, similarToAssetId]
+    [rangeFilters, similarToAssetId, recentImportsLimit]
   );
 
   // Repeatedly drives process_pending_jobs/process_audio_analysis_jobs to
@@ -2873,17 +3007,57 @@ export function App() {
       .catch(() => {});
   }, [editProjectId, editProjectName, editProjectExportPath, editProjectSfxExportPath, collections]);
 
-  const handleExportToProject = useCallback(
-    (project: CollectionRecord, assetIds: string[]) => {
-      if (assetIds.length === 0 || (!project.export_path && !project.sfx_export_path)) return;
-      Promise.all(assetIds.map((assetId) => invoke<string>("export_asset_to_project", { assetId, projectId: project.id })))
-        .then(() => {
-          setLastExportProjectId(project.id);
-          if (activeLibraryId) refreshProjectMemberships(activeLibraryId);
-        })
-        .catch(() => {});
+  /** Copies tracks into one named project's folder. Every send in the app
+   * funnels through here, so there is exactly one place that talks to
+   * `export_asset_to_project` — and it always names a single project. The
+   * backend still picks *which* of that project's folders (sound vs sound
+   * effects vs a role-matched custom folder) from each asset's media type.
+   *
+   * `allSettled`, not `all`: a batch where one track's source file is
+   * offline should still deliver the rest and say how many landed, rather
+   * than rejecting on the first failure and leaving the user unsure what
+   * actually made it into the folder. */
+  const sendAssetsToProject = useCallback(
+    (assetIds: string[], project: { id: string; name: string }) => {
+      if (assetIds.length === 0) return;
+      setEditorActionStatus(
+        assetIds.length === 1
+          ? `Sending to "${project.name}"…`
+          : `Sending ${assetIds.length} sounds to "${project.name}"…`
+      );
+      Promise.allSettled(
+        assetIds.map((assetId) =>
+          invoke<string>("export_asset_to_project", { assetId, projectId: project.id })
+        )
+      ).then((results) => {
+        const sent = results.filter((result) => result.status === "fulfilled").length;
+        const failure = results.find(
+          (result): result is PromiseRejectedResult => result.status === "rejected"
+        );
+        if (sent === 0) {
+          setEditorActionStatus(`Send to "${project.name}" failed: ${String(failure?.reason)}`);
+        } else if (failure) {
+          setEditorActionStatus(
+            `Sent ${sent}/${assetIds.length} to "${project.name}" — last error: ${String(failure.reason)}`
+          );
+        } else {
+          setEditorActionStatus(
+            sent === 1 ? `Sent to "${project.name}"` : `Sent ${sent} sounds to "${project.name}"`
+          );
+        }
+        setLastExportProjectId(project.id);
+        if (activeLibraryId) refreshProjectMemberships(activeLibraryId);
+      });
     },
     [activeLibraryId, refreshProjectMemberships]
+  );
+
+  const handleExportToProject = useCallback(
+    (project: CollectionRecord, assetIds: string[]) => {
+      if (!projectHasExportFolder(project)) return;
+      sendAssetsToProject(assetIds, project);
+    },
+    [sendAssetsToProject]
   );
 
   // Structure sync runs invisibly in the backend (see spawn_resolve_structure_sync's
@@ -2938,37 +3112,131 @@ export function App() {
   }, []);
 
   // Per-row "send to folder" — independent of the sidebar/bulk-selection
-  // export buttons above: any track already associated with a project can
-  // be sent straight to that project's folder at any time, right from its
-  // own row. If the user is currently browsing a specific project, that's
-  // the target (matches "the button in the tracks after status" request);
-  // otherwise it sends to every project the track belongs to that has
-  // either a sound or a sound effects folder configured — the backend
-  // picks the right one per asset based on its media type.
+  // export buttons: any track already assigned to a project can be sent to
+  // that project's folder at any time, right from its own row.
+  //
+  // This used to fan out — `Promise.all` over *every* project the track
+  // belonged to — which copied one file into several editors' working
+  // folders in a single click and left the per-project "already sent"
+  // state meaningless. It now resolves to exactly one project
+  // (`resolveSendTarget`) and, when it can't, opens the picker anchored to
+  // the clicked button instead of guessing.
   const handleSendAssetToItsProjects = useCallback(
-    (asset: AssetRecord, memberships: AssetProjectMembership[]) => {
-      const hasAnyFolder = (membership: AssetProjectMembership) =>
-        Boolean(membership.export_path || membership.sfx_export_path);
-      const currentProjectId =
-        typeof activeFilter === "object" && "project" in activeFilter ? activeFilter.project : null;
-      const inCurrentProject = currentProjectId
-        ? memberships.find((membership) => membership.project_id === currentProjectId && hasAnyFolder(membership))
-        : undefined;
-      const targets = inCurrentProject ? [inCurrentProject] : memberships.filter(hasAnyFolder);
-      if (targets.length === 0) return;
+    (asset: AssetRecord, memberships: AssetProjectMembership[], anchor: HTMLElement) => {
+      const resolution = resolveSendTarget(memberships);
+      if (resolution.kind === "none") return;
+      if (resolution.kind === "resolved") {
+        sendAssetsToProject([asset.id], {
+          id: resolution.target.project_id,
+          name: resolution.target.project_name
+        });
+        return;
+      }
 
-      Promise.all(
-        targets.map((target) =>
-          invoke<string>("export_asset_to_project", { assetId: asset.id, projectId: target.project_id })
-        )
-      )
-        .then(() => {
-          if (activeLibraryId) refreshProjectMemberships(activeLibraryId);
-        })
-        .catch(() => {});
+      const rect = anchor.getBoundingClientRect();
+      setSendTargetPicker({
+        top: rect.bottom + 6,
+        left: Math.max(8, Math.min(rect.left, window.innerWidth - 280)),
+        assetIds: [asset.id],
+        label: asset.display_name,
+        candidates: resolution.candidates
+      });
     },
-    [activeFilter, activeLibraryId, refreshProjectMemberships]
+    [resolveSendTarget, sendAssetsToProject]
   );
+
+  // Same dismissal contract as the row context menu: any pointer press
+  // outside the menu, or Escape, closes it without sending anything.
+  useEffect(() => {
+    if (!sendTargetPicker) return;
+    const closeOnOutsideInteraction = (event: PointerEvent) => {
+      if (sendTargetPickerRef.current?.contains(event.target as Node)) return;
+      setSendTargetPicker(null);
+    };
+    const closeOnEscape = (event: KeyboardEvent) => {
+      if (event.key === "Escape") setSendTargetPicker(null);
+    };
+    window.addEventListener("pointerdown", closeOnOutsideInteraction, true);
+    window.addEventListener("keydown", closeOnEscape);
+    return () => {
+      window.removeEventListener("pointerdown", closeOnOutsideInteraction, true);
+      window.removeEventListener("keydown", closeOnEscape);
+    };
+  }, [sendTargetPicker]);
+
+  // --- Managing a project's tracks ------------------------------------
+  //
+  // These only exist while the browser is inside a project view, where
+  // "this project" is unambiguous — which is exactly what makes them safe
+  // to apply to a whole selection at once.
+
+  /** The project being browsed, as a full record. */
+  const browsedProject = useMemo(
+    () =>
+      browsingProjectId
+        ? collections.find((collection) => collection.id === browsingProjectId) ?? null
+        : null,
+    [browsingProjectId, collections]
+  );
+
+  /** Whether each selected track has already been sent to the project
+   * currently being browsed. Drives the bulk bar's counts, so the user can
+   * see "12 selected — 9 already sent" before choosing an action. */
+  const browsedProjectSelectionStatus = useMemo(() => {
+    if (!browsingProjectId) return null;
+    let sent = 0;
+    const unsentIds: string[] = [];
+    const memberIds: string[] = [];
+    for (const assetId of bulkAssetIds) {
+      const membership = (membershipsByAsset.get(assetId) ?? []).find(
+        (entry) => entry.project_id === browsingProjectId
+      );
+      // A selected id with no membership row here isn't part of this
+      // project, so neither count nor action should touch it. Inside a
+      // project view that shouldn't happen, but the selection can outlive
+      // a membership refresh, and these actions write files — they don't
+      // get to act on a track that isn't in the project.
+      if (!membership) continue;
+      memberIds.push(assetId);
+      if (membership.exported) sent += 1;
+      else unsentIds.push(assetId);
+    }
+    return { sent, unsentIds, memberIds };
+  }, [browsingProjectId, bulkAssetIds, membershipsByAsset]);
+
+  const handleRemoveSelectedFromBrowsedProject = useCallback(() => {
+    const memberIds = browsedProjectSelectionStatus?.memberIds ?? [];
+    if (!browsedProject || memberIds.length === 0) return;
+    const count = memberIds.length;
+    invoke<string>("remove_from_collection", {
+      collectionId: browsedProject.id,
+      assetIds: memberIds
+    })
+      .then((undoId) => {
+        setUndoStack((previous) => [...previous, { id: undoId, label: `Remove from "${browsedProject.name}"` }]);
+        setRedoStack([]);
+        // Membership only — nothing is deleted from the library, and any
+        // file already copied into the project folder stays on disk.
+        setEditorActionStatus(
+          count === 1
+            ? `Removed from "${browsedProject.name}" — the track and any exported file are untouched`
+            : `Removed ${count} tracks from "${browsedProject.name}" — the tracks and any exported files are untouched`
+        );
+        if (activeLibraryId) {
+          refreshProjectMemberships(activeLibraryId);
+          refreshAssets(activeLibraryId, searchQuery, activeFilter);
+        }
+      })
+      .catch((error) => setEditorActionStatus(`Could not remove: ${String(error)}`));
+  }, [
+    browsedProject,
+    browsedProjectSelectionStatus,
+    activeLibraryId,
+    refreshProjectMemberships,
+    refreshAssets,
+    searchQuery,
+    activeFilter
+  ]);
 
   const handleRevealAssets = useCallback((assetIds: string[]) => {
     if (assetIds.length === 0) return;
@@ -4839,6 +5107,32 @@ export function App() {
     });
   }, []);
 
+  // Clamped here as well as in Rust — the settings input is not the only
+  // possible caller, and the view should never ask for a limit the
+  // backend is about to rewrite underneath it.
+  const handleSetRecentImportsLimit = useCallback((limit: number) => {
+    const clamped = Math.min(MAX_RECENT_IMPORTS_LIMIT, Math.max(MIN_RECENT_IMPORTS_LIMIT, Math.round(limit)));
+    setPreferences((previous) => {
+      if (!previous) return previous;
+      const next = { ...previous, recent_imports_limit: clamped };
+      invoke("save_app_preferences", { preferences: next }).catch(() => {});
+      return next;
+    });
+  }, []);
+
+  /** Applies the settings input's in-progress text, if it parses. A blank
+   * or nonsense draft is simply discarded, leaving the stored value alone
+   * rather than snapping the view to the minimum. */
+  const commitRecentImportsLimitDraft = useCallback(() => {
+    setRecentImportsLimitDraft((draft) => {
+      if (draft !== null) {
+        const parsed = Number(draft);
+        if (draft.trim() !== "" && Number.isFinite(parsed)) handleSetRecentImportsLimit(parsed);
+      }
+      return null;
+    });
+  }, [handleSetRecentImportsLimit]);
+
   const handleSetTheme = useCallback((theme: AppPreferences["theme"]) => {
     setPreferences((previous) => {
       if (!previous) return previous;
@@ -5499,6 +5793,17 @@ export function App() {
             All Sounds
           </button>
 
+          <button
+            className={activeFilter === "recent" ? "nav-item sidebar-styled-item active" : "nav-item sidebar-styled-item"}
+            onClick={() => setActiveFilter("recent")}
+            title={`The ${recentImportsLimit} most recently imported tracks, newest first — change the count in Settings → General`}
+            aria-label={`Recently added — the ${recentImportsLimit} most recently imported tracks`}
+          >
+            <Clock size={13} />
+            Recently Added
+            <span className="nav-item-count">{recentImportsLimit}</span>
+          </button>
+
           <div className="nav-item-row">
             <button
               className={activeFilter === "favorites" ? "nav-item sidebar-styled-item active" : "nav-item sidebar-styled-item"}
@@ -5948,6 +6253,37 @@ export function App() {
                       <Plus size={14} />
                     </button>
                   ) : null}
+                  {/* Sets this project as the export target. A track in
+                      several projects sends here without asking, so this is
+                      the one-time setup that makes the row buttons
+                      unambiguous for the rest of the session. */}
+                  {project.collection_type === "Project" ? (
+                    <button
+                      type="button"
+                      className={
+                        activeProject?.id === project.id
+                          ? "project-target-toggle active"
+                          : "project-target-toggle"
+                      }
+                      aria-pressed={activeProject?.id === project.id}
+                      aria-label={
+                        activeProject?.id === project.id
+                          ? `${project.name} is the active export target — click to clear it`
+                          : `Make ${project.name} the active export target`
+                      }
+                      title={
+                        activeProject?.id === project.id
+                          ? `Active export target — tracks in several projects send here without asking. Click to clear.`
+                          : `Make "${project.name}" the active export target`
+                      }
+                      onClick={(event) => {
+                        event.stopPropagation();
+                        handleSetActiveProject(activeProject?.id === project.id ? null : project.id);
+                      }}
+                    >
+                      <Crosshair size={13} />
+                    </button>
+                  ) : null}
                   <button
                     className={
                       typeof activeFilter === "object" && "project" in activeFilter && activeFilter.project === project.id
@@ -6189,6 +6525,57 @@ export function App() {
         <section className="filter-panel" aria-label="Range filters">
           <div className="selection-bar" aria-label="Selection actions">
             <strong>{(selectedCount || (selectedAsset ? 1 : 0))} selected</strong>
+            {/* Inside a project view "this project" is unambiguous, which
+                is exactly what makes these safe to run over a whole
+                selection — the same actions would have no single meaning
+                out in the whole library. */}
+            {browsedProject && browsedProjectSelectionStatus && browsedProjectSelectionStatus.memberIds.length > 0 ? (
+              <>
+                <span className="selection-bar-detail">
+                  {browsedProjectSelectionStatus.sent} already sent
+                </span>
+                <button
+                  type="button"
+                  className="text-button"
+                  disabled={
+                    !projectHasExportFolder(browsedProject) ||
+                    browsedProjectSelectionStatus.unsentIds.length === 0
+                  }
+                  title={
+                    !projectHasExportFolder(browsedProject)
+                      ? `"${browsedProject.name}" has no export folder configured yet`
+                      : `Send the ${browsedProjectSelectionStatus.unsentIds.length} not-yet-sent selected tracks to "${browsedProject.name}"`
+                  }
+                  onClick={() =>
+                    sendAssetsToProject(browsedProjectSelectionStatus.unsentIds, browsedProject)
+                  }
+                >
+                  <Clapperboard size={13} />
+                  Send unsent ({browsedProjectSelectionStatus.unsentIds.length})
+                </button>
+                <button
+                  type="button"
+                  className="text-button"
+                  disabled={!projectHasExportFolder(browsedProject)}
+                  title={`Re-copy every selected track into "${browsedProject.name}"'s folder, overwriting what's there`}
+                  onClick={() =>
+                    sendAssetsToProject(browsedProjectSelectionStatus.memberIds, browsedProject)
+                  }
+                >
+                  <RefreshCw size={13} />
+                  Re-send all
+                </button>
+                <button
+                  type="button"
+                  className="text-button bulk-action-danger"
+                  title={`Take the selected tracks out of "${browsedProject.name}". The tracks stay in the library and any already-exported files stay on disk.`}
+                  onClick={handleRemoveSelectedFromBrowsedProject}
+                >
+                  <X size={13} />
+                  Remove from project
+                </button>
+              </>
+            ) : null}
           </div>
           <ListFilter size={13} />
           <label>
@@ -6430,24 +6817,72 @@ export function App() {
                 {(() => {
                   const memberships = membershipsByAsset.get(asset.id) ?? [];
                   if (memberships.length === 0) return <span />;
-                  const anyExported = memberships.some((membership) => membership.exported);
-                  const sendableCount = memberships.filter((membership) => projectHasExportFolder(membership)).length;
+                  const resolution = resolveSendTarget(memberships);
                   const projectNames = memberships.map((membership) => membership.project_name).join(", ");
-                  const label = anyExported
-                    ? `Already sent to a project folder (${projectNames}) — click to send again`
-                    : sendableCount > 0
-                      ? `Send to project folder (${projectNames})`
-                      : `In project "${projectNames}" — no export folder configured yet`;
+
+                  // No project this track is in has a folder to receive it.
+                  if (resolution.kind === "none") {
+                    const label = `In ${memberships.length === 1 ? "project" : "projects"} "${projectNames}" — no export folder configured yet`;
+                    return (
+                      <button
+                        type="button"
+                        className="icon-button project-status pending"
+                        aria-label={label}
+                        title={label}
+                        disabled
+                      >
+                        <Clapperboard size={15} />
+                      </button>
+                    );
+                  }
+
+                  // Ambiguous: several projects could receive it and
+                  // nothing in the current context picks one. The badge
+                  // deliberately doesn't claim a sent/unsent state here —
+                  // there isn't one until a project is named.
+                  if (resolution.kind === "choose") {
+                    const label = `In ${resolution.candidates.length} projects (${projectNames}) — choose which folder to send to`;
+                    return (
+                      <button
+                        type="button"
+                        className="icon-button project-status choose"
+                        aria-label={label}
+                        title={label}
+                        onClick={(event) => {
+                          event.stopPropagation();
+                          handleSendAssetToItsProjects(asset, memberships, event.currentTarget);
+                        }}
+                      >
+                        <Clapperboard size={15} />
+                      </button>
+                    );
+                  }
+
+                  // Resolved to exactly one project — and the badge now
+                  // reflects *that project's* export state, not "sent to
+                  // any of them", which used to mark a track green in
+                  // every project once it had been sent to one of them.
+                  const { target, reason } = resolution;
+                  const why =
+                    reason === "browsing"
+                      ? "the project you're browsing"
+                      : reason === "active"
+                        ? "your active project"
+                        : "its only project with a folder";
+                  const label = target.exported
+                    ? `Already sent to "${target.project_name}" (${why}) — click to send again`
+                    : `Send to "${target.project_name}" (${why})`;
                   return (
                     <button
                       type="button"
-                      className={anyExported ? "icon-button project-status exported" : "icon-button project-status pending"}
+                      className={
+                        target.exported ? "icon-button project-status exported" : "icon-button project-status pending"
+                      }
                       aria-label={label}
                       title={label}
-                      disabled={sendableCount === 0}
                       onClick={(event) => {
                         event.stopPropagation();
-                        handleSendAssetToItsProjects(asset, memberships);
+                        handleSendAssetToItsProjects(asset, memberships, event.currentTarget);
                       }}
                     >
                       <Clapperboard size={15} />
@@ -6612,6 +7047,79 @@ export function App() {
                 >
                   <Trash2 size={15} />
                   {bulkAssetIds.length > 1 ? "Move All to Trash" : "Move to Trash"}
+                </button>
+              </motion.div>
+            ) : null}
+          </AnimatePresence>,
+          document.body
+        )}
+        {/* The send-target picker. Only ever rendered when a send is
+            genuinely ambiguous — a track in several projects, with no
+            browsed project and no active project to settle it. Portaled
+            for the same reason the row context menu is: it's anchored to a
+            button deep inside the scrolling browser. */}
+        {createPortal(
+          <AnimatePresence>
+            {sendTargetPicker ? (
+              <motion.div
+                ref={sendTargetPickerRef}
+                className="modal-card filter-menu row-context-menu send-target-picker"
+                style={{
+                  top: sendTargetPicker.top,
+                  left: sendTargetPicker.left,
+                  transformOrigin: "top left"
+                }}
+                initial={{ opacity: 0, scale: 0.92 }}
+                animate={{ opacity: 1, scale: 1 }}
+                exit={{ opacity: 0, scale: 0.92 }}
+                transition={{ duration: 0.12, ease: [0.16, 1, 0.3, 1] }}
+              >
+                <div className="row-context-menu-header">
+                  Send “{sendTargetPicker.label}” to…
+                </div>
+                {sendTargetPicker.candidates.map((candidate) => (
+                  <button
+                    key={candidate.project_id}
+                    type="button"
+                    className="row-context-menu-item send-target-option"
+                    onClick={() => {
+                      sendAssetsToProject(sendTargetPicker.assetIds, {
+                        id: candidate.project_id,
+                        name: candidate.project_name
+                      });
+                      setSendTargetPicker(null);
+                    }}
+                  >
+                    <Clapperboard size={15} />
+                    <span className="send-target-name">{candidate.project_name}</span>
+                    <span className={candidate.exported ? "send-target-state sent" : "send-target-state"}>
+                      {candidate.exported ? "already sent" : "not sent"}
+                    </span>
+                  </button>
+                ))}
+                <div className="row-context-menu-separator" />
+                {/* The fan-out, kept — but only as a deliberate, labelled
+                    choice. It was the silent default before, which is what
+                    made it a bug; genuinely wanting the same cue in three
+                    editors' folders is a real (if rarer) thing to want. */}
+                <button
+                  type="button"
+                  className="row-context-menu-item"
+                  title="Copies the file into every one of these projects' folders"
+                  onClick={() => {
+                    const candidates = sendTargetPicker.candidates;
+                    const assetIds = sendTargetPicker.assetIds;
+                    setSendTargetPicker(null);
+                    for (const candidate of candidates) {
+                      sendAssetsToProject(assetIds, {
+                        id: candidate.project_id,
+                        name: candidate.project_name
+                      });
+                    }
+                  }}
+                >
+                  <Copy size={15} />
+                  Send to all {sendTargetPicker.candidates.length} projects
                 </button>
               </motion.div>
             ) : null}
@@ -7792,6 +8300,67 @@ export function App() {
                         With 2 or more subfolders, dropping a file onto the window asks which one it
                         goes into — with a "remember for this session" option. 0 or 1 means it never
                         asks.
+                      </p>
+                    </div>
+
+                    <div className="settings-section">
+                      <h2>Browser</h2>
+                      <div className="settings-grid">
+                        <div className="settings-row">
+                          <Clock size={14} />
+                          <span>Recently Added shows</span>
+                          <div className="settings-row-value">
+                            {/* Held as a draft string and only committed on
+                                blur/Enter. Clamping on every keystroke
+                                instead would make an in-range value
+                                unreachable by typing: the first "1" of
+                                "150" would immediately become the minimum. */}
+                            <input
+                              type="number"
+                              min={MIN_RECENT_IMPORTS_LIMIT}
+                              max={MAX_RECENT_IMPORTS_LIMIT}
+                              step={10}
+                              aria-label="How many tracks the Recently Added view shows"
+                              value={recentImportsLimitDraft ?? String(recentImportsLimit)}
+                              onChange={(event) => setRecentImportsLimitDraft(event.target.value)}
+                              onBlur={() => commitRecentImportsLimitDraft()}
+                              onKeyDown={(event) => {
+                                if (event.key === "Enter") {
+                                  commitRecentImportsLimitDraft();
+                                  event.currentTarget.blur();
+                                } else if (event.key === "Escape") {
+                                  setRecentImportsLimitDraft(null);
+                                }
+                              }}
+                            />
+                            <span className="settings-inline-hint">
+                              tracks ({MIN_RECENT_IMPORTS_LIMIT}–{MAX_RECENT_IMPORTS_LIMIT})
+                            </span>
+                          </div>
+                        </div>
+                        <div className="settings-row">
+                          <Crosshair size={14} />
+                          <span>Active export target</span>
+                          <div className="settings-row-value">
+                            <strong>{activeProject?.name ?? "None — you'll be asked each time"}</strong>
+                            {activeProject ? (
+                              <button
+                                type="button"
+                                className="text-button"
+                                onClick={() => handleSetActiveProject(null)}
+                              >
+                                Clear
+                              </button>
+                            ) : null}
+                          </div>
+                        </div>
+                      </div>
+                      <p className="settings-hint">
+                        Recently Added is the newest imports first, capped at this count. The active
+                        export target settles where a track goes when it belongs to more than one
+                        project — set it from the crosshair next to a project in the sidebar. With
+                        none set, a track in several projects asks which folder to send to instead of
+                        copying itself into all of them.
                       </p>
                     </div>
 
