@@ -1946,6 +1946,7 @@ struct OrganizeProgress {
     total: usize,
 }
 
+#[cfg(test)]
 fn organize_assets_refiling(
     catalog: &Catalog,
     parsed: &[(Uuid, Option<String>)],
