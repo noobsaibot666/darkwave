@@ -4673,3 +4673,96 @@ dd {
   font-weight: 400;
   opacity: 0.6;
 }
+
+/* Organize: move option + where each category's folder goes */
+.organize-move-option {
+  padding: 8px 10px;
+  border: 1px solid rgba(var(--ink-rgb), 0.1);
+  border-radius: var(--radius-sm, 6px);
+  background: rgba(var(--ink-rgb), 0.03);
+}
+
+.organize-destination {
+  display: flex;
+  align-items: center;
+  gap: 5px;
+  margin: 3px 0 0 50px;
+  font-size: 11px;
+  opacity: 0.6;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+/* Browser: category chips + organize result, above the track list */
+.category-bar {
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+  padding: 8px 18px 6px;
+  flex-shrink: 0;
+  border-bottom: 1px solid rgba(var(--ink-rgb), 0.06);
+}
+
+.category-bar-status {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  padding: 6px 8px;
+  border-radius: var(--radius-sm, 6px);
+  background: rgba(var(--ink-rgb), 0.05);
+  font-size: 12px;
+}
+
+.category-bar-status span {
+  flex: 1;
+  min-width: 0;
+}
+
+.category-chips {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 6px;
+}
+
+.category-chip {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  padding: 3px 10px;
+  border: 1px solid rgba(var(--ink-rgb), 0.12);
+  border-radius: 999px;
+  background: transparent;
+  color: inherit;
+  font: inherit;
+  font-size: 12px;
+  cursor: pointer;
+}
+
+.category-chip:hover {
+  background: rgba(var(--ink-rgb), 0.05);
+}
+
+.category-chip.active {
+  border-color: var(--sfx-ink, currentColor);
+  background: rgba(var(--ink-rgb), 0.08);
+  font-weight: 600;
+}
+
+.category-chip small {
+  opacity: 0.55;
+  font-variant-numeric: tabular-nums;
+}
+
+.category-badge {
+  display: inline-block;
+  margin-left: 8px;
+  padding: 0 7px;
+  border-radius: 999px;
+  border: 1px solid rgba(var(--ink-rgb), 0.14);
+  font-size: 10px;
+  font-weight: 500;
+  line-height: 16px;
+  vertical-align: 1px;
+  opacity: 0.8;
+}

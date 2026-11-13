@@ -1512,6 +1512,9 @@ struct OrganizeMember {
     asset_id: String,
     filename: String,
     display_name: String,
+    /// The folder the file sits in now — shown in the review so the user
+    /// can see where its category folder will be created.
+    folder: String,
     reason: search::sfx_categories::CategoryReason,
     matched: String,
     series: Option<String>,
@@ -1585,31 +1588,74 @@ fn propose_sfx_organization(
         .collect();
     let plan = search::sfx_categories::propose_sfx_categories(&inputs, &existing_names);
 
+    let category_names: Vec<String> = catalog
+        .list_tags()
+        .map_err(storage_error_message)?
+        .into_iter()
+        .filter(|tag| tag.facet.as_deref() == Some(storage::CATEGORY_FACET))
+        .map(|tag| tag.name)
+        .collect();
     let member = |id: &str, reason, matched: String, series: Option<String>| {
         let asset = by_id[id];
+        let folder = resolve_asset_path(&catalog, asset)
+            .ok()
+            .map(|path| category_folder_base(std::path::Path::new(&path), &category_names).display().to_string())
+            .unwrap_or_default();
         OrganizeMember {
             asset_id: id.to_string(),
             filename: asset.original_filename.clone(),
             display_name: asset.display_name.clone(),
+            folder,
             reason,
             matched,
             series,
         }
     };
+    let mut categories: Vec<OrganizeCategory> = plan
+        .categories
+        .into_iter()
+        .map(|category| OrganizeCategory {
+            name: category.name,
+            existing: category.existing,
+            members: category
+                .members
+                .into_iter()
+                .map(|m| member(&m.id, m.reason, m.matched, m.series))
+                .collect(),
+        })
+        .collect();
+
+    // Tracks that already have a category aren't re-guessed (that would
+    // override a choice the user made), but they're still listed under the
+    // category they're in, so "move files" can file them into its folder.
+    // A matched word of "" tells the UI "already in this category".
+    for asset in &skipped {
+        let Some((_, name)) = current.get(&asset.id) else { continue };
+        let folder = resolve_asset_path(&catalog, asset)
+            .ok()
+            .map(|path| category_folder_base(std::path::Path::new(&path), &category_names).display().to_string())
+            .unwrap_or_default();
+        let entry = OrganizeMember {
+            asset_id: asset.id.to_string(),
+            filename: asset.original_filename.clone(),
+            display_name: asset.display_name.clone(),
+            folder,
+            reason: search::sfx_categories::CategoryReason::Existing,
+            matched: String::new(),
+            series: None,
+        };
+        match categories.iter_mut().find(|category| category.name.eq_ignore_ascii_case(name)) {
+            Some(category) => {
+                category.existing = true;
+                category.members.push(entry);
+            }
+            None => categories.push(OrganizeCategory { name: name.clone(), existing: true, members: vec![entry] }),
+        }
+    }
+    categories.sort_by(|left, right| right.members.len().cmp(&left.members.len()).then(left.name.cmp(&right.name)));
+
     Ok(OrganizeProposal {
-        categories: plan
-            .categories
-            .into_iter()
-            .map(|category| OrganizeCategory {
-                name: category.name,
-                existing: category.existing,
-                members: category
-                    .members
-                    .into_iter()
-                    .map(|m| member(&m.id, m.reason, m.matched, m.series))
-                    .collect(),
-            })
-            .collect(),
+        categories,
         uncategorized: plan
             .uncategorized
             .iter()
@@ -1631,15 +1677,158 @@ struct CategoryAssignment {
 struct ApplyOrganizationResult {
     undo_id: String,
     assigned: usize,
+    /// Files actually moved into a category folder on disk.
+    moved: usize,
+    /// Category folders that didn't exist before and were created.
+    folders_created: usize,
+    /// Files that kept their category but couldn't be moved, with why.
+    move_failures: Vec<String>,
+}
+
+/// One file Organize moved, as recorded for undo/redo.
+#[derive(serde::Serialize, serde::Deserialize, Clone)]
+struct FileMove {
+    asset: Uuid,
+    from: PathBuf,
+    to: PathBuf,
+}
+
+/// Undo payload for an Organize run that moved files: the catalog-side
+/// category change is its own (`set_asset_categories`) undo entry, nested
+/// here so one Undo reverts both together.
+#[derive(serde::Serialize, serde::Deserialize)]
+struct OrganizeMovesUndo {
+    category_undo: Uuid,
+    moves: Vec<FileMove>,
+    created_dirs: Vec<PathBuf>,
+}
+
+const ORGANIZE_MOVES_UNDO_KIND: &str = "organize_file_moves";
+
+/// The folder a file's category folder is created in: the folder the file
+/// is in now — unless that folder is itself already a category folder
+/// (a re-sort, or a move from the inspector), in which case its parent, so
+/// `_SoundFX/Doors/x.wav` moving to Impacts becomes `_SoundFX/Impacts/x.wav`
+/// rather than `_SoundFX/Doors/Impacts/x.wav`.
+fn category_folder_base(file: &std::path::Path, category_names: &[String]) -> PathBuf {
+    let parent = file.parent().map(PathBuf::from).unwrap_or_default();
+    let parent_name = parent.file_name().and_then(|name| name.to_str()).unwrap_or_default();
+    let is_category_folder = category_names.iter().any(|name| {
+        export_pipeline::sanitize_filename(name).eq_ignore_ascii_case(parent_name)
+    });
+    if is_category_folder {
+        parent.parent().map(PathBuf::from).unwrap_or(parent)
+    } else {
+        parent
+    }
+}
+
+/// `dir/filename`, or `dir/stem (2).ext`, `(3)`… — never an existing path,
+/// so a move can never overwrite another file.
+fn unique_destination(dir: &std::path::Path, filename: &str) -> PathBuf {
+    let candidate = dir.join(filename);
+    if !candidate.exists() {
+        return candidate;
+    }
+    let path = std::path::Path::new(filename);
+    let stem = path.file_stem().and_then(|stem| stem.to_str()).unwrap_or(filename);
+    let extension = path.extension().and_then(|extension| extension.to_str());
+    for counter in 2.. {
+        let name = match extension {
+            Some(extension) => format!("{stem} ({counter}).{extension}"),
+            None => format!("{stem} ({counter})"),
+        };
+        let candidate = dir.join(name);
+        if !candidate.exists() {
+            return candidate;
+        }
+    }
+    unreachable!()
+}
+
+/// Moves one file without ever overwriting: `rename` when it can (same
+/// volume, the normal case for a folder inside the file's own folder),
+/// otherwise copy → verify size → remove the original. The macOS
+/// AppleDouble sidecar (`._name`), if present on a NAS/exFAT share, moves
+/// along with it so the file's Finder metadata isn't orphaned as junk.
+fn move_file_safely(from: &std::path::Path, to: &std::path::Path) -> std::io::Result<()> {
+    if to.exists() {
+        return Err(std::io::Error::new(std::io::ErrorKind::AlreadyExists, "destination already exists"));
+    }
+    if std::fs::rename(from, to).is_err() {
+        let expected = std::fs::metadata(from)?.len();
+        std::fs::copy(from, to)?;
+        let copied = std::fs::metadata(to)?.len();
+        if copied != expected {
+            let _ = std::fs::remove_file(to);
+            return Err(std::io::Error::other("copy was incomplete; original left in place"));
+        }
+        std::fs::remove_file(from)?;
+    }
+    if let (Some(from_name), Some(to_name)) = (from.file_name(), to.file_name()) {
+        let sidecar = from.with_file_name(format!("._{}", from_name.to_string_lossy()));
+        if sidecar.exists() {
+            let _ = std::fs::rename(&sidecar, to.with_file_name(format!("._{}", to_name.to_string_lossy())));
+        }
+    }
+    Ok(())
+}
+
+/// After a move, points the catalog row at the file's new location,
+/// keeping its storage mode (see `Catalog::set_asset_location`).
+fn record_moved_location(catalog: &Catalog, asset: &AssetRecord, to: &std::path::Path) -> Result<(), String> {
+    let path = match &asset.path {
+        AssetPath::Managed(_) => {
+            let library = catalog
+                .get_library(asset.library_id)
+                .map_err(storage_error_message)?
+                .ok_or_else(|| "library not found".to_string())?;
+            match to.strip_prefix(&library.media_root) {
+                Ok(relative) => AssetPath::Managed(relative.to_string_lossy().to_string()),
+                Err(_) => AssetPath::Referenced(to.to_string_lossy().to_string()),
+            }
+        }
+        AssetPath::Referenced(_) => AssetPath::Referenced(to.to_string_lossy().to_string()),
+    };
+    catalog.set_asset_location(asset.id, &path).map_err(storage_error_message)
+}
+
+/// Removes a folder Organize created if nothing real is left in it (Finder
+/// may have dropped a `.DS_Store` in the meantime — that doesn't count).
+fn remove_dir_if_effectively_empty(dir: &std::path::Path) {
+    let Ok(entries) = std::fs::read_dir(dir) else { return };
+    let mut junk = Vec::new();
+    for entry in entries.flatten() {
+        let name = entry.file_name().to_string_lossy().to_string();
+        if import_pipeline::junk_file_kind(&name).is_some() {
+            junk.push(entry.path());
+        } else {
+            return;
+        }
+    }
+    for path in junk {
+        let _ = std::fs::remove_file(path);
+    }
+    let _ = std::fs::remove_dir(dir);
 }
 
 /// Step two of Organize (and the inspector's per-track Category field):
-/// writes the reviewed assignments as one undoable batch. Each asset ends
-/// up in exactly one category (or none) — see `Catalog::set_asset_categories`.
-#[tauri::command]
+/// writes the reviewed assignments as one undoable batch — each asset ends
+/// up in exactly one category (or none), see
+/// `Catalog::set_asset_categories`.
+///
+/// With `move_files`, each categorized file is also moved on disk into a
+/// folder named after its category, created next to it (see
+/// `category_folder_base`). Never overwrites (`unique_destination`), skips
+/// files that aren't reachable right now (they keep their category and are
+/// reported), and records one undo entry covering both the categories and
+/// every move, so a single Undo puts every file back where it was.
+// (async): renames on a NAS share are network round-trips.
+#[tauri::command(async)]
 fn apply_sfx_organization(
     state: tauri::State<CatalogState>,
     assignments: Vec<CategoryAssignment>,
+    move_files: Option<bool>,
 ) -> Result<ApplyOrganizationResult, String> {
     let parsed = assignments
         .into_iter()
@@ -1651,8 +1840,118 @@ fn apply_sfx_organization(
         })
         .collect::<Result<Vec<_>, String>>()?;
     let catalog = state.0.lock().expect("catalog mutex poisoned");
-    let undo_id = catalog.set_asset_categories(&parsed).map_err(storage_error_message)?;
-    Ok(ApplyOrganizationResult { undo_id: undo_id.to_string(), assigned: parsed.len() })
+    organize_assets(&catalog, &parsed, move_files.unwrap_or(false))
+}
+
+fn organize_assets(
+    catalog: &Catalog,
+    parsed: &[(Uuid, Option<String>)],
+    move_files: bool,
+) -> Result<ApplyOrganizationResult, String> {
+    let category_undo = catalog.set_asset_categories(parsed).map_err(storage_error_message)?;
+
+    let mut result = ApplyOrganizationResult {
+        undo_id: category_undo.to_string(),
+        assigned: parsed.len(),
+        moved: 0,
+        folders_created: 0,
+        move_failures: Vec::new(),
+    };
+    if !move_files {
+        return Ok(result);
+    }
+
+    let category_names: Vec<String> = catalog
+        .list_tags()
+        .map_err(storage_error_message)?
+        .into_iter()
+        .filter(|tag| tag.facet.as_deref() == Some(storage::CATEGORY_FACET))
+        .map(|tag| tag.name)
+        .collect();
+    let mut moves = Vec::new();
+    let mut created_dirs: Vec<PathBuf> = Vec::new();
+
+    for (asset_id, category) in parsed {
+        let Some(category) = category else { continue };
+        let Some(asset) = catalog.get_asset(*asset_id).map_err(storage_error_message)? else { continue };
+        let Ok(current) = resolve_asset_path(catalog, &asset) else { continue };
+        let from = PathBuf::from(&current);
+        if !from.is_file() {
+            result.move_failures.push(format!("{}: file not reachable right now", asset.original_filename));
+            continue;
+        }
+        let folder = category_folder_base(&from, &category_names).join(export_pipeline::sanitize_filename(category));
+        if from.parent() == Some(folder.as_path()) {
+            continue; // already in its category folder
+        }
+        if !folder.exists() {
+            if let Err(error) = std::fs::create_dir_all(&folder) {
+                result.move_failures.push(format!("{}: couldn't create {}: {error}", asset.original_filename, folder.display()));
+                continue;
+            }
+            created_dirs.push(folder.clone());
+            result.folders_created += 1;
+        }
+        let file_name = from.file_name().map(|name| name.to_string_lossy().to_string()).unwrap_or_default();
+        let to = unique_destination(&folder, &file_name);
+        if let Err(error) = move_file_safely(&from, &to) {
+            result.move_failures.push(format!("{}: {error}", asset.original_filename));
+            continue;
+        }
+        if let Err(error) = record_moved_location(catalog, &asset, &to) {
+            // Put it back rather than leave the catalog pointing at nothing.
+            let _ = move_file_safely(&to, &from);
+            result.move_failures.push(format!("{}: {error}", asset.original_filename));
+            continue;
+        }
+        moves.push(FileMove { asset: asset.id, from, to });
+    }
+
+    result.moved = moves.len();
+    if !moves.is_empty() || !created_dirs.is_empty() {
+        let payload = serde_json::to_string(&OrganizeMovesUndo { category_undo, moves, created_dirs })
+            .map_err(|error| error.to_string())?;
+        let undo_id = catalog
+            .record_external_undo(ORGANIZE_MOVES_UNDO_KIND, &payload)
+            .map_err(storage_error_message)?;
+        result.undo_id = undo_id.to_string();
+    }
+    Ok(result)
+}
+
+/// Reverses (`forward = false`) or replays (`forward = true`) the file
+/// moves of one Organize run. A file is only moved if it's still exactly
+/// where the run left it and its destination is free — anything the user
+/// has since moved or replaced by hand is left alone, never overwritten.
+fn replay_organize_moves(catalog: &Catalog, undo: &OrganizeMovesUndo, forward: bool) {
+    if forward {
+        for dir in &undo.created_dirs {
+            let _ = std::fs::create_dir_all(dir);
+        }
+    }
+    let ordered: Box<dyn Iterator<Item = &FileMove>> =
+        if forward { Box::new(undo.moves.iter()) } else { Box::new(undo.moves.iter().rev()) };
+    for file_move in ordered {
+        let (source, destination) = if forward { (&file_move.from, &file_move.to) } else { (&file_move.to, &file_move.from) };
+        if !source.is_file() || destination.exists() {
+            continue;
+        }
+        if let Some(parent) = destination.parent() {
+            let _ = std::fs::create_dir_all(parent);
+        }
+        if move_file_safely(source, destination).is_ok() {
+            if let Ok(Some(asset)) = catalog.get_asset(file_move.asset) {
+                if record_moved_location(catalog, &asset, destination).is_err() {
+                    let _ = move_file_safely(destination, source);
+                }
+            }
+        }
+    }
+    if !forward {
+        for dir in undo.created_dirs.iter().rev() {
+            remove_dir_if_effectively_empty(dir);
+        }
+    }
 }
 
 #[derive(serde::Serialize)]
@@ -4508,6 +4807,18 @@ fn relink_asset(
 fn undo_action(state: tauri::State<CatalogState>, undo_id: String) -> Result<(), String> {
     let undo_id = parse_uuid_field(&undo_id, "undo id")?;
     let catalog = state.0.lock().expect("catalog mutex poisoned");
+    undo_with_files(&catalog, undo_id)
+}
+
+/// `Catalog::undo`, plus the on-disk half of an Organize run that moved files.
+fn undo_with_files(catalog: &Catalog, undo_id: Uuid) -> Result<(), String> {
+    if let Some((kind, payload, false)) = catalog.undo_entry(undo_id).map_err(storage_error_message)? {
+        if kind == ORGANIZE_MOVES_UNDO_KIND {
+            let undo: OrganizeMovesUndo = serde_json::from_str(&payload).map_err(|error| error.to_string())?;
+            replay_organize_moves(catalog, &undo, false);
+            catalog.undo(undo.category_undo).map_err(storage_error_message)?;
+        }
+    }
     catalog.undo(undo_id).map_err(storage_error_message)
 }
 
@@ -4515,6 +4826,17 @@ fn undo_action(state: tauri::State<CatalogState>, undo_id: String) -> Result<(),
 fn redo_action(state: tauri::State<CatalogState>, undo_id: String) -> Result<(), String> {
     let undo_id = parse_uuid_field(&undo_id, "undo id")?;
     let catalog = state.0.lock().expect("catalog mutex poisoned");
+    redo_with_files(&catalog, undo_id)
+}
+
+fn redo_with_files(catalog: &Catalog, undo_id: Uuid) -> Result<(), String> {
+    if let Some((kind, payload, true)) = catalog.undo_entry(undo_id).map_err(storage_error_message)? {
+        if kind == ORGANIZE_MOVES_UNDO_KIND {
+            let undo: OrganizeMovesUndo = serde_json::from_str(&payload).map_err(|error| error.to_string())?;
+            catalog.redo(undo.category_undo).map_err(storage_error_message)?;
+            replay_organize_moves(catalog, &undo, true);
+        }
+    }
     catalog.redo(undo_id).map_err(storage_error_message)
 }
 
@@ -6713,6 +7035,94 @@ mod tests {
         assert_eq!(files.len(), 2);
         assert!(files.iter().any(|path| path.ends_with("top-level.wav")));
         assert!(files.iter().any(|path| path.ends_with("buried.wav")));
+    }
+
+    fn organize_fixture(name: &str) -> (std::path::PathBuf, storage::Catalog, uuid::Uuid) {
+        let root = std::env::temp_dir().join(format!("darkwave-organize-{name}-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(root.join("_SoundFX")).expect("dir");
+        let catalog = storage::Catalog::open(root.join("lib.darkwave")).expect("catalog");
+        let library = catalog.create_library("Org", root.to_string_lossy()).expect("library");
+        (root, catalog, library.id)
+    }
+
+    fn referenced_asset(catalog: &storage::Catalog, library_id: uuid::Uuid, path: &std::path::Path, hash: &str) -> storage::AssetRecord {
+        std::fs::write(path, hash.as_bytes()).expect("write");
+        match catalog
+            .register_asset(storage::NewAssetRecord {
+                library_id,
+                original_filename: path.file_name().unwrap().to_string_lossy().to_string(),
+                display_name: "x".into(),
+                path: storage::AssetPath::Referenced(path.to_string_lossy().to_string()),
+                storage_mode: shared_types::StorageMode::Referenced,
+                content_hash: Some(hash.into()),
+                media_type: "sound_effect".into(),
+                file_size: hash.len() as u64,
+                availability_state: shared_types::AvailabilityState::Local,
+            })
+            .expect("register")
+        {
+            storage::RegisterAssetOutcome::Created(asset) => asset,
+            other => panic!("unexpected {other:?}"),
+        }
+    }
+
+    #[test]
+    fn organize_moves_files_into_category_folders_and_undo_puts_them_back() {
+        let (root, catalog, library_id) = organize_fixture("move");
+        let sfx = root.join("_SoundFX");
+        let door = referenced_asset(&catalog, library_id, &sfx.join("door-closing.wav"), "door");
+        let slam = referenced_asset(&catalog, library_id, &sfx.join("doorslam.wav"), "slam");
+        std::fs::write(sfx.join("._doorslam.wav"), b"sidecar").expect("sidecar");
+        // A file already sitting where one would land must never be overwritten.
+        std::fs::create_dir_all(sfx.join("Doors")).expect("pre-existing");
+        std::fs::write(sfx.join("Doors").join("doorslam.wav"), b"someone else's").expect("occupant");
+
+        let result = super::organize_assets(
+            &catalog,
+            &[(door.id, Some("Doors".into())), (slam.id, Some("Doors".into()))],
+            true,
+        )
+        .expect("organize");
+        assert_eq!(result.moved, 2);
+        assert_eq!(result.folders_created, 0, "Doors already existed");
+        assert!(sfx.join("Doors/door-closing.wav").is_file());
+        assert!(sfx.join("Doors/doorslam (2).wav").is_file());
+        assert_eq!(std::fs::read(sfx.join("Doors/doorslam.wav")).unwrap(), b"someone else's");
+        assert!(sfx.join("Doors/._doorslam (2).wav").is_file(), "sidecar travels with its file");
+        let moved = catalog.get_asset(door.id).unwrap().unwrap();
+        assert_eq!(moved.path, storage::AssetPath::Referenced(sfx.join("Doors/door-closing.wav").to_string_lossy().to_string()));
+
+        // Re-sorting moves sideways, never nests.
+        let undo_id = result.undo_id.parse().unwrap();
+        let resort = super::organize_assets(&catalog, &[(door.id, Some("Impacts".into()))], true).expect("resort");
+        assert!(sfx.join("Impacts/door-closing.wav").is_file());
+        assert!(!sfx.join("Doors/Impacts").exists());
+        super::undo_with_files(&catalog, resort.undo_id.parse().unwrap()).expect("undo resort");
+        assert!(!sfx.join("Impacts").exists(), "created folder removed once empty");
+
+        super::undo_with_files(&catalog, undo_id).expect("undo");
+        assert!(sfx.join("door-closing.wav").is_file());
+        assert!(sfx.join("doorslam.wav").is_file());
+        assert!(sfx.join("Doors/doorslam.wav").is_file(), "the occupant is untouched");
+        assert!(catalog.asset_categories_for_library(library_id).unwrap().is_empty());
+
+        super::redo_with_files(&catalog, undo_id).expect("redo");
+        assert!(sfx.join("Doors/door-closing.wav").is_file());
+        assert_eq!(catalog.asset_categories_for_library(library_id).unwrap()[&door.id].1, "Doors");
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn organize_keeps_the_category_but_reports_unreachable_files() {
+        let (root, catalog, library_id) = organize_fixture("offline");
+        let gone = referenced_asset(&catalog, library_id, &root.join("_SoundFX/whoosh.wav"), "w");
+        std::fs::remove_file(root.join("_SoundFX/whoosh.wav")).unwrap();
+        let result = super::organize_assets(&catalog, &[(gone.id, Some("Whooshes".into()))], true).expect("organize");
+        assert_eq!(result.moved, 0);
+        assert_eq!(result.move_failures.len(), 1);
+        assert!(!root.join("_SoundFX/Whooshes").exists());
+        assert_eq!(catalog.asset_categories_for_library(library_id).unwrap()[&gone.id].1, "Whooshes");
+        let _ = std::fs::remove_dir_all(&root);
     }
 
     #[test]

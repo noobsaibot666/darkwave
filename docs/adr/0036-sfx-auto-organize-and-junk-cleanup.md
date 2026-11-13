@@ -22,21 +22,55 @@ every analysis job.
 
 ## Decision
 
-### Categories are virtual: tags, never moved files
+### Categories are tags first; folders on disk follow them
 
-Every asset in a typical library is **Referenced**. It lives in the user's
-own folder (`/Volumes/DATA/01_ADDS/_SoundFX/`), and NLE projects may link
-to it. Moving files into real subfolders would break those links and
-reach into storage Darkwave doesn't own. A category is a tag with facet
-`category` (`storage::CATEGORY_FACET`), and the real folder structure
-appears only where Darkwave writes files: `export_asset_to_project` now
-routes into a subfolder named after the asset's category
-(`03_SFX/Doors/…`) before falling back to the old "first tag" rule.
+*Revised 2026-11-13.* The first version kept categories inside Darkwave
+only, because every asset in a typical library is **Referenced** (it lives
+in the user's own folder, e.g. `/Volumes/DATA/01_ADDS/_SoundFX/`, which
+edit projects may link to). In practice the user's model of "organized"
+is real folders, so Organize can now also **move the files** (on by
+default in the review). The category itself is still a tag with facet
+`category` (`storage::CATEGORY_FACET`). That tag is what the sidebar,
+the category chips, the row badges and `export_asset_to_project`'s
+`03_SFX/<Category>/` routing read. The folder on disk is a mirror of it.
 
-- **One category per asset.** `Catalog::set_asset_categories` replaces
-  rather than stacks, so the export subfolder is unambiguous. The
-  generic Apply Tag grid hides category tags so it can't break this.
-  Categories are set via Organize or the inspector's Category field.
+Moving rules (`organize_assets` in `src-tauri/src/lib.rs`):
+
+- The category folder is created **next to the file**. If the file is
+  already inside a category folder (a re-sort), it's created next to that
+  folder instead, so files move sideways and never nest
+  (`category_folder_base`).
+- **Never overwrite.** A taken name gets ` (2)`, ` (3)`…
+  (`unique_destination`). `rename` is used when possible, otherwise
+  copy → verify size → delete. A file's `._` sidecar moves with it.
+- A file that isn't reachable (NAS offline) keeps its new category, is
+  not moved, and is reported.
+- The catalog path is updated with `Catalog::set_asset_location`, which,
+  unlike `relink_asset`, keeps the waveform cache (it's the same file).
+- **One Undo reverts both halves.** The run records an
+  `organize_file_moves` undo entry that nests the catalog's
+  `set_asset_categories` entry. `undo_action` moves each file back (only
+  if it's still where the run left it and its old spot is free), removes
+  category folders it created once they're empty, and then undoes the
+  categories. Redo replays the run.
+- Known cost: an edit project that already used a moved file sees it
+  offline until relinked. The review modal says so next to the option.
+
+Tracks that already have a category are not re-guessed (that would
+override a choice the user made), but the review still lists them under
+their current category, so a later run with "move files" puts them in
+their folder. The inspector's Category field moves the file too; clearing
+a category leaves the file where it is.
+
+- **One category per asset**, enforced in storage on every path:
+  `set_asset_categories`, plus `apply_tag_to_assets` and
+  `set_tag_approval`, both of which turn a category tag into a move
+  rather than stacking it. `suggest_tag_for_asset` won't suggest a
+  category to a track that already has one. Category names are resolved
+  *before* any asset is touched, because promoting a legacy tag partway
+  through a batch once left stale "Impact" suggestions next to real
+  categories (seen on a real library). A repair in `migrate()` clears
+  those.
 - **One undo per batch.** A 300-file Organize records a single
   `set_asset_categories` undo entry (JSON payload with each asset's
   previous category rows).

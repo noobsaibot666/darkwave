@@ -1971,6 +1971,16 @@ impl Catalog {
         tag_id: Uuid,
         origin: TagOrigin,
     ) -> Result<Uuid, StorageError> {
+        // A category is exclusive (one per asset), so applying one is a
+        // move, never a second category stacked next to the first — no
+        // matter which UI path got here (Apply Tag grid, quick-tag chips).
+        if self.tag_is_category(tag_id)? {
+            let transaction = self.connection.unchecked_transaction()?;
+            let assignments: Vec<(Uuid, Option<Uuid>)> = asset_ids.iter().map(|asset| (*asset, Some(tag_id))).collect();
+            let undo_id = self.set_asset_category_tags(&assignments)?;
+            transaction.commit()?;
+            return Ok(undo_id);
+        }
         let now = Utc::now().to_rfc3339();
         for asset_id in asset_ids {
             self.connection.execute(
@@ -2128,16 +2138,41 @@ impl Catalog {
     /// 300-file "Organize" is a single Undo, not 300.
     pub fn set_asset_categories(&self, assignments: &[(Uuid, Option<String>)]) -> Result<Uuid, StorageError> {
         let transaction = self.connection.unchecked_transaction()?;
-        let now = Utc::now().to_rfc3339();
-        let mut changes: Vec<CategoryChange> = Vec::new();
-
+        // Resolve every category tag BEFORE touching any asset.
+        // ensure_category_tag can promote a legacy tag (e.g. the seeded
+        // "Impact") to a category, and only rows whose tag is *already* a
+        // category are cleared below. Resolving lazily per asset meant
+        // assets processed before a promotion kept a stale "Impact"
+        // suggestion alongside their new category (seen on a real library,
+        // 2026-11-13).
+        let mut resolved = Vec::with_capacity(assignments.len());
         for (asset_id, category) in assignments {
             let new_tag = match category.as_deref().map(str::trim).filter(|name| !name.is_empty()) {
                 Some(name) => Some(self.ensure_category_tag(name)?.id),
                 None => None,
             };
+            resolved.push((*asset_id, new_tag));
+        }
+        let undo_id = self.set_asset_category_tags(&resolved)?;
+        transaction.commit()?;
+        Ok(undo_id)
+    }
+
+    /// The core of [`Self::set_asset_categories`], by tag id. Not
+    /// transactional itself, so callers that are already inside one
+    /// (`set_asset_categories`) or are single-statement-safe can share it.
+    fn set_asset_category_tags(&self, assignments: &[(Uuid, Option<Uuid>)]) -> Result<Uuid, StorageError> {
+        let now = Utc::now().to_rfc3339();
+        let mut changes: Vec<CategoryChange> = Vec::new();
+
+        for (asset_id, new_tag) in assignments {
+            let new_tag = *new_tag;
             let previous = self.category_rows_for_asset(*asset_id)?;
-            if previous.len() == 1 && new_tag.is_some_and(|tag| previous[0].0 == tag) {
+            // Already exactly this one accepted category: nothing to do.
+            if previous.len() == 1
+                && previous[0].2 == "accepted"
+                && new_tag.is_some_and(|tag| previous[0].0 == tag)
+            {
                 continue;
             }
             self.connection.execute(
@@ -2162,9 +2197,22 @@ impl Catalog {
         }
 
         let payload = serde_json::to_string(&changes).map_err(|error| StorageError::InvalidInput(error.to_string()))?;
-        let undo_id = self.record_undo("set_asset_categories", &payload)?;
-        transaction.commit()?;
-        Ok(undo_id)
+        self.record_undo("set_asset_categories", &payload)
+    }
+
+    fn tag_is_category(&self, tag_id: Uuid) -> Result<bool, StorageError> {
+        let facet: Option<Option<String>> = self
+            .connection
+            .query_row("SELECT facet FROM tags WHERE id = ?1", params![tag_id.to_string()], |row| row.get(0))
+            .optional()?;
+        Ok(facet.flatten().as_deref() == Some(CATEGORY_FACET))
+    }
+
+    fn asset_has_accepted_category(&self, asset_id: Uuid) -> Result<bool, StorageError> {
+        Ok(self
+            .category_rows_for_asset(asset_id)?
+            .iter()
+            .any(|(_, _, approval_state)| approval_state == "accepted"))
     }
 
     fn category_rows_for_asset(&self, asset_id: Uuid) -> Result<Vec<(Uuid, String, String)>, StorageError> {
@@ -3112,6 +3160,12 @@ impl Catalog {
         origin: TagOrigin,
         confidence: f32,
     ) -> Result<(), StorageError> {
+        // A category suggestion on a track the user (or Organize) already
+        // placed would only offer to undo that choice — and accepting it
+        // used to stack a second category. Skip it.
+        if self.tag_is_category(tag_id)? && self.asset_has_accepted_category(asset_id)? {
+            return Ok(());
+        }
         let existing_state: Option<String> = self
             .connection
             .query_row(
@@ -3166,6 +3220,21 @@ impl Catalog {
         origin: TagOrigin,
         approval_state: TagApprovalState,
     ) -> Result<(), StorageError> {
+        // Accepting a suggested category moves the asset into it
+        // (replacing any other category) instead of stacking it.
+        if approval_state == TagApprovalState::Accepted && self.tag_is_category(tag_id)? {
+            let has_row: bool = self.connection.query_row(
+                "SELECT EXISTS(SELECT 1 FROM asset_tags WHERE asset_id = ?1 AND tag_id = ?2 AND origin = ?3)",
+                params![asset_id.to_string(), tag_id.to_string(), tag_origin_to_db(origin)],
+                |row| row.get(0),
+            )?;
+            if has_row {
+                let transaction = self.connection.unchecked_transaction()?;
+                self.set_asset_category_tags(&[(asset_id, Some(tag_id))])?;
+                transaction.commit()?;
+            }
+            return Ok(());
+        }
         self.connection.execute(
             "UPDATE asset_tags SET approval_state = ?1
              WHERE asset_id = ?2 AND tag_id = ?3 AND origin = ?4",
@@ -3240,6 +3309,45 @@ impl Catalog {
         self.clear_waveform_cache(asset_id)?;
 
         Ok(())
+    }
+
+    /// Points an asset at the same file's new location after Darkwave
+    /// itself moved it (Organize's category folders). Unlike
+    /// [`Self::relink_asset`] the waveform cache is kept, since it's the very
+    /// same file, and the storage mode is preserved: a managed asset gets a
+    /// new `relative_path`, a referenced one a new `referenced_path`.
+    pub fn set_asset_location(&self, asset_id: Uuid, path: &AssetPath) -> Result<(), StorageError> {
+        match path {
+            AssetPath::Managed(relative) => self.connection.execute(
+                "UPDATE assets SET relative_path = ?1, last_seen = ?2 WHERE id = ?3",
+                params![relative, Utc::now().to_rfc3339(), asset_id.to_string()],
+            )?,
+            AssetPath::Referenced(absolute) => self.connection.execute(
+                "UPDATE assets SET referenced_path = ?1, availability_state = 'local', last_seen = ?2 WHERE id = ?3",
+                params![absolute, Utc::now().to_rfc3339(), asset_id.to_string()],
+            )?,
+        };
+        Ok(())
+    }
+
+    /// Records an undo entry whose effect lives outside the catalog (e.g.
+    /// files Organize moved on disk). [`Self::undo`]/[`Self::redo`] only
+    /// flip its applied flag for an unknown kind, so the caller performs
+    /// the actual reversal; see [`Self::undo_entry`].
+    pub fn record_external_undo(&self, kind: &str, payload: &str) -> Result<Uuid, StorageError> {
+        self.record_undo(kind, payload)
+    }
+
+    /// `(kind, payload, applied)` for one undo entry.
+    pub fn undo_entry(&self, undo_id: Uuid) -> Result<Option<(String, String, bool)>, StorageError> {
+        Ok(self
+            .connection
+            .query_row(
+                "SELECT kind, payload, applied_at IS NOT NULL FROM undo_actions WHERE id = ?1",
+                params![undo_id.to_string()],
+                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+            )
+            .optional()?)
     }
 
     pub fn record_usage_event(
@@ -4149,6 +4257,22 @@ impl Catalog {
         // so silent availability retries can't eat into the unrelated
         // real-failure auto-retry cap.
         self.ensure_column("background_jobs", "availability_attempts", "INTEGER NOT NULL DEFAULT 0")?;
+
+        // Repair (idempotent): drop stale *suggested* category rows on any
+        // asset that already has an accepted category. A first Organize run
+        // could leave these behind (see set_asset_categories); accepting one
+        // would have stacked a second category.
+        self.connection.execute(
+            "DELETE FROM asset_tags
+             WHERE approval_state = 'suggested'
+               AND tag_id IN (SELECT id FROM tags WHERE facet = ?1)
+               AND asset_id IN (
+                 SELECT asset_tags.asset_id FROM asset_tags
+                 JOIN tags ON tags.id = asset_tags.tag_id
+                 WHERE tags.facet = ?1 AND asset_tags.approval_state = 'accepted'
+               )",
+            params![CATEGORY_FACET],
+        )?;
 
         Ok(())
     }
@@ -5920,6 +6044,34 @@ mod tests {
         catalog.redo(first).expect("redo batch");
         let counts = catalog.category_counts_for_library(library.id).expect("counts");
         assert_eq!(counts.iter().map(|(tag, count)| (tag.name.as_str(), *count)).collect::<Vec<_>>(), vec![("Doors", 1), ("Impact", 1)]);
+    }
+
+    #[test]
+    fn categories_stay_exclusive_through_every_tag_path() {
+        let catalog_path = unique_catalog_path("categories-exclusive");
+        let catalog = Catalog::open(&catalog_path).expect("open catalog");
+        let library = catalog.create_library("Ex", "/library").expect("library");
+        let early = test_asset(&catalog, library.id, "coins.wav", "hash-a");
+        let late = test_asset(&catalog, library.id, "hit.wav", "hash-b");
+        // The real-library sequence: an acoustic "Impact" suggestion from
+        // long ago, then an Organize run that promotes "Impact" mid-batch.
+        let impact = catalog.create_tag("Impact", "action", true).expect("tag");
+        catalog.suggest_tag_for_asset(early.id, impact.id, TagOrigin::AcousticModel, 0.6).expect("suggest");
+        catalog
+            .set_asset_categories(&[(early.id, Some("Coins".into())), (late.id, Some("Impact".into()))])
+            .expect("organize");
+        assert_eq!(catalog.category_rows_for_asset(early.id).expect("rows").len(), 1, "stale suggestion cleared");
+
+        // Accepting a category suggestion moves, never stacks.
+        catalog.suggest_tag_for_asset(early.id, impact.id, TagOrigin::AcousticModel, 0.6).expect("suggest");
+        assert_eq!(catalog.category_rows_for_asset(early.id).expect("rows").len(), 1, "no suggestion on a placed track");
+
+        // Applying a category tag through the generic path moves too.
+        let doors = catalog.ensure_category_tag("Doors").expect("doors");
+        catalog.apply_tag_to_assets(&[early.id], doors.id, TagOrigin::Manual).expect("apply");
+        let rows = catalog.category_rows_for_asset(early.id).expect("rows");
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].0, doors.id);
     }
 
     #[test]

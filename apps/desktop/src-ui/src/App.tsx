@@ -263,6 +263,8 @@ type OrganizeMember = {
   asset_id: string;
   filename: string;
   display_name: string;
+  // Folder the file is in now (where its category folder gets created).
+  folder: string;
   reason: OrganizeReason;
   matched: string;
   series: string | null;
@@ -276,6 +278,20 @@ type OrganizeProposal = {
 };
 
 type SfxCategorySummary = { tag_id: string; name: string; count: number };
+
+type ApplyOrganizationResult = {
+  undo_id: string;
+  assigned: number;
+  moved: number;
+  folders_created: number;
+  move_failures: string[];
+};
+
+// The last path component, for showing "…/_SoundFX/Doors" compactly.
+function shortFolder(path: string): string {
+  const parts = path.split(/[\\/]/).filter(Boolean);
+  return parts.length <= 2 ? path : `…/${parts.slice(-2).join("/")}`;
+}
 
 // The media types Organize works on, and what to call them in the UI.
 const ORGANIZABLE_MEDIA_TYPES: Record<string, string> = {
@@ -291,6 +307,8 @@ type OrganizeDraftGroup = { key: string; name: string; existing: boolean; includ
 type OrganizeDraft = {
   mediaType: string;
   includeCategorized: boolean;
+  // Also move each file into a folder named after its category on disk.
+  moveFiles: boolean;
   loading: boolean;
   busy: boolean;
   error: string | null;
@@ -305,7 +323,7 @@ type OrganizeDraft = {
 function organizeReasonLabel(member: OrganizeMember): string {
   switch (member.reason) {
     case "existing":
-      return `matches your category via "${member.matched}"`;
+      return member.matched ? `matches your category via "${member.matched}"` : "already in this category";
     case "keyword":
       return member.matched ? `"${member.matched}" in the name` : "no match";
     case "series":
@@ -1545,6 +1563,8 @@ export function App() {
   const [assetCategoryById, setAssetCategoryById] = useState<Record<string, string>>({});
   const [organizeDraft, setOrganizeDraft] = useState<OrganizeDraft | null>(null);
   const [categoryInput, setCategoryInput] = useState("");
+  // Result of the last Organize / category move, shown above the list.
+  const [organizeStatus, setOrganizeStatus] = useState<string | null>(null);
   const [appliedTags, setAppliedTags] = useState<TagRecord[]>([]);
   const [suggestedTags, setSuggestedTags] = useState<TagRecord[]>([]);
   const [assetInstruments, setAssetInstruments] = useState<{ name: string; confidence: number }[]>([]);
@@ -2957,6 +2977,17 @@ export function App() {
     refreshSfxCategories(activeLibraryId);
   }, [activeLibraryId, assets, refreshSfxCategories]);
 
+  // Once a library has categories, show them in the sidebar without making
+  // the user find the "By category" toggle first. Opens once per library;
+  // collapsing it by hand afterwards sticks.
+  const autoOpenedCategoriesForRef = useRef<string | null>(null);
+  useEffect(() => {
+    if (activeLibraryId && sfxCategories.length > 0 && autoOpenedCategoriesForRef.current !== activeLibraryId) {
+      autoOpenedCategoriesForRef.current = activeLibraryId;
+      setSfxSubcategoriesOpen(true);
+    }
+  }, [activeLibraryId, sfxCategories.length]);
+
   // Which category the Organize button works on: the one being browsed if
   // it's organizable, otherwise Sound Effects.
   const organizeMediaType =
@@ -2970,6 +3001,7 @@ export function App() {
       setOrganizeDraft((current) => ({
         mediaType,
         includeCategorized,
+        moveFiles: current?.moveFiles ?? true,
         loading: true,
         busy: false,
         error: null,
@@ -3039,9 +3071,25 @@ export function App() {
     if (assignments.length === 0) return;
     setOrganizeDraft({ ...organizeDraft, busy: true, error: null });
     try {
-      const result = await invoke<{ undo_id: string; assigned: number }>("apply_sfx_organization", { assignments });
+      const result = await invoke<ApplyOrganizationResult>("apply_sfx_organization", {
+        assignments,
+        moveFiles: organizeDraft.moveFiles,
+      });
       const label = `Organize ${result.assigned} ${ORGANIZABLE_MEDIA_TYPES[organizeDraft.mediaType] ?? "sounds"} into ${categoryCount} ${categoryCount === 1 ? "category" : "categories"}`;
       setUndoStack((previous) => [...previous, { id: result.undo_id, label }]);
+      setOrganizeStatus(
+        [
+          `Organized ${result.assigned} ${result.assigned === 1 ? "sound" : "sounds"} into ${categoryCount} ${categoryCount === 1 ? "category" : "categories"}`,
+          organizeDraft.moveFiles
+            ? `moved ${result.moved} ${result.moved === 1 ? "file" : "files"} into category folders${result.folders_created > 0 ? ` (${result.folders_created} new)` : ""}`
+            : null,
+          result.move_failures.length > 0
+            ? `${result.move_failures.length} not moved: ${result.move_failures.slice(0, 2).join("; ")}${result.move_failures.length > 2 ? "…" : ""}`
+            : null,
+        ]
+          .filter(Boolean)
+          .join(" · ") + ". ⌘Z undoes all of it."
+      );
       setRedoStack([]);
       setOrganizeDraft(null);
       setSfxSubcategoriesOpen(true);
@@ -3059,10 +3107,18 @@ export function App() {
     (assetIds: string[], category: string | null) => {
       if (assetIds.length === 0 || !activeLibraryId) return;
       const name = category?.trim() || null;
-      invoke<{ undo_id: string; assigned: number }>("apply_sfx_organization", {
+      invoke<ApplyOrganizationResult>("apply_sfx_organization", {
         assignments: assetIds.map((asset_id) => ({ asset_id, category: name })),
+        // Setting a category files the track into that category's folder
+        // on disk too, same as Organize; clearing leaves the file put.
+        moveFiles: name !== null,
       })
         .then((result) => {
+          if (result.move_failures.length > 0) {
+            setOrganizeStatus(`Category set, but not moved on disk: ${result.move_failures.slice(0, 2).join("; ")}`);
+          } else if (result.moved > 0) {
+            setOrganizeStatus(`Moved ${result.moved === 1 ? "the file" : `${result.moved} files`} into the "${name}" folder.`);
+          }
           const label = name
             ? `Move ${assetIds.length === 1 ? "track" : `${assetIds.length} tracks`} to "${name}"`
             : `Clear category`;
@@ -3071,11 +3127,10 @@ export function App() {
           setCategoryInput("");
           refreshSfxCategories(activeLibraryId);
           if (selectedAssetId) refreshAssetTags(selectedAssetId);
-          if (typeof activeFilter === "object" && "tag" in activeFilter) {
-            refreshAssets(activeLibraryId, searchQuery, activeFilter);
-          }
+          // Paths (and, in a category view, membership) changed.
+          refreshAssets(activeLibraryId, searchQuery, activeFilter);
         })
-        .catch(() => {});
+        .catch((error) => setOrganizeStatus(`Couldn't set the category: ${String(error)}`));
     },
     [activeLibraryId, refreshSfxCategories, selectedAssetId, refreshAssetTags, activeFilter, refreshAssets, searchQuery]
   );
@@ -7047,6 +7102,60 @@ export function App() {
           ) : null}
           {similarToAssetId && similarStatus ? <span className="filter-panel-status">{similarStatus}</span> : null}
         </section>
+          {(() => {
+            // Category chips (outside the scrolling browser section on
+            // purpose: row virtualization doesn't account for anything
+            // above the rows, so a wrapping bar in there would offset
+            // them): a one-click way to check and find sorted
+            // sounds, shown on the organizable category views and while a
+            // category itself is open.
+            const activeCategoryTag =
+              typeof activeFilter === "object" && "tag" in activeFilter
+                ? sfxCategories.find((category) => category.tag_id === activeFilter.tag) ?? null
+                : null;
+            const onOrganizableView = typeof activeFilter === "string" && activeFilter in ORGANIZABLE_MEDIA_TYPES;
+            if (!organizeStatus && !(sfxCategories.length > 0 && (onOrganizableView || activeCategoryTag))) return null;
+            return (
+              <div className="category-bar">
+                {organizeStatus ? (
+                  <div className="category-bar-status">
+                    <FolderTree size={13} />
+                    <span>{organizeStatus}</span>
+                    <button
+                      type="button"
+                      className="icon-button"
+                      aria-label="Dismiss"
+                      onClick={() => setOrganizeStatus(null)}
+                    >
+                      <X size={12} />
+                    </button>
+                  </div>
+                ) : null}
+                {sfxCategories.length > 0 && (onOrganizableView || activeCategoryTag) ? (
+                  <div className="category-chips" role="toolbar" aria-label="Categories">
+                    <button
+                      type="button"
+                      className={onOrganizableView ? "category-chip active" : "category-chip"}
+                      onClick={() => setActiveFilter("sound_effect")}
+                    >
+                      All sound effects
+                    </button>
+                    {sfxCategories.map((category) => (
+                      <button
+                        key={category.tag_id}
+                        type="button"
+                        className={activeCategoryTag?.tag_id === category.tag_id ? "category-chip active" : "category-chip"}
+                        onClick={() => setActiveFilter({ tag: category.tag_id })}
+                      >
+                        {category.name}
+                        <small>{category.count}</small>
+                      </button>
+                    ))}
+                  </div>
+                ) : null}
+              </div>
+            );
+          })()}
         {instrumentFilter?.instrumentPage ? (
           <InstrumentDetectionPage
             libraryId={activeLibraryId}
@@ -7144,6 +7253,11 @@ export function App() {
                 </div>
                 <strong>
                   {asset.display_name}
+                  {assetCategoryById[asset.id] ? (
+                    <span className="category-badge" title={`Category: ${assetCategoryById[asset.id]}`}>
+                      {assetCategoryById[asset.id]}
+                    </span>
+                  ) : null}
                   {asset.stem_group_id ? (
                     <span className="stem-badge" title="Stems available — select to view in the inspector">
                       <Layers size={11} />
@@ -9933,9 +10047,23 @@ export function App() {
                   <p className="settings-hint">
                     Proposed {draft.groups.length} {draft.groups.length === 1 ? "category" : "categories"} for{" "}
                     {toSort - uncategorized.length} of {toSort} sounds, from their file names. Rename, untick or move
-                    anything before applying. Files aren't moved on disk; when you send a sound to a project it's copied into a
-                    subfolder named after its category.
+                    anything before applying. Each category then shows up under Sound Effects › By category.
                   </p>
+                  <label className="junk-cleanup-option organize-move-option">
+                    <input
+                      type="checkbox"
+                      checked={draft.moveFiles}
+                      disabled={draft.busy}
+                      onChange={(event) => update((current) => ({ ...current, moveFiles: event.target.checked }))}
+                    />
+                    <span>
+                      <strong>Also move the files into category folders on the drive</strong>
+                      <br />
+                      A folder named after each category is created next to the files, and they're moved in. Nothing is
+                      ever overwritten, files that aren't reachable stay put, and ⌘Z moves everything back. Any edit
+                      project already using one of these files will need to relink it.
+                    </span>
+                  </label>
                   {proposal.already_categorized > 0 || draft.includeCategorized ? (
                     <label className="junk-cleanup-option">
                       <input
@@ -10010,6 +10138,23 @@ export function App() {
                             ) : null}
                             <span className="junk-cleanup-count">{members.length}</span>
                           </div>
+                          {draft.moveFiles && group.included && group.name.trim() && members.length > 0 ? (
+                            (() => {
+                              const folders = [...new Set(members.map((member) => member.folder).filter(Boolean))];
+                              const target = (folder: string) => `${folder}/${group.name.trim()}`;
+                              return (
+                                <p
+                                  className="organize-destination"
+                                  title={folders.map(target).join("\n")}
+                                >
+                                  <FolderTree size={11} />
+                                  {folders.length === 1
+                                    ? shortFolder(target(folders[0]))
+                                    : `${group.name.trim()}/ in ${folders.length} folders`}
+                                </p>
+                              );
+                            })()
+                          ) : null}
                           {expanded ? (
                             members.length > 0 ? (
                               <ul className="organize-members">{members.map((member) => memberRow(member, group.key))}</ul>
@@ -10063,8 +10208,10 @@ export function App() {
                     disabled={draft.busy || organizeSummary.assignments.length === 0}
                   >
                     {draft.busy
-                      ? "Organizing…"
-                      : `Organize ${organizeSummary.assignments.length} sound${organizeSummary.assignments.length === 1 ? "" : "s"} into ${organizeSummary.categoryCount} ${organizeSummary.categoryCount === 1 ? "category" : "categories"}`}
+                      ? draft.moveFiles
+                        ? "Organizing and moving files…"
+                        : "Organizing…"
+                      : `${draft.moveFiles ? "Organize & move" : "Organize"} ${organizeSummary.assignments.length} sound${organizeSummary.assignments.length === 1 ? "" : "s"} into ${organizeSummary.categoryCount} ${organizeSummary.categoryCount === 1 ? "category" : "categories"}`}
                   </button>
                   <p className="settings-hint organize-footnote">One step to undo (⌘Z) if you change your mind.</p>
                 </div>
