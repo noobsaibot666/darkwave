@@ -122,6 +122,39 @@ pub fn should_ignore_watched_file(filename: &str) -> bool {
         || lower.ends_with(".download")
         || lower.ends_with(".part")
         || lower.ends_with(".tmp")
+        || junk_file_kind(filename).is_some()
+}
+
+/// A file that only *looks* like audio by its extension but holds none —
+/// what the library cleanup ("Clean Up Junk Files" in Settings) finds and
+/// what `prepare_import` refuses to bring in at all. Deliberately decided
+/// from the filename and size alone (no decode attempt), so it's cheap
+/// enough to run over every asset in a large library on demand.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum JunkFileKind {
+    /// macOS "AppleDouble" sidecar (`._name.wav`): Finder writes one next to
+    /// every file it touches on a non-Apple filesystem (exFAT/FAT/SMB/NAS
+    /// shares) to hold extended attributes. It copies the real file's name
+    /// and extension but is a few hundred bytes of metadata, never audio.
+    AppleDouble,
+    /// OS housekeeping files (`.DS_Store`, `Thumbs.db`, `desktop.ini`, …).
+    SystemFile,
+}
+
+/// Classifies `filename` as junk (see [`JunkFileKind`]) or `None` for a
+/// file that should be treated as a real candidate.
+pub fn junk_file_kind(filename: &str) -> Option<JunkFileKind> {
+    if filename.starts_with("._") {
+        return Some(JunkFileKind::AppleDouble);
+    }
+    let lower = filename.to_ascii_lowercase();
+    if matches!(
+        lower.as_str(),
+        ".ds_store" | "thumbs.db" | "ehthumbs.db" | "desktop.ini" | ".localized" | "icon\r"
+    ) {
+        return Some(JunkFileKind::SystemFile);
+    }
+    None
 }
 
 pub fn is_stable_watched_file(filename: &str, previous_size: u64, current_size: u64) -> bool {
@@ -329,6 +362,15 @@ pub fn prepare_import(
         .and_then(|file_name| file_name.to_str())
         .ok_or(ImportError::MissingFilename)?
         .to_string();
+    // A `._track.wav` AppleDouble sidecar passes the extension check above
+    // but holds no audio. Folder import already skips dotfiles, but a
+    // drag-drop or file-picker import of a whole selection on a NAS/exFAT
+    // drive hands these over explicitly — this is the one chokepoint every
+    // import path goes through. Reported as UnsupportedFormat, which every
+    // caller already treats as a silent skip rather than a failure.
+    if junk_file_kind(&original_filename).is_some() {
+        return Err(ImportError::UnsupportedFormat(metadata.extension));
+    }
     let display_name = path
         .file_stem()
         .and_then(|file_stem| file_stem.to_str())
@@ -610,6 +652,27 @@ mod tests {
     fn incomplete_browser_downloads_are_ignored() {
         assert!(should_ignore_watched_file("track.wav.crdownload"));
         assert!(!should_ignore_watched_file("track.wav"));
+    }
+
+    #[test]
+    fn junk_files_are_classified_by_name() {
+        assert_eq!(junk_file_kind("._Shaft Drop 2.wav"), Some(JunkFileKind::AppleDouble));
+        assert_eq!(junk_file_kind(".DS_Store"), Some(JunkFileKind::SystemFile));
+        assert_eq!(junk_file_kind("Thumbs.db"), Some(JunkFileKind::SystemFile));
+        assert_eq!(junk_file_kind("Shaft Drop 2.wav"), None);
+        assert_eq!(junk_file_kind("_underscore.wav"), None);
+        assert!(should_ignore_watched_file("._track.wav"));
+    }
+
+    #[test]
+    fn prepare_import_skips_apple_double_sidecars() {
+        let dir = std::env::temp_dir().join(format!("darkwave-junk-{}", Uuid::new_v4()));
+        fs::create_dir_all(&dir).expect("dir");
+        let sidecar = dir.join("._kick.wav");
+        fs::write(&sidecar, b"Mac OS X        \x00\x00").expect("write");
+        let result = prepare_import(&sidecar, ImportMode::Referenced, None);
+        assert!(matches!(result, Err(ImportError::UnsupportedFormat(_))));
+        let _ = fs::remove_dir_all(&dir);
     }
 
     #[test]

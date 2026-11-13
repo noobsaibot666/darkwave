@@ -2,7 +2,7 @@ mod license;
 mod power;
 mod security_scoped_bookmark;
 
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 use std::path::PathBuf;
 use std::sync::Mutex;
 
@@ -1501,6 +1501,371 @@ fn empty_library_trash(
     }
 
     Ok(removed)
+}
+
+/// Media types the Organize button works on: the categories whose export
+/// already routes into a per-category subfolder (see sfx_export_subfolder).
+const ORGANIZABLE_MEDIA_TYPES: &[&str] = &["sound_effect", "foley", "ambience"];
+
+#[derive(serde::Serialize)]
+struct OrganizeMember {
+    asset_id: String,
+    filename: String,
+    display_name: String,
+    reason: search::sfx_categories::CategoryReason,
+    matched: String,
+    series: Option<String>,
+}
+
+#[derive(serde::Serialize)]
+struct OrganizeCategory {
+    name: String,
+    existing: bool,
+    members: Vec<OrganizeMember>,
+}
+
+#[derive(serde::Serialize)]
+struct OrganizeProposal {
+    categories: Vec<OrganizeCategory>,
+    uncategorized: Vec<OrganizeMember>,
+    /// Assets skipped because they already have a category (only when
+    /// `include_categorized` is false).
+    already_categorized: usize,
+    total_considered: usize,
+}
+
+/// The browser's "Organize" button, step one: proposes a category for every
+/// asset of `media_type` from its filename (see `search::sfx_categories`).
+/// Read-only — the user reviews, edits and confirms before
+/// `apply_sfx_organization` writes anything. Assets that already have a
+/// category are left out unless `include_categorized`, so re-running
+/// Organize after new imports only touches the new files and never
+/// overrides a choice the user already made by hand.
+#[tauri::command]
+fn propose_sfx_organization(
+    state: tauri::State<CatalogState>,
+    library_id: String,
+    media_type: String,
+    include_categorized: bool,
+) -> Result<OrganizeProposal, String> {
+    let library_id = parse_uuid_field(&library_id, "library id")?;
+    if !ORGANIZABLE_MEDIA_TYPES.contains(&media_type.as_str()) {
+        return Err(format!("{media_type} can't be organized into categories"));
+    }
+    let catalog = state.0.lock().expect("catalog mutex poisoned");
+    let assets: Vec<AssetRecord> = catalog
+        .list_assets(library_id)
+        .map_err(storage_error_message)?
+        .into_iter()
+        .filter(|asset| asset.media_type == media_type)
+        .filter(|asset| import_pipeline::junk_file_kind(&asset.original_filename).is_none())
+        .collect();
+    let current = catalog
+        .asset_categories_for_library(library_id)
+        .map_err(storage_error_message)?;
+    let existing_names: Vec<String> = catalog
+        .list_tags()
+        .map_err(storage_error_message)?
+        .into_iter()
+        .filter(|tag| matches!(tag.facet.as_deref(), Some(storage::CATEGORY_FACET) | Some("action")))
+        .map(|tag| tag.name)
+        .collect();
+
+    let total_considered = assets.len();
+    let (candidates, skipped): (Vec<&AssetRecord>, Vec<&AssetRecord>) = assets
+        .iter()
+        .partition(|asset| include_categorized || !current.contains_key(&asset.id));
+    let by_id: HashMap<String, &AssetRecord> = candidates.iter().map(|asset| (asset.id.to_string(), *asset)).collect();
+    let inputs: Vec<search::sfx_categories::OrganizeInput> = candidates
+        .iter()
+        .map(|asset| search::sfx_categories::OrganizeInput {
+            id: asset.id.to_string(),
+            filename: asset.original_filename.clone(),
+        })
+        .collect();
+    let plan = search::sfx_categories::propose_sfx_categories(&inputs, &existing_names);
+
+    let member = |id: &str, reason, matched: String, series: Option<String>| {
+        let asset = by_id[id];
+        OrganizeMember {
+            asset_id: id.to_string(),
+            filename: asset.original_filename.clone(),
+            display_name: asset.display_name.clone(),
+            reason,
+            matched,
+            series,
+        }
+    };
+    Ok(OrganizeProposal {
+        categories: plan
+            .categories
+            .into_iter()
+            .map(|category| OrganizeCategory {
+                name: category.name,
+                existing: category.existing,
+                members: category
+                    .members
+                    .into_iter()
+                    .map(|m| member(&m.id, m.reason, m.matched, m.series))
+                    .collect(),
+            })
+            .collect(),
+        uncategorized: plan
+            .uncategorized
+            .iter()
+            .map(|id| member(id, search::sfx_categories::CategoryReason::Keyword, String::new(), None))
+            .collect(),
+        already_categorized: skipped.len(),
+        total_considered,
+    })
+}
+
+#[derive(serde::Deserialize)]
+struct CategoryAssignment {
+    asset_id: String,
+    /// `None` / empty clears the asset's category.
+    category: Option<String>,
+}
+
+#[derive(serde::Serialize)]
+struct ApplyOrganizationResult {
+    undo_id: String,
+    assigned: usize,
+}
+
+/// Step two of Organize (and the inspector's per-track Category field):
+/// writes the reviewed assignments as one undoable batch. Each asset ends
+/// up in exactly one category (or none) — see `Catalog::set_asset_categories`.
+#[tauri::command]
+fn apply_sfx_organization(
+    state: tauri::State<CatalogState>,
+    assignments: Vec<CategoryAssignment>,
+) -> Result<ApplyOrganizationResult, String> {
+    let parsed = assignments
+        .into_iter()
+        .map(|assignment| {
+            Ok((
+                parse_uuid_field(&assignment.asset_id, "asset id")?,
+                assignment.category.map(|name| name.trim().to_string()).filter(|name| !name.is_empty()),
+            ))
+        })
+        .collect::<Result<Vec<_>, String>>()?;
+    let catalog = state.0.lock().expect("catalog mutex poisoned");
+    let undo_id = catalog.set_asset_categories(&parsed).map_err(storage_error_message)?;
+    Ok(ApplyOrganizationResult { undo_id: undo_id.to_string(), assigned: parsed.len() })
+}
+
+#[derive(serde::Serialize)]
+struct SfxCategorySummary {
+    tag_id: String,
+    name: String,
+    count: usize,
+}
+
+/// The sidebar's Sound Effects › By category list (and the inspector's
+/// Category picker): every category with at least one track in this library.
+#[tauri::command]
+fn list_sfx_categories(state: tauri::State<CatalogState>, library_id: String) -> Result<Vec<SfxCategorySummary>, String> {
+    let library_id = parse_uuid_field(&library_id, "library id")?;
+    let catalog = state.0.lock().expect("catalog mutex poisoned");
+    Ok(catalog
+        .category_counts_for_library(library_id)
+        .map_err(storage_error_message)?
+        .into_iter()
+        .map(|(tag, count)| SfxCategorySummary { tag_id: tag.id.to_string(), name: tag.name, count })
+        .collect())
+}
+
+/// Each asset's current category in this library (`asset id → name`), for
+/// showing it on browser rows and in the inspector.
+#[tauri::command]
+fn asset_categories(state: tauri::State<CatalogState>, library_id: String) -> Result<HashMap<String, String>, String> {
+    let library_id = parse_uuid_field(&library_id, "library id")?;
+    let catalog = state.0.lock().expect("catalog mutex poisoned");
+    Ok(catalog
+        .asset_categories_for_library(library_id)
+        .map_err(storage_error_message)?
+        .into_iter()
+        .map(|(asset, (_, name))| (asset.to_string(), name))
+        .collect())
+}
+
+/// One asset the library cleanup flagged as junk. `kind` is one of
+/// `apple_double` / `system_file` / `empty` / `unreadable` — see
+/// `junk_kind_for_asset` for exactly what each means and how cleanup
+/// treats it.
+#[derive(serde::Serialize)]
+struct JunkAsset {
+    asset_id: String,
+    filename: String,
+    path: String,
+    file_size: u64,
+    kind: &'static str,
+    detail: Option<String>,
+}
+
+/// Classifies one catalogued asset for the cleanup. Order matters: an
+/// AppleDouble sidecar also fails to decode, but it's reported as the more
+/// specific (and safely file-deletable) `apple_double`, not `unreadable`.
+///
+/// `unreadable` is only ever claimed for a format this build can actually
+/// decode (`supported_mvp_format`) — a cataloged-but-not-playable format
+/// like AAC/M4A (see ADR 0028) fails decode by design and is real audio
+/// the user wants to keep.
+fn junk_kind_for_asset(asset: &AssetRecord, decode_error: Option<&String>) -> Option<&'static str> {
+    match import_pipeline::junk_file_kind(&asset.original_filename) {
+        Some(import_pipeline::JunkFileKind::AppleDouble) => return Some("apple_double"),
+        Some(import_pipeline::JunkFileKind::SystemFile) => return Some("system_file"),
+        None => {}
+    }
+    if asset.file_size == 0 {
+        return Some("empty");
+    }
+    let extension = std::path::Path::new(&asset.original_filename)
+        .extension()
+        .and_then(|extension| extension.to_str())
+        .unwrap_or_default();
+    if decode_error.is_some() && audio_metadata::supported_mvp_format(extension) {
+        return Some("unreadable");
+    }
+    None
+}
+
+/// Settings → "Clean Up Junk Files", step one: lists every asset in this
+/// library that holds no real audio. Read-only — nothing is changed until
+/// the user reviews this list and confirms `clean_up_junk_files`.
+#[tauri::command]
+fn scan_junk_files(state: tauri::State<CatalogState>, library_id: String) -> Result<Vec<JunkAsset>, String> {
+    let library_id = parse_uuid_field(&library_id, "library id")?;
+    let catalog = state.0.lock().expect("catalog mutex poisoned");
+    let assets = catalog.list_assets(library_id).map_err(storage_error_message)?;
+    let decode_failures: HashMap<Uuid, String> = catalog
+        .decode_failures_for_library(library_id)
+        .map_err(storage_error_message)?
+        .into_iter()
+        .collect();
+
+    let mut junk = Vec::new();
+    for asset in &assets {
+        let decode_error = decode_failures.get(&asset.id);
+        let Some(kind) = junk_kind_for_asset(asset, decode_error) else {
+            continue;
+        };
+        let path = resolve_asset_path(&catalog, asset).unwrap_or_default();
+        junk.push(JunkAsset {
+            asset_id: asset.id.to_string(),
+            filename: asset.original_filename.clone(),
+            path,
+            file_size: asset.file_size,
+            kind,
+            detail: if kind == "unreadable" { decode_error.cloned() } else { None },
+        });
+    }
+    junk.sort_by(|left, right| left.kind.cmp(right.kind).then_with(|| left.filename.cmp(&right.filename)));
+    Ok(junk)
+}
+
+#[derive(serde::Serialize, Default)]
+struct JunkCleanupResult {
+    /// Removed from the library for good (with a re-import block).
+    removed: usize,
+    /// Moved to Darkwave's Trash instead (unreadable audio — restorable).
+    trashed: usize,
+    /// Real files deleted from the drive (AppleDouble/system files only).
+    files_deleted: usize,
+    /// Ids the frontend sent that no longer classify as junk, or failed.
+    skipped: usize,
+    errors: Vec<String>,
+}
+
+/// Settings → "Clean Up Junk Files", step two. Every id is re-classified
+/// here rather than trusting the list the UI sent, so a stale or tampered
+/// selection can never remove a real track. What happens per kind:
+///
+/// - `apple_double` / `system_file`: removed from the library permanently
+///   (`finalize_permanent_deletion`, which also leaves a re-import
+///   tombstone). With `delete_files`, the file itself is also deleted from
+///   the drive — safe, since by name it's an OS metadata file, never audio.
+/// - `empty`: removed from the library, but the file is **never** deleted:
+///   a 0-byte file can be a cloud-sync placeholder (iCloud/Dropbox/NAS
+///   sync stub) whose deletion would propagate and delete the real file.
+/// - `unreadable`: moved to Darkwave's Trash (restorable) and the file is
+///   left alone. It has a real audio name, so the call to destroy it stays
+///   with the Trash view's own explicit per-item "Delete".
+#[tauri::command]
+fn clean_up_junk_files(
+    app: tauri::AppHandle,
+    state: tauri::State<CatalogState>,
+    library_id: String,
+    asset_ids: Vec<String>,
+    delete_files: bool,
+) -> Result<JunkCleanupResult, String> {
+    let library_id = parse_uuid_field(&library_id, "library id")?;
+    let catalog = state.0.lock().expect("catalog mutex poisoned");
+    let decode_failures: HashMap<Uuid, String> = catalog
+        .decode_failures_for_library(library_id)
+        .map_err(storage_error_message)?
+        .into_iter()
+        .collect();
+    let cache_dir = preview_cache_dir(&app).ok();
+    let mut result = JunkCleanupResult::default();
+
+    for raw_id in asset_ids {
+        let asset_id = parse_uuid_field(&raw_id, "asset id")?;
+        let Some(asset) = catalog.get_asset(asset_id).map_err(storage_error_message)? else {
+            result.skipped += 1;
+            continue;
+        };
+        let kind = if asset.library_id == library_id {
+            junk_kind_for_asset(&asset, decode_failures.get(&asset.id))
+        } else {
+            None
+        };
+        let Some(kind) = kind else {
+            result.skipped += 1;
+            continue;
+        };
+
+        if kind == "unreadable" {
+            match catalog.move_asset_to_trash(asset_id, "unreadable (cleanup)", current_time_ms()) {
+                Ok(_) => result.trashed += 1,
+                Err(error) => {
+                    result.skipped += 1;
+                    result.errors.push(format!("{}: {}", asset.original_filename, storage_error_message(error)));
+                }
+            }
+            continue;
+        }
+
+        if delete_files && matches!(kind, "apple_double" | "system_file") {
+            if let Ok(absolute_path) = resolve_asset_path(&catalog, &asset) {
+                match std::fs::remove_file(&absolute_path) {
+                    Ok(()) => result.files_deleted += 1,
+                    Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+                    Err(error) => {
+                        // Leave the row in place so the user can see it's
+                        // still there and retry (e.g. a read-only share).
+                        result.skipped += 1;
+                        result.errors.push(format!("{}: {error}", asset.original_filename));
+                        continue;
+                    }
+                }
+            }
+        }
+
+        if let Some(cache_dir) = &cache_dir {
+            let _ = std::fs::remove_file(cached_file_path(cache_dir, &asset));
+        }
+        match catalog.finalize_permanent_deletion(asset_id) {
+            Ok(()) => result.removed += 1,
+            Err(error) => {
+                result.skipped += 1;
+                result.errors.push(format!("{}: {}", asset.original_filename, storage_error_message(error)));
+            }
+        }
+    }
+
+    Ok(result)
 }
 
 /// Counts returned to the UI so "library deleted" can say what it actually
@@ -4678,12 +5043,17 @@ fn export_asset_to_project(
         }
     };
 
-    let primary_tag_name = catalog
-        .tags_for_asset(asset_id)
+    // The asset's category (set by Organize, or by hand in the inspector)
+    // decides its export subfolder — e.g. 03_SFX/Doors/. Only without one
+    // does it fall back to the old "first tag" rule, which is alphabetical
+    // by facet and so effectively arbitrary once an asset has several tags.
+    let asset_tags = catalog.tags_for_asset(asset_id).map_err(storage_error_message)?;
+    let category_name = catalog
+        .asset_categories_for_library(asset.library_id)
         .map_err(storage_error_message)?
-        .into_iter()
-        .next()
-        .map(|tag| tag.name);
+        .remove(&asset_id)
+        .map(|(_, name)| name);
+    let primary_tag_name = category_name.or_else(|| asset_tags.into_iter().next().map(|tag| tag.name));
     let category_subfolder = if is_music {
         None
     } else {
@@ -6003,6 +6373,12 @@ pub fn run() {
             optimize_library,
             clear_deleted_import_history,
             empty_library_trash,
+            scan_junk_files,
+            clean_up_junk_files,
+            propose_sfx_organization,
+            apply_sfx_organization,
+            list_sfx_categories,
+            asset_categories,
             delete_library,
             list_assets,
             list_recent_assets,
