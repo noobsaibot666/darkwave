@@ -1884,6 +1884,7 @@ fn remove_dir_if_effectively_empty(dir: &std::path::Path) {
 // (async): renames on a NAS share are network round-trips.
 #[tauri::command(async)]
 fn apply_sfx_organization(
+    app: tauri::AppHandle,
     state: tauri::State<CatalogState>,
     assignments: Vec<CategoryAssignment>,
     move_files: Option<bool>,
@@ -1903,7 +1904,10 @@ fn apply_sfx_organization(
         })
         .collect::<Result<Vec<_>, String>>()?;
     let catalog = state.0.lock().expect("catalog mutex poisoned");
-    organize_assets_refiling(&catalog, &parsed, &refile, move_files.unwrap_or(false))
+    let emit = |done: usize, total: usize| {
+        let _ = tauri::Emitter::emit(&app, "organize-progress", OrganizeProgress { done, total });
+    };
+    organize_assets_with_progress(&catalog, &parsed, &refile, move_files.unwrap_or(false), &emit)
 }
 
 #[cfg(test)]
@@ -1934,11 +1938,29 @@ fn remove_emptied_category_folders(moves: &[FileMove], category_names: &[String]
     }
 }
 
+/// Progress of an Organize/rename run, emitted as `organize-progress` so
+/// the activity panel can show a real bar while files move.
+#[derive(serde::Serialize, Clone)]
+struct OrganizeProgress {
+    done: usize,
+    total: usize,
+}
+
 fn organize_assets_refiling(
     catalog: &Catalog,
     parsed: &[(Uuid, Option<String>)],
     refile: &[(Uuid, String)],
     move_files: bool,
+) -> Result<ApplyOrganizationResult, String> {
+    organize_assets_with_progress(catalog, parsed, refile, move_files, &|_, _| {})
+}
+
+fn organize_assets_with_progress(
+    catalog: &Catalog,
+    parsed: &[(Uuid, Option<String>)],
+    refile: &[(Uuid, String)],
+    move_files: bool,
+    progress: &dyn Fn(usize, usize),
 ) -> Result<ApplyOrganizationResult, String> {
     let mut media_types = Vec::new();
     for (asset_id, media_type) in refile {
@@ -1984,7 +2006,11 @@ fn organize_assets_refiling(
     let mut moves = Vec::new();
     let mut created_dirs: Vec<PathBuf> = Vec::new();
 
-    for (asset_id, category) in parsed {
+    let total = parsed.len();
+    for (index, (asset_id, category)) in parsed.iter().enumerate() {
+        if index % 10 == 0 {
+            progress(index, total);
+        }
         let Some(category) = category else { continue };
         let Some(asset) = catalog.get_asset(*asset_id).map_err(storage_error_message)? else { continue };
         let Ok(current) = resolve_asset_path(catalog, &asset) else { continue };
@@ -2020,6 +2046,7 @@ fn organize_assets_refiling(
         moves.push(FileMove { asset: asset.id, from, to });
     }
 
+    progress(total, total);
     result.moved = moves.len();
     remove_emptied_category_folders(&moves, &category_names);
     if !moves.is_empty() || !created_dirs.is_empty() || !media_types.is_empty() {
@@ -2089,6 +2116,7 @@ fn replay_organize_moves(catalog: &Catalog, undo: &OrganizeMovesUndo, forward: b
 /// (emptied old folders are removed), and one Undo reverts all of it.
 #[tauri::command(async)]
 fn rename_sfx_category(
+    app: tauri::AppHandle,
     state: tauri::State<CatalogState>,
     library_id: String,
     tag_id: String,
@@ -2102,7 +2130,10 @@ fn rename_sfx_category(
         return Err("a category needs a name".into());
     }
     let catalog = state.0.lock().expect("catalog mutex poisoned");
-    rename_category(&catalog, library_id, tag_id, &new_name, move_files.unwrap_or(false))
+    let emit = |done: usize, total: usize| {
+        let _ = tauri::Emitter::emit(&app, "organize-progress", OrganizeProgress { done, total });
+    };
+    rename_category(&catalog, library_id, tag_id, &new_name, move_files.unwrap_or(false), &emit)
 }
 
 fn rename_category(
@@ -2111,6 +2142,7 @@ fn rename_category(
     tag_id: Uuid,
     new_name: &str,
     move_files: bool,
+    progress: &dyn Fn(usize, usize),
 ) -> Result<ApplyOrganizationResult, String> {
     let members = catalog.assets_in_category(library_id, tag_id).map_err(storage_error_message)?;
     // Same category key ("whooshes" → "Whooshes"): only the display name
@@ -2126,7 +2158,7 @@ fn rename_category(
         });
     }
     let parsed: Vec<(Uuid, Option<String>)> = members.into_iter().map(|asset| (asset, Some(new_name.to_string()))).collect();
-    organize_assets_refiling(catalog, &parsed, &[], move_files)
+    organize_assets_with_progress(catalog, &parsed, &[], move_files, progress)
 }
 
 #[derive(serde::Serialize)]
@@ -7300,7 +7332,7 @@ mod tests {
         let typo = catalog.find_category_tag("Wooshes").unwrap().unwrap();
 
         // Rename the typo onto the existing "Whooshes": a merge.
-        let result = super::rename_category(&catalog, library_id, typo.id, "Whooshes", true).expect("rename");
+        let result = super::rename_category(&catalog, library_id, typo.id, "Whooshes", true, &|_, _| {}).expect("rename");
         assert_eq!(result.moved, 2);
         assert!(sfx.join("Whooshes/a.wav").is_file() && sfx.join("Whooshes/c.wav").is_file());
         assert!(!sfx.join("Wooshes").exists(), "the emptied old folder is gone");
@@ -7314,7 +7346,7 @@ mod tests {
 
         // Capitalization-only rename keeps the same category.
         let whooshes = catalog.find_category_tag("Whooshes").unwrap().unwrap();
-        super::rename_category(&catalog, library_id, whooshes.id, "WHOOSHES", true).expect("case rename");
+        super::rename_category(&catalog, library_id, whooshes.id, "WHOOSHES", true, &|_, _| {}).expect("case rename");
         assert_eq!(catalog.asset_categories_for_library(library_id).unwrap()[&c.id].1, "WHOOSHES");
         let _ = std::fs::remove_dir_all(&root);
     }

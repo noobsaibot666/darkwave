@@ -1584,6 +1584,9 @@ export function App() {
   const [categoryInput, setCategoryInput] = useState("");
   // Result of the last Organize / category move, shown above the list.
   const [organizeStatus, setOrganizeStatus] = useState<string | null>(null);
+  // Live progress of a running check / organize / rename, shown in the
+  // activity panel (total 0 = indeterminate, e.g. while checking).
+  const [organizeProgress, setOrganizeProgress] = useState<{ label: string; done: number; total: number } | null>(null);
   // Sidebar inline rename of a category.
   const [renamingCategory, setRenamingCategory] = useState<{ tagId: string; value: string } | null>(null);
   // "Move to Category…" picker for the selected tracks.
@@ -3004,6 +3007,15 @@ export function App() {
     refreshSfxCategories(activeLibraryId);
   }, [activeLibraryId, assets, refreshSfxCategories]);
 
+  useEffect(() => {
+    const unlisten = listen<{ done: number; total: number }>("organize-progress", (event) =>
+      setOrganizeProgress((current) => (current ? { ...current, done: event.payload.done, total: event.payload.total } : current))
+    );
+    return () => {
+      unlisten.then((stop) => stop());
+    };
+  }, []);
+
   // Once a library has categories, show them in the sidebar without making
   // the user find the "By category" toggle first. Opens once per library;
   // collapsing it by hand afterwards sticks.
@@ -3020,6 +3032,7 @@ export function App() {
   const handleOpenOrganize = useCallback(
     (mediaType: string, includeCategorized: boolean) => {
       if (!activeLibraryId) return;
+      setOrganizeProgress({ label: "Checking the library…", done: 0, total: 0 });
       setOrganizeDraft((current) => ({
         mediaType,
         includeCategorized,
@@ -3066,7 +3079,8 @@ export function App() {
         })
         .catch((error) =>
           setOrganizeDraft((current) => (current ? { ...current, loading: false, error: String(error) } : current))
-        );
+        )
+        .finally(() => setOrganizeProgress(null));
     },
     [activeLibraryId]
   );
@@ -3097,8 +3111,16 @@ export function App() {
     if (!organizeDraft || organizeDraft.busy || !activeLibraryId) return;
     const { assignments, categoryCount } = organizeSummary;
     if (assignments.length === 0) return;
-    setOrganizeDraft({ ...organizeDraft, busy: true, error: null });
+    // The review closes right away; the activity panel's bar takes over.
+    const draftSnapshot = organizeDraft;
+    setOrganizeDraft(null);
+    setOrganizeProgress({
+      label: draftSnapshot.moveFiles ? "Organizing and moving files" : "Organizing",
+      done: 0,
+      total: assignments.length,
+    });
     try {
+      const organizeDraft = draftSnapshot;
       const result = await invoke<ApplyOrganizationResult>("apply_sfx_organization", {
         assignments,
         moveFiles: organizeDraft.moveFiles,
@@ -3120,13 +3142,14 @@ export function App() {
           .join(" · ") + ". ⌘Z undoes all of it."
       );
       setRedoStack([]);
-      setOrganizeDraft(null);
       setSfxSubcategoriesOpen(true);
       refreshSfxCategories(activeLibraryId);
       refreshAssets(activeLibraryId, searchQuery, activeFilter);
       if (selectedAssetId) refreshAssetTags(selectedAssetId);
     } catch (error) {
-      setOrganizeDraft((current) => (current ? { ...current, busy: false, error: String(error) } : current));
+      setOrganizeStatus(`Organize failed: ${String(error)}`);
+    } finally {
+      setOrganizeProgress(null);
     }
   }, [organizeDraft, organizeSummary, activeLibraryId, refreshSfxCategories, refreshAssets, searchQuery, activeFilter, selectedAssetId, refreshAssetTags]);
 
@@ -3137,6 +3160,7 @@ export function App() {
       if (assetIds.length === 0 || !activeLibraryId) return;
       const name = category?.trim() || null;
       const mediaTypeOf = new Map(assets.map((asset) => [asset.id, asset.media_type]));
+      setOrganizeProgress({ label: name ? `Moving to "${name}"` : "Clearing category", done: 0, total: assetIds.length });
       invoke<ApplyOrganizationResult>("apply_sfx_organization", {
         // A track moved into a category by hand is a sound effect by the
         // user's own say-so; re-file it if it was filed as music etc.
@@ -3167,7 +3191,8 @@ export function App() {
           // Paths (and, in a category view, membership) changed.
           refreshAssets(activeLibraryId, searchQuery, activeFilter);
         })
-        .catch((error) => setOrganizeStatus(`Couldn't set the category: ${String(error)}`));
+        .catch((error) => setOrganizeStatus(`Couldn't set the category: ${String(error)}`))
+        .finally(() => setOrganizeProgress(null));
     },
     [activeLibraryId, refreshSfxCategories, selectedAssetId, refreshAssetTags, activeFilter, refreshAssets, searchQuery, assets]
   );
@@ -3182,6 +3207,11 @@ export function App() {
       setRenamingCategory(null);
       if (!activeLibraryId || !name || name === oldName) return;
       const merging = sfxCategories.some((category) => category.tag_id !== tagId && category.name.toLowerCase() === name.toLowerCase());
+      setOrganizeProgress({
+        label: merging ? `Merging into "${name}"` : `Renaming to "${name}"`,
+        done: 0,
+        total: sfxCategories.find((category) => category.tag_id === tagId)?.count ?? 0,
+      });
       invoke<ApplyOrganizationResult>("rename_sfx_category", { libraryId: activeLibraryId, tagId, newName: name, moveFiles: true })
         .then((result) => {
           if (result.undo_id) {
@@ -3200,7 +3230,8 @@ export function App() {
           refreshSfxCategories(activeLibraryId);
           refreshAssets(activeLibraryId, searchQuery, activeFilter);
         })
-        .catch((error) => setOrganizeStatus(`Couldn't rename: ${String(error)}`));
+        .catch((error) => setOrganizeStatus(`Couldn't rename: ${String(error)}`))
+        .finally(() => setOrganizeProgress(null));
     },
     [activeLibraryId, sfxCategories, refreshSfxCategories, refreshAssets, searchQuery, activeFilter]
   );
@@ -6149,7 +6180,8 @@ export function App() {
   // LED already meant. Collapsing import/refresh status into this one
   // indicator (instead of also showing a separate topbar chip) means
   // there's one place to check for anything happening in the background.
-  const activityPreparing = importStatus === "Importing…" || refreshStatus === "Scanning for new files…";
+  const activityPreparing =
+    importStatus === "Importing…" || refreshStatus === "Scanning for new files…" || organizeProgress !== null;
   const activityBusy = jobProgress.length > 0;
   const waveformActiveIndex = peaks && duration > 0 ? Math.floor((currentTime / duration) * peaks.length) : -1;
   const drTargetAssetId = playingAssetId ?? selectedAssetId;
@@ -9482,6 +9514,7 @@ export function App() {
                 jobProgress.length === 0 &&
                 !refreshStatus &&
                 !importStatus &&
+                !organizeProgress &&
                 !audioAnalysisPaused &&
                 !waveformGenerationPaused &&
                 syncingProjects.length === 0 &&
@@ -9520,6 +9553,34 @@ export function App() {
                       </div>
                     </div>
                   ))}
+                  {organizeProgress ? (
+                    <div className="job-progress-row">
+                      <span className="job-progress-icon">
+                        <FolderTree size={15} />
+                      </span>
+                      <div className="job-progress-body">
+                        <div className="job-progress-head">
+                          <span className="job-progress-label">Organize</span>
+                          {organizeProgress.total > 0 ? (
+                            <span className="job-progress-count">
+                              {organizeProgress.done} / {organizeProgress.total}
+                            </span>
+                          ) : null}
+                        </div>
+                        <div className="job-progress-track">
+                          <div
+                            className={organizeProgress.total > 0 ? "job-progress-fill" : "job-progress-fill indeterminate"}
+                            style={
+                              organizeProgress.total > 0
+                                ? { width: `${Math.round((organizeProgress.done / organizeProgress.total) * 100)}%` }
+                                : undefined
+                            }
+                          />
+                        </div>
+                        <div className="status-line">{organizeProgress.label}</div>
+                      </div>
+                    </div>
+                  ) : null}
                   {importStatus ? (
                   <div className="job-progress-row">
                     <span className="job-progress-icon">
