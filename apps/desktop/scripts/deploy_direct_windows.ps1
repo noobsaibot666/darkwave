@@ -1,5 +1,5 @@
 # deploy_direct_windows.ps1
-# Direct-sale Windows build: rebuild sidecar -> NSIS installer -> archive ->
+# Direct-sale Windows build: NSIS installer -> archive ->
 # hand off to Store Manager for review/publish. Mirrors deploy_direct_macos.sh's
 # handoff step (see that script + this repo's CLAUDE.md "Every release
 # updates the self-served store too"), but has no signing step: Windows
@@ -37,24 +37,14 @@ Write-Host "----------------------------------------------------------"
 # checkout building an already-approved version is the same mistake as a
 # stale Mac one, just without Apple's 409 to catch it. No build-number
 # check here: that's an App Store Connect-only constraint.
-Write-Host "[0/4] Checking version against docs/macos/version-ledger.md..."
+Write-Host "[0/3] Checking version against docs/macos/version-ledger.md..."
 . (Join-Path $PSScriptRoot "check_version_ledger.ps1")
 Test-VersionLedger -CurrentVersion $Version
 
-# -- 1. Rebuild the sidecar --------------------------------------------------
-# apps/desktop/src-tauri/binaries/ is gitignored (compiled, machine-specific),
-# so a pull never brings a copy along -- rebuild every run, matching
-# docs/development/windows-setup.md's "After every pull" sequence, or the
-# build fails with "resource path ...similarity-worker-...exe doesn't exist".
-Write-Host "[1/4] Rebuilding similarity-worker sidecar..."
-cargo build -p similarity-worker --release --manifest-path (Join-Path $WorkspaceRoot "Cargo.toml")
-if ($LASTEXITCODE -ne 0) { throw "similarity-worker build failed" }
-$Triple = (rustc -vV | Select-String '^host:').Line.Split(' ')[1]
-New-Item -ItemType Directory -Force -Path "src-tauri\binaries" | Out-Null
-Copy-Item (Join-Path $WorkspaceRoot "target\release\similarity-worker.exe") `
-  "src-tauri\binaries\similarity-worker-$Triple.exe" -Force
-
-# -- 2. Build the installer ---------------------------------------------------
+# -- 1. Build the installer ---------------------------------------------------
+# No sidecar step: the similarity-worker crate was removed on 2026-09-18
+# (docs/adr/0033-drop-bliss-rs-similarity-sidecar.md); its replacement links
+# straight into darkwave-desktop, so there is nothing to prebuild or copy.
 # direct-dist feature + tauri.direct.conf.json, same as macOS's build step.
 # tauri.windows.conf.json is layered on top (Windows-only): it adds
 # DirectML.dll to bundle.resources so the ONNX Runtime DirectML EP is
@@ -67,7 +57,7 @@ Copy-Item (Join-Path $WorkspaceRoot "target\release\similarity-worker.exe") `
 # model bundling instead of augmenting it.
 # --bundles nsis pinned explicitly (not relying on "targets":"all") so a
 # stray MSI/WiX pass never runs alongside it.
-Write-Host "[2/4] Building (direct-dist, NSIS)..."
+Write-Host "[1/3] Building (direct-dist, NSIS)..."
 npx tauri build --features direct-dist --config src-tauri\tauri.direct.conf.json --config src-tauri\tauri.windows.conf.json --bundles nsis
 if ($LASTEXITCODE -ne 0) { throw "tauri build failed" }
 
@@ -77,21 +67,21 @@ if (-not (Test-Path $InstallerPath)) {
     throw "Expected installer not found at $InstallerPath (version mismatch with tauri.conf.json?)"
 }
 
-# -- 3. Archive locally --------------------------------------------------------
-Write-Host "[3/4] Archiving locally..."
+# -- 2. Archive locally --------------------------------------------------------
+Write-Host "[2/3] Archiving locally..."
 $BuildDest = "builds\direct_distribution\windows"
 New-Item -ItemType Directory -Force -Path $BuildDest | Out-Null
 Copy-Item $InstallerPath (Join-Path $BuildDest $InstallerName) -Force
 Write-Host "  -> $BuildDest\$InstallerName (local archive)"
 
-# -- 4. Hand off to Store Manager ----------------------------------------------
+# -- 3. Hand off to Store Manager ----------------------------------------------
 # Same shape as the macOS script's ingest drop: store-manager/ingest/<category>/
 # <slug>/<version>/. If a macOS drop for this exact version already landed
 # first, merge the "windows" key into its manifest.json instead of
 # overwriting -- both platforms ship from one manifest per version (see
 # docs/manifest-schema.md on the share). Otherwise write a fresh windows-only
 # manifest.
-Write-Host "[4/4] Staging for Store Manager review..."
+Write-Host "[3/3] Staging for Store Manager review..."
 
 if (Test-Path $IngestRoot) {
     $DropDir = Join-Path $IngestRoot "$ProductCategory\$ProductSlug\$Version"

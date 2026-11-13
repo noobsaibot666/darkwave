@@ -7,6 +7,19 @@ Newest entry on top. Add a new entry, don't edit old ones.
 
 ---
 
+## 2026-11-13 — 0.3.3 builds fine on Windows; Windows deploy script fixed
+
+1. **`ort-sys` builds locally.** A clean `npx tauri build` of 0.3.3 (`f2a1e11`) compiled
+   without errors here, `ort-sys` included, so the red Windows CI looks specific to the CI runner,
+   not the code. `cargo test --workspace` not run yet.
+2. **`deploy_direct_windows.ps1` was broken.** Step 1/4 still built `similarity-worker`, which
+   was removed in ADR 0033. Step removed (now 3 steps), plus the matching stale line in
+   `windows-setup.md`.
+3. **The 0.3.3 bump left the lockfiles out of date.** `Cargo.lock` and `package-lock.json` still
+   said 0.3.2; any build rewrites them. Please bump them along with the version next time.
+
+---
+
 ## 2026-09-13 — found why audio-analysis still never finished after the retry-loop fix — wasn't the loop, wasn't the NAS, wasn't the files
 
 Pulled `main` at `2e892ba` (all three retry-loop fixes, #4/#5/#6) — confirmed that part is genuinely fixed: a

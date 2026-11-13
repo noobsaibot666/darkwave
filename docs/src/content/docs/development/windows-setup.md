@@ -48,9 +48,6 @@ platform audit" is still an open gate in
 produce a real `.msi`/`.exe` installer for local testing, not to cut an
 actual release.
 
-Rebuild the sidecar first if you haven't already this session — packaging
-fails immediately without it, same as `tauri dev` does.
-
 Windows has no App Store distribution channel for Darkwave (direct-sale
 only — see the distribution plan) — every Windows build is the
 `direct-dist` feature, using `tauri.direct.conf.json`'s identifier and the
