@@ -1503,18 +1503,20 @@ fn empty_library_trash(
     Ok(removed)
 }
 
-/// Media types the Organize button works on: the categories whose export
-/// already routes into a per-category subfolder (see sfx_export_subfolder).
-const ORGANIZABLE_MEDIA_TYPES: &[&str] = &["sound_effect", "foley", "ambience"];
-
 #[derive(serde::Serialize)]
 struct OrganizeMember {
     asset_id: String,
     filename: String,
     display_name: String,
+    /// The folder the file sits in now — shown in the review so the user
+    /// can see where its category folder will be created.
+    folder: String,
     reason: search::sfx_categories::CategoryReason,
     matched: String,
     series: Option<String>,
+    /// `Some(current media type)` when the check found a sound effect filed
+    /// as something else (music, ambience…); applying re-files it.
+    reclassify_from: Option<String>,
 }
 
 #[derive(serde::Serialize)]
@@ -1528,20 +1530,53 @@ struct OrganizeCategory {
 struct OrganizeProposal {
     categories: Vec<OrganizeCategory>,
     uncategorized: Vec<OrganizeMember>,
-    /// Assets skipped because they already have a category (only when
-    /// `include_categorized` is false).
+    /// Sound effects that already had a category (listed under it, not re-guessed).
     already_categorized: usize,
+    /// Sound effects found filed under another media type.
+    misfiled: usize,
+    /// Every track the check looked at.
     total_considered: usize,
 }
 
-/// The browser's "Organize" button, step one: proposes a category for every
-/// asset of `media_type` from its filename (see `search::sfx_categories`).
-/// Read-only — the user reviews, edits and confirms before
-/// `apply_sfx_organization` writes anything. Assets that already have a
-/// category are left out unless `include_categorized`, so re-running
-/// Organize after new imports only touches the new files and never
-/// overrides a choice the user already made by hand.
-#[tauri::command]
+/// Media types the library check considers. Voiceover and Foley are
+/// deliberate, separate categories in the export taxonomy (02_VO,
+/// 04_FOLEY), so they're never second-guessed into sound effects.
+const SFX_CHECK_MEDIA_TYPES: &[&str] = &["sound_effect", "music", "ambience", "other", "needs_review"];
+
+/// Folder names around a file, nearest first, for the engine's folder
+/// signal (and the SFX/music folder markers). Stops at the volume root.
+fn enclosing_folders(path: &std::path::Path) -> Vec<String> {
+    path.parent()
+        .map(|parent| {
+            parent
+                .components()
+                .filter_map(|component| match component {
+                    std::path::Component::Normal(name) => Some(name.to_string_lossy().to_string()),
+                    _ => None,
+                })
+                .collect::<Vec<_>>()
+        })
+        .map(|mut folders| {
+            folders.reverse();
+            folders.truncate(8);
+            folders
+        })
+        .unwrap_or_default()
+}
+
+/// The "Organize" button, step one: a read-only check of the whole
+/// library. Every imported track (except voiceover/foley, see
+/// SFX_CHECK_MEDIA_TYPES) goes through `search::sfx_categories`, which
+/// decides whether it's a sound effect — including ones filed as music or
+/// ambience — and which category it belongs in, from its name, UCS code,
+/// folders, numbering and duration. The user reviews, edits and confirms
+/// before `apply_sfx_organization` writes anything.
+///
+/// Sound effects that already have a category aren't re-guessed unless
+/// `include_categorized` (that would override a choice the user made), but
+/// they're listed under their category so "move files" can file them.
+/// `media_type` is accepted for compatibility and must be `sound_effect`.
+#[tauri::command(async)]
 fn propose_sfx_organization(
     state: tauri::State<CatalogState>,
     library_id: String,
@@ -1549,7 +1584,7 @@ fn propose_sfx_organization(
     include_categorized: bool,
 ) -> Result<OrganizeProposal, String> {
     let library_id = parse_uuid_field(&library_id, "library id")?;
-    if !ORGANIZABLE_MEDIA_TYPES.contains(&media_type.as_str()) {
+    if media_type != "sound_effect" {
         return Err(format!("{media_type} can't be organized into categories"));
     }
     let catalog = state.0.lock().expect("catalog mutex poisoned");
@@ -1557,65 +1592,120 @@ fn propose_sfx_organization(
         .list_assets(library_id)
         .map_err(storage_error_message)?
         .into_iter()
-        .filter(|asset| asset.media_type == media_type)
+        .filter(|asset| SFX_CHECK_MEDIA_TYPES.contains(&asset.media_type.as_str()))
         .filter(|asset| import_pipeline::junk_file_kind(&asset.original_filename).is_none())
         .collect();
     let current = catalog
         .asset_categories_for_library(library_id)
         .map_err(storage_error_message)?;
-    let existing_names: Vec<String> = catalog
+    // Only categories that actually hold tracks: an emptied (renamed-away)
+    // category must not attract new files back under its old name, and
+    // the seeded Impact/Whoosh/Rise tags are not categories until used.
+    let live_categories: Vec<String> = catalog
+        .category_counts_for_library(library_id)
+        .map_err(storage_error_message)?
+        .into_iter()
+        .map(|(tag, _)| tag.name)
+        .collect();
+    let all_category_names: Vec<String> = catalog
         .list_tags()
         .map_err(storage_error_message)?
         .into_iter()
-        .filter(|tag| matches!(tag.facet.as_deref(), Some(storage::CATEGORY_FACET) | Some("action")))
+        .filter(|tag| tag.facet.as_deref() == Some(storage::CATEGORY_FACET))
         .map(|tag| tag.name)
         .collect();
 
     let total_considered = assets.len();
-    let (candidates, skipped): (Vec<&AssetRecord>, Vec<&AssetRecord>) = assets
+    let paths: HashMap<Uuid, String> = assets
         .iter()
-        .partition(|asset| include_categorized || !current.contains_key(&asset.id));
-    let by_id: HashMap<String, &AssetRecord> = candidates.iter().map(|asset| (asset.id.to_string(), *asset)).collect();
+        .filter_map(|asset| resolve_asset_path(&catalog, asset).ok().map(|path| (asset.id, path)))
+        .collect();
+    let by_id: HashMap<String, &AssetRecord> = assets.iter().map(|asset| (asset.id.to_string(), asset)).collect();
+    let (skipped, candidates): (Vec<&AssetRecord>, Vec<&AssetRecord>) = assets
+        .iter()
+        .partition(|asset| !include_categorized && current.contains_key(&asset.id));
     let inputs: Vec<search::sfx_categories::OrganizeInput> = candidates
         .iter()
         .map(|asset| search::sfx_categories::OrganizeInput {
             id: asset.id.to_string(),
             filename: asset.original_filename.clone(),
+            folders: paths
+                .get(&asset.id)
+                .map(|path| enclosing_folders(std::path::Path::new(path)))
+                .unwrap_or_default(),
+            media_type: asset.media_type.clone(),
+            duration_ms: asset.duration_ms,
         })
         .collect();
-    let plan = search::sfx_categories::propose_sfx_categories(&inputs, &existing_names);
+    let plan = search::sfx_categories::propose_sfx_categories(&inputs, &live_categories);
 
-    let member = |id: &str, reason, matched: String, series: Option<String>| {
+    let member = |id: &str, reason, matched: String, series: Option<String>, reclassify_from: Option<String>| {
         let asset = by_id[id];
+        let folder = paths
+            .get(&asset.id)
+            .map(|path| category_folder_base(std::path::Path::new(path), &all_category_names).display().to_string())
+            .unwrap_or_default();
         OrganizeMember {
             asset_id: id.to_string(),
             filename: asset.original_filename.clone(),
             display_name: asset.display_name.clone(),
+            folder,
             reason,
             matched,
             series,
+            reclassify_from,
         }
     };
+    let mut misfiled = 0;
+    let mut categories: Vec<OrganizeCategory> = plan
+        .categories
+        .into_iter()
+        .map(|category| OrganizeCategory {
+            name: category.name,
+            existing: category.existing,
+            members: category
+                .members
+                .into_iter()
+                .map(|m| {
+                    if m.reclassify_from.is_some() {
+                        misfiled += 1;
+                    }
+                    member(&m.id, m.reason, m.matched, m.series, m.reclassify_from)
+                })
+                .collect(),
+        })
+        .collect();
+
+    // Already-categorized sound effects: listed under their category with
+    // an empty `matched` ("already in this category"), never re-guessed.
+    for asset in &skipped {
+        let Some((_, name)) = current.get(&asset.id) else { continue };
+        let entry = member(
+            &asset.id.to_string(),
+            search::sfx_categories::CategoryReason::Existing,
+            String::new(),
+            None,
+            None,
+        );
+        match categories.iter_mut().find(|category| category.name.eq_ignore_ascii_case(name)) {
+            Some(category) => {
+                category.existing = true;
+                category.members.push(entry);
+            }
+            None => categories.push(OrganizeCategory { name: name.clone(), existing: true, members: vec![entry] }),
+        }
+    }
+    categories.sort_by(|left, right| right.members.len().cmp(&left.members.len()).then(left.name.cmp(&right.name)));
+
     Ok(OrganizeProposal {
-        categories: plan
-            .categories
-            .into_iter()
-            .map(|category| OrganizeCategory {
-                name: category.name,
-                existing: category.existing,
-                members: category
-                    .members
-                    .into_iter()
-                    .map(|m| member(&m.id, m.reason, m.matched, m.series))
-                    .collect(),
-            })
-            .collect(),
+        categories,
         uncategorized: plan
             .uncategorized
             .iter()
-            .map(|id| member(id, search::sfx_categories::CategoryReason::Keyword, String::new(), None))
+            .map(|id| member(id, search::sfx_categories::CategoryReason::Keyword, String::new(), None, None))
             .collect(),
         already_categorized: skipped.len(),
+        misfiled,
         total_considered,
     })
 }
@@ -1625,34 +1715,451 @@ struct CategoryAssignment {
     asset_id: String,
     /// `None` / empty clears the asset's category.
     category: Option<String>,
+    /// Re-file the track under this media type too (the library check's
+    /// "this is really a sound effect" finds). `None` leaves it alone.
+    #[serde(default)]
+    media_type: Option<String>,
 }
 
 #[derive(serde::Serialize)]
 struct ApplyOrganizationResult {
     undo_id: String,
     assigned: usize,
+    /// Files actually moved into a category folder on disk.
+    moved: usize,
+    /// Category folders that didn't exist before and were created.
+    folders_created: usize,
+    /// Files that kept their category but couldn't be moved, with why.
+    move_failures: Vec<String>,
+}
+
+/// One media-type re-filing Organize did, as recorded for undo/redo.
+#[derive(serde::Serialize, serde::Deserialize, Clone)]
+struct MediaTypeChange {
+    asset: Uuid,
+    from: String,
+    to: String,
+}
+
+/// One file Organize moved, as recorded for undo/redo.
+#[derive(serde::Serialize, serde::Deserialize, Clone)]
+struct FileMove {
+    asset: Uuid,
+    from: PathBuf,
+    to: PathBuf,
+}
+
+/// Undo payload for an Organize run that moved files: the catalog-side
+/// category change is its own (`set_asset_categories`) undo entry, nested
+/// here so one Undo reverts both together.
+#[derive(serde::Serialize, serde::Deserialize)]
+struct OrganizeMovesUndo {
+    category_undo: Uuid,
+    moves: Vec<FileMove>,
+    created_dirs: Vec<PathBuf>,
+    #[serde(default)]
+    media_types: Vec<MediaTypeChange>,
+}
+
+const ORGANIZE_MOVES_UNDO_KIND: &str = "organize_file_moves";
+
+/// The folder a file's category folder is created in: the folder the file
+/// is in now — unless that folder is itself already a category folder
+/// (a re-sort, or a move from the inspector), in which case its parent, so
+/// `_SoundFX/Doors/x.wav` moving to Impacts becomes `_SoundFX/Impacts/x.wav`
+/// rather than `_SoundFX/Doors/Impacts/x.wav`.
+fn category_folder_base(file: &std::path::Path, category_names: &[String]) -> PathBuf {
+    let parent = file.parent().map(PathBuf::from).unwrap_or_default();
+    let parent_name = parent.file_name().and_then(|name| name.to_str()).unwrap_or_default();
+    let is_category_folder = category_names.iter().any(|name| {
+        export_pipeline::sanitize_filename(name).eq_ignore_ascii_case(parent_name)
+    });
+    if is_category_folder {
+        parent.parent().map(PathBuf::from).unwrap_or(parent)
+    } else {
+        parent
+    }
+}
+
+/// `dir/filename`, or `dir/stem (2).ext`, `(3)`… — never an existing path,
+/// so a move can never overwrite another file.
+fn unique_destination(dir: &std::path::Path, filename: &str) -> PathBuf {
+    let candidate = dir.join(filename);
+    if !candidate.exists() {
+        return candidate;
+    }
+    let path = std::path::Path::new(filename);
+    let stem = path.file_stem().and_then(|stem| stem.to_str()).unwrap_or(filename);
+    let extension = path.extension().and_then(|extension| extension.to_str());
+    for counter in 2.. {
+        let name = match extension {
+            Some(extension) => format!("{stem} ({counter}).{extension}"),
+            None => format!("{stem} ({counter})"),
+        };
+        let candidate = dir.join(name);
+        if !candidate.exists() {
+            return candidate;
+        }
+    }
+    unreachable!()
+}
+
+/// Moves one file without ever overwriting: `rename` when it can (same
+/// volume, the normal case for a folder inside the file's own folder),
+/// otherwise copy → verify size → remove the original. The macOS
+/// AppleDouble sidecar (`._name`), if present on a NAS/exFAT share, moves
+/// along with it so the file's Finder metadata isn't orphaned as junk.
+fn move_file_safely(from: &std::path::Path, to: &std::path::Path) -> std::io::Result<()> {
+    if to.exists() {
+        return Err(std::io::Error::new(std::io::ErrorKind::AlreadyExists, "destination already exists"));
+    }
+    if std::fs::rename(from, to).is_err() {
+        let expected = std::fs::metadata(from)?.len();
+        std::fs::copy(from, to)?;
+        let copied = std::fs::metadata(to)?.len();
+        if copied != expected {
+            let _ = std::fs::remove_file(to);
+            return Err(std::io::Error::other("copy was incomplete; original left in place"));
+        }
+        std::fs::remove_file(from)?;
+    }
+    if let (Some(from_name), Some(to_name)) = (from.file_name(), to.file_name()) {
+        let sidecar = from.with_file_name(format!("._{}", from_name.to_string_lossy()));
+        if sidecar.exists() {
+            let _ = std::fs::rename(&sidecar, to.with_file_name(format!("._{}", to_name.to_string_lossy())));
+        }
+    }
+    Ok(())
+}
+
+/// After a move, points the catalog row at the file's new location,
+/// keeping its storage mode (see `Catalog::set_asset_location`).
+fn record_moved_location(catalog: &Catalog, asset: &AssetRecord, to: &std::path::Path) -> Result<(), String> {
+    let path = match &asset.path {
+        AssetPath::Managed(_) => {
+            let library = catalog
+                .get_library(asset.library_id)
+                .map_err(storage_error_message)?
+                .ok_or_else(|| "library not found".to_string())?;
+            match to.strip_prefix(&library.media_root) {
+                Ok(relative) => AssetPath::Managed(relative.to_string_lossy().to_string()),
+                Err(_) => AssetPath::Referenced(to.to_string_lossy().to_string()),
+            }
+        }
+        AssetPath::Referenced(_) => AssetPath::Referenced(to.to_string_lossy().to_string()),
+    };
+    catalog.set_asset_location(asset.id, &path).map_err(storage_error_message)
+}
+
+/// Removes a folder Organize created if nothing real is left in it (Finder
+/// may have dropped a `.DS_Store` in the meantime — that doesn't count).
+fn remove_dir_if_effectively_empty(dir: &std::path::Path) {
+    let Ok(entries) = std::fs::read_dir(dir) else { return };
+    let mut junk = Vec::new();
+    for entry in entries.flatten() {
+        let name = entry.file_name().to_string_lossy().to_string();
+        if import_pipeline::junk_file_kind(&name).is_some() {
+            junk.push(entry.path());
+        } else {
+            return;
+        }
+    }
+    for path in junk {
+        let _ = std::fs::remove_file(path);
+    }
+    let _ = std::fs::remove_dir(dir);
 }
 
 /// Step two of Organize (and the inspector's per-track Category field):
-/// writes the reviewed assignments as one undoable batch. Each asset ends
-/// up in exactly one category (or none) — see `Catalog::set_asset_categories`.
-#[tauri::command]
+/// writes the reviewed assignments as one undoable batch — each asset ends
+/// up in exactly one category (or none), see
+/// `Catalog::set_asset_categories`.
+///
+/// With `move_files`, each categorized file is also moved on disk into a
+/// folder named after its category, created next to it (see
+/// `category_folder_base`). Never overwrites (`unique_destination`), skips
+/// files that aren't reachable right now (they keep their category and are
+/// reported), and records one undo entry covering both the categories and
+/// every move, so a single Undo puts every file back where it was.
+// (async): renames on a NAS share are network round-trips.
+#[tauri::command(async)]
 fn apply_sfx_organization(
+    app: tauri::AppHandle,
     state: tauri::State<CatalogState>,
     assignments: Vec<CategoryAssignment>,
+    move_files: Option<bool>,
 ) -> Result<ApplyOrganizationResult, String> {
+    let mut refile = Vec::new();
     let parsed = assignments
         .into_iter()
         .map(|assignment| {
+            let asset_id = parse_uuid_field(&assignment.asset_id, "asset id")?;
+            if let Some(media_type) = assignment.media_type.filter(|media_type| media_type == "sound_effect") {
+                refile.push((asset_id, media_type));
+            }
             Ok((
-                parse_uuid_field(&assignment.asset_id, "asset id")?,
+                asset_id,
                 assignment.category.map(|name| name.trim().to_string()).filter(|name| !name.is_empty()),
             ))
         })
         .collect::<Result<Vec<_>, String>>()?;
     let catalog = state.0.lock().expect("catalog mutex poisoned");
-    let undo_id = catalog.set_asset_categories(&parsed).map_err(storage_error_message)?;
-    Ok(ApplyOrganizationResult { undo_id: undo_id.to_string(), assigned: parsed.len() })
+    let emit = |done: usize, total: usize| {
+        let _ = tauri::Emitter::emit(&app, "organize-progress", OrganizeProgress { done, total });
+    };
+    organize_assets_with_progress(&catalog, &parsed, &refile, move_files.unwrap_or(false), &emit)
+}
+
+#[cfg(test)]
+fn organize_assets(
+    catalog: &Catalog,
+    parsed: &[(Uuid, Option<String>)],
+    move_files: bool,
+) -> Result<ApplyOrganizationResult, String> {
+    organize_assets_refiling(catalog, parsed, &[], move_files)
+}
+
+/// Category folders emptied by moves (a re-sort or a rename) are removed;
+/// undo recreates any parent it needs when moving files back.
+fn remove_emptied_category_folders(moves: &[FileMove], category_names: &[String]) {
+    let mut seen = std::collections::HashSet::new();
+    for file_move in moves {
+        let Some(parent) = file_move.from.parent() else { continue };
+        if !seen.insert(parent.to_path_buf()) {
+            continue;
+        }
+        let name = parent.file_name().and_then(|name| name.to_str()).unwrap_or_default();
+        let is_category_folder = category_names
+            .iter()
+            .any(|category| export_pipeline::sanitize_filename(category).eq_ignore_ascii_case(name));
+        if is_category_folder {
+            remove_dir_if_effectively_empty(parent);
+        }
+    }
+}
+
+/// Progress of an Organize/rename run, emitted as `organize-progress` so
+/// the activity panel can show a real bar while files move.
+#[derive(serde::Serialize, Clone)]
+struct OrganizeProgress {
+    done: usize,
+    total: usize,
+}
+
+#[cfg(test)]
+fn organize_assets_refiling(
+    catalog: &Catalog,
+    parsed: &[(Uuid, Option<String>)],
+    refile: &[(Uuid, String)],
+    move_files: bool,
+) -> Result<ApplyOrganizationResult, String> {
+    organize_assets_with_progress(catalog, parsed, refile, move_files, &|_, _| {})
+}
+
+fn organize_assets_with_progress(
+    catalog: &Catalog,
+    parsed: &[(Uuid, Option<String>)],
+    refile: &[(Uuid, String)],
+    move_files: bool,
+    progress: &dyn Fn(usize, usize),
+) -> Result<ApplyOrganizationResult, String> {
+    let mut media_types = Vec::new();
+    for (asset_id, media_type) in refile {
+        let Some(asset) = catalog.get_asset(*asset_id).map_err(storage_error_message)? else { continue };
+        if asset.media_type != *media_type {
+            catalog.set_media_type(*asset_id, media_type).map_err(storage_error_message)?;
+            media_types.push(MediaTypeChange { asset: *asset_id, from: asset.media_type, to: media_type.clone() });
+        }
+    }
+    let category_undo = catalog.set_asset_categories(parsed).map_err(storage_error_message)?;
+
+    let mut result = ApplyOrganizationResult {
+        undo_id: category_undo.to_string(),
+        assigned: parsed.len(),
+        moved: 0,
+        folders_created: 0,
+        move_failures: Vec::new(),
+    };
+    if !move_files {
+        if !media_types.is_empty() {
+            let payload = serde_json::to_string(&OrganizeMovesUndo {
+                category_undo,
+                moves: Vec::new(),
+                created_dirs: Vec::new(),
+                media_types,
+            })
+            .map_err(|error| error.to_string())?;
+            result.undo_id = catalog
+                .record_external_undo(ORGANIZE_MOVES_UNDO_KIND, &payload)
+                .map_err(storage_error_message)?
+                .to_string();
+        }
+        return Ok(result);
+    }
+
+    let category_names: Vec<String> = catalog
+        .list_tags()
+        .map_err(storage_error_message)?
+        .into_iter()
+        .filter(|tag| tag.facet.as_deref() == Some(storage::CATEGORY_FACET))
+        .map(|tag| tag.name)
+        .collect();
+    let mut moves = Vec::new();
+    let mut created_dirs: Vec<PathBuf> = Vec::new();
+
+    let total = parsed.len();
+    for (index, (asset_id, category)) in parsed.iter().enumerate() {
+        if index % 10 == 0 {
+            progress(index, total);
+        }
+        let Some(category) = category else { continue };
+        let Some(asset) = catalog.get_asset(*asset_id).map_err(storage_error_message)? else { continue };
+        let Ok(current) = resolve_asset_path(catalog, &asset) else { continue };
+        let from = PathBuf::from(&current);
+        if !from.is_file() {
+            result.move_failures.push(format!("{}: file not reachable right now", asset.original_filename));
+            continue;
+        }
+        let folder = category_folder_base(&from, &category_names).join(export_pipeline::sanitize_filename(category));
+        if from.parent() == Some(folder.as_path()) {
+            continue; // already in its category folder
+        }
+        if !folder.exists() {
+            if let Err(error) = std::fs::create_dir_all(&folder) {
+                result.move_failures.push(format!("{}: couldn't create {}: {error}", asset.original_filename, folder.display()));
+                continue;
+            }
+            created_dirs.push(folder.clone());
+            result.folders_created += 1;
+        }
+        let file_name = from.file_name().map(|name| name.to_string_lossy().to_string()).unwrap_or_default();
+        let to = unique_destination(&folder, &file_name);
+        if let Err(error) = move_file_safely(&from, &to) {
+            result.move_failures.push(format!("{}: {error}", asset.original_filename));
+            continue;
+        }
+        if let Err(error) = record_moved_location(catalog, &asset, &to) {
+            // Put it back rather than leave the catalog pointing at nothing.
+            let _ = move_file_safely(&to, &from);
+            result.move_failures.push(format!("{}: {error}", asset.original_filename));
+            continue;
+        }
+        moves.push(FileMove { asset: asset.id, from, to });
+    }
+
+    progress(total, total);
+    result.moved = moves.len();
+    remove_emptied_category_folders(&moves, &category_names);
+    if !moves.is_empty() || !created_dirs.is_empty() || !media_types.is_empty() {
+        let payload = serde_json::to_string(&OrganizeMovesUndo { category_undo, moves, created_dirs, media_types })
+            .map_err(|error| error.to_string())?;
+        let undo_id = catalog
+            .record_external_undo(ORGANIZE_MOVES_UNDO_KIND, &payload)
+            .map_err(storage_error_message)?;
+        result.undo_id = undo_id.to_string();
+    }
+    Ok(result)
+}
+
+/// Reverses (`forward = false`) or replays (`forward = true`) the file
+/// moves of one Organize run. A file is only moved if it's still exactly
+/// where the run left it and its destination is free — anything the user
+/// has since moved or replaced by hand is left alone, never overwritten.
+fn replay_organize_moves(catalog: &Catalog, undo: &OrganizeMovesUndo, forward: bool) {
+    if forward {
+        for dir in &undo.created_dirs {
+            let _ = std::fs::create_dir_all(dir);
+        }
+    }
+    let ordered: Box<dyn Iterator<Item = &FileMove>> =
+        if forward { Box::new(undo.moves.iter()) } else { Box::new(undo.moves.iter().rev()) };
+    for file_move in ordered {
+        let (source, destination) = if forward { (&file_move.from, &file_move.to) } else { (&file_move.to, &file_move.from) };
+        if !source.is_file() || destination.exists() {
+            continue;
+        }
+        if let Some(parent) = destination.parent() {
+            let _ = std::fs::create_dir_all(parent);
+        }
+        if move_file_safely(source, destination).is_ok() {
+            if let Ok(Some(asset)) = catalog.get_asset(file_move.asset) {
+                if record_moved_location(catalog, &asset, destination).is_err() {
+                    let _ = move_file_safely(destination, source);
+                }
+            }
+        }
+    }
+    for change in &undo.media_types {
+        let _ = catalog.set_media_type(change.asset, if forward { &change.to } else { &change.from });
+    }
+    if forward {
+        let names: Vec<String> = catalog
+            .list_tags()
+            .map(|tags| {
+                tags.into_iter()
+                    .filter(|tag| tag.facet.as_deref() == Some(storage::CATEGORY_FACET))
+                    .map(|tag| tag.name)
+                    .collect()
+            })
+            .unwrap_or_default();
+        remove_emptied_category_folders(&undo.moves, &names);
+    } else {
+        for dir in undo.created_dirs.iter().rev() {
+            remove_dir_if_effectively_empty(dir);
+        }
+    }
+}
+
+/// Renames a category (the sidebar's double-click). Renaming onto another
+/// existing category's name merges the two. Implemented as "move every
+/// track of this category to the new name" through the same path as
+/// Organize, so with `move_files` the files move into the new folder
+/// (emptied old folders are removed), and one Undo reverts all of it.
+#[tauri::command(async)]
+fn rename_sfx_category(
+    app: tauri::AppHandle,
+    state: tauri::State<CatalogState>,
+    library_id: String,
+    tag_id: String,
+    new_name: String,
+    move_files: Option<bool>,
+) -> Result<ApplyOrganizationResult, String> {
+    let library_id = parse_uuid_field(&library_id, "library id")?;
+    let tag_id = parse_uuid_field(&tag_id, "tag id")?;
+    let new_name = new_name.trim().to_string();
+    if new_name.is_empty() {
+        return Err("a category needs a name".into());
+    }
+    let catalog = state.0.lock().expect("catalog mutex poisoned");
+    let emit = |done: usize, total: usize| {
+        let _ = tauri::Emitter::emit(&app, "organize-progress", OrganizeProgress { done, total });
+    };
+    rename_category(&catalog, library_id, tag_id, &new_name, move_files.unwrap_or(false), &emit)
+}
+
+fn rename_category(
+    catalog: &Catalog,
+    library_id: Uuid,
+    tag_id: Uuid,
+    new_name: &str,
+    move_files: bool,
+    progress: &dyn Fn(usize, usize),
+) -> Result<ApplyOrganizationResult, String> {
+    let members = catalog.assets_in_category(library_id, tag_id).map_err(storage_error_message)?;
+    // Same category key ("whooshes" → "Whooshes"): only the display name
+    // changes. Not undoable on its own, and nothing on disk to move.
+    if catalog.find_category_tag(new_name).map_err(storage_error_message)?.is_some_and(|tag| tag.id == tag_id) {
+        catalog.set_category_display_name(tag_id, new_name).map_err(storage_error_message)?;
+        return Ok(ApplyOrganizationResult {
+            undo_id: String::new(),
+            assigned: members.len(),
+            moved: 0,
+            folders_created: 0,
+            move_failures: Vec::new(),
+        });
+    }
+    let parsed: Vec<(Uuid, Option<String>)> = members.into_iter().map(|asset| (asset, Some(new_name.to_string()))).collect();
+    organize_assets_with_progress(catalog, &parsed, &[], move_files, progress)
 }
 
 #[derive(serde::Serialize)]
@@ -4508,6 +5015,18 @@ fn relink_asset(
 fn undo_action(state: tauri::State<CatalogState>, undo_id: String) -> Result<(), String> {
     let undo_id = parse_uuid_field(&undo_id, "undo id")?;
     let catalog = state.0.lock().expect("catalog mutex poisoned");
+    undo_with_files(&catalog, undo_id)
+}
+
+/// `Catalog::undo`, plus the on-disk half of an Organize run that moved files.
+fn undo_with_files(catalog: &Catalog, undo_id: Uuid) -> Result<(), String> {
+    if let Some((kind, payload, false)) = catalog.undo_entry(undo_id).map_err(storage_error_message)? {
+        if kind == ORGANIZE_MOVES_UNDO_KIND {
+            let undo: OrganizeMovesUndo = serde_json::from_str(&payload).map_err(|error| error.to_string())?;
+            replay_organize_moves(catalog, &undo, false);
+            catalog.undo(undo.category_undo).map_err(storage_error_message)?;
+        }
+    }
     catalog.undo(undo_id).map_err(storage_error_message)
 }
 
@@ -4515,6 +5034,17 @@ fn undo_action(state: tauri::State<CatalogState>, undo_id: String) -> Result<(),
 fn redo_action(state: tauri::State<CatalogState>, undo_id: String) -> Result<(), String> {
     let undo_id = parse_uuid_field(&undo_id, "undo id")?;
     let catalog = state.0.lock().expect("catalog mutex poisoned");
+    redo_with_files(&catalog, undo_id)
+}
+
+fn redo_with_files(catalog: &Catalog, undo_id: Uuid) -> Result<(), String> {
+    if let Some((kind, payload, true)) = catalog.undo_entry(undo_id).map_err(storage_error_message)? {
+        if kind == ORGANIZE_MOVES_UNDO_KIND {
+            let undo: OrganizeMovesUndo = serde_json::from_str(&payload).map_err(|error| error.to_string())?;
+            catalog.redo(undo.category_undo).map_err(storage_error_message)?;
+            replay_organize_moves(catalog, &undo, true);
+        }
+    }
     catalog.redo(undo_id).map_err(storage_error_message)
 }
 
@@ -6377,6 +6907,7 @@ pub fn run() {
             clean_up_junk_files,
             propose_sfx_organization,
             apply_sfx_organization,
+            rename_sfx_category,
             list_sfx_categories,
             asset_categories,
             delete_library,
@@ -6713,6 +7244,146 @@ mod tests {
         assert_eq!(files.len(), 2);
         assert!(files.iter().any(|path| path.ends_with("top-level.wav")));
         assert!(files.iter().any(|path| path.ends_with("buried.wav")));
+    }
+
+    fn organize_fixture(name: &str) -> (std::path::PathBuf, storage::Catalog, uuid::Uuid) {
+        let root = std::env::temp_dir().join(format!("darkwave-organize-{name}-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(root.join("_SoundFX")).expect("dir");
+        let catalog = storage::Catalog::open(root.join("lib.darkwave")).expect("catalog");
+        let library = catalog.create_library("Org", root.to_string_lossy()).expect("library");
+        (root, catalog, library.id)
+    }
+
+    fn referenced_asset(catalog: &storage::Catalog, library_id: uuid::Uuid, path: &std::path::Path, hash: &str) -> storage::AssetRecord {
+        std::fs::write(path, hash.as_bytes()).expect("write");
+        match catalog
+            .register_asset(storage::NewAssetRecord {
+                library_id,
+                original_filename: path.file_name().unwrap().to_string_lossy().to_string(),
+                display_name: "x".into(),
+                path: storage::AssetPath::Referenced(path.to_string_lossy().to_string()),
+                storage_mode: shared_types::StorageMode::Referenced,
+                content_hash: Some(hash.into()),
+                media_type: "sound_effect".into(),
+                file_size: hash.len() as u64,
+                availability_state: shared_types::AvailabilityState::Local,
+            })
+            .expect("register")
+        {
+            storage::RegisterAssetOutcome::Created(asset) => asset,
+            other => panic!("unexpected {other:?}"),
+        }
+    }
+
+    #[test]
+    fn organize_moves_files_into_category_folders_and_undo_puts_them_back() {
+        let (root, catalog, library_id) = organize_fixture("move");
+        let sfx = root.join("_SoundFX");
+        let door = referenced_asset(&catalog, library_id, &sfx.join("door-closing.wav"), "door");
+        let slam = referenced_asset(&catalog, library_id, &sfx.join("doorslam.wav"), "slam");
+        std::fs::write(sfx.join("._doorslam.wav"), b"sidecar").expect("sidecar");
+        // A file already sitting where one would land must never be overwritten.
+        std::fs::create_dir_all(sfx.join("Doors")).expect("pre-existing");
+        std::fs::write(sfx.join("Doors").join("doorslam.wav"), b"someone else's").expect("occupant");
+
+        let result = super::organize_assets(
+            &catalog,
+            &[(door.id, Some("Doors".into())), (slam.id, Some("Doors".into()))],
+            true,
+        )
+        .expect("organize");
+        assert_eq!(result.moved, 2);
+        assert_eq!(result.folders_created, 0, "Doors already existed");
+        assert!(sfx.join("Doors/door-closing.wav").is_file());
+        assert!(sfx.join("Doors/doorslam (2).wav").is_file());
+        assert_eq!(std::fs::read(sfx.join("Doors/doorslam.wav")).unwrap(), b"someone else's");
+        assert!(sfx.join("Doors/._doorslam (2).wav").is_file(), "sidecar travels with its file");
+        let moved = catalog.get_asset(door.id).unwrap().unwrap();
+        assert_eq!(moved.path, storage::AssetPath::Referenced(sfx.join("Doors/door-closing.wav").to_string_lossy().to_string()));
+
+        // Re-sorting moves sideways, never nests.
+        let undo_id = result.undo_id.parse().unwrap();
+        let resort = super::organize_assets(&catalog, &[(door.id, Some("Impacts".into()))], true).expect("resort");
+        assert!(sfx.join("Impacts/door-closing.wav").is_file());
+        assert!(!sfx.join("Doors/Impacts").exists());
+        super::undo_with_files(&catalog, resort.undo_id.parse().unwrap()).expect("undo resort");
+        assert!(!sfx.join("Impacts").exists(), "created folder removed once empty");
+
+        super::undo_with_files(&catalog, undo_id).expect("undo");
+        assert!(sfx.join("door-closing.wav").is_file());
+        assert!(sfx.join("doorslam.wav").is_file());
+        assert!(sfx.join("Doors/doorslam.wav").is_file(), "the occupant is untouched");
+        assert!(catalog.asset_categories_for_library(library_id).unwrap().is_empty());
+
+        super::redo_with_files(&catalog, undo_id).expect("redo");
+        assert!(sfx.join("Doors/door-closing.wav").is_file());
+        assert_eq!(catalog.asset_categories_for_library(library_id).unwrap()[&door.id].1, "Doors");
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn renaming_a_category_moves_its_folder_and_merging_works_too() {
+        let (root, catalog, library_id) = organize_fixture("rename");
+        let sfx = root.join("_SoundFX");
+        let a = referenced_asset(&catalog, library_id, &sfx.join("a.wav"), "a");
+        let b = referenced_asset(&catalog, library_id, &sfx.join("b.wav"), "b");
+        let c = referenced_asset(&catalog, library_id, &sfx.join("c.wav"), "c");
+        super::organize_assets(&catalog, &[(a.id, Some("Wooshes".into())), (b.id, Some("Wooshes".into())), (c.id, Some("Whooshes".into()))], true)
+            .expect("organize");
+        let typo = catalog.find_category_tag("Wooshes").unwrap().unwrap();
+
+        // Rename the typo onto the existing "Whooshes": a merge.
+        let result = super::rename_category(&catalog, library_id, typo.id, "Whooshes", true, &|_, _| {}).expect("rename");
+        assert_eq!(result.moved, 2);
+        assert!(sfx.join("Whooshes/a.wav").is_file() && sfx.join("Whooshes/c.wav").is_file());
+        assert!(!sfx.join("Wooshes").exists(), "the emptied old folder is gone");
+        let counts = catalog.category_counts_for_library(library_id).unwrap();
+        assert_eq!(counts.iter().map(|(tag, n)| (tag.name.clone(), *n)).collect::<Vec<_>>(), vec![("Whooshes".to_string(), 3)]);
+
+        // One undo un-merges, files and all.
+        super::undo_with_files(&catalog, result.undo_id.parse().unwrap()).expect("undo");
+        assert!(sfx.join("Wooshes/a.wav").is_file());
+        assert_eq!(catalog.asset_categories_for_library(library_id).unwrap()[&a.id].1, "Wooshes");
+
+        // Capitalization-only rename keeps the same category.
+        let whooshes = catalog.find_category_tag("Whooshes").unwrap().unwrap();
+        super::rename_category(&catalog, library_id, whooshes.id, "WHOOSHES", true, &|_, _| {}).expect("case rename");
+        assert_eq!(catalog.asset_categories_for_library(library_id).unwrap()[&c.id].1, "WHOOSHES");
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn refiling_a_misfiled_sound_effect_is_undone_with_the_rest() {
+        let (root, catalog, library_id) = organize_fixture("refile");
+        let asset = referenced_asset(&catalog, library_id, &root.join("_SoundFX/whoosh.wav"), "w");
+        catalog.set_media_type(asset.id, "music").unwrap();
+        let result = super::organize_assets_refiling(
+            &catalog,
+            &[(asset.id, Some("Whooshes".into()))],
+            &[(asset.id, "sound_effect".into())],
+            false,
+        )
+        .expect("refile");
+        assert_eq!(catalog.get_asset(asset.id).unwrap().unwrap().media_type, "sound_effect");
+        super::undo_with_files(&catalog, result.undo_id.parse().unwrap()).expect("undo");
+        assert_eq!(catalog.get_asset(asset.id).unwrap().unwrap().media_type, "music");
+        assert!(catalog.asset_categories_for_library(library_id).unwrap().is_empty());
+        super::redo_with_files(&catalog, result.undo_id.parse().unwrap()).expect("redo");
+        assert_eq!(catalog.get_asset(asset.id).unwrap().unwrap().media_type, "sound_effect");
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn organize_keeps_the_category_but_reports_unreachable_files() {
+        let (root, catalog, library_id) = organize_fixture("offline");
+        let gone = referenced_asset(&catalog, library_id, &root.join("_SoundFX/whoosh.wav"), "w");
+        std::fs::remove_file(root.join("_SoundFX/whoosh.wav")).unwrap();
+        let result = super::organize_assets(&catalog, &[(gone.id, Some("Whooshes".into()))], true).expect("organize");
+        assert_eq!(result.moved, 0);
+        assert_eq!(result.move_failures.len(), 1);
+        assert!(!root.join("_SoundFX/Whooshes").exists());
+        assert_eq!(catalog.asset_categories_for_library(library_id).unwrap()[&gone.id].1, "Whooshes");
+        let _ = std::fs::remove_dir_all(&root);
     }
 
     #[test]

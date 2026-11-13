@@ -7,6 +7,23 @@ Newest entry on top. Add a new entry, don't edit old ones.
 
 ---
 
+## 2026-11-13 — 0.3.3 (build 15): Organize sound effects + junk cleanup — pull main once #13–#15 are merged
+
+No new deps. `cargo test --workspace` passes on macOS.
+
+1. **Organize** (folder icon next to Settings) checks the whole library, sorts sound effects
+   into categories (name, UCS code, folder, numbering) and can move files into category folders
+   on disk, with one undo. Read `docs/adr/0036-sfx-auto-organize-and-junk-cleanup.md` before
+   touching it. Please try it on Windows paths (`\` separators, drive letters) and log anything odd
+   in bug-log.md.
+2. **Settings › Clean Up Junk Files** removes macOS `._` files etc.; `._` files are no longer imported.
+3. **Windows CI is red** (`ort-sys` build script, `build.rs:126` file copy "path not found") since
+   2026-11-13, unrelated to these changes. Does `cargo test --workspace` pass on your machine?
+4. Release builds on macOS needed `[profile.release.build-override] strip = false` (PR #14);
+   harmless on Windows.
+
+---
+
 ## 2026-09-23 — Recently Added view + sends now target one project, not all of them — pull main
 
 Two changes, no new deps, no build-step changes. `cargo test --workspace` and
