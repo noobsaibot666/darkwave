@@ -2107,6 +2107,54 @@ impl Catalog {
         Ok(rows)
     }
 
+    /// Changes only a category's display name (e.g. "whooshes" → "Whooshes"),
+    /// for a rename that resolves to the same category key.
+    pub fn set_category_display_name(&self, tag_id: Uuid, name: &str) -> Result<(), StorageError> {
+        self.connection.execute(
+            "UPDATE tags SET name = ?1 WHERE id = ?2 AND facet = ?3",
+            params![name.trim(), tag_id.to_string(), CATEGORY_FACET],
+        )?;
+        Ok(())
+    }
+
+    /// The category tag a name resolves to, without creating one.
+    pub fn find_category_tag(&self, name: &str) -> Result<Option<TagRecord>, StorageError> {
+        let plain_key = normalize_term(name.trim());
+        for key in [format!("{CATEGORY_FACET}:{plain_key}"), plain_key] {
+            let tag = self
+                .connection
+                .query_row(
+                    "SELECT id, name, normalized_name, facet, is_system FROM tags WHERE normalized_name = ?1",
+                    params![key],
+                    tag_from_row,
+                )
+                .optional()?;
+            if let Some(tag) = tag.filter(|tag| tag.facet.as_deref() == Some(CATEGORY_FACET)) {
+                return Ok(Some(tag));
+            }
+        }
+        Ok(None)
+    }
+
+    /// Non-trashed assets of this library currently in category `tag_id`
+    /// (accepted rows only) — what a category rename/merge moves.
+    pub fn assets_in_category(&self, library_id: Uuid, tag_id: Uuid) -> Result<Vec<Uuid>, StorageError> {
+        let mut statement = self.connection.prepare(
+            "SELECT asset_tags.asset_id FROM asset_tags
+             JOIN assets ON assets.id = asset_tags.asset_id AND assets.library_id = ?1
+             WHERE asset_tags.tag_id = ?2 AND asset_tags.approval_state = 'accepted'
+               AND NOT EXISTS (
+                 SELECT 1 FROM trash_items WHERE trash_items.asset_id = assets.id AND trash_items.state = 'in_trash'
+               )",
+        )?;
+        let rows = statement
+            .query_map(params![library_id.to_string(), tag_id.to_string()], |row| {
+                Ok(parse_uuid(row.get::<_, String>(0)?))
+            })?
+            .collect::<Result<Vec<_>, _>>()?;
+        Ok(rows)
+    }
+
     /// Every category tag that has at least one non-trashed asset in this
     /// library, with its count — the sidebar's Sound Effects › By category list.
     pub fn category_counts_for_library(&self, library_id: Uuid) -> Result<Vec<(TagRecord, usize)>, StorageError> {

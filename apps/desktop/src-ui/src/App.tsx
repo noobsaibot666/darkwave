@@ -257,7 +257,7 @@ const JUNK_KIND_ORDER: JunkKind[] = ["apple_double", "system_file", "empty", "un
 
 // Organize (see propose_sfx_organization / apply_sfx_organization in
 // src-tauri and crates/search/src/sfx_categories.rs).
-type OrganizeReason = "existing" | "keyword" | "series" | "shared_word";
+type OrganizeReason = "existing" | "ucs" | "keyword" | "folder" | "series" | "shared_word";
 
 type OrganizeMember = {
   asset_id: string;
@@ -268,12 +268,15 @@ type OrganizeMember = {
   reason: OrganizeReason;
   matched: string;
   series: string | null;
+  // Set when the check found a sound effect filed as something else.
+  reclassify_from: string | null;
 };
 
 type OrganizeProposal = {
   categories: { name: string; existing: boolean; members: OrganizeMember[] }[];
   uncategorized: OrganizeMember[];
   already_categorized: number;
+  misfiled: number;
   total_considered: number;
 };
 
@@ -294,6 +297,16 @@ function shortFolder(path: string): string {
 }
 
 // The media types Organize works on, and what to call them in the UI.
+const MEDIA_TYPE_LABELS: Record<string, string> = {
+  music: "Soundtrack",
+  ambience: "Ambience",
+  other: "Other",
+  needs_review: "Needs Review",
+  foley: "Foley",
+  voiceover: "Voiceover",
+  sound_effect: "Sound Effect",
+};
+
 const ORGANIZABLE_MEDIA_TYPES: Record<string, string> = {
   sound_effect: "Sound Effects",
   foley: "Foley",
@@ -309,6 +322,8 @@ type OrganizeDraft = {
   includeCategorized: boolean;
   // Also move each file into a folder named after its category on disk.
   moveFiles: boolean;
+  // Re-file the sound effects the check found under Music/Ambience/….
+  refile: boolean;
   loading: boolean;
   busy: boolean;
   error: string | null;
@@ -324,8 +339,12 @@ function organizeReasonLabel(member: OrganizeMember): string {
   switch (member.reason) {
     case "existing":
       return member.matched ? `matches your category via "${member.matched}"` : "already in this category";
+    case "ucs":
+      return `UCS code ${member.matched}`;
     case "keyword":
       return member.matched ? `"${member.matched}" in the name` : "no match";
+    case "folder":
+      return `"${member.matched}" in its folder`;
     case "series":
       return `numbered series "${member.series ?? member.matched}"`;
     case "shared_word":
@@ -1565,6 +1584,14 @@ export function App() {
   const [categoryInput, setCategoryInput] = useState("");
   // Result of the last Organize / category move, shown above the list.
   const [organizeStatus, setOrganizeStatus] = useState<string | null>(null);
+  // Sidebar inline rename of a category.
+  const [renamingCategory, setRenamingCategory] = useState<{ tagId: string; value: string } | null>(null);
+  // "Move to Category…" picker for the selected tracks.
+  const [categoryPicker, setCategoryPicker] = useState<{ assetIds: string[]; value: string } | null>(null);
+  const [dragOverCategoryId, setDragOverCategoryId] = useState<string | null>(null);
+  // The drag-and-drop effect is set up before handleSetCategory exists;
+  // it calls through this ref so it always reaches the current one.
+  const handleSetCategoryRef = useRef<(assetIds: string[], category: string | null) => void>(() => {});
   const [appliedTags, setAppliedTags] = useState<TagRecord[]>([]);
   const [suggestedTags, setSuggestedTags] = useState<TagRecord[]>([]);
   const [assetInstruments, setAssetInstruments] = useState<{ name: string; confidence: number }[]>([]);
@@ -2988,11 +3015,6 @@ export function App() {
     }
   }, [activeLibraryId, sfxCategories.length]);
 
-  // Which category the Organize button works on: the one being browsed if
-  // it's organizable, otherwise Sound Effects.
-  const organizeMediaType =
-    typeof activeFilter === "string" && activeFilter in ORGANIZABLE_MEDIA_TYPES ? activeFilter : "sound_effect";
-
   // Organize, step one: fetch a proposal (read-only) and turn it into an
   // editable draft. Nothing is written until handleApplyOrganize.
   const handleOpenOrganize = useCallback(
@@ -3002,6 +3024,7 @@ export function App() {
         mediaType,
         includeCategorized,
         moveFiles: current?.moveFiles ?? true,
+        refile: current?.refile ?? true,
         loading: true,
         busy: false,
         error: null,
@@ -3051,18 +3074,23 @@ export function App() {
   // Groups that will actually be written: included, named, with members.
   // Two groups renamed to the same name (case-insensitive) merge into one.
   const organizeSummary = useMemo(() => {
-    if (!organizeDraft) return { assignments: [] as { asset_id: string; category: string }[], categoryCount: 0 };
+    if (!organizeDraft)
+      return { assignments: [] as { asset_id: string; category: string; media_type?: string }[], categoryCount: 0, refiled: 0 };
     const groupByKey = new Map(organizeDraft.groups.map((group) => [group.key, group]));
-    const assignments: { asset_id: string; category: string }[] = [];
+    const assignments: { asset_id: string; category: string; media_type?: string }[] = [];
     const names = new Set<string>();
+    let refiled = 0;
     for (const [assetId, key] of Object.entries(organizeDraft.assignment)) {
       const group = key ? groupByKey.get(key) : undefined;
       const name = group?.name.trim();
       if (!group || !group.included || !name) continue;
-      assignments.push({ asset_id: assetId, category: name });
+      const misfiled = Boolean(organizeDraft.members[assetId]?.reclassify_from);
+      if (misfiled && !organizeDraft.refile) continue;
+      assignments.push(misfiled ? { asset_id: assetId, category: name, media_type: "sound_effect" } : { asset_id: assetId, category: name });
+      if (misfiled) refiled += 1;
       names.add(name.toLowerCase());
     }
-    return { assignments, categoryCount: names.size };
+    return { assignments, categoryCount: names.size, refiled };
   }, [organizeDraft]);
 
   const handleApplyOrganize = useCallback(async () => {
@@ -3075,11 +3103,12 @@ export function App() {
         assignments,
         moveFiles: organizeDraft.moveFiles,
       });
-      const label = `Organize ${result.assigned} ${ORGANIZABLE_MEDIA_TYPES[organizeDraft.mediaType] ?? "sounds"} into ${categoryCount} ${categoryCount === 1 ? "category" : "categories"}`;
+      const label = `Organize ${result.assigned} sound effects into ${categoryCount} ${categoryCount === 1 ? "category" : "categories"}`;
       setUndoStack((previous) => [...previous, { id: result.undo_id, label }]);
       setOrganizeStatus(
         [
-          `Organized ${result.assigned} ${result.assigned === 1 ? "sound" : "sounds"} into ${categoryCount} ${categoryCount === 1 ? "category" : "categories"}`,
+          `Organized ${result.assigned} ${result.assigned === 1 ? "sound effect" : "sound effects"} into ${categoryCount} ${categoryCount === 1 ? "category" : "categories"}`,
+          organizeSummary.refiled > 0 ? `re-filed ${organizeSummary.refiled} found elsewhere as Sound Effects` : null,
           organizeDraft.moveFiles
             ? `moved ${result.moved} ${result.moved === 1 ? "file" : "files"} into category folders${result.folders_created > 0 ? ` (${result.folders_created} new)` : ""}`
             : null,
@@ -3107,8 +3136,16 @@ export function App() {
     (assetIds: string[], category: string | null) => {
       if (assetIds.length === 0 || !activeLibraryId) return;
       const name = category?.trim() || null;
+      const mediaTypeOf = new Map(assets.map((asset) => [asset.id, asset.media_type]));
       invoke<ApplyOrganizationResult>("apply_sfx_organization", {
-        assignments: assetIds.map((asset_id) => ({ asset_id, category: name })),
+        // A track moved into a category by hand is a sound effect by the
+        // user's own say-so; re-file it if it was filed as music etc.
+        assignments: assetIds.map((asset_id) => {
+          const mediaType = mediaTypeOf.get(asset_id);
+          return name && mediaType && !(mediaType in ORGANIZABLE_MEDIA_TYPES)
+            ? { asset_id, category: name, media_type: "sound_effect" }
+            : { asset_id, category: name };
+        }),
         // Setting a category files the track into that category's folder
         // on disk too, same as Organize; clearing leaves the file put.
         moveFiles: name !== null,
@@ -3132,7 +3169,40 @@ export function App() {
         })
         .catch((error) => setOrganizeStatus(`Couldn't set the category: ${String(error)}`));
     },
-    [activeLibraryId, refreshSfxCategories, selectedAssetId, refreshAssetTags, activeFilter, refreshAssets, searchQuery]
+    [activeLibraryId, refreshSfxCategories, selectedAssetId, refreshAssetTags, activeFilter, refreshAssets, searchQuery, assets]
+  );
+
+  handleSetCategoryRef.current = handleSetCategory;
+
+  // Sidebar rename (Enter) — renaming onto another category's name merges
+  // them; files move into the renamed folder too. One undo step.
+  const handleRenameCategory = useCallback(
+    (tagId: string, oldName: string, newName: string) => {
+      const name = newName.trim();
+      setRenamingCategory(null);
+      if (!activeLibraryId || !name || name === oldName) return;
+      const merging = sfxCategories.some((category) => category.tag_id !== tagId && category.name.toLowerCase() === name.toLowerCase());
+      invoke<ApplyOrganizationResult>("rename_sfx_category", { libraryId: activeLibraryId, tagId, newName: name, moveFiles: true })
+        .then((result) => {
+          if (result.undo_id) {
+            setUndoStack((previous) => [
+              ...previous,
+              { id: result.undo_id, label: merging ? `Merge "${oldName}" into "${name}"` : `Rename "${oldName}" to "${name}"` },
+            ]);
+            setRedoStack([]);
+          }
+          setOrganizeStatus(
+            `${merging ? `Merged "${oldName}" into` : `Renamed "${oldName}" to`} "${name}"` +
+              (result.moved > 0 ? ` · moved ${result.moved} ${result.moved === 1 ? "file" : "files"}` : "") +
+              (result.move_failures.length > 0 ? ` · ${result.move_failures.length} not moved` : "") +
+              (result.undo_id ? ". ⌘Z undoes it." : ".")
+          );
+          refreshSfxCategories(activeLibraryId);
+          refreshAssets(activeLibraryId, searchQuery, activeFilter);
+        })
+        .catch((error) => setOrganizeStatus(`Couldn't rename: ${String(error)}`));
+    },
+    [activeLibraryId, sfxCategories, refreshSfxCategories, refreshAssets, searchQuery, activeFilter]
   );
 
   useEffect(() => {
@@ -3815,10 +3885,10 @@ export function App() {
       }
       dragPreviewX.set(event.clientX);
       dragPreviewY.set(event.clientY);
-      const hovered = (event.target as HTMLElement | null)
-        ?.ownerDocument?.elementFromPoint(event.clientX, event.clientY)
-        ?.closest<HTMLElement>("[data-drop-project-id]");
+      const under = (event.target as HTMLElement | null)?.ownerDocument?.elementFromPoint(event.clientX, event.clientY);
+      const hovered = under?.closest<HTMLElement>("[data-drop-project-id]");
       setDragOverProjectId(hovered?.dataset.dropProjectId ?? null);
+      setDragOverCategoryId(under?.closest<HTMLElement>("[data-drop-category-id]")?.dataset.dropCategoryId ?? null);
     };
 
     const handlePointerUp = (event: PointerEvent) => {
@@ -3827,12 +3897,20 @@ export function App() {
       dragActiveRef.current = false;
       setDragPreview(null);
       setDragOverProjectId(null);
+      setDragOverCategoryId(null);
       if (!wasDragging) return;
       suppressNextRowClickRef.current = true;
-      const hovered = document.elementFromPoint(event.clientX, event.clientY)?.closest<HTMLElement>("[data-drop-project-id]");
+      const under = document.elementFromPoint(event.clientX, event.clientY);
+      const hovered = under?.closest<HTMLElement>("[data-drop-project-id]");
       const projectId = hovered?.dataset.dropProjectId;
       const ids = draggedIdsRef.current;
       draggedIdsRef.current = [];
+      // Dropped on a sidebar category: move the dragged tracks into it.
+      const categoryName = under?.closest<HTMLElement>("[data-drop-category-id]")?.dataset.dropCategoryName;
+      if (categoryName && ids.length > 0) {
+        handleSetCategoryRef.current(ids, categoryName);
+        return;
+      }
       if (!projectId || ids.length === 0) return;
       const project = collections.find((entry) => entry.id === projectId);
       if (!project || project.collection_type !== "Project") return;
@@ -6540,29 +6618,47 @@ export function App() {
               </button>
               {sfxSubcategoriesOpen ? (
                 <>
-                  {sfxCategories.map((category) => (
-                    <button
-                      key={category.tag_id}
-                      className={
-                        typeof activeFilter === "object" && "tag" in activeFilter && activeFilter.tag === category.tag_id
-                          ? "nav-subitem nav-subitem-counted active"
-                          : "nav-subitem nav-subitem-counted"
-                      }
-                      onClick={() => setActiveFilter({ tag: category.tag_id })}
-                    >
-                      <span>{category.name}</span>
-                      <small>{category.count}</small>
-                    </button>
-                  ))}
-                  <button
-                    className="nav-subitem nav-subitem-action"
-                    disabled={!activeLibraryId}
-                    title="Sort sound effects into categories from their file names"
-                    onClick={() => handleOpenOrganize("sound_effect", false)}
-                  >
-                    <FolderTree size={11} />
-                    {sfxCategories.length === 0 ? "Organize into categories…" : "Organize new sounds…"}
-                  </button>
+                  {sfxCategories.map((category) =>
+                    renamingCategory?.tagId === category.tag_id ? (
+                      <input
+                        key={category.tag_id}
+                        className="nav-subitem-rename"
+                        aria-label={`Rename ${category.name}`}
+                        autoFocus
+                        value={renamingCategory.value}
+                        onChange={(event) => setRenamingCategory({ tagId: category.tag_id, value: event.target.value })}
+                        onBlur={() => setRenamingCategory(null)}
+                        onKeyDown={(event) => {
+                          if (event.key === "Enter") handleRenameCategory(category.tag_id, category.name, renamingCategory.value);
+                          if (event.key === "Escape") setRenamingCategory(null);
+                        }}
+                      />
+                    ) : (
+                      <button
+                        key={category.tag_id}
+                        data-drop-category-id={category.tag_id}
+                        data-drop-category-name={category.name}
+                        title="Click to open · double-click to rename · drop tracks here to move them"
+                        className={[
+                          "nav-subitem nav-subitem-counted",
+                          typeof activeFilter === "object" && "tag" in activeFilter && activeFilter.tag === category.tag_id ? "active" : "",
+                          dragOverCategoryId === category.tag_id ? "drag-over" : "",
+                        ]
+                          .filter(Boolean)
+                          .join(" ")}
+                        onClick={() => setActiveFilter({ tag: category.tag_id })}
+                        onDoubleClick={() => setRenamingCategory({ tagId: category.tag_id, value: category.name })}
+                      >
+                        <span>{category.name}</span>
+                        <small>{category.count}</small>
+                      </button>
+                    )
+                  )}
+                  {sfxCategories.length === 0 ? (
+                    <span className="nav-subitem nav-subitem-hint">
+                      Use <FolderTree size={11} /> at the top to sort sound effects
+                    </span>
+                  ) : null}
                 </>
               ) : null}
               <button
@@ -6880,6 +6976,15 @@ export function App() {
             <Archive size={17} />
             {trashItems.length > 0 ? <span className="icon-button-badge">{trashItems.length}</span> : null}
           </button>
+          <button
+            className="icon-button"
+            aria-label="Organize sound effects"
+            title="Organize sound effects: check the library, find sound effects and sort them into categories"
+            disabled={!activeLibraryId}
+            onClick={() => handleOpenOrganize("sound_effect", false)}
+          >
+            <FolderTree size={17} />
+          </button>
           <button className="icon-button" aria-label="Open settings" onClick={() => setSettingsOpen(true)}>
             <Settings size={17} />
           </button>
@@ -7068,16 +7173,7 @@ export function App() {
               Similar Sounds
             </button>
           )}
-          <button
-            type="button"
-            className="text-button"
-            disabled={!activeLibraryId}
-            title={`Sort ${ORGANIZABLE_MEDIA_TYPES[organizeMediaType]} into categories from their file names. You review everything before it's applied.`}
-            onClick={() => handleOpenOrganize(organizeMediaType, false)}
-          >
-            <FolderTree size={13} />
-            Organize {ORGANIZABLE_MEDIA_TYPES[organizeMediaType]}
-          </button>
+
           {hasActiveRangeFilters(rangeFilters) || formatFilter || similarToAssetId ? (
             <>
               <button
@@ -7431,6 +7527,17 @@ export function App() {
                     : selectedAsset?.review_state === "Reviewed"
                       ? "Mark Unreviewed"
                       : "Mark Reviewed"}
+                </button>
+                <button
+                  type="button"
+                  className="row-context-menu-item"
+                  onClick={() => {
+                    setCategoryPicker({ assetIds: bulkAssetIds, value: "" });
+                    setRowContextMenuPosition(null);
+                  }}
+                >
+                  <FolderTree size={15} />
+                  Move to Category…
                 </button>
                 <div className="row-context-menu-separator" />
                 <div className="row-context-menu-classify-row">
@@ -9939,6 +10046,94 @@ export function App() {
       ) : null}
       </AnimatePresence>
       <AnimatePresence>
+      {categoryPicker ? (
+        <motion.div
+          className="modal-overlay"
+          onClick={() => setCategoryPicker(null)}
+          initial={{ opacity: 0 }}
+          animate={{ opacity: 1 }}
+          exit={{ opacity: 0 }}
+          transition={{ duration: 0.18 }}
+        >
+          <motion.div
+            className="modal-card category-picker-card"
+            onClick={(event) => event.stopPropagation()}
+            aria-label="Move to category"
+            initial={{ opacity: 0, scale: 0.96, y: 10 }}
+            animate={{ opacity: 1, scale: 1, y: 0 }}
+            exit={{ opacity: 0, scale: 0.96, y: 10 }}
+            transition={{ duration: 0.2, ease: [0.4, 0, 0.2, 1] }}
+          >
+            <div className="modal-head">
+              <h1>
+                Move {categoryPicker.assetIds.length === 1 ? "track" : `${categoryPicker.assetIds.length} tracks`} to…
+              </h1>
+              <button type="button" className="icon-button" aria-label="Close" onClick={() => setCategoryPicker(null)}>
+                <X size={16} />
+              </button>
+            </div>
+            <div className="settings-stack">
+              {sfxCategories.length > 0 ? (
+                <div className="category-chips">
+                  {sfxCategories.map((category) => (
+                    <button
+                      key={category.tag_id}
+                      type="button"
+                      className="category-chip"
+                      onClick={() => {
+                        handleSetCategory(categoryPicker.assetIds, category.name);
+                        setCategoryPicker(null);
+                      }}
+                    >
+                      {category.name}
+                      <small>{category.count}</small>
+                    </button>
+                  ))}
+                </div>
+              ) : null}
+              <div className="setup-field-row">
+                <input
+                  autoFocus
+                  placeholder="New category name"
+                  value={categoryPicker.value}
+                  onChange={(event) => setCategoryPicker({ ...categoryPicker, value: event.target.value })}
+                  onKeyDown={(event) => {
+                    if (event.key === "Enter" && categoryPicker.value.trim()) {
+                      handleSetCategory(categoryPicker.assetIds, categoryPicker.value.trim());
+                      setCategoryPicker(null);
+                    }
+                  }}
+                />
+                <button
+                  type="button"
+                  disabled={!categoryPicker.value.trim()}
+                  onClick={() => {
+                    handleSetCategory(categoryPicker.assetIds, categoryPicker.value.trim());
+                    setCategoryPicker(null);
+                  }}
+                >
+                  Move
+                </button>
+              </div>
+              {categoryPicker.assetIds.some((id) => assetCategoryById[id]) ? (
+                <button
+                  type="button"
+                  className="text-button"
+                  onClick={() => {
+                    handleSetCategory(categoryPicker.assetIds, null);
+                    setCategoryPicker(null);
+                  }}
+                >
+                  Remove from category
+                </button>
+              ) : null}
+              <p className="settings-hint">The files move into that category's folder on the drive too. ⌘Z undoes it.</p>
+            </div>
+          </motion.div>
+        </motion.div>
+      ) : null}
+      </AnimatePresence>
+      <AnimatePresence>
       {organizeDraft ? (
         <motion.div
           className="modal-overlay"
@@ -9958,7 +10153,7 @@ export function App() {
             transition={{ duration: 0.2, ease: [0.4, 0, 0.2, 1] }}
           >
             <div className="modal-head">
-              <h1>Organize {ORGANIZABLE_MEDIA_TYPES[organizeDraft.mediaType]}</h1>
+              <h1>Organize Sound Effects</h1>
               <button
                 type="button"
                 className="icon-button"
@@ -9972,7 +10167,7 @@ export function App() {
             {(() => {
               const draft = organizeDraft;
               const proposal = draft.proposal;
-              if (draft.loading) return <p className="settings-hint">Reading file names…</p>;
+              if (draft.loading) return <p className="settings-hint">Checking the library…</p>;
               if (!proposal) return <p className="settings-hint">{draft.error ?? "Couldn't build a proposal."}</p>;
 
               const update = (change: (current: OrganizeDraft) => OrganizeDraft) =>
@@ -10017,6 +10212,14 @@ export function App() {
               const memberRow = (member: OrganizeMember, currentKey: string) => (
                 <li key={member.asset_id}>
                   <span className="organize-member-name" title={member.filename}>
+                    {member.reclassify_from ? (
+                      <span
+                        className="organize-refile-badge"
+                        title={`Filed as ${MEDIA_TYPE_LABELS[member.reclassify_from] ?? member.reclassify_from}, but looks like a sound effect`}
+                      >
+                        was {MEDIA_TYPE_LABELS[member.reclassify_from] ?? member.reclassify_from}
+                      </span>
+                    ) : null}
                     {member.filename}
                   </span>
                   <small>{organizeReasonLabel(member)}</small>
@@ -10045,10 +10248,30 @@ export function App() {
               return (
                 <div className="settings-stack">
                   <p className="settings-hint">
-                    Proposed {draft.groups.length} {draft.groups.length === 1 ? "category" : "categories"} for{" "}
-                    {toSort - uncategorized.length} of {toSort} sounds, from their file names. Rename, untick or move
-                    anything before applying. Each category then shows up under Sound Effects › By category.
+                    Checked {proposal.total_considered} tracks in this library. Proposed {draft.groups.length}{" "}
+                    {draft.groups.length === 1 ? "category" : "categories"} for {toSort - uncategorized.length} sound
+                    effects, from their names, UCS codes, folders and numbering. Rename, untick or move anything before
+                    applying. Each category then shows up under Sound Effects › By category.
                   </p>
+                  {proposal.misfiled > 0 ? (
+                    <label className="junk-cleanup-option organize-move-option">
+                      <input
+                        type="checkbox"
+                        checked={draft.refile}
+                        disabled={draft.busy}
+                        onChange={(event) => update((current) => ({ ...current, refile: event.target.checked }))}
+                      />
+                      <span>
+                        <strong>
+                          Re-file {proposal.misfiled} sound {proposal.misfiled === 1 ? "effect" : "effects"} found filed as
+                          something else
+                        </strong>
+                        <br />
+                        Tracks filed as Soundtrack, Ambience or Other that are clearly sound effects (by name, UCS code, folder
+                        and length). They're marked "was …" below; move one to "Leave uncategorized" to keep it where it is.
+                      </span>
+                    </label>
+                  ) : null}
                   <label className="junk-cleanup-option organize-move-option">
                     <input
                       type="checkbox"

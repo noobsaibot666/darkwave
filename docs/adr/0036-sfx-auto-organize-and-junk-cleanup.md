@@ -91,6 +91,28 @@ files before `apply_sfx_organization`. Assets that already have a
 category are left out unless the user opts in, so re-running after an
 import only sorts the new files and never overrides a choice made by hand.
 
+*Revised again 2026-11-13, after a run on the real 4,471-track
+library:* Organize is a **whole-library check**, started from one icon
+next to Settings. Every imported track except Voiceover and Foley (those
+are deliberate, see the export taxonomy) is considered, and the engine
+also answers "is this really a sound effect?" for tracks filed as music,
+ambience, other or needs-review (`sfx_evidence`: UCS code +3, under an
+SFX folder +2, under a music folder −3, a specific word in the file name
++2 / only in its folder +1, ≤15 s +1, >2 min −1, >5 min −2; re-filed at
+≥3, never an ambience whose category is itself ambient). Category
+signals added: **UCS CatIDs** (`DSGNSynth_…`) and the **nearest folder
+names** (`Whooshes/170 Other Whooshes/01_001.wav`), with the file name
+outweighing folders. Fallback groups need ≥3 files and get a 2-word
+name. On the real library this went from 138 categories (46 with one or
+two files) and 134 uncategorized to 39 categories and 30 uncategorized,
+whooshes from 508 to 609, plus 41 misfiled sound effects found (36 filed
+as music), each checked by hand against the real file names.
+
+Categories can be renamed in the sidebar (renaming onto another
+category's name merges them), and tracks moved between categories by
+drag-and-drop onto the sidebar or "Move to Category…". Both go through
+the same move-and-undo path as Organize, folders included.
+
 The engine is pure and deterministic (no ML). Signals, strongest first:
 existing user categories, then numbered series kept together, then a
 weighted UCS-style keyword vocabulary, then a shared first word. In the

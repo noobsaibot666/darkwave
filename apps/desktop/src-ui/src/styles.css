@@ -4766,3 +4766,42 @@ dd {
   vertical-align: 1px;
   opacity: 0.8;
 }
+
+/* Sidebar category rename + drop target */
+.nav-subitem-rename {
+  width: calc(100% - 16px);
+  margin: 1px 8px;
+  padding: 3px 6px;
+  border: 1px solid rgba(var(--ink-rgb), 0.25);
+  border-radius: 4px;
+  background: rgba(var(--ink-rgb), 0.06);
+  color: inherit;
+  font: inherit;
+  font-size: 12px;
+}
+
+.nav-subitem.drag-over {
+  outline: 1px dashed var(--sfx-ink, currentColor);
+  background: rgba(var(--ink-rgb), 0.08);
+}
+
+.nav-subitem-hint {
+  display: flex;
+  align-items: center;
+  gap: 4px;
+  opacity: 0.55;
+  cursor: default;
+}
+
+.organize-refile-badge {
+  margin-right: 6px;
+  padding: 0 6px;
+  border-radius: 999px;
+  background: rgba(var(--ink-rgb), 0.1);
+  font-size: 10px;
+  white-space: nowrap;
+}
+
+.category-picker-card {
+  width: 480px;
+}
