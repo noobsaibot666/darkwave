@@ -58,3 +58,13 @@ uuid = { version = "1", features = ["v4", "serde"] }
 lto = "thin"
 codegen-units = 1
 strip = true
+
+# Build scripts and proc macros only (host tooling that's never shipped):
+# keep them unstripped. With Xcode's current `strip`, a stripped
+# proc-macro dylib loses the metadata rustc needs to load it, and every
+# release build fails with "error[E0463]: can't find crate for
+# `phf_macros`" (also serde/thiserror/zerofrom derive). Seen 2026-11-13 on
+# rustc 1.93.1. The shipped app binary is still stripped by `strip = true`
+# above.
+[profile.release.build-override]
+strip = false
