@@ -37,6 +37,7 @@ import {
   Layers,
   Library,
   Link2,
+  FolderTree,
   ListFilter,
   Mic,
   MicOff,
@@ -207,6 +208,112 @@ type DeleteLibraryResult = {
   cache_files_removed: number;
   trash_items_cleared: number;
 };
+
+// Settings → Clean Up Junk Files (see scan_junk_files/clean_up_junk_files
+// in src-tauri for what each kind means and how cleanup treats it).
+type JunkKind = "apple_double" | "system_file" | "empty" | "unreadable";
+
+type JunkAsset = {
+  asset_id: string;
+  filename: string;
+  path: string;
+  file_size: number;
+  kind: JunkKind;
+  detail: string | null;
+};
+
+type JunkCleanupResult = {
+  removed: number;
+  trashed: number;
+  files_deleted: number;
+  skipped: number;
+  errors: string[];
+};
+
+const JUNK_KIND_INFO: Record<JunkKind, { label: string; hint: string; selectedByDefault: boolean }> = {
+  apple_double: {
+    label: "macOS ._ metadata files",
+    hint: "Hidden sidecars Finder writes on NAS/exFAT drives. They copy the real file's name but hold no audio.",
+    selectedByDefault: true,
+  },
+  system_file: {
+    label: "System files",
+    hint: ".DS_Store, Thumbs.db and similar OS housekeeping files.",
+    selectedByDefault: true,
+  },
+  empty: {
+    label: "Empty files (0 bytes)",
+    hint: "Removed from the library only. The files stay on the drive, since they can be cloud-sync placeholders.",
+    selectedByDefault: true,
+  },
+  unreadable: {
+    label: "Unreadable audio",
+    hint: "Couldn't be decoded, possibly a corrupt or truncated download. Moved to Trash so you can restore them; the files are never deleted here.",
+    selectedByDefault: false,
+  },
+};
+
+const JUNK_KIND_ORDER: JunkKind[] = ["apple_double", "system_file", "empty", "unreadable"];
+
+// Organize (see propose_sfx_organization / apply_sfx_organization in
+// src-tauri and crates/search/src/sfx_categories.rs).
+type OrganizeReason = "existing" | "keyword" | "series" | "shared_word";
+
+type OrganizeMember = {
+  asset_id: string;
+  filename: string;
+  display_name: string;
+  reason: OrganizeReason;
+  matched: string;
+  series: string | null;
+};
+
+type OrganizeProposal = {
+  categories: { name: string; existing: boolean; members: OrganizeMember[] }[];
+  uncategorized: OrganizeMember[];
+  already_categorized: number;
+  total_considered: number;
+};
+
+type SfxCategorySummary = { tag_id: string; name: string; count: number };
+
+// The media types Organize works on, and what to call them in the UI.
+const ORGANIZABLE_MEDIA_TYPES: Record<string, string> = {
+  sound_effect: "Sound Effects",
+  foley: "Foley",
+  ambience: "Ambience",
+};
+
+// One editable group in the Organize review. `key` is stable across
+// renames so React doesn't remount the row while the name is being typed.
+type OrganizeDraftGroup = { key: string; name: string; existing: boolean; included: boolean };
+
+type OrganizeDraft = {
+  mediaType: string;
+  includeCategorized: boolean;
+  loading: boolean;
+  busy: boolean;
+  error: string | null;
+  proposal: OrganizeProposal | null;
+  groups: OrganizeDraftGroup[];
+  // asset id → group key ("" = leave uncategorized)
+  assignment: Record<string, string>;
+  members: Record<string, OrganizeMember>;
+  expanded: Set<string>;
+};
+
+function organizeReasonLabel(member: OrganizeMember): string {
+  switch (member.reason) {
+    case "existing":
+      return `matches your category via "${member.matched}"`;
+    case "keyword":
+      return member.matched ? `"${member.matched}" in the name` : "no match";
+    case "series":
+      return `numbered series "${member.series ?? member.matched}"`;
+    case "shared_word":
+      return `shares the word "${member.matched}"`;
+  }
+}
 
 type TagRecord = {
   id: string;
@@ -1432,6 +1539,12 @@ export function App() {
   }, []);
 
   const [tags, setTags] = useState<TagRecord[]>([]);
+  // Sound-effect categories (tags with facet "category") for the active
+  // library: the sidebar list with counts, and each asset's current one.
+  const [sfxCategories, setSfxCategories] = useState<SfxCategorySummary[]>([]);
+  const [assetCategoryById, setAssetCategoryById] = useState<Record<string, string>>({});
+  const [organizeDraft, setOrganizeDraft] = useState<OrganizeDraft | null>(null);
+  const [categoryInput, setCategoryInput] = useState("");
   const [appliedTags, setAppliedTags] = useState<TagRecord[]>([]);
   const [suggestedTags, setSuggestedTags] = useState<TagRecord[]>([]);
   const [assetInstruments, setAssetInstruments] = useState<{ name: string; confidence: number }[]>([]);
@@ -1551,6 +1664,16 @@ export function App() {
   const [backupStatus, setBackupStatus] = useState<string | null>(null);
   const [cacheStatus, setCacheStatus] = useState<string | null>(null);
   const [libraryAdminStatus, setLibraryAdminStatus] = useState<string | null>(null);
+  // Clean Up Junk Files review modal: null when closed; `items` null while
+  // the scan is still running.
+  const [junkCleanup, setJunkCleanup] = useState<{
+    library: LibraryRecord;
+    items: JunkAsset[] | null;
+    selected: Set<string>;
+    deleteFiles: boolean;
+    busy: boolean;
+    error: string | null;
+  } | null>(null);
 
   const [preferences, setPreferences] = useState<AppPreferences | null>(null);
   // In-progress text of the Recently Added count field; null means "not
@@ -2810,6 +2933,153 @@ export function App() {
     });
   }, [redoStack, activeLibraryId, searchQuery, activeFilter, refreshAssets, selectedAssetId, refreshAssetTags]);
 
+  // Categories follow the asset list: any change that reloads `assets`
+  // (import, undo/redo, an Organize run, a cleanup) refreshes them too, so
+  // the sidebar counts never go stale. One small aggregate query each.
+  const refreshSfxCategories = useCallback((libraryId: string) => {
+    invoke<SfxCategorySummary[]>("list_sfx_categories", { libraryId })
+      .then(setSfxCategories)
+      .catch(() => setSfxCategories([]));
+    invoke<Record<string, string>>("asset_categories", { libraryId })
+      .then(setAssetCategoryById)
+      .catch(() => setAssetCategoryById({}));
+    // Organize can create category tags or promote a legacy "action" tag
+    // to a category, so the cached tag list (Apply Tag grid) follows too.
+    invoke<TagRecord[]>("list_tags").then(setTags).catch(() => {});
+  }, []);
+
+  useEffect(() => {
+    if (!activeLibraryId) {
+      setSfxCategories([]);
+      setAssetCategoryById({});
+      return;
+    }
+    refreshSfxCategories(activeLibraryId);
+  }, [activeLibraryId, assets, refreshSfxCategories]);
+
+  // Which category the Organize button works on: the one being browsed if
+  // it's organizable, otherwise Sound Effects.
+  const organizeMediaType =
+    typeof activeFilter === "string" && activeFilter in ORGANIZABLE_MEDIA_TYPES ? activeFilter : "sound_effect";
+
+  // Organize, step one: fetch a proposal (read-only) and turn it into an
+  // editable draft. Nothing is written until handleApplyOrganize.
+  const handleOpenOrganize = useCallback(
+    (mediaType: string, includeCategorized: boolean) => {
+      if (!activeLibraryId) return;
+      setOrganizeDraft((current) => ({
+        mediaType,
+        includeCategorized,
+        loading: true,
+        busy: false,
+        error: null,
+        proposal: null,
+        groups: [],
+        assignment: {},
+        members: {},
+        expanded: current?.expanded ?? new Set(),
+      }));
+      invoke<OrganizeProposal>("propose_sfx_organization", {
+        libraryId: activeLibraryId,
+        mediaType,
+        includeCategorized,
+      })
+        .then((proposal) => {
+          const groups: OrganizeDraftGroup[] = proposal.categories.map((category, index) => ({
+            key: `g${index}`,
+            name: category.name,
+            existing: category.existing,
+            included: true,
+          }));
+          const assignment: Record<string, string> = {};
+          const members: Record<string, OrganizeMember> = {};
+          proposal.categories.forEach((category, index) => {
+            for (const member of category.members) {
+              assignment[member.asset_id] = `g${index}`;
+              members[member.asset_id] = member;
+            }
+          });
+          for (const member of proposal.uncategorized) {
+            assignment[member.asset_id] = "";
+            members[member.asset_id] = member;
+          }
+          setOrganizeDraft((current) =>
+            current && current.mediaType === mediaType && current.includeCategorized === includeCategorized
+              ? { ...current, loading: false, proposal, groups, assignment, members }
+              : current
+          );
+        })
+        .catch((error) =>
+          setOrganizeDraft((current) => (current ? { ...current, loading: false, error: String(error) } : current))
+        );
+    },
+    [activeLibraryId]
+  );
+
+  // Groups that will actually be written: included, named, with members.
+  // Two groups renamed to the same name (case-insensitive) merge into one.
+  const organizeSummary = useMemo(() => {
+    if (!organizeDraft) return { assignments: [] as { asset_id: string; category: string }[], categoryCount: 0 };
+    const groupByKey = new Map(organizeDraft.groups.map((group) => [group.key, group]));
+    const assignments: { asset_id: string; category: string }[] = [];
+    const names = new Set<string>();
+    for (const [assetId, key] of Object.entries(organizeDraft.assignment)) {
+      const group = key ? groupByKey.get(key) : undefined;
+      const name = group?.name.trim();
+      if (!group || !group.included || !name) continue;
+      assignments.push({ asset_id: assetId, category: name });
+      names.add(name.toLowerCase());
+    }
+    return { assignments, categoryCount: names.size };
+  }, [organizeDraft]);
+
+  const handleApplyOrganize = useCallback(async () => {
+    if (!organizeDraft || organizeDraft.busy || !activeLibraryId) return;
+    const { assignments, categoryCount } = organizeSummary;
+    if (assignments.length === 0) return;
+    setOrganizeDraft({ ...organizeDraft, busy: true, error: null });
+    try {
+      const result = await invoke<{ undo_id: string; assigned: number }>("apply_sfx_organization", { assignments });
+      const label = `Organize ${result.assigned} ${ORGANIZABLE_MEDIA_TYPES[organizeDraft.mediaType] ?? "sounds"} into ${categoryCount} ${categoryCount === 1 ? "category" : "categories"}`;
+      setUndoStack((previous) => [...previous, { id: result.undo_id, label }]);
+      setRedoStack([]);
+      setOrganizeDraft(null);
+      setSfxSubcategoriesOpen(true);
+      refreshSfxCategories(activeLibraryId);
+      refreshAssets(activeLibraryId, searchQuery, activeFilter);
+      if (selectedAssetId) refreshAssetTags(selectedAssetId);
+    } catch (error) {
+      setOrganizeDraft((current) => (current ? { ...current, busy: false, error: String(error) } : current));
+    }
+  }, [organizeDraft, organizeSummary, activeLibraryId, refreshSfxCategories, refreshAssets, searchQuery, activeFilter, selectedAssetId, refreshAssetTags]);
+
+  // The inspector's Category field: moves the selected track(s) into one
+  // category (or out of all of them, with `null`) as one undoable step.
+  const handleSetCategory = useCallback(
+    (assetIds: string[], category: string | null) => {
+      if (assetIds.length === 0 || !activeLibraryId) return;
+      const name = category?.trim() || null;
+      invoke<{ undo_id: string; assigned: number }>("apply_sfx_organization", {
+        assignments: assetIds.map((asset_id) => ({ asset_id, category: name })),
+      })
+        .then((result) => {
+          const label = name
+            ? `Move ${assetIds.length === 1 ? "track" : `${assetIds.length} tracks`} to "${name}"`
+            : `Clear category`;
+          setUndoStack((previous) => [...previous, { id: result.undo_id, label }]);
+          setRedoStack([]);
+          setCategoryInput("");
+          refreshSfxCategories(activeLibraryId);
+          if (selectedAssetId) refreshAssetTags(selectedAssetId);
+          if (typeof activeFilter === "object" && "tag" in activeFilter) {
+            refreshAssets(activeLibraryId, searchQuery, activeFilter);
+          }
+        })
+        .catch(() => {});
+    },
+    [activeLibraryId, refreshSfxCategories, selectedAssetId, refreshAssetTags, activeFilter, refreshAssets, searchQuery]
+  );
+
   useEffect(() => {
     const unlistenUndo = listen("menu-undo", () => handleUndo());
     const unlistenRedo = listen("menu-redo", () => handleRedo());
@@ -3854,6 +4124,56 @@ export function App() {
       )
       .catch((error) => setLibraryAdminStatus(`Clear failed: ${String(error)}`));
   }, []);
+
+  // Clean Up Junk Files, step one: scan (read-only) and open the review
+  // modal with each kind pre-selected per JUNK_KIND_INFO.selectedByDefault.
+  // Nothing is removed until handleConfirmJunkCleanup.
+  const handleOpenJunkCleanup = useCallback((library: LibraryRecord) => {
+    setJunkCleanup({ library, items: null, selected: new Set(), deleteFiles: true, busy: false, error: null });
+    invoke<JunkAsset[]>("scan_junk_files", { libraryId: library.id })
+      .then((items) => {
+        const selected = new Set(
+          items.filter((item) => JUNK_KIND_INFO[item.kind].selectedByDefault).map((item) => item.asset_id)
+        );
+        setJunkCleanup((current) =>
+          current && current.library.id === library.id ? { ...current, items, selected } : current
+        );
+      })
+      .catch((error) =>
+        setJunkCleanup((current) => (current ? { ...current, items: [], error: `Scan failed: ${String(error)}` } : current))
+      );
+  }, []);
+
+  const handleConfirmJunkCleanup = useCallback(async () => {
+    if (!junkCleanup || junkCleanup.busy || junkCleanup.selected.size === 0) return;
+    const { library, selected, deleteFiles } = junkCleanup;
+    setJunkCleanup({ ...junkCleanup, busy: true, error: null });
+    try {
+      const result = await invoke<JunkCleanupResult>("clean_up_junk_files", {
+        libraryId: library.id,
+        assetIds: [...selected],
+        deleteFiles,
+      });
+      const parts = [
+        result.removed > 0 ? `removed ${result.removed} junk file${result.removed === 1 ? "" : "s"}` : null,
+        result.files_deleted > 0 ? `deleted ${result.files_deleted} from the drive` : null,
+        result.trashed > 0 ? `moved ${result.trashed} unreadable file${result.trashed === 1 ? "" : "s"} to Trash` : null,
+        result.skipped > 0 ? `skipped ${result.skipped}` : null,
+      ].filter(Boolean);
+      setLibraryAdminStatus(
+        `${library.name}: ${parts.length > 0 ? parts.join(", ") : "nothing to clean up"}` +
+          (result.errors.length > 0 ? ` — ${result.errors.slice(0, 3).join("; ")}` : "")
+      );
+      setJunkCleanup(null);
+      if (library.id === activeLibraryId) {
+        refreshAssets(library.id, searchQuery, activeFilter);
+        refreshTrashItems(library.id);
+        if (selectedAssetId && selected.has(selectedAssetId)) setSelectedAssetId(null);
+      }
+    } catch (error) {
+      setJunkCleanup((current) => (current ? { ...current, busy: false, error: `Cleanup failed: ${String(error)}` } : current));
+    }
+  }, [junkCleanup, activeLibraryId, refreshAssets, searchQuery, activeFilter, refreshTrashItems, selectedAssetId]);
 
   const handleEmptyLibraryTrash = useCallback(
     async (library: LibraryRecord) => {
@@ -6163,23 +6483,33 @@ export function App() {
               >
                 {sfxSubcategoriesOpen ? <ChevronDown size={11} /> : <ChevronRight size={11} />} By category
               </button>
-              {sfxSubcategoriesOpen
-                ? tags
-                    .filter((tag) => tag.facet === "action")
-                    .map((tag) => (
-                      <button
-                        key={tag.id}
-                        className={
-                          typeof activeFilter === "object" && "tag" in activeFilter && activeFilter.tag === tag.id
-                            ? "nav-subitem active"
-                            : "nav-subitem"
-                        }
-                        onClick={() => setActiveFilter({ tag: tag.id })}
-                      >
-                        {tag.name}
-                      </button>
-                    ))
-                : null}
+              {sfxSubcategoriesOpen ? (
+                <>
+                  {sfxCategories.map((category) => (
+                    <button
+                      key={category.tag_id}
+                      className={
+                        typeof activeFilter === "object" && "tag" in activeFilter && activeFilter.tag === category.tag_id
+                          ? "nav-subitem nav-subitem-counted active"
+                          : "nav-subitem nav-subitem-counted"
+                      }
+                      onClick={() => setActiveFilter({ tag: category.tag_id })}
+                    >
+                      <span>{category.name}</span>
+                      <small>{category.count}</small>
+                    </button>
+                  ))}
+                  <button
+                    className="nav-subitem nav-subitem-action"
+                    disabled={!activeLibraryId}
+                    title="Sort sound effects into categories from their file names"
+                    onClick={() => handleOpenOrganize("sound_effect", false)}
+                  >
+                    <FolderTree size={11} />
+                    {sfxCategories.length === 0 ? "Organize into categories…" : "Organize new sounds…"}
+                  </button>
+                </>
+              ) : null}
               <button
                 className={activeFilter === "foley" ? "nav-item sidebar-styled-item active" : "nav-item sidebar-styled-item"}
                 onClick={() => setActiveFilter("foley")}
@@ -6683,6 +7013,16 @@ export function App() {
               Similar Sounds
             </button>
           )}
+          <button
+            type="button"
+            className="text-button"
+            disabled={!activeLibraryId}
+            title={`Sort ${ORGANIZABLE_MEDIA_TYPES[organizeMediaType]} into categories from their file names. You review everything before it's applied.`}
+            onClick={() => handleOpenOrganize(organizeMediaType, false)}
+          >
+            <FolderTree size={13} />
+            Organize {ORGANIZABLE_MEDIA_TYPES[organizeMediaType]}
+          </button>
           {hasActiveRangeFilters(rangeFilters) || formatFilter || similarToAssetId ? (
             <>
               <button
@@ -7521,6 +7861,54 @@ export function App() {
               </>
             ) : null;
           })()}
+          {selectedAsset && selectedAsset.media_type in ORGANIZABLE_MEDIA_TYPES ? (
+            <>
+              <h2>Category</h2>
+              <div className="category-field">
+                {(() => {
+                  const current = assetCategoryById[selectedAsset.id] ?? null;
+                  const count = bulkAssetIds.length;
+                  const target = categoryInput.trim();
+                  return (
+                    <>
+                      <span className={current ? "category-current" : "category-current empty"}>
+                        <FolderTree size={12} />
+                        {count > 1 ? `${count} selected` : current ?? "No category"}
+                      </span>
+                      <div className="setup-field-row">
+                        <input
+                          list="sfx-category-options"
+                          placeholder={current ? "Move to…" : "Set category…"}
+                          value={categoryInput}
+                          onChange={(event) => setCategoryInput(event.target.value)}
+                          onKeyDown={(event) => {
+                            if (event.key === "Enter" && target) handleSetCategory(bulkAssetIds, target);
+                          }}
+                        />
+                        <datalist id="sfx-category-options">
+                          {sfxCategories.map((category) => (
+                            <option key={category.tag_id} value={category.name} />
+                          ))}
+                        </datalist>
+                        <button type="button" disabled={!target} onClick={() => handleSetCategory(bulkAssetIds, target)}>
+                          Set
+                        </button>
+                        {current || count > 1 ? (
+                          <button
+                            type="button"
+                            title="Remove from its category"
+                            onClick={() => handleSetCategory(bulkAssetIds, null)}
+                          >
+                            Clear
+                          </button>
+                        ) : null}
+                      </div>
+                    </>
+                  );
+                })()}
+              </div>
+            </>
+          ) : null}
           <h2>Apply Tag</h2>
           <div className="tag-grid">
             {tags
@@ -7532,6 +7920,9 @@ export function App() {
                 // offering tags that can't actually apply to what's
                 // selected — e.g. a Soundtrack shouldn't be cluttered with
                 // SFX-only tags.
+                // Categories are exclusive (one per track) and set through
+                // the Category field above, never stacked from this grid.
+                if (tag.facet === "category") return false;
                 if (tag.facet !== "action") return true;
                 return selectedAsset?.media_type === "sound_effect" || selectedAsset?.media_type === "foley";
               })
@@ -8412,6 +8803,15 @@ export function App() {
                               </button>
                               <button type="button" className="text-button" onClick={() => handleEmptyLibraryTrash(library)}>
                                 Empty Trash
+                              </button>
+                              <button
+                                type="button"
+                                className="text-button"
+                                title="Find files that look like audio but aren't (macOS ._ files, empty or unreadable files) and remove them"
+                                onClick={() => handleOpenJunkCleanup(library)}
+                              >
+                                <Sparkles size={13} />
+                                Clean Up Junk Files
                               </button>
                               <button
                                 type="button"
@@ -9419,6 +9819,394 @@ export function App() {
               >
                 {createLibraryBusy ? "Saving…" : "Choose location…"}
               </button>
+            </div>
+          </motion.div>
+        </motion.div>
+      ) : null}
+      </AnimatePresence>
+      <AnimatePresence>
+      {organizeDraft ? (
+        <motion.div
+          className="modal-overlay"
+          onClick={() => (organizeDraft.busy ? undefined : setOrganizeDraft(null))}
+          initial={{ opacity: 0 }}
+          animate={{ opacity: 1 }}
+          exit={{ opacity: 0 }}
+          transition={{ duration: 0.18 }}
+        >
+          <motion.div
+            className="modal-card organize-card"
+            onClick={(event) => event.stopPropagation()}
+            aria-label="Organize into categories"
+            initial={{ opacity: 0, scale: 0.96, y: 10 }}
+            animate={{ opacity: 1, scale: 1, y: 0 }}
+            exit={{ opacity: 0, scale: 0.96, y: 10 }}
+            transition={{ duration: 0.2, ease: [0.4, 0, 0.2, 1] }}
+          >
+            <div className="modal-head">
+              <h1>Organize {ORGANIZABLE_MEDIA_TYPES[organizeDraft.mediaType]}</h1>
+              <button
+                type="button"
+                className="icon-button"
+                aria-label="Close"
+                disabled={organizeDraft.busy}
+                onClick={() => setOrganizeDraft(null)}
+              >
+                <X size={16} />
+              </button>
+            </div>
+            {(() => {
+              const draft = organizeDraft;
+              const proposal = draft.proposal;
+              if (draft.loading) return <p className="settings-hint">Reading file names…</p>;
+              if (!proposal) return <p className="settings-hint">{draft.error ?? "Couldn't build a proposal."}</p>;
+
+              const update = (change: (current: OrganizeDraft) => OrganizeDraft) =>
+                setOrganizeDraft((current) => (current ? change(current) : current));
+              const membersOf = (key: string) =>
+                Object.entries(draft.assignment)
+                  .filter(([, groupKey]) => groupKey === key)
+                  .map(([assetId]) => draft.members[assetId])
+                  .filter(Boolean);
+              const moveTo = (assetId: string, key: string) =>
+                update((current) => ({ ...current, assignment: { ...current.assignment, [assetId]: key } }));
+              const toggleExpanded = (key: string) =>
+                update((current) => {
+                  const expanded = new Set(current.expanded);
+                  if (expanded.has(key)) expanded.delete(key);
+                  else expanded.add(key);
+                  return { ...current, expanded };
+                });
+              const nameCounts = new Map<string, number>();
+              for (const group of draft.groups) {
+                const name = group.name.trim().toLowerCase();
+                if (group.included && name) nameCounts.set(name, (nameCounts.get(name) ?? 0) + 1);
+              }
+              const uncategorized = membersOf("");
+              const memberSelect = (member: OrganizeMember, currentKey: string) => (
+                <select
+                  aria-label={`Category for ${member.filename}`}
+                  value={currentKey}
+                  disabled={draft.busy}
+                  onChange={(event) => moveTo(member.asset_id, event.target.value)}
+                >
+                  <option value="">Leave uncategorized</option>
+                  {draft.groups
+                    .filter((group) => group.name.trim())
+                    .map((group) => (
+                      <option key={group.key} value={group.key}>
+                        {group.name.trim()}
+                      </option>
+                    ))}
+                </select>
+              );
+              const memberRow = (member: OrganizeMember, currentKey: string) => (
+                <li key={member.asset_id}>
+                  <span className="organize-member-name" title={member.filename}>
+                    {member.filename}
+                  </span>
+                  <small>{organizeReasonLabel(member)}</small>
+                  {memberSelect(member, currentKey)}
+                </li>
+              );
+              const toSort = Object.keys(draft.assignment).length;
+
+              if (toSort === 0) {
+                return (
+                  <div className="settings-stack">
+                    <p className="settings-hint">
+                      {proposal.total_considered === 0
+                        ? `There are no ${ORGANIZABLE_MEDIA_TYPES[draft.mediaType].toLowerCase()} in this library yet.`
+                        : `All ${proposal.already_categorized} already have a category. New imports will show up here next time.`}
+                    </p>
+                    {proposal.already_categorized > 0 ? (
+                      <button type="button" className="text-button" onClick={() => handleOpenOrganize(draft.mediaType, true)}>
+                        Re-sort all {proposal.already_categorized} from scratch
+                      </button>
+                    ) : null}
+                  </div>
+                );
+              }
+
+              return (
+                <div className="settings-stack">
+                  <p className="settings-hint">
+                    Proposed {draft.groups.length} {draft.groups.length === 1 ? "category" : "categories"} for{" "}
+                    {toSort - uncategorized.length} of {toSort} sounds, from their file names. Rename, untick or move
+                    anything before applying. Files aren't moved on disk; when you send a sound to a project it's copied into a
+                    subfolder named after its category.
+                  </p>
+                  {proposal.already_categorized > 0 || draft.includeCategorized ? (
+                    <label className="junk-cleanup-option">
+                      <input
+                        type="checkbox"
+                        checked={draft.includeCategorized}
+                        disabled={draft.busy}
+                        onChange={(event) => handleOpenOrganize(draft.mediaType, event.target.checked)}
+                      />
+                      <span>
+                        {draft.includeCategorized
+                          ? "Re-sorting everything, including sounds that already had a category"
+                          : `Also re-sort the ${proposal.already_categorized} that already have a category (otherwise left as they are)`}
+                      </span>
+                    </label>
+                  ) : null}
+                  <div className="organize-groups">
+                    {draft.groups.map((group) => {
+                      const members = membersOf(group.key);
+                      const expanded = draft.expanded.has(group.key);
+                      const merges = (nameCounts.get(group.name.trim().toLowerCase()) ?? 0) > 1;
+                      return (
+                        <section
+                          className={group.included ? "organize-group" : "organize-group excluded"}
+                          key={group.key}
+                        >
+                          <div className="organize-group-head">
+                            <input
+                              type="checkbox"
+                              aria-label={`Include ${group.name}`}
+                              checked={group.included}
+                              disabled={draft.busy}
+                              onChange={(event) =>
+                                update((current) => ({
+                                  ...current,
+                                  groups: current.groups.map((g) =>
+                                    g.key === group.key ? { ...g, included: event.target.checked } : g
+                                  ),
+                                }))
+                              }
+                            />
+                            <button
+                              type="button"
+                              className="icon-button"
+                              aria-label={expanded ? `Hide files in ${group.name}` : `Show files in ${group.name}`}
+                              onClick={() => toggleExpanded(group.key)}
+                            >
+                              {expanded ? <ChevronDown size={13} /> : <ChevronRight size={13} />}
+                            </button>
+                            <input
+                              className="organize-group-name"
+                              aria-label="Category name"
+                              value={group.name}
+                              disabled={draft.busy}
+                              placeholder="Category name"
+                              onChange={(event) =>
+                                update((current) => ({
+                                  ...current,
+                                  groups: current.groups.map((g) =>
+                                    g.key === group.key ? { ...g, name: event.target.value } : g
+                                  ),
+                                }))
+                              }
+                            />
+                            {merges ? (
+                              <span className="organize-badge" title="Another category has the same name, so they'll be combined">
+                                merges
+                              </span>
+                            ) : group.existing ? (
+                              <span className="organize-badge" title="You already have this category">
+                                existing
+                              </span>
+                            ) : null}
+                            <span className="junk-cleanup-count">{members.length}</span>
+                          </div>
+                          {expanded ? (
+                            members.length > 0 ? (
+                              <ul className="organize-members">{members.map((member) => memberRow(member, group.key))}</ul>
+                            ) : (
+                              <p className="settings-hint organize-empty">
+                                No files yet. Move some here from another category.
+                              </p>
+                            )
+                          ) : null}
+                        </section>
+                      );
+                    })}
+                  </div>
+                  <button
+                    type="button"
+                    className="text-button"
+                    disabled={draft.busy}
+                    onClick={() =>
+                      update((current) => {
+                        const key = `n${Date.now()}`;
+                        const expanded = new Set(current.expanded);
+                        expanded.add(key);
+                        return {
+                          ...current,
+                          groups: [...current.groups, { key, name: "", existing: false, included: true }],
+                          expanded,
+                        };
+                      })
+                    }
+                  >
+                    <Plus size={13} />
+                    New category
+                  </button>
+                  {uncategorized.length > 0 ? (
+                    <section className="organize-group uncategorized">
+                      <div className="organize-group-head">
+                        <strong>Left uncategorized</strong>
+                        <span className="junk-cleanup-count">{uncategorized.length}</span>
+                      </div>
+                      <p className="settings-hint organize-empty">
+                        Nothing in these names gave a clear category. Pick one, or leave them for later.
+                      </p>
+                      <ul className="organize-members">{uncategorized.map((member) => memberRow(member, ""))}</ul>
+                    </section>
+                  ) : null}
+                  {draft.error ? <p className="settings-hint">{draft.error}</p> : null}
+                  <button
+                    className="primary-action"
+                    type="button"
+                    onClick={handleApplyOrganize}
+                    disabled={draft.busy || organizeSummary.assignments.length === 0}
+                  >
+                    {draft.busy
+                      ? "Organizing…"
+                      : `Organize ${organizeSummary.assignments.length} sound${organizeSummary.assignments.length === 1 ? "" : "s"} into ${organizeSummary.categoryCount} ${organizeSummary.categoryCount === 1 ? "category" : "categories"}`}
+                  </button>
+                  <p className="settings-hint organize-footnote">One step to undo (⌘Z) if you change your mind.</p>
+                </div>
+              );
+            })()}
+          </motion.div>
+        </motion.div>
+      ) : null}
+      </AnimatePresence>
+      <AnimatePresence>
+      {junkCleanup ? (
+        <motion.div
+          className="modal-overlay"
+          onClick={() => (junkCleanup.busy ? undefined : setJunkCleanup(null))}
+          initial={{ opacity: 0 }}
+          animate={{ opacity: 1 }}
+          exit={{ opacity: 0 }}
+          transition={{ duration: 0.18 }}
+        >
+          <motion.div
+            className="modal-card junk-cleanup-card"
+            onClick={(event) => event.stopPropagation()}
+            aria-label="Clean up junk files"
+            initial={{ opacity: 0, scale: 0.96, y: 10 }}
+            animate={{ opacity: 1, scale: 1, y: 0 }}
+            exit={{ opacity: 0, scale: 0.96, y: 10 }}
+            transition={{ duration: 0.2, ease: [0.4, 0, 0.2, 1] }}
+          >
+            <div className="modal-head">
+              <h1>Clean Up Junk Files</h1>
+              <button
+                type="button"
+                className="icon-button"
+                aria-label="Close"
+                disabled={junkCleanup.busy}
+                onClick={() => setJunkCleanup(null)}
+              >
+                <X size={16} />
+              </button>
+            </div>
+            <div className="settings-stack">
+              {junkCleanup.items === null ? (
+                <p className="settings-hint">Scanning {junkCleanup.library.name}…</p>
+              ) : junkCleanup.items.length === 0 ? (
+                <p className="settings-hint">
+                  {junkCleanup.error ?? `${junkCleanup.library.name} is clean: every file in it is real audio.`}
+                </p>
+              ) : (
+                <>
+                  <p className="settings-hint">
+                    Found {junkCleanup.items.length} file{junkCleanup.items.length === 1 ? "" : "s"} in{" "}
+                    {junkCleanup.library.name} that look like audio but aren't. Untick anything you want to keep.
+                  </p>
+                  <div className="junk-cleanup-groups">
+                    {JUNK_KIND_ORDER.map((kind) => {
+                      const group = junkCleanup.items!.filter((item) => item.kind === kind);
+                      if (group.length === 0) return null;
+                      const selectedInGroup = group.filter((item) => junkCleanup.selected.has(item.asset_id)).length;
+                      const toggleGroup = () =>
+                        setJunkCleanup((current) => {
+                          if (!current) return current;
+                          const selected = new Set(current.selected);
+                          const selectAll = selectedInGroup < group.length;
+                          for (const item of group) {
+                            if (selectAll) selected.add(item.asset_id);
+                            else selected.delete(item.asset_id);
+                          }
+                          return { ...current, selected };
+                        });
+                      return (
+                        <section className="junk-cleanup-group" key={kind}>
+                          <label className="junk-cleanup-group-head">
+                            <input
+                              type="checkbox"
+                              checked={selectedInGroup === group.length}
+                              ref={(node) => {
+                                if (node) node.indeterminate = selectedInGroup > 0 && selectedInGroup < group.length;
+                              }}
+                              onChange={toggleGroup}
+                              disabled={junkCleanup.busy}
+                            />
+                            <strong>{JUNK_KIND_INFO[kind].label}</strong>
+                            <span className="junk-cleanup-count">{group.length}</span>
+                          </label>
+                          <p className="settings-hint">{JUNK_KIND_INFO[kind].hint}</p>
+                          <ul className="junk-cleanup-list">
+                            {group.map((item) => (
+                              <li key={item.asset_id} title={item.detail ? `${item.path}\n${item.detail}` : item.path}>
+                                <label>
+                                  <input
+                                    type="checkbox"
+                                    checked={junkCleanup.selected.has(item.asset_id)}
+                                    disabled={junkCleanup.busy}
+                                    onChange={() =>
+                                      setJunkCleanup((current) => {
+                                        if (!current) return current;
+                                        const selected = new Set(current.selected);
+                                        if (selected.has(item.asset_id)) selected.delete(item.asset_id);
+                                        else selected.add(item.asset_id);
+                                        return { ...current, selected };
+                                      })
+                                    }
+                                  />
+                                  <span className="junk-cleanup-name">{item.filename}</span>
+                                  <small>{formatFileSize(item.file_size)}</small>
+                                </label>
+                              </li>
+                            ))}
+                          </ul>
+                        </section>
+                      );
+                    })}
+                  </div>
+                  {junkCleanup.items.some((item) => item.kind === "apple_double" || item.kind === "system_file") ? (
+                    <label className="junk-cleanup-option">
+                      <input
+                        type="checkbox"
+                        checked={junkCleanup.deleteFiles}
+                        disabled={junkCleanup.busy}
+                        onChange={(event) =>
+                          setJunkCleanup((current) => (current ? { ...current, deleteFiles: event.target.checked } : current))
+                        }
+                      />
+                      <span>
+                        Also delete the macOS ._ and system files from the drive. They hold no audio, and deleting
+                        them keeps them from coming back the next time the folder is imported.
+                      </span>
+                    </label>
+                  ) : null}
+                  {junkCleanup.error ? <p className="settings-hint">{junkCleanup.error}</p> : null}
+                  <button
+                    className="primary-action"
+                    type="button"
+                    onClick={handleConfirmJunkCleanup}
+                    disabled={junkCleanup.busy || junkCleanup.selected.size === 0}
+                  >
+                    {junkCleanup.busy
+                      ? "Cleaning up…"
+                      : `Clean Up ${junkCleanup.selected.size} File${junkCleanup.selected.size === 1 ? "" : "s"}`}
+                  </button>
+                </>
+              )}
             </div>
           </motion.div>
         </motion.div>

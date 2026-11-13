@@ -2,6 +2,7 @@ use chrono::Utc;
 use rusqlite::{params, params_from_iter, Connection, OptionalExtension};
 use serde::{Deserialize, Serialize};
 use shared_types::{AvailabilityState, StorageMode};
+use std::collections::HashMap;
 use std::path::Path;
 use thiserror::Error;
 use uuid::Uuid;
@@ -255,6 +256,25 @@ pub enum TagApprovalState {
     Suggested,
     Accepted,
     Rejected,
+}
+
+/// Facet of the tags that represent a sound effect's category (Doors,
+/// Footsteps, …) — one per asset at most; see `set_asset_categories`.
+pub const CATEGORY_FACET: &str = "category";
+
+/// One asset's entry in a `set_asset_categories` undo payload.
+#[derive(Serialize, Deserialize)]
+struct CategoryChange {
+    asset: Uuid,
+    new_tag: Option<Uuid>,
+    previous: Vec<PreviousTagRow>,
+}
+
+#[derive(Serialize, Deserialize)]
+struct PreviousTagRow {
+    tag: Uuid,
+    origin: String,
+    approval_state: String,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
@@ -1691,6 +1711,33 @@ impl Catalog {
         Ok(rows)
     }
 
+    /// `(asset id, error)` for every non-trashed asset in a library with at
+    /// least one *failed* background job whose error says the file's bytes
+    /// couldn't be decoded as audio (`DecodeFailed(..)` / `InvalidWav`, the
+    /// Debug form `fail_job` stores). Deliberately excludes every other
+    /// failure — notably an unreachable file, which fails with an I/O
+    /// error after `defer_unavailable_job`'s silent retries: an offline NAS
+    /// share is not junk. Feeds the library cleanup's "Unreadable" group.
+    pub fn decode_failures_for_library(&self, library_id: Uuid) -> Result<Vec<(Uuid, String)>, StorageError> {
+        let mut statement = self.connection.prepare(
+            "SELECT assets.id, MIN(background_jobs.error) FROM assets
+             JOIN background_jobs ON background_jobs.asset_id = assets.id
+             WHERE assets.library_id = ?1
+               AND background_jobs.state = 'failed'
+               AND (background_jobs.error LIKE 'DecodeFailed%' OR background_jobs.error = 'InvalidWav')
+               AND NOT EXISTS (
+                 SELECT 1 FROM trash_items WHERE trash_items.asset_id = assets.id AND trash_items.state = 'in_trash'
+               )
+             GROUP BY assets.id",
+        )?;
+        let rows = statement
+            .query_map(params![library_id.to_string()], |row| {
+                Ok((parse_uuid(row.get::<_, String>(0)?), row.get::<_, String>(1)?))
+            })?
+            .collect::<Result<Vec<_>, _>>()?;
+        Ok(rows)
+    }
+
     /// Replaces an asset's detected-instrument list (the output of the
     /// `InstrumentDetection` job). An empty slice clears it — a valid
     /// result meaning "the model found nothing", distinct from "not yet
@@ -1969,6 +2016,201 @@ impl Catalog {
             "readd_asset_tags",
             &format!("{}|{}|{}", tag_id, origin, join_uuids(&[asset_id])),
         )
+    }
+
+    /// Finds or creates the tag that represents sound-effect category
+    /// `name` (facet [`CATEGORY_FACET`]).
+    ///
+    /// `tags.normalized_name` is unique across every facet, and a library
+    /// already has same-named tags meaning something else — the seeded
+    /// `Ambience` media-type tag, `Metal`/`Glass` source tags. So a new
+    /// category tag gets a namespaced key (`category:doors`) while keeping
+    /// its plain display name: "Ambience" the category and "Ambience" the
+    /// media type coexist without either being renamed or re-faceted.
+    ///
+    /// The one exception is a same-named tag with no facet or the legacy
+    /// `action` facet (what the sidebar's "By category" list used to show):
+    /// that *was* a category in all but name, so it's promoted in place and
+    /// keeps its existing asset links.
+    pub fn ensure_category_tag(&self, name: &str) -> Result<TagRecord, StorageError> {
+        let name = name.trim();
+        let plain_key = normalize_term(name);
+        let category_key = format!("{CATEGORY_FACET}:{plain_key}");
+        let find = |key: &str| {
+            self.connection
+                .query_row(
+                    "SELECT id, name, normalized_name, facet, is_system FROM tags WHERE normalized_name = ?1",
+                    params![key],
+                    tag_from_row,
+                )
+                .optional()
+        };
+
+        if let Some(tag) = find(&category_key)? {
+            return Ok(tag);
+        }
+        match find(&plain_key)? {
+            Some(tag) if tag.facet.as_deref() == Some(CATEGORY_FACET) => return Ok(tag),
+            Some(tag) if tag.facet.is_none() || tag.facet.as_deref() == Some("action") => {
+                self.connection.execute(
+                    "UPDATE tags SET facet = ?1 WHERE id = ?2",
+                    params![CATEGORY_FACET, tag.id.to_string()],
+                )?;
+                return Ok(TagRecord { facet: Some(CATEGORY_FACET.to_string()), ..tag });
+            }
+            _ => {}
+        }
+
+        let tag = TagRecord {
+            id: Uuid::new_v4(),
+            name: name.to_string(),
+            normalized_name: category_key,
+            facet: Some(CATEGORY_FACET.to_string()),
+            is_system: false,
+        };
+        self.connection.execute(
+            "INSERT INTO tags (id, name, normalized_name, facet, is_system, is_hidden, created_at)
+             VALUES (?1, ?2, ?3, ?4, 0, 0, ?5)",
+            params![tag.id.to_string(), tag.name, tag.normalized_name, CATEGORY_FACET, Utc::now().to_rfc3339()],
+        )?;
+        Ok(tag)
+    }
+
+    /// `asset id → (category tag id, category name)` for every non-trashed
+    /// asset in the library that has an accepted category tag.
+    pub fn asset_categories_for_library(&self, library_id: Uuid) -> Result<HashMap<Uuid, (Uuid, String)>, StorageError> {
+        let mut statement = self.connection.prepare(
+            "SELECT asset_tags.asset_id, tags.id, tags.name FROM asset_tags
+             JOIN tags ON tags.id = asset_tags.tag_id
+             JOIN assets ON assets.id = asset_tags.asset_id
+             WHERE assets.library_id = ?1 AND tags.facet = ?2 AND asset_tags.approval_state = 'accepted'
+             ORDER BY asset_tags.created_at",
+        )?;
+        let rows = statement
+            .query_map(params![library_id.to_string(), CATEGORY_FACET], |row| {
+                Ok((
+                    parse_uuid(row.get::<_, String>(0)?),
+                    (parse_uuid(row.get::<_, String>(1)?), row.get::<_, String>(2)?),
+                ))
+            })?
+            .collect::<Result<HashMap<_, _>, _>>()?;
+        Ok(rows)
+    }
+
+    /// Every category tag that has at least one non-trashed asset in this
+    /// library, with its count — the sidebar's Sound Effects › By category list.
+    pub fn category_counts_for_library(&self, library_id: Uuid) -> Result<Vec<(TagRecord, usize)>, StorageError> {
+        let mut statement = self.connection.prepare(
+            "SELECT tags.id, tags.name, tags.normalized_name, tags.facet, tags.is_system,
+                    COUNT(DISTINCT asset_tags.asset_id)
+             FROM tags
+             JOIN asset_tags ON asset_tags.tag_id = tags.id AND asset_tags.approval_state = 'accepted'
+             JOIN assets ON assets.id = asset_tags.asset_id AND assets.library_id = ?1
+             WHERE tags.facet = ?2
+               AND NOT EXISTS (
+                 SELECT 1 FROM trash_items WHERE trash_items.asset_id = assets.id AND trash_items.state = 'in_trash'
+               )
+             GROUP BY tags.id
+             ORDER BY tags.name COLLATE NOCASE",
+        )?;
+        let rows = statement
+            .query_map(params![library_id.to_string(), CATEGORY_FACET], |row| {
+                Ok((tag_from_row(row)?, row.get::<_, i64>(5)? as usize))
+            })?
+            .collect::<Result<Vec<_>, _>>()?;
+        Ok(rows)
+    }
+
+    /// Sets each asset's sound-effect category, replacing whatever category
+    /// it had (an asset is in at most one category — that's what makes the
+    /// export subfolder unambiguous). `None` clears it. Runs as one
+    /// transaction and records ONE undo entry for the whole batch, so a
+    /// 300-file "Organize" is a single Undo, not 300.
+    pub fn set_asset_categories(&self, assignments: &[(Uuid, Option<String>)]) -> Result<Uuid, StorageError> {
+        let transaction = self.connection.unchecked_transaction()?;
+        let now = Utc::now().to_rfc3339();
+        let mut changes: Vec<CategoryChange> = Vec::new();
+
+        for (asset_id, category) in assignments {
+            let new_tag = match category.as_deref().map(str::trim).filter(|name| !name.is_empty()) {
+                Some(name) => Some(self.ensure_category_tag(name)?.id),
+                None => None,
+            };
+            let previous = self.category_rows_for_asset(*asset_id)?;
+            if previous.len() == 1 && new_tag.is_some_and(|tag| previous[0].0 == tag) {
+                continue;
+            }
+            self.connection.execute(
+                "DELETE FROM asset_tags WHERE asset_id = ?1 AND tag_id IN (SELECT id FROM tags WHERE facet = ?2)",
+                params![asset_id.to_string(), CATEGORY_FACET],
+            )?;
+            if let Some(tag_id) = new_tag {
+                self.connection.execute(
+                    "INSERT OR REPLACE INTO asset_tags (asset_id, tag_id, origin, confidence, approval_state, created_at)
+                     VALUES (?1, ?2, 'user_rule', 1.0, 'accepted', ?3)",
+                    params![asset_id.to_string(), tag_id.to_string(), now],
+                )?;
+            }
+            changes.push(CategoryChange {
+                asset: *asset_id,
+                new_tag,
+                previous: previous
+                    .into_iter()
+                    .map(|(tag, origin, approval_state)| PreviousTagRow { tag, origin, approval_state })
+                    .collect(),
+            });
+        }
+
+        let payload = serde_json::to_string(&changes).map_err(|error| StorageError::InvalidInput(error.to_string()))?;
+        let undo_id = self.record_undo("set_asset_categories", &payload)?;
+        transaction.commit()?;
+        Ok(undo_id)
+    }
+
+    fn category_rows_for_asset(&self, asset_id: Uuid) -> Result<Vec<(Uuid, String, String)>, StorageError> {
+        let mut statement = self.connection.prepare(
+            "SELECT asset_tags.tag_id, asset_tags.origin, asset_tags.approval_state FROM asset_tags
+             JOIN tags ON tags.id = asset_tags.tag_id
+             WHERE asset_tags.asset_id = ?1 AND tags.facet = ?2",
+        )?;
+        let rows = statement
+            .query_map(params![asset_id.to_string(), CATEGORY_FACET], |row| {
+                Ok((parse_uuid(row.get::<_, String>(0)?), row.get(1)?, row.get(2)?))
+            })?
+            .collect::<Result<Vec<_>, _>>()?;
+        Ok(rows)
+    }
+
+    /// Undo (`forward = false`) or redo (`forward = true`) of one
+    /// `set_asset_categories` batch.
+    fn replay_category_changes(&self, payload: &str, forward: bool) -> Result<(), StorageError> {
+        let changes: Vec<CategoryChange> =
+            serde_json::from_str(payload).map_err(|error| StorageError::InvalidInput(error.to_string()))?;
+        let now = Utc::now().to_rfc3339();
+        for change in changes {
+            self.connection.execute(
+                "DELETE FROM asset_tags WHERE asset_id = ?1 AND tag_id IN (SELECT id FROM tags WHERE facet = ?2)",
+                params![change.asset.to_string(), CATEGORY_FACET],
+            )?;
+            if forward {
+                if let Some(tag) = change.new_tag {
+                    self.connection.execute(
+                        "INSERT OR REPLACE INTO asset_tags (asset_id, tag_id, origin, confidence, approval_state, created_at)
+                         VALUES (?1, ?2, 'user_rule', 1.0, 'accepted', ?3)",
+                        params![change.asset.to_string(), tag.to_string(), now],
+                    )?;
+                }
+            } else {
+                for row in change.previous {
+                    self.connection.execute(
+                        "INSERT OR REPLACE INTO asset_tags (asset_id, tag_id, origin, confidence, approval_state, created_at)
+                         VALUES (?1, ?2, ?3, 1.0, ?4, ?5)",
+                        params![change.asset.to_string(), row.tag.to_string(), row.origin, row.approval_state, now],
+                    )?;
+                }
+            }
+        }
+        Ok(())
     }
 
     pub fn tags_for_asset(&self, asset_id: Uuid) -> Result<Vec<TagRecord>, StorageError> {
@@ -3150,6 +3392,7 @@ impl Catalog {
         };
 
         match kind.as_str() {
+            "set_asset_categories" => self.replay_category_changes(&payload, false)?,
             "remove_asset_tags" => {
                 let (tag_id, _origin, asset_ids) = split_tag_owner_origin_and_assets(&payload);
                 for asset_id in asset_ids {
@@ -3216,6 +3459,7 @@ impl Catalog {
 
         let now = Utc::now().to_rfc3339();
         match kind.as_str() {
+            "set_asset_categories" => self.replay_category_changes(&payload, true)?,
             "remove_asset_tags" => {
                 let (tag_id, origin, asset_ids) = split_tag_owner_origin_and_assets(&payload);
                 for asset_id in asset_ids {
@@ -5637,6 +5881,70 @@ mod tests {
                 })
                 .expect("asset"),
         )
+    }
+
+    #[test]
+    fn set_asset_categories_is_exclusive_and_undoes_as_one_batch() {
+        let catalog_path = unique_catalog_path("categories");
+        let catalog = Catalog::open(&catalog_path).expect("open catalog");
+        let library = catalog.create_library("Cats", "/library").expect("library");
+        let door = test_asset(&catalog, library.id, "door.wav", "hash-door");
+        let steps = test_asset(&catalog, library.id, "steps.wav", "hash-steps");
+        // A legacy action tag is promoted, not duplicated; a same-named tag
+        // with another facet is left alone and gets a separate category.
+        let legacy = catalog.create_tag("Impact", "action", true).expect("tag");
+        let source = catalog.create_tag("Glass", "source", false).expect("tag");
+
+        let first = catalog
+            .set_asset_categories(&[(door.id, Some("Doors".into())), (steps.id, Some("Impact".into()))])
+            .expect("assign");
+        let categories = catalog.asset_categories_for_library(library.id).expect("categories");
+        assert_eq!(categories[&door.id].1, "Doors");
+        assert_eq!(categories[&steps.id].0, legacy.id);
+
+        // Moving to another category replaces, never stacks.
+        let second = catalog.set_asset_categories(&[(door.id, Some("Glass".into()))]).expect("move");
+        let categories = catalog.asset_categories_for_library(library.id).expect("categories");
+        assert_eq!(categories[&door.id].1, "Glass");
+        assert_ne!(categories[&door.id].0, source.id);
+        // The user's own source tag is untouched, and asking again returns
+        // the same category tag rather than a second one.
+        assert!(catalog.list_tags().expect("tags").iter().any(|tag| tag.id == source.id && tag.facet.as_deref() == Some("source")));
+        assert_eq!(catalog.ensure_category_tag("glass").expect("again").id, categories[&door.id].0);
+        assert_eq!(catalog.category_rows_for_asset(door.id).expect("rows").len(), 1);
+
+        catalog.undo(second).expect("undo move");
+        assert_eq!(catalog.asset_categories_for_library(library.id).expect("c")[&door.id].1, "Doors");
+        catalog.undo(first).expect("undo batch");
+        assert!(catalog.asset_categories_for_library(library.id).expect("c").is_empty());
+        catalog.redo(first).expect("redo batch");
+        let counts = catalog.category_counts_for_library(library.id).expect("counts");
+        assert_eq!(counts.iter().map(|(tag, count)| (tag.name.as_str(), *count)).collect::<Vec<_>>(), vec![("Doors", 1), ("Impact", 1)]);
+    }
+
+    #[test]
+    fn decode_failures_only_reports_decode_errors_not_unreachable_files() {
+        let catalog_path = unique_catalog_path("decode-failures");
+        let catalog = Catalog::open(&catalog_path).expect("open catalog");
+        let library = catalog.create_library("Junk", "/library").expect("library");
+        let broken = test_asset(&catalog, library.id, "._broken.wav", "hash-broken");
+        let offline = test_asset(&catalog, library.id, "offline.wav", "hash-offline");
+        let healthy = test_asset(&catalog, library.id, "healthy.wav", "hash-healthy");
+
+        let job = catalog.enqueue_job(broken.id, JobKind::WaveformGeneration, 30).expect("job");
+        catalog
+            .fail_job(job.id, "DecodeFailed(\"wav: no suitable format reader found\")")
+            .expect("fail");
+        let job = catalog.enqueue_job(offline.id, JobKind::WaveformGeneration, 30).expect("job");
+        catalog.fail_job(job.id, "file unavailable: No such file or directory").expect("fail");
+        catalog.enqueue_job(healthy.id, JobKind::WaveformGeneration, 30).expect("job");
+
+        let failures = catalog.decode_failures_for_library(library.id).expect("failures");
+        assert_eq!(failures.len(), 1);
+        assert_eq!(failures[0].0, broken.id);
+
+        catalog.move_asset_to_trash(broken.id, "manual", 0).expect("trash");
+        assert!(catalog.decode_failures_for_library(library.id).expect("failures").is_empty());
     }
 
     #[test]
